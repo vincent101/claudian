@@ -10,6 +10,7 @@ import type { InputController } from '../controllers/InputController';
 import type { NavigationController } from '../controllers/NavigationController';
 import type { SelectionController } from '../controllers/SelectionController';
 import type { StreamController } from '../controllers/StreamController';
+import type { TurnCoordinator } from '../controllers/TurnCoordinator';
 import type { MessageRenderer } from '../rendering/MessageRenderer';
 import type { SubagentManager } from '../services/SubagentManager';
 import type { ChatState } from '../state/ChatState';
@@ -108,6 +109,8 @@ export interface TabControllers {
   streamController: StreamController | null;
   inputController: InputController | null;
   navigationController: NavigationController | null;
+  /** Feature-layer turn lease (S2): user sends and auto turns arbitrate here. */
+  turnCoordinator: TurnCoordinator | null;
 }
 
 /**

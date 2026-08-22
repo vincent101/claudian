@@ -2,6 +2,7 @@ import { createMockEl } from '@test/helpers/mockElement';
 import { Notice } from 'obsidian';
 
 import { InputController, type InputControllerDeps } from '@/features/chat/controllers/InputController';
+import { TurnCoordinator } from '@/features/chat/controllers/TurnCoordinator';
 import { ChatState } from '@/features/chat/state/ChatState';
 import { encodeClaudeTurn } from '@/providers/claude/prompt/ClaudeTurnEncoder';
 import { ResumeSessionDropdown } from '@/shared/components/ResumeSessionDropdown';
@@ -241,6 +242,40 @@ describe('InputController - Message Queue', () => {
         canvasContext: null,
       });
       expect(inputEl.value).toBe('');
+    });
+
+    it('should only queue in the UI queue while an auto turn holds the feature lease (S2)', async () => {
+      // An SDK-initiated auto turn owns the feature lease; isStreaming is
+      // driven by the coordinator in the real wiring.
+      const coordinator = new TurnCoordinator({
+        state: deps.state,
+        getConversationId: () => deps.state.currentConversationId,
+        processQueuedMessage: () => controller.processQueuedMessage(),
+      });
+      (deps as any).getTurnCoordinator = () => coordinator;
+      coordinator.beginAutoTurn('auto-1', 0);
+      inputEl.value = 'during auto turn';
+
+      await controller.sendMessage();
+
+      // Only the UI queue: no user/assistant message, no runtime query.
+      expect(deps.state.queuedMessage).toEqual({
+        content: 'during auto turn',
+        images: undefined,
+        editorContext: null,
+        browserContext: null,
+        canvasContext: null,
+      });
+      expect(deps.state.messages).toHaveLength(0);
+      const agentService = deps.getAgentService?.() as unknown as { query: jest.Mock } | null;
+      expect(agentService?.query).toBeDefined();
+      expect(agentService?.query).not.toHaveBeenCalled();
+      expect(inputEl.value).toBe('');
+
+      // After the auto lease is released, the queued message may proceed.
+      coordinator.finish('auto-1');
+      coordinator.release('auto-1');
+      expect(inputEl.value).toBe('during auto turn');
     });
 
     it('should queue message with images when streaming', async () => {
@@ -2979,6 +3014,84 @@ describe('InputController - Message Queue', () => {
       expect(restoreFn).toHaveBeenCalled();
       // Auto-send should have been triggered
       expect(mockAgentService.query).toHaveBeenCalledTimes(2);
+    });
+
+    it('releases the feature lease even when the post-turn save throws (S2)', async () => {
+      // Regression: a rejection inside the finally cleanup body (save, title
+      // refresh, createNew, finalize) must not leak the feature lease —
+      // isBusy() would stay true forever and deadlock all future sends.
+      const deps = createSendableDeps();
+      const mockAgentService = (deps as any).mockAgentService;
+      mockAgentService.query = jest.fn().mockImplementation(() =>
+        createMockStream([{ type: 'text', content: 'ok' }, { type: 'done' }]),
+      );
+      (deps.conversationController as any).save = jest.fn().mockRejectedValue(new Error('save failed'));
+
+      const coordinator = new TurnCoordinator({
+        state: deps.state,
+        getConversationId: () => deps.state.currentConversationId,
+        processQueuedMessage: () => {},
+      });
+      (deps as any).getTurnCoordinator = () => coordinator;
+
+      const controller = new InputController(deps);
+      const inputEl = deps.getInputEl();
+      inputEl.value = 'hello';
+
+      await expect(controller.sendMessage()).rejects.toThrow('save failed');
+      expect(coordinator.isBusy()).toBe(false);
+    });
+
+    it('implement auto-send fires with a real TurnCoordinator wiring (lease released before send)', async () => {
+      // Regression: with the coordinator injected (the production wiring),
+      // the plan auto-send runs after finishFeatureTurn — otherwise the send
+      // dead-ends in the queuedMessage branch because the old lease still
+      // reports busy, and nothing ever pumps it.
+      const restoreFn = jest.fn();
+      const deps = createSendableDeps({
+        restorePrePlanPermissionModeIfNeeded: restoreFn,
+      });
+      const mockAgentService = (deps as any).mockAgentService;
+      mockAgentService.providerId = 'codex';
+      mockAgentService.consumeTurnMetadata = jest.fn()
+        .mockReturnValueOnce({ planCompleted: true, wasSent: true })
+        .mockReturnValueOnce({ wasSent: true });
+
+      let callCount = 0;
+      mockAgentService.query = jest.fn().mockImplementation(() => {
+        callCount++;
+        if (callCount === 1) {
+          return createMockStream([
+            { type: 'text', content: 'Plan content' },
+            { type: 'done' },
+          ]);
+        }
+        return createMockStream([{ type: 'done' }]);
+      });
+
+      const coordinator = new TurnCoordinator({
+        state: deps.state,
+        getConversationId: () => deps.state.currentConversationId,
+        processQueuedMessage: () => {},
+      });
+      (deps as any).getTurnCoordinator = () => coordinator;
+
+      const controller = new InputController(deps);
+      (controller as any).showPlanApproval = jest.fn().mockResolvedValue({
+        decision: { type: 'implement' },
+        invalidated: false,
+      });
+
+      const inputEl = deps.getInputEl();
+      inputEl.value = 'Plan this feature';
+      await controller.sendMessage();
+      await new Promise(resolve => setTimeout(resolve, 0));
+
+      expect(restoreFn).toHaveBeenCalled();
+      // The auto-implement message went straight out, not into the queue.
+      expect(mockAgentService.query).toHaveBeenCalledTimes(2);
+      expect(deps.state.queuedMessage).toBeNull();
+      expect(coordinator.isBusy()).toBe(false);
     });
 
     it('revise keeps plan mode active and populates input', async () => {

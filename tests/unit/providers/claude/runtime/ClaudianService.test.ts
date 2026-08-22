@@ -4083,4 +4083,246 @@ describe('ClaudianService', () => {
     });
   });
 
+  // ============================================
+  // S2: completion/cancellation order skeleton, lifecycle callbacks,
+  // S1 leftovers (queue-full drop signal, abort controller reset,
+  // cancel() turn settlement)
+  // ============================================
+
+  describe('S2 turn completion order (v4 acceptance 2)', () => {
+    beforeEach(() => {
+      (service as any).messageChannel = new MessageChannel(
+        undefined,
+        (turnId: string) => (service as any).handleTurnDequeued(turnId),
+      );
+      (service as any).responseHandlers = [];
+      (service as any).runtimeTurns.clear();
+    });
+
+    function channelOf2(): MessageChannel {
+      return (service as any).messageChannel as MessageChannel;
+    }
+
+    it('auto turn settles in strict finish → deferredRestart → settle → completeTurn → released order', async () => {
+      const order: string[] = [];
+      const autoTurnId = (() => {
+        let id = '';
+        service.setOnAutoTurnStarted((event) => { id = event.turnId; });
+        return () => id;
+      })();
+      service.setOnAutoTurnFinished(() => order.push('finishFeatureTurn'));
+      service.setOnAutoTurnReleased(() => order.push('processQueuedMessage'));
+
+      const originalRestart = (service as any).executeDeferredRestartIfAny.bind(service);
+      jest.spyOn(service as any, 'executeDeferredRestartIfAny')
+        .mockImplementation(async function (this: unknown, ...args: unknown[]) {
+          order.push('deferredRestart');
+          return (originalRestart as (...a: unknown[]) => Promise<void>)(...args);
+        });
+      const originalComplete = (service as any).completeChannelTurn.bind(service);
+      jest.spyOn(service as any, 'completeChannelTurn')
+        .mockImplementation((...args: unknown[]) => {
+          order.push('completeTurn');
+          // Settle (step 5) must precede channel release (step 6).
+          expect((service as any).runtimeTurns.has(args[0])).toBe(false);
+          return originalComplete(...(args as [string]));
+        });
+
+      // Start an auto turn via an unleased assistant message, then complete.
+      await (service as any).routeMessage({
+        type: 'assistant',
+        message: { content: [{ type: 'text', text: 'Background' }] },
+      });
+      const turnId = autoTurnId();
+      expect(turnId).toBeTruthy();
+
+      await (service as any).routeMessage({
+        type: 'result',
+        subtype: 'success',
+        result: 'done',
+      });
+
+      expect(order).toEqual(['finishFeatureTurn', 'deferredRestart', 'completeTurn', 'processQueuedMessage']);
+      expect((service as any).runtimeTurns.has(turnId)).toBe(false);
+      expect(channelOf2().getActiveTurnId()).toBeNull();
+    });
+
+    it('cancellation settles the turn waiters before releasing the channel lease', async () => {
+      const order: string[] = [];
+      service.setOnAutoTurnCancelled(() => order.push('featureCancellation'));
+
+      const onDone = jest.fn(() => order.push('waitersSettled'));
+      const handler = createResponseHandler({
+        id: 'handler-cancel-order',
+        onChunk: jest.fn(),
+        onDone,
+        onError: jest.fn(),
+      });
+      const turn = createRuntimeTurn({ id: 'user-cancel-order', kind: 'user', phase: 'collecting' });
+      turn.waiters.add(handler);
+      (service as any).runtimeTurns.set('user-cancel-order', turn);
+      channelOf2().beginExternalTurn('user-cancel-order');
+
+      const originalComplete = (service as any).completeChannelTurn.bind(service);
+      jest.spyOn(service as any, 'completeChannelTurn')
+        .mockImplementation((...args: unknown[]) => {
+          order.push('completeTurn');
+          return originalComplete(...(args as [string]));
+        });
+
+      (service as any).cancelTurn('user-cancel-order', 'test_cancel');
+
+      expect(order).toEqual(['waitersSettled', 'completeTurn']);
+      expect((service as any).runtimeTurns.has('user-cancel-order')).toBe(false);
+    });
+
+    it('auto turn cancellation fires onAutoTurnCancelled with the bumped generation before the lease releases', async () => {
+      const cancelled: any[] = [];
+      service.setOnAutoTurnCancelled((event) => cancelled.push({ ...event }));
+
+      let autoTurnId = '';
+      service.setOnAutoTurnStarted((event) => { autoTurnId = event.turnId; });
+      await (service as any).routeMessage({
+        type: 'assistant',
+        message: { content: [{ type: 'text', text: 'Background' }] },
+      });
+
+      (service as any).cancelTurn(autoTurnId, 'lifecycle_cancel');
+
+      expect(cancelled).toHaveLength(1);
+      expect(cancelled[0].turnId).toBe(autoTurnId);
+      // cancelTurn bumped the generation from 0 to 1 before firing.
+      expect(cancelled[0].generation).toBe(1);
+      expect(cancelled[0].reason).toBe('lifecycle_cancel');
+      expect(channelOf2().getActiveTurnId()).toBeNull();
+      expect((service as any).runtimeTurns.has(autoTurnId)).toBe(false);
+    });
+  });
+
+  describe('S1 leftover #3: cancel() settles the active turn', () => {
+    beforeEach(() => {
+      (service as any).messageChannel = new MessageChannel(
+        undefined,
+        (turnId: string) => (service as any).handleTurnDequeued(turnId),
+      );
+      (service as any).responseHandlers = [];
+      (service as any).runtimeTurns.clear();
+    });
+
+    it('cancel() settles the leased turn immediately', () => {
+      const channel = (service as any).messageChannel as MessageChannel;
+      const turn = createRuntimeTurn({ id: 'user-active-cancel', kind: 'user', phase: 'collecting' });
+      const onDone = jest.fn();
+      const handler = createResponseHandler({
+        id: 'handler-cancel',
+        onChunk: jest.fn(),
+        onDone,
+        onError: jest.fn(),
+      });
+      turn.waiters.add(handler);
+      (service as any).runtimeTurns.set('user-active-cancel', turn);
+      channel.beginExternalTurn('user-active-cancel');
+
+      service.cancel();
+
+      expect(onDone).toHaveBeenCalledTimes(1);
+      expect((service as any).runtimeTurns.has('user-active-cancel')).toBe(false);
+      expect(channel.getActiveTurnId()).toBeNull();
+    });
+
+    it('a cancelled user turn still hands its metadata to the feature layer', () => {
+      const channel = (service as any).messageChannel as MessageChannel;
+      const turn = createRuntimeTurn({ id: 'user-cancel-meta', kind: 'user', phase: 'collecting' });
+      turn.metadata = { userMessageId: 'u-1', assistantMessageId: 'a-1', wasSent: true };
+      const handler = createResponseHandler({
+        id: 'handler-cancel-meta',
+        onChunk: jest.fn(),
+        onDone: jest.fn(),
+        onError: jest.fn(),
+      });
+      turn.waiters.add(handler);
+      (service as any).runtimeTurns.set('user-cancel-meta', turn);
+      channel.beginExternalTurn('user-cancel-meta');
+
+      service.cancel();
+
+      // The trailing result is dropped lease-less, so the cancel settlement
+      // itself must surface the turn metadata (rewind/fork anchoring).
+      expect(service.consumeTurnMetadata()).toEqual({
+        userMessageId: 'u-1',
+        assistantMessageId: 'a-1',
+        wasSent: true,
+      });
+    });
+
+    it('a trailing result for the settled turn is dropped without creating a ghost auto turn', async () => {
+      const started: any[] = [];
+      service.setOnAutoTurnStarted((event) => started.push({ ...event }));
+
+      const channel = (service as any).messageChannel as MessageChannel;
+      const turn = createRuntimeTurn({ id: 'user-trailing', kind: 'user', phase: 'collecting' });
+      (service as any).runtimeTurns.set('user-trailing', turn);
+      channel.beginExternalTurn('user-trailing');
+      service.cancel();
+      expect(channel.getActiveTurnId()).toBeNull();
+
+      // SDK still emits the aborted turn's result — lease-less by now.
+      await (service as any).routeMessage({ type: 'result', subtype: 'success', result: '' });
+
+      expect(started).toHaveLength(0);
+      expect((service as any).runtimeTurns.size).toBe(0);
+      expect(channel.getActiveTurnId()).toBeNull();
+    });
+  });
+
+  describe('S1 leftover #2: retry re-registration resets the abort controller', () => {
+    it('reRegisterTurnForRetry gives the turn a fresh, un-aborted controller', () => {
+      const turn = createRuntimeTurn({ id: 'user-retry-abort', kind: 'user' });
+      (service as any).runtimeTurns.set('user-retry-abort', turn);
+      turn.abortController.abort();
+      expect(turn.abortController.signal.aborted).toBe(true);
+
+      (service as any).reRegisterTurnForRetry(turn);
+
+      expect(turn.abortController.signal.aborted).toBe(false);
+      expect(turn.phase).toBe('queued');
+      expect((service as any).runtimeTurns.get('user-retry-abort')).toBe(turn);
+    });
+  });
+
+  describe('S1 leftover #1: queue-full drop settles the turn', () => {
+    it('a dropped enqueue surfaces as an error chunk instead of a hanging handler', async () => {
+      const startSpy = jest.spyOn(service as any, 'startPersistentQuery');
+      startSpy.mockImplementation(async (...args: unknown[]) => {
+        const [vaultPath, cliPath] = args as [string, string];
+        const channel = new MessageChannel(
+          undefined,
+          (turnId: string) => (service as any).handleTurnDequeued(turnId),
+        );
+        // Simulate an overflowed queue: the next enqueue reports a drop.
+        jest.spyOn(channel, 'enqueue').mockReturnValue({ canonicalTurnId: 'user-drop', dropped: true });
+        (service as any).messageChannel = channel;
+        (service as any).vaultPath = vaultPath;
+        (service as any).persistentQuery = sdkMock.query({
+          prompt: channel,
+          options: { cwd: vaultPath, pathToClaudeCodeExecutable: cliPath } as any,
+        });
+        (service as any).currentConfig = (service as any).buildPersistentQueryConfig(vaultPath, cliPath, []);
+        (service as any).startResponseConsumer();
+      });
+      await service.ensureReady();
+
+      const turn = service.prepareTurn({ turnId: 'user-drop', text: 'overflowed' });
+      const chunks = await collectChunks(service.query(turn));
+
+      expect(chunks).toEqual([
+        { type: 'error', content: expect.stringContaining('dropped') },
+        { type: 'done' },
+      ]);
+      expect((service as any).runtimeTurns.has('user-drop')).toBe(false);
+      // The dropped message must not stay eligible for crash-recovery replay.
+      expect((service as any).lastSentMessage).toBeNull();
+      expect((service as any).lastSentTurnId).toBeNull();
+    });
+  });
 });

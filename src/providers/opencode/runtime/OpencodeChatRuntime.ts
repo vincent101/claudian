@@ -16,7 +16,9 @@ import type {
   ApprovalCallback,
   ApprovalDecisionOption,
   AskUserQuestionCallback,
+  AutoTurnCancelledEvent,
   AutoTurnResult,
+  AutoTurnStartedEvent,
   ChatRewindResult,
   ChatRuntimeEnsureReadyOptions,
   ChatRuntimeQueryOptions,
@@ -485,6 +487,12 @@ export class OpencodeChatRuntime implements ChatRuntime {
   setSubagentHookProvider(_getState: () => SubagentRuntimeState): void {}
 
   setAutoTurnCallback(_callback: ((result: AutoTurnResult) => void) | null): void {}
+
+  // S2 auto-turn lifecycle: OpenCode has no SDK-initiated turns — no-ops.
+  setOnAutoTurnStarted(_callback: ((event: AutoTurnStartedEvent) => void) | null): void {}
+  setOnAutoTurnFinished(_callback: ((turnId: string) => void) | null): void {}
+  setOnAutoTurnReleased(_callback: ((turnId: string) => void) | null): void {}
+  setOnAutoTurnCancelled(_callback: ((event: AutoTurnCancelledEvent) => void) | null): void {}
 
   consumeTurnMetadata(): ChatTurnMetadata {
     const metadata = this.currentTurnMetadata;

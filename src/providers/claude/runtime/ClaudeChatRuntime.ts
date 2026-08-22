@@ -34,7 +34,9 @@ import type { ChatRuntime } from '../../../core/runtime/ChatRuntime';
 import type {
   ApprovalCallback,
   AskUserQuestionCallback,
+  AutoTurnCancelledEvent,
   AutoTurnResult,
+  AutoTurnStartedEvent,
   ChatRewindResult,
   ChatRuntimeConversationState,
   ChatRuntimeQueryOptions,
@@ -98,7 +100,6 @@ import {
   buildClaudeSDKUserMessage,
 } from './ClaudeUserMessageFactory';
 import {
-  type AutoTurnStartedEvent,
   type ClaudeEnsureReadyOptions,
   type ClosePersistentQueryOptions,
   createResponseHandler,
@@ -193,6 +194,12 @@ export class ClaudianService implements ChatRuntime {
   private _autoTurnCallback: ((result: AutoTurnResult) => void) | null = null;
   /** Sync signal for feature layer when an SDK-initiated turn starts (S1 API). */
   private _onAutoTurnStarted: ((event: AutoTurnStartedEvent) => void) | null = null;
+  /** S2 lifecycle: feature lease cleared (v4 §3.1 step 3). */
+  private _onAutoTurnFinished: ((turnId: string) => void) | null = null;
+  /** S2 lifecycle: lease gone + channel released → UI queue may proceed (step 7). */
+  private _onAutoTurnReleased: ((turnId: string) => void) | null = null;
+  /** S2 lifecycle: feature clears its auto lease only (v3 §4.2). */
+  private _onAutoTurnCancelled: ((event: AutoTurnCancelledEvent) => void) | null = null;
 
   // S1 turn-lease base: live turn registry keyed by turnId. All transform,
   // usage, metadata and dedup state lives on the turn, never on the runtime.
@@ -817,7 +824,7 @@ export class ClaudianService implements ChatRuntime {
               const replayTurnId = this.lastSentTurnId;
               const replayTurn = replayTurnId ? this.runtimeTurns.get(replayTurnId) : undefined;
               if (replayTurnId && replayTurn) {
-                replayTurn.phase = 'queued';
+                this.reRegisterTurnForRetry(replayTurn);
                 this.messageChannel.enqueue(replayTurnId, messageToReplay);
               } else {
                 // Turn registry lost the turn — settle instead of replaying
@@ -898,6 +905,15 @@ export class ClaudianService implements ChatRuntime {
     // The SDK throws errors as exceptions, not as message types
 
     let turn = this.resolveActiveTurn();
+
+    if (!turn && isTurnCompleteMessage(message)) {
+      // Trailing result of a turn already settled by cancel()/close: its
+      // generation is invalid, so instead of spinning up a ghost auto turn
+      // (which would flash isStreaming in the feature layer), drop it and
+      // keep the consumer alive (S1 leftover #3).
+      console.warn('[Claudian] trailing result without a turn lease; dropping');
+      return;
+    }
 
     // Auto turn (lease signed) must exist before the notification handler runs
     // so its accounting happens under one exclusive turn (v4 §6 order).
@@ -1092,12 +1108,47 @@ export class ClaudianService implements ChatRuntime {
     }
   }
 
+  private fireOnAutoTurnFinished(turnId: string): void {
+    try {
+      this._onAutoTurnFinished?.(turnId);
+    } catch (error) {
+      console.warn('[Claudian] onAutoTurnFinished callback failed', error);
+    }
+  }
+
+  private fireOnAutoTurnReleased(turnId: string): void {
+    try {
+      this._onAutoTurnReleased?.(turnId);
+    } catch (error) {
+      console.warn('[Claudian] onAutoTurnReleased callback failed', error);
+    }
+  }
+
+  private fireOnAutoTurnCancelled(turnId: string, generation: number, reason: string): void {
+    try {
+      this._onAutoTurnCancelled?.({ turnId, generation, reason });
+    } catch (error) {
+      console.warn('[Claudian] onAutoTurnCancelled callback failed', error);
+    }
+  }
+
   /**
-   * Terminal settlement on an SDK result message: settle waiters (or flush
-   * buffered chunks through the auto-turn adapter), delete the turn, release
-   * the channel lease, then run any deferred config restart while idle.
+   * Terminal settlement on an SDK result message, in the fixed v4 §3.1 order:
+   * projecting → feature projection → finishFeatureTurn → deferred restart →
+   * settle → completeTurn (releases dequeue) → onTurnReleased.
+   *
+   * User turns: the feature generator owns projection/finalize and clears its
+   * own lease in sendMessage()'s finally; the runtime-side order here runs
+   * projecting → onDone → deferred restart → settle → completeTurn (the full
+   * seven-step order with runtime-driven projection lands with S4).
+   *
+   * Auto turns: the complete order runs here — legacy-adapter projection
+   * (S2), feature finish, deferred restart, settle, channel release, then
+   * the released signal that lets the UI queue proceed.
    */
   private async settleTurnAtResult(turn: RuntimeTurn): Promise<void> {
+    turn.phase = 'projecting';
+
     if (turn.waiters.size > 0) {
       // Feature layer consumes this after the generator drains.
       this.pendingFeatureTurnMetadata = { ...turn.metadata };
@@ -1107,9 +1158,16 @@ export class ClaudianService implements ChatRuntime {
         handler.onDone();
       }
       turn.waiters.clear();
-    } else if (turn.chunks.length > 0) {
-      // Old auto-turn adapter (kept until S2/S4): flush buffered chunks of a
-      // turn whose consumer is gone.
+      await this.executeDeferredRestartIfAny(turn.id);
+      turn.phase = 'settled';
+      this.runtimeTurns.delete(turn.id);
+      this.completeChannelTurn(turn.id);
+      return;
+    }
+
+    // Auto turn (or a user turn whose generator already exited): buffered
+    // chunks flush through the legacy adapter (kept until S4 projection).
+    if (turn.chunks.length > 0) {
       const chunks = [...turn.chunks];
       const metadata = { ...turn.metadata };
       turn.chunks = [];
@@ -1120,10 +1178,27 @@ export class ClaudianService implements ChatRuntime {
       }
     }
 
+    // v4 §3.1 step 3: feature clears its lease before the channel releases.
+    // Only auto turns drive the lifecycle callbacks — a user turn whose
+    // generator exited early keeps its feature lease until sendMessage()'s
+    // finally runs (S4 moves user projection onto this order as well).
+    if (turn.kind === 'auto') {
+      this.fireOnAutoTurnFinished(turn.id);
+    }
+    // Step 4: deferred config restart runs only when the channel is idle
+    // (this turn's lease excepted), i.e. strictly before the next queued
+    // user turn dequeues (step 6).
+    await this.executeDeferredRestartIfAny(turn.id);
+    // Step 5: settle — phase, registry entry, waiters are all gone.
     turn.phase = 'settled';
     this.runtimeTurns.delete(turn.id);
+    // Step 6: release the lease so the async iterator may dequeue the next
+    // queued user message.
     this.completeChannelTurn(turn.id);
-    await this.executeDeferredRestartIfAny();
+    // Step 7: no active lease remains — the UI queued message may proceed.
+    if (turn.kind === 'auto') {
+      this.fireOnAutoTurnReleased(turn.id);
+    }
   }
 
   /** Channel dequeue hook: a user message left the queue and now owns the lease. */
@@ -1138,6 +1213,21 @@ export class ClaudianService implements ChatRuntime {
     }
     if (turn.phase === 'queued') {
       turn.phase = 'collecting';
+    }
+  }
+
+  /**
+   * Re-registers a turn that a failed attempt already settled (session-expired
+   * retry, pre-send restart, crash-recovery replay). The abort controller is
+   * replaced: reusing one that cancel() already aborted would make the retry
+   * break on its first aborted-signal check (S1 leftover #2).
+   */
+  private reRegisterTurnForRetry(turn: RuntimeTurn): void {
+    turn.abortController = new AbortController();
+    turn.phase = 'queued';
+    this.runtimeTurns.set(turn.id, turn);
+    if (this.abortController) {
+      this.abortController = turn.abortController;
     }
   }
 
@@ -1191,9 +1281,10 @@ export class ClaudianService implements ChatRuntime {
   }
 
   /**
-   * Forces a turn to its terminal state (v3 §4.2): phase/generation/abort →
-   * dequeue removal → lease release → waiter settlement → delete. Plain
-   * cancellation settles waiters with onDone; failures settle with onError.
+   * Forces a turn to its terminal state (v3 §4.2 / v4 §3.2): phase/generation
+   * /abort → feature cancellation (auto turns only, strictly before channel
+   * release) → dequeue removal → waiter settlement → delete → lease release.
+   * Plain cancellation settles waiters with onDone; failures with onError.
    */
   private cancelTurn(turnId: string, reason: string, error?: Error): void {
     const turn = this.runtimeTurns.get(turnId);
@@ -1209,14 +1300,24 @@ export class ClaudianService implements ChatRuntime {
       // Already aborted
     }
 
+    // Feature cancellation first: the feature layer clears only this turn's
+    // lease-created state and never writes new state (v4 §3.2).
+    if (turn.kind === 'auto') {
+      this.fireOnAutoTurnCancelled(turn.id, turn.generation, reason);
+    }
+
     // Still queued → remove the item so it never dequeues.
     this.messageChannel?.cancelQueuedTurn(turnId);
 
-    // Holds the lease → release so the next queued message can flow.
-    if (this.messageChannel?.getActiveTurnId() === turnId) {
-      this.completeChannelTurn(turnId);
+    // A cancelled user turn still hands its metadata (message ids, wasSent)
+    // to the feature layer: the trailing SDK result is dropped lease-less by
+    // routeMessage, so this is the last chance for rewind/fork anchoring.
+    if (turn.kind === 'user' && turn.waiters.size > 0) {
+      this.pendingFeatureTurnMetadata = { ...turn.metadata };
     }
 
+    // Settle waiters and delete the turn before releasing the lease, so the
+    // next queued message can only flow after this turn is fully settled.
     for (const handler of turn.waiters) {
       if (error) {
         handler.onError(error);
@@ -1225,8 +1326,12 @@ export class ClaudianService implements ChatRuntime {
       }
     }
     turn.waiters.clear();
-
     this.runtimeTurns.delete(turnId);
+
+    // Holds the lease → release so the next queued message can flow.
+    if (this.messageChannel?.getActiveTurnId() === turnId) {
+      this.completeChannelTurn(turnId);
+    }
   }
 
   /** Cancels every live turn plus any turn still holding channel state. */
@@ -1240,10 +1345,12 @@ export class ClaudianService implements ChatRuntime {
 
   /**
    * Executes a config restart that was deferred while a turn was mid-flight.
-   * Fires only when the channel is fully idle (no active lease, empty queue)
-   * so no queued message is dropped by the rebuild.
+   * Fires only when the channel is fully idle (no active lease other than the
+   * turn currently settling, empty queue) so no queued message is dropped by
+   * the rebuild. v4 §3.1 step 4: runs after the feature lease is gone and
+   * before the channel releases the dequeue.
    */
-  private async executeDeferredRestartIfAny(): Promise<void> {
+  private async executeDeferredRestartIfAny(exemptTurnId?: string): Promise<void> {
     const paths = this.deferredRestartPaths;
     if (!paths) {
       return;
@@ -1253,7 +1360,9 @@ export class ClaudianService implements ChatRuntime {
       this.deferredRestartPaths = null;
       return;
     }
-    if (channel.getActiveTurnId() !== null || channel.getQueueLength() > 0) {
+    const activeTurnId = channel.getActiveTurnId();
+    const busyWithAnotherTurn = activeTurnId !== null && activeTurnId !== exemptTurnId;
+    if (busyWithAnotherTurn || channel.getQueueLength() > 0) {
       // Still busy — retry after the next settle.
       return;
     }
@@ -1577,11 +1686,10 @@ export class ClaudianService implements ChatRuntime {
             const retryRequest = this.buildHistoryRebuildRequest(prompt, conversationHistory);
 
             this.coldStartInProgress = true;
-            this.abortController = turn.abortController;
             // The failed attempt settled the turn in its finally block —
             // re-register it so the retry reuses the same turnId/lease slot.
-            turn.phase = 'queued';
-            this.runtimeTurns.set(turnId, turn);
+            this.reRegisterTurnForRetry(turn);
+            this.abortController = turn.abortController;
 
             try {
               yield* this.queryViaSDK(
@@ -1621,8 +1729,7 @@ export class ClaudianService implements ChatRuntime {
         const retryRequest = this.buildHistoryRebuildRequest(prompt, conversationHistory);
 
         // Re-register the turn settled by the failed attempt (same turnId).
-        turn.phase = 'queued';
-        this.runtimeTurns.set(turnId, turn);
+        this.reRegisterTurnForRetry(turn);
 
         try {
           yield* this.queryViaSDK(
@@ -1712,8 +1819,7 @@ export class ClaudianService implements ChatRuntime {
     // one, whose message has not been enqueued yet. Re-register it so the
     // channel lease below resolves against a live turn.
     if (this.runtimeTurns.get(turn.id) !== turn) {
-      turn.phase = 'queued';
-      this.runtimeTurns.set(turn.id, turn);
+      this.reRegisterTurnForRetry(turn);
     }
 
     // Check if applyDynamicUpdates triggered a restart that failed
@@ -1781,7 +1887,18 @@ export class ClaudianService implements ChatRuntime {
       // The channel could close between our null check above and this call
       try {
         const enqueueResult = this.messageChannel.enqueue(turn.id, message);
-        if (enqueueResult.canonicalTurnId !== turn.id) {
+        if (enqueueResult.dropped) {
+          // Queue overflow dropped this message (S1 leftover #1): settle the
+          // turn immediately instead of leaving its handler waiting on a
+          // lease that will never come. The dropped message must not remain
+          // eligible for crash-recovery replay either. onError flips
+          // state.done, so the loop below is skipped and the error is
+          // yielded on the shared drain path.
+          this.lastSentMessage = null;
+          this.lastSentQueryOptions = null;
+          this.lastSentTurnId = null;
+          handler.onError(new Error('Message queue is full; the newest message was dropped.'));
+        } else if (enqueueResult.canonicalTurnId !== turn.id) {
           // Merged into an already queued item (text merge / attachment
           // replace): join the canonical turn's lease so our handler receives
           // that turn's chunks and settlement.
@@ -2072,6 +2189,15 @@ export class ClaudianService implements ChatRuntime {
       this.sessionManager.markInterrupted();
     }
 
+    // v3 §4.2: user cancel settles the active turn itself (queued user turns
+    // are kept). A trailing SDK result for the settled turn then arrives
+    // lease-less and is dropped by routeMessage instead of creating a ghost
+    // auto turn (S1 leftover #3).
+    const activeTurnId = this.messageChannel?.getActiveTurnId() ?? null;
+    if (activeTurnId && this.runtimeTurns.has(activeTurnId)) {
+      this.cancelTurn(activeTurnId, 'user_cancel');
+    }
+
     // Interrupt persistent query (Phase 1.9)
     if (this.persistentQuery && !this.shuttingDown) {
       void this.persistentQuery.interrupt().catch(() => {
@@ -2243,6 +2369,21 @@ export class ClaudianService implements ChatRuntime {
   /** S1: fired synchronously when an SDK-initiated (auto) turn starts. */
   setOnAutoTurnStarted(callback: ((event: AutoTurnStartedEvent) => void) | null): void {
     this._onAutoTurnStarted = callback;
+  }
+
+  /** S2 (v4 §3.1 step 3): feature clears its auto-turn lease. */
+  setOnAutoTurnFinished(callback: ((turnId: string) => void) | null): void {
+    this._onAutoTurnFinished = callback;
+  }
+
+  /** S2 (v4 §3.1 step 7): lease gone + channel released → UI queue may proceed. */
+  setOnAutoTurnReleased(callback: ((turnId: string) => void) | null): void {
+    this._onAutoTurnReleased = callback;
+  }
+
+  /** S2 (v3 §4.2): feature clears only the cancelled turn's state. */
+  setOnAutoTurnCancelled(callback: ((event: AutoTurnCancelledEvent) => void) | null): void {
+    this._onAutoTurnCancelled = callback;
   }
 
   private createApprovalCallback(): CanUseTool {

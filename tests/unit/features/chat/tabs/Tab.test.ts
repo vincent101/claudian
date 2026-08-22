@@ -5,6 +5,7 @@ import { Notice } from 'obsidian';
 
 import { ProviderRegistry } from '@/core/providers/ProviderRegistry';
 import { ProviderWorkspaceRegistry } from '@/core/providers/ProviderWorkspaceRegistry';
+import { TurnCoordinator } from '@/features/chat/controllers/TurnCoordinator';
 import { ChatState } from '@/features/chat/state/ChatState';
 import {
   activateTab,
@@ -1464,6 +1465,108 @@ describe('Tab - Service Callbacks', () => {
       expect(addMessageSpy).not.toHaveBeenCalled();
       expect(renderStoredMessage).not.toHaveBeenCalled();
       expect(scrollToBottom).not.toHaveBeenCalled();
+    });
+
+    it('wires the auto-turn lifecycle callbacks through the TurnCoordinator (S2)', () => {
+      const plugin = createMockPlugin();
+      const tab = createTab(createMockOptions({ plugin }));
+      const processQueuedMessage = jest.fn();
+      tab.controllers.inputController = { processQueuedMessage } as any;
+      tab.controllers.turnCoordinator = new TurnCoordinator({
+        state: tab.state,
+        getConversationId: () => tab.state.currentConversationId,
+        processQueuedMessage,
+      });
+
+      const service = {
+        setApprovalCallback: jest.fn(),
+        setApprovalDismisser: jest.fn(),
+        setAskUserQuestionCallback: jest.fn(),
+        setExitPlanModeCallback: jest.fn(),
+        setSubagentHookProvider: jest.fn(),
+        setAutoTurnCallback: jest.fn(),
+        setOnAutoTurnStarted: jest.fn(),
+        setOnAutoTurnFinished: jest.fn(),
+        setOnAutoTurnReleased: jest.fn(),
+        setOnAutoTurnCancelled: jest.fn(),
+        setPermissionModeSyncCallback: jest.fn(),
+      };
+      tab.service = service as any;
+
+      setupServiceCallbacks(tab, plugin);
+
+      // started → lease taken, isStreaming on
+      const started = service.setOnAutoTurnStarted.mock.calls[0][0];
+      started({ turnId: 'auto-1', generation: 0 });
+      expect(tab.controllers.turnCoordinator.isBusy()).toBe(true);
+      expect(tab.state.isStreaming).toBe(true);
+
+      // finished → lease cleared without pumping the queue
+      const finished = service.setOnAutoTurnFinished.mock.calls[0][0];
+      finished('auto-1');
+      expect(tab.controllers.turnCoordinator.isBusy()).toBe(false);
+      expect(tab.state.isStreaming).toBe(false);
+      expect(processQueuedMessage).not.toHaveBeenCalled();
+
+      // released → queued message pump runs
+      const released = service.setOnAutoTurnReleased.mock.calls[0][0];
+      released('auto-1');
+      expect(processQueuedMessage).toHaveBeenCalledTimes(1);
+
+      // cancelled (stale generation) → no-op; fresh generation clears the lease
+      started({ turnId: 'auto-2', generation: 3 });
+      const cancelled = service.setOnAutoTurnCancelled.mock.calls[0][0];
+      cancelled({ turnId: 'auto-2', generation: 3 });
+      expect(tab.controllers.turnCoordinator.isBusy()).toBe(true);
+      cancelled({ turnId: 'auto-2', generation: 4 });
+      expect(tab.controllers.turnCoordinator.isBusy()).toBe(false);
+    });
+
+    it('drops the legacy adapter projection once the lifecycle is invalidated (S2)', () => {
+      const plugin = createMockPlugin();
+      const tab = createTab(createMockOptions({ plugin }));
+      const addMessageSpy = jest.spyOn(tab.state, 'addMessage');
+
+      Object.defineProperty(tab.dom.contentEl, 'isConnected', {
+        value: true,
+        writable: true,
+        configurable: true,
+      });
+      tab.renderer = { renderStoredMessage: jest.fn(), scrollToBottom: jest.fn() } as any;
+      tab.controllers.inputController = {} as any;
+      tab.controllers.turnCoordinator = new TurnCoordinator({
+        state: tab.state,
+        getConversationId: () => tab.state.currentConversationId,
+        processQueuedMessage: () => {},
+      });
+      const service = {
+        setApprovalCallback: jest.fn(),
+        setApprovalDismisser: jest.fn(),
+        setAskUserQuestionCallback: jest.fn(),
+        setExitPlanModeCallback: jest.fn(),
+        setSubagentHookProvider: jest.fn(),
+        setAutoTurnCallback: jest.fn(),
+        setPermissionModeSyncCallback: jest.fn(),
+      };
+      tab.service = service as any;
+      setupServiceCallbacks(tab, plugin);
+      const autoTurnCallback = service.setAutoTurnCallback.mock.calls[0][0];
+
+      // Auto lease current → projection allowed.
+      tab.controllers.turnCoordinator.beginAutoTurn('auto-1', 0);
+      autoTurnCallback({
+        chunks: [{ type: 'text', content: 'live projection' }],
+        metadata: {},
+      });
+      expect(addMessageSpy).toHaveBeenCalledTimes(1);
+
+      // Tab destroyed / conversation switched → stale projection dropped.
+      tab.controllers.turnCoordinator.invalidateLifecycle();
+      autoTurnCallback({
+        chunks: [{ type: 'text', content: 'stale projection' }],
+        metadata: {},
+      });
+      expect(addMessageSpy).toHaveBeenCalledTimes(1);
     });
   });
 });

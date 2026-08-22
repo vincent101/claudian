@@ -149,7 +149,7 @@ export class MessageChannel implements AsyncIterable<SDKUserMessage> {
         // Don't set activeTurnId here; next() will set it when it dequeues
         if (this.queue.length >= MESSAGE_CHANNEL_CONFIG.MAX_QUEUED_MESSAGES) {
           this.onWarning(`[MessageChannel] Queue full (${MESSAGE_CHANNEL_CONFIG.MAX_QUEUED_MESSAGES}), dropping newest`);
-          return { canonicalTurnId: turnId };
+          return { canonicalTurnId: turnId, dropped: true };
         }
         if (hasAttachments) {
           this.queue.push({ type: 'attachment', turnId, message });
@@ -188,7 +188,7 @@ export class MessageChannel implements AsyncIterable<SDKUserMessage> {
       // Check merged size
       if (mergedContent.length > MESSAGE_CHANNEL_CONFIG.MAX_MERGED_CHARS) {
         this.onWarning(`[MessageChannel] Merged content exceeds ${MESSAGE_CHANNEL_CONFIG.MAX_MERGED_CHARS} chars, dropping newest`);
-        return { canonicalTurnId: existing.turnId };
+        return { canonicalTurnId: existing.turnId, dropped: true };
       }
 
       existing.content = mergedContent;

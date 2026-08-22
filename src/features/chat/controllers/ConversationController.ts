@@ -37,6 +37,8 @@ export interface ConversationControllerDeps {
   getMcpServerSelector: () => McpServerSelector | null;
   getExternalContextSelector: () => ExternalContextSelector | null;
   clearQueuedMessage: () => void;
+  /** S2 lifecycle cancellation: invalidate the feature turn lease (generation++). */
+  invalidateTurnLifecycle?: () => void;
   getTitleGenerationService: () => TitleGenerationService | null;
   getStatusPanel: () => StatusPanel | null;
   getAgentService?: () => ChatRuntime | null;
@@ -98,6 +100,11 @@ export class ConversationController {
         state.bumpStreamGeneration();
         this.getAgentService()?.cancel();
       }
+
+      // S2 lifecycle cancellation: force-reset drops the feature lease and
+      // invalidates every in-flight turn callback (generation++), so a late
+      // auto-turn finish cannot write into the freshly blanked conversation.
+      this.deps.invalidateTurnLifecycle?.();
 
       // Save current conversation if it has messages
       if (state.currentConversationId && state.messages.length > 0) {
@@ -238,6 +245,13 @@ export class ConversationController {
 
     try {
       this.deps.dismissPendingInlinePrompts?.();
+
+      // S2 lifecycle cancellation: an auto turn may start between the
+      // isStreaming guard above and the restore below; invalidating the
+      // lease generation keeps its late callbacks from writing into the
+      // conversation being switched to.
+      this.deps.invalidateTurnLifecycle?.();
+
       await this.save();
 
       subagentManager.orphanAllActive();

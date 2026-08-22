@@ -3,7 +3,9 @@ import type { ChatMessage, Conversation, SlashCommand, StreamChunk, ToolCallInfo
 import type {
   ApprovalCallback,
   AskUserQuestionCallback,
+  AutoTurnCancelledEvent,
   AutoTurnResult,
+  AutoTurnStartedEvent,
   ChatRewindResult,
   ChatRuntimeConversationState,
   ChatRuntimeEnsureReadyOptions,
@@ -54,6 +56,16 @@ export interface ChatRuntime {
   /** Fix 2: optional — providers that emit harness task-notifications. */
   setSubagentNotificationHandler?(handler: SubagentTaskNotificationHandler | null): void;
   setAutoTurnCallback(callback: ((result: AutoTurnResult) => void) | null): void;
+  /**
+   * S2 auto-turn lifecycle (providers with SDK-initiated turns only; others
+   * provide no-ops). Fixed completion order (v4 §3.1): started → finished
+   * (feature lease cleared) → released (queued UI message may proceed) — with
+   * cancelled replacing finished/released on the cancellation path.
+   */
+  setOnAutoTurnStarted?(callback: ((event: AutoTurnStartedEvent) => void) | null): void;
+  setOnAutoTurnFinished?(callback: ((turnId: string) => void) | null): void;
+  setOnAutoTurnReleased?(callback: ((turnId: string) => void) | null): void;
+  setOnAutoTurnCancelled?(callback: ((event: AutoTurnCancelledEvent) => void) | null): void;
   consumeTurnMetadata(): ChatTurnMetadata;
 
   buildSessionUpdates(params: {

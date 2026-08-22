@@ -184,6 +184,30 @@ describe('MessageChannel', () => {
       // Verify the queue length is capped at MAX_QUEUED_MESSAGES (8)
       expect(channel.getQueueLength()).toBe(8);
     });
+
+    it('reports a dropped signal on queue-full overflow (S1 leftover #1)', () => {
+      for (let i = 0; i < 8; i++) {
+        const result = channel.enqueue(`turn-${i}`, createTextUserMessage(`msg-${i}`));
+        expect(result.dropped).toBeUndefined();
+      }
+      // The 9th message overflows: recognizable drop signal so the runtime
+      // can settle the turn instead of leaving its handler pending forever.
+      const dropped = channel.enqueue('turn-overflow', createTextUserMessage('msg-8'));
+      expect(dropped).toEqual({ canonicalTurnId: 'turn-overflow', dropped: true });
+      expect(channel.getQueueLength()).toBe(8);
+    });
+
+    it('reports a dropped signal when merged text exceeds the cap', async () => {
+      const iterator = channel[Symbol.asyncIterator]();
+      const firstPromise = iterator.next();
+      channel.enqueue('turn-1', createTextUserMessage('first'));
+      await firstPromise;
+
+      channel.enqueue('turn-2', createTextUserMessage('a'.repeat(11000)));
+      const dropped = channel.enqueue('turn-3', createTextUserMessage('b'.repeat(2000)));
+      expect(dropped).toEqual({ canonicalTurnId: 'turn-2', dropped: true });
+      expect(warnings.filter((msg) => msg.includes('Merged content exceeds'))).not.toHaveLength(0);
+    });
   });
 
   describe('close resolves pending consumer', () => {

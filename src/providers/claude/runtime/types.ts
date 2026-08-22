@@ -5,6 +5,7 @@ import type {
 } from '@anthropic-ai/claude-agent-sdk';
 
 import type {
+  AutoTurnStartedEvent,
   ChatRuntimeEnsureReadyOptions,
   ChatTurnMetadata,
 } from '../../../core/runtime/types';
@@ -62,13 +63,17 @@ export type TurnChannelResult =
 export interface EnqueueResult {
   /** Turn id that owns the resulting queue item (first writer wins on text merge). */
   canonicalTurnId: string;
+  /**
+   * True when this message was dropped (queue full / merged text overflow).
+   * The runtime settles the dropped turn immediately instead of leaving its
+   * handler waiting on a lease that will never come (S1 leftover #1).
+   */
+  dropped?: boolean;
 }
 
-/** Sync payload fired when the runtime starts an SDK-initiated (auto) turn. */
-export interface AutoTurnStartedEvent {
-  turnId: string;
-  generation: number;
-}
+// Auto-turn lifecycle payloads live in the provider-neutral core contract;
+// re-exported here for the existing provider-local import sites.
+export type { AutoTurnStartedEvent };
 
 export type RuntimeTurnKind = 'user' | 'auto';
 

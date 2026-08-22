@@ -48,6 +48,7 @@ import type { CanvasSelectionController } from './CanvasSelectionController';
 import type { ConversationController } from './ConversationController';
 import type { SelectionController } from './SelectionController';
 import type { StreamController } from './StreamController';
+import type { TurnCoordinator } from './TurnCoordinator';
 
 const APPROVAL_OPTION_MAP: Record<string, ApprovalDecision> = {
   'Deny': 'deny',
@@ -91,6 +92,8 @@ export interface InputControllerDeps {
   getAuxiliaryModel?: () => string | null;
   getAgentService?: () => ChatRuntime | null;
   getSubagentManager: () => SubagentManager;
+  /** Feature-layer turn lease (S2); absent in legacy tests → state-only checks. */
+  getTurnCoordinator?: () => TurnCoordinator | null;
   /** Tab-level provider fallback for blank tabs (derived from draft model). */
   getTabProviderId?: () => ProviderId;
   /** Returns true if ready. */
@@ -127,6 +130,10 @@ export class InputController {
 
   private getAgentService(): ChatRuntime | null {
     return this.deps.getAgentService?.() ?? null;
+  }
+
+  private getTurnCoordinator(): TurnCoordinator | null {
+    return this.deps.getTurnCoordinator?.() ?? null;
   }
 
   private getAuxiliaryModel(): string | null {
@@ -220,8 +227,10 @@ export class InputController {
       return;
     }
 
-    // If agent is working, queue the message instead of dropping it
-    if (state.isStreaming) {
+    // If agent is working, queue the message instead of dropping it.
+    // The feature turn lease (S2) covers both user turns and SDK-initiated
+    // auto turns; either way the input may only enter the UI queue.
+    if (state.isStreaming || this.getTurnCoordinator()?.isBusy()) {
       const images = hasImages ? [...(imageContextManager?.getAttachedImages() || [])] : undefined;
       const editorContext = selectionController.getContext();
       const browserContext = browserSelectionController?.getContext() ?? null;
@@ -254,6 +263,13 @@ export class InputController {
     state.autoScrollEnabled = plugin.settings.enableAutoScroll ?? true; // Reset auto-scroll based on setting
     const streamGeneration = state.bumpStreamGeneration();
 
+    // v4 §2.1: the user turnId is minted here (single source) and threads
+    // through the feature lease, ChatTurnRequest and the runtime turn. The
+    // feature lease must be taken before any user/assistant DOM is created
+    // (v3 §3) so a racing auto turn cannot interleave.
+    const turnId = this.deps.generateId();
+    this.getTurnCoordinator()?.beginUserTurn(turnId, streamGeneration);
+
     // Hide welcome message when sending first message
     const welcomeEl = this.deps.getWelcomeEl();
     if (welcomeEl) {
@@ -274,6 +290,7 @@ export class InputController {
     }
 
     const { displayContent, turnRequest } = this.buildTurnSubmission({
+      turnId,
       content,
       images: imagesForMessage,
       editorContextOverride: options?.editorContextOverride,
@@ -333,6 +350,7 @@ export class InputController {
         new Notice('Failed to initialize agent service. Please try again.');
         streamController.hideThinkingIndicator();
         state.isStreaming = false;
+        this.getTurnCoordinator()?.finish(turnId);
         this.activeStreamingAssistantMessage = null;
         this.resetProviderMessageBoundaryState();
         return;
@@ -342,6 +360,7 @@ export class InputController {
     const agentService = this.getAgentService();
     if (!agentService) {
       new Notice('Agent service not available. Please reload the plugin.');
+      this.getTurnCoordinator()?.finish(turnId);
       this.activeStreamingAssistantMessage = null;
       this.resetProviderMessageBoundaryState();
       return;
@@ -397,6 +416,12 @@ export class InputController {
       const errorMsg = error instanceof Error ? error.message : 'Unknown error';
       await streamController.appendText(`\n\n**Error:** ${errorMsg}`);
     } finally {
+      // Nested finally: the cleanup body below contains throwing awaits
+      // (finalize, plan approval prompt, save, title refresh, createNew).
+      // The lease release in the inner finally must run even when one of
+      // them rejects — otherwise the feature lease leaks and isBusy() stays
+      // true forever, deadlocking all future sends.
+      try {
       const finalAssistantMsg = this.activeStreamingAssistantMessage ?? assistantMsg;
       const turnMetadata = agentService.consumeTurnMetadata();
       userMsg.userMessageId = turnMetadata.userMessageId ?? userMsg.userMessageId;
@@ -465,6 +490,15 @@ export class InputController {
             }
           }
         }
+
+        // finishFeatureTurn (v4 §3.1 step 3): projection cleanup is complete —
+        // release the feature lease here, BEFORE the plan-approval prompt,
+        // save, title refresh and auto-send/pump below. Every one of those is
+        // an await that may throw; a finish placed after them would leak the
+        // lease and permanently block new sends (isBusy() stays true). The
+        // auto-send path also needs the lease gone to send immediately
+        // instead of dead-ending in the queuedMessage branch.
+        this.getTurnCoordinator()?.finish(turnId);
 
         // Provider-agnostic post-plan approval: show UI and await decision before save/auto-send
         let planAutoSendContent: string | null = null;
@@ -545,9 +579,17 @@ export class InputController {
         this.clearPendingSteerState();
         this.updateQueueIndicator();
       }
+      } finally {
+        // finishFeatureTurn (v4 §3.1 step 3), guaranteed: the
+        // non-invalidated branch already finished before its throwing
+        // awaits; this inner finally covers the invalidated path, an early
+        // skip, and any rejection in between. A second finish for an
+        // already-cleared lease is a harmless no-op.
+        this.getTurnCoordinator()?.finish(turnId);
 
-      this.activeStreamingAssistantMessage = null;
-      this.resetProviderMessageBoundaryState();
+        this.activeStreamingAssistantMessage = null;
+        this.resetProviderMessageBoundaryState();
+      }
     }
   }
 
@@ -622,7 +664,8 @@ export class InputController {
     this.updateQueueIndicator();
   }
 
-  private processQueuedMessage(): void {
+  /** Queue pump (v4 §3.1 step 7 target). Public for the TurnCoordinator wiring. */
+  processQueuedMessage(): void {
     const { state } = this.deps;
     if (!state.queuedMessage) return;
 
@@ -647,6 +690,8 @@ export class InputController {
   }
 
   private buildTurnSubmission(options: {
+    /** User turns pass the feature-lease turnId; steer mints its own below. */
+    turnId?: string;
     content: string;
     images?: ChatMessage['images'];
     editorContextOverride?: EditorSelectionContext | null;
@@ -691,8 +736,10 @@ export class InputController {
       turnRequest: {
         // Single-source user turn id: generated here (feature layer), passed
         // unchanged through prepareTurn → runtime turn registry → message
-        // channel lease. The runtime must not regenerate it.
-        turnId: this.deps.generateId(),
+        // channel lease. The runtime must not regenerate it. Steer requests
+        // (mid-turn injections) mint their own id — they do not take the
+        // feature lease.
+        turnId: options.turnId ?? this.deps.generateId(),
         text: transformedText,
         images: options.images,
         currentNotePath: shouldSendCurrentNote && currentNotePath ? currentNotePath : undefined,

@@ -13,7 +13,9 @@ import type { ChatRuntime } from '../../../core/runtime/ChatRuntime';
 import type {
   ApprovalCallback,
   AskUserQuestionCallback,
+  AutoTurnCancelledEvent,
   AutoTurnResult,
+  AutoTurnStartedEvent,
   ChatRewindResult,
   ChatRuntimeConversationState,
   ChatRuntimeEnsureReadyOptions,
@@ -782,6 +784,12 @@ export class CodexChatRuntime implements ChatRuntime {
   setAutoTurnCallback(callback: ((result: AutoTurnResult) => void) | null): void {
     this.autoTurnCallback = callback;
   }
+
+  // S2 auto-turn lifecycle: Codex has no SDK-initiated turns — no-ops.
+  setOnAutoTurnStarted(_callback: ((event: AutoTurnStartedEvent) => void) | null): void {}
+  setOnAutoTurnFinished(_callback: ((turnId: string) => void) | null): void {}
+  setOnAutoTurnReleased(_callback: ((turnId: string) => void) | null): void {}
+  setOnAutoTurnCancelled(_callback: ((event: AutoTurnCancelledEvent) => void) | null): void {}
 
   buildSessionUpdates(params: {
     conversation: Conversation | null;

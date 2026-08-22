@@ -128,6 +128,23 @@ export interface AutoTurnResult {
   metadata: ChatTurnMetadata;
 }
 
+/**
+ * S2 provider-neutral auto-turn lifecycle. Sync payload fired when a runtime
+ * starts an SDK-initiated (auto) turn; the feature layer takes its exclusive
+ * turn lease here (v4 §6: strictly before the notification is dispatched).
+ */
+export interface AutoTurnStartedEvent {
+  turnId: string;
+  generation: number;
+}
+
+/** Fired when a runtime cancels an SDK-initiated (auto) turn (v3 §4.2). */
+export interface AutoTurnCancelledEvent {
+  turnId: string;
+  generation: number;
+  reason: string;
+}
+
 export type {
   ApprovalDecision,
   ExitPlanModeCallback,

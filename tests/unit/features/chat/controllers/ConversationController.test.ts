@@ -180,6 +180,20 @@ describe('ConversationController', () => {
 
         clearMessagesSpy.mockRestore();
       });
+
+      it('should invalidate the feature turn lease lifecycle on createNew, including force (S2)', async () => {
+        const invalidateTurnLifecycle = jest.fn();
+        deps = createMockDeps({ invalidateTurnLifecycle });
+        controller = new ConversationController(deps);
+
+        await controller.createNew();
+        expect(invalidateTurnLifecycle).toHaveBeenCalledTimes(1);
+
+        // Force path (streaming): still invalidated after the forced cancel.
+        deps.state.isStreaming = true;
+        await controller.createNew({ force: true });
+        expect(invalidateTurnLifecycle).toHaveBeenCalledTimes(2);
+      });
     });
 
     describe('Switching conversations', () => {
@@ -236,6 +250,17 @@ describe('ConversationController', () => {
         await controller.switchTo('new-conv');
 
         expect(dropdown.hasClass('visible')).toBe(false);
+      });
+
+      it('should invalidate the feature turn lease lifecycle on switch (S2)', async () => {
+        const invalidateTurnLifecycle = jest.fn();
+        deps = createMockDeps({ invalidateTurnLifecycle });
+        controller = new ConversationController(deps);
+        deps.state.currentConversationId = 'old-conv';
+
+        await controller.switchTo('new-conv');
+
+        expect(invalidateTurnLifecycle).toHaveBeenCalledTimes(1);
       });
     });
 

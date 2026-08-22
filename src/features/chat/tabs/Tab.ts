@@ -32,6 +32,7 @@ import { InputController } from '../controllers/InputController';
 import { NavigationController } from '../controllers/NavigationController';
 import { SelectionController } from '../controllers/SelectionController';
 import { StreamController } from '../controllers/StreamController';
+import { TurnCoordinator } from '../controllers/TurnCoordinator';
 import { MessageRenderer } from '../rendering/MessageRenderer';
 import { cleanupThinkingBlock } from '../rendering/ThinkingBlockRenderer';
 import { findRewindContext } from '../rewind';
@@ -404,6 +405,7 @@ export function createTab(options: TabCreateOptions): TabData {
       streamController: null,
       inputController: null,
       navigationController: null,
+      turnCoordinator: null,
     },
     services: {
       subagentManager,
@@ -1267,6 +1269,8 @@ export function initializeTabControllers(
       getMcpServerSelector: () => ui.mcpServerSelector,
       getExternalContextSelector: () => ui.externalContextSelector,
       clearQueuedMessage: () => tab.controllers.inputController?.clearQueuedMessage(),
+      /** S2 lifecycle cancellation: feature lease generation++ on reset/switch. */
+      invalidateTurnLifecycle: () => tab.controllers.turnCoordinator?.invalidateLifecycle(),
       getTitleGenerationService: () => services.titleGenerationService,
       getStatusPanel: () => ui.statusPanel,
       getAgentService: () => tab.service, // Use tab's service instead of plugin's
@@ -1321,6 +1325,15 @@ export function initializeTabControllers(
     }
   );
 
+  // Feature-layer turn lease (S2): created before the InputController so its
+  // deps getter can resolve it lazily. Both user sends and runtime auto
+  // turns must hold this lease; on release it pumps the UI queued message.
+  tab.controllers.turnCoordinator = new TurnCoordinator({
+    state,
+    getConversationId: () => state.currentConversationId,
+    processQueuedMessage: () => tab.controllers.inputController?.processQueuedMessage(),
+  });
+
   tab.controllers.inputController = new InputController({
     plugin,
     state,
@@ -1330,6 +1343,7 @@ export function initializeTabControllers(
     browserSelectionController: tab.controllers.browserSelectionController,
     canvasSelectionController: tab.controllers.canvasSelectionController,
     conversationController: tab.controllers.conversationController,
+    getTurnCoordinator: () => tab.controllers.turnCoordinator,
     getInputEl: () => dom.inputEl,
     getInputContainerEl: () => dom.inputContainerEl,
     getWelcomeEl: () => dom.welcomeEl,
@@ -1571,6 +1585,11 @@ export function deactivateTab(tab: TabData): void {
 export async function destroyTab(tab: TabData): Promise<void> {
   tab.lifecycleState = 'closing';
 
+  // Feature lease invalidation (S2): generation++ so late auto-turn
+  // callbacks cannot write into the torn-down tab, and the lease is cleared
+  // without triggering the queued-message pump.
+  tab.controllers.turnCoordinator?.invalidateLifecycle();
+
   tab.controllers.selectionController?.stop();
   tab.controllers.selectionController?.clear();
   tab.controllers.browserSelectionController?.stop();
@@ -1695,7 +1714,27 @@ export function setupServiceCallbacks(tab: TabData, plugin: ClaudianPlugin): voi
       tab.services.subagentManager.handleTaskNotification(taskId, status, result);
     });
     tab.service.setAutoTurnCallback((result: AutoTurnResult) => {
+      // S2 lifecycle guard: a cancelled/switched-away auto turn must not
+      // write stale messages into the (possibly new) conversation.
+      const coordinator = tab.controllers.turnCoordinator;
+      if (coordinator && !coordinator.canProjectAutoTurn()) {
+        return;
+      }
       renderAutoTriggeredTurn(tab, result);
+    });
+    // S2 auto-turn lifecycle (v4 §3.1): the runtime signals lease start,
+    // finish and release in fixed order; the coordinator owns the lease.
+    tab.service.setOnAutoTurnStarted?.((event) => {
+      tab.controllers.turnCoordinator?.beginAutoTurn(event.turnId, event.generation);
+    });
+    tab.service.setOnAutoTurnFinished?.((turnId) => {
+      tab.controllers.turnCoordinator?.finish(turnId);
+    });
+    tab.service.setOnAutoTurnReleased?.((turnId) => {
+      tab.controllers.turnCoordinator?.release(turnId);
+    });
+    tab.service.setOnAutoTurnCancelled?.((event) => {
+      tab.controllers.turnCoordinator?.cancelAutoTurn(event.turnId, event.generation);
     });
     tab.service.setPermissionModeSyncCallback((sdkMode) => {
       const mode = sdkMode === 'bypassPermissions' || sdkMode === 'yolo'
