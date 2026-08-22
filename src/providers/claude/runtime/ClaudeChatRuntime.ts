@@ -42,6 +42,7 @@ import type {
   ChatTurnRequest,
   PreparedChatTurn,
   SessionUpdateResult,
+  SubagentTaskNotificationHandler,
 } from '../../../core/runtime/types';
 import { TOOL_ENTER_PLAN_MODE, TOOL_SKILL } from '../../../core/tools/toolNames';
 import type {
@@ -67,7 +68,12 @@ import {
 } from '../../../utils/session';
 import { CLAUDE_PROVIDER_CAPABILITIES } from '../capabilities';
 import { loadSubagentFinalResult, loadSubagentToolCalls } from '../history/ClaudeHistoryStore';
-import { createStopSubagentHook, type SubagentHookState } from '../hooks/SubagentHooks';
+import { extractXmlTag } from '../history/sdkMessageParsing';
+import {
+  createStopSubagentHook,
+  type StopHookCircuitBreaker,
+  type SubagentHookState,
+} from '../hooks/SubagentHooks';
 import { encodeClaudeTurn } from '../prompt/ClaudeTurnEncoder';
 import { isContextWindowEvent, isSessionInitEvent, isStreamChunk } from '../sdk/typeGuards';
 import type { TransformEvent } from '../sdk/types';
@@ -174,6 +180,13 @@ export class ClaudianService implements ChatRuntime {
 
   // Subagent hook state provider (set from feature layer to avoid core→feature dependency)
   private _subagentStateProvider: (() => SubagentHookState) | null = null;
+
+  // Fix 1 (熔断): consecutive Stop-hook blocks since the last allow / user message.
+  private _stopHookConsecutiveBlocks = 0;
+  private static readonly STOP_HOOK_MAX_CONSECUTIVE_BLOCKS = 3;
+
+  // Fix 2 (通知直接销账): live task-notification sink (set from feature layer).
+  private _subagentNotificationHandler: SubagentTaskNotificationHandler | null = null;
 
   // Auto-triggered turn handling (e.g., task-notification delivery by the SDK)
   private _autoTurnBuffer: StreamChunk[] = [];
@@ -703,10 +716,31 @@ export class ClaudianService implements ChatRuntime {
   private buildHooks() {
     const hooks: Options['hooks'] = {};
 
+    // Fix 1 (熔断): the hook is a stateless closure, so the consecutive-block
+    // counter lives on this runtime instance. Reset on every allow and on every
+    // user-initiated turn (see query()).
+    const breaker: StopHookCircuitBreaker = {
+      registerBlock: () => {
+        this._stopHookConsecutiveBlocks += 1;
+        if (this._stopHookConsecutiveBlocks > ClaudianService.STOP_HOOK_MAX_CONSECUTIVE_BLOCKS) {
+          this._stopHookConsecutiveBlocks = 0;
+          new Notice(
+            `Claudian: Stop hook blocked ${ClaudianService.STOP_HOOK_MAX_CONSECUTIVE_BLOCKS} times while background tasks were still marked running. Allowing stop (circuit breaker) — please verify your background tasks.`
+          );
+          return true;
+        }
+        return false;
+      },
+      reset: () => {
+        this._stopHookConsecutiveBlocks = 0;
+      },
+    };
+
     // Always register subagent hooks — closures resolve provider at execution time
     // so hooks work even when provider is set after the persistent query starts.
     hooks.Stop = [createStopSubagentHook(
-      () => this._subagentStateProvider?.() ?? { hasRunning: false }
+      () => this._subagentStateProvider?.() ?? { hasRunning: false },
+      breaker
     )];
 
     return hooks;
@@ -828,6 +862,19 @@ export class ClaudianService implements ChatRuntime {
   private async routeMessage(message: SDKMessage): Promise<void> {
     // Note: Session expiration errors are handled in catch blocks (queryViaSDK, handleAbort)
     // The SDK throws errors as exceptions, not as message types
+
+    // Fix 2 (通知直接销账): intercept harness task-notifications on the live
+    // stream. Two shapes exist:
+    // 1. queue-operation messages carrying a <task-notification> XML payload
+    //    (the form observed in transcripts);
+    // 2. system/subtype=task_notification structured messages (the SDK's
+    //    typed spelling; 'stopped' there is the same terminal state as 'killed').
+    // Neither shape is otherwise handled below, so settling here and returning
+    // is safe. Session-load replay (collectAsyncSubagentResults) reads these
+    // from the transcript independently — double settlement is tolerated.
+    if (this.dispatchTaskNotification(message)) {
+      return;
+    }
 
     // Safe to use last handler - design guarantees single handler at a time
     const handler = this.responseHandlers[this.responseHandlers.length - 1];
@@ -952,6 +999,62 @@ export class ClaudianService implements ChatRuntime {
         }
       }
     }
+  }
+
+  /**
+   * Fix 2 (通知直接销账): parses a live message as a harness task-notification
+   * and forwards it to the notification handler. Returns true when the message
+   * was a task-notification (and has been fully handled here).
+   */
+  private dispatchTaskNotification(message: SDKMessage): boolean {
+    if (!this._subagentNotificationHandler) {
+      return false;
+    }
+
+    let taskId: string | null;
+    let status: string | null;
+    let result: string | null;
+
+    const record = message as Record<string, unknown>;
+
+    if (record['type'] === 'queue-operation') {
+      if (record['operation'] !== 'enqueue' || typeof record['content'] !== 'string') {
+        return false;
+      }
+      const content = record['content'];
+      if (!content.includes('<task-notification>')) {
+        return false;
+      }
+      taskId = extractXmlTag(content, 'task-id');
+      status = extractXmlTag(content, 'status');
+      result = extractXmlTag(content, 'result');
+    } else if (record['type'] === 'system' && record['subtype'] === 'task_notification') {
+      if (typeof record['task_id'] !== 'string' || typeof record['status'] !== 'string') {
+        return false;
+      }
+      taskId = record['task_id'];
+      status = record['status'];
+      result = typeof record['summary'] === 'string' ? record['summary'] : null;
+    } else {
+      return false;
+    }
+
+    if (!taskId || !status) {
+      console.warn('[Claudian] task-notification arrived without task-id/status; ignoring');
+      return true;
+    }
+
+    try {
+      this._subagentNotificationHandler(taskId, status, result);
+    } catch (error) {
+      // Settlement must never break the message routing loop.
+      console.warn('[Claudian] task-notification handler failed', error);
+    }
+    return true;
+  }
+
+  setSubagentNotificationHandler(handler: SubagentTaskNotificationHandler | null): void {
+    this._subagentNotificationHandler = handler;
   }
 
   private registerResponseHandler(handler: ResponseHandler): void {
@@ -1093,6 +1196,10 @@ export class ClaudianService implements ChatRuntime {
     const images = normalized.request.images;
     const conversationHistory = normalized.conversationHistory;
     const queryOptions = normalized.queryOptions;
+
+    // Fix 1 (熔断): a user-initiated turn resets the consecutive Stop-hook
+    // block count — the breaker scope is "since last user message / last allow".
+    this._stopHookConsecutiveBlocks = 0;
 
     const vaultPath = getVaultPath(this.plugin.app);
     if (!vaultPath) {

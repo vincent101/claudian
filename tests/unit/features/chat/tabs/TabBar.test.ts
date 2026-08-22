@@ -22,6 +22,7 @@ function createTabBarItem(overrides: Partial<TabBarItem> = {}): TabBarItem {
     isActive: false,
     isStreaming: false,
     needsAttention: false,
+    needsReview: false,
     canClose: true,
     ...overrides,
   };

@@ -181,6 +181,9 @@ export class TabManager implements TabManagerInterface {
       ...(typeof draftModel === 'string' ? { draftModel } : {}),
       defaultProviderId,
       onStreamingChanged: (isStreaming) => {
+        if (!isStreaming && tab.id !== this.activeTabId && !tab.state.cancelRequested) {
+          tab.state.needsReview = true;
+        }
         this.callbacks.onTabStreamingChanged?.(tab.id, isStreaming);
       },
       onTitleChanged: (title) => {
@@ -261,6 +264,7 @@ export class TabManager implements TabManagerInterface {
       // Activate new tab
       this.activeTabId = tabId;
       activateTab(tab);
+      tab.state.needsReview = false;
 
       // Load conversation if not already loaded
       if (tab.conversationId && tab.state.messages.length === 0) {
@@ -405,6 +409,7 @@ export class TabManager implements TabManagerInterface {
         isActive: tab.id === this.activeTabId,
         isStreaming: tab.state.isStreaming,
         needsAttention: tab.state.needsAttention,
+        needsReview: tab.state.needsReview,
         canClose: this.tabs.size > 1 || !tab.state.isStreaming,
       });
     }

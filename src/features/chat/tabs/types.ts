@@ -287,5 +287,7 @@ export interface TabBarItem {
   isActive: boolean;
   isStreaming: boolean;
   needsAttention: boolean;
+  /** Background tab finished streaming and awaits user review. */
+  needsReview: boolean;
   canClose: boolean;
 }

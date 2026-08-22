@@ -14,6 +14,7 @@ import type {
   PreparedChatTurn,
   SessionUpdateResult,
   SubagentRuntimeState,
+  SubagentTaskNotificationHandler,
 } from './types';
 
 export interface ChatRuntime {
@@ -50,6 +51,8 @@ export interface ChatRuntime {
   setExitPlanModeCallback(callback: ExitPlanModeCallback | null): void;
   setPermissionModeSyncCallback(callback: ((sdkMode: string) => void) | null): void;
   setSubagentHookProvider(getState: () => SubagentRuntimeState): void;
+  /** Fix 2: optional — providers that emit harness task-notifications. */
+  setSubagentNotificationHandler?(handler: SubagentTaskNotificationHandler | null): void;
   setAutoTurnCallback(callback: ((result: AutoTurnResult) => void) | null): void;
   consumeTurnMetadata(): ChatTurnMetadata;
 

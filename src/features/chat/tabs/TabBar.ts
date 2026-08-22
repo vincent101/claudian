@@ -54,6 +54,8 @@ export class TabBar {
       stateClass = 'claudian-tab-badge-attention';
     } else if (item.isStreaming) {
       stateClass = 'claudian-tab-badge-streaming';
+    } else if (item.needsReview) {
+      stateClass = 'claudian-tab-badge-review';
     }
 
     const badgeEl = this.containerEl.createDiv({

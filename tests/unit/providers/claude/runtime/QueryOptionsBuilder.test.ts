@@ -269,7 +269,7 @@ describe('QueryOptionsBuilder', () => {
 
     it('normalizes unsupported xhigh effort for adaptive models', () => {
       const ctx = createMockContext({
-        settings: createMockSettings({ model: 'sonnet', effortLevel: 'xhigh' }),
+        settings: createMockSettings({ model: 'claude-sonnet-4-5', effortLevel: 'xhigh' }),
       });
       const config = QueryOptionsBuilder.buildPersistentQueryConfig(ctx);
 
@@ -440,7 +440,7 @@ describe('QueryOptionsBuilder', () => {
     it('clamps unsupported xhigh effort before building adaptive options', () => {
       const ctx = {
         ...createMockContext({
-          settings: createMockSettings({ model: 'sonnet', effortLevel: 'xhigh' }),
+          settings: createMockSettings({ model: 'claude-sonnet-4-5', effortLevel: 'xhigh' }),
         }),
         abortController: new AbortController(),
         hooks: {},

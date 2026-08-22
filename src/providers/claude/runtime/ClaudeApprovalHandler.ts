@@ -82,6 +82,14 @@ export function createClaudeApprovalCallback(
     const askUserQuestionCallback = deps.getAskUserQuestionCallback();
     if (toolName === TOOL_ASK_USER_QUESTION && askUserQuestionCallback) {
       try {
+        const questions = input.questions;
+        if (Array.isArray(questions)) {
+          for (const q of questions) {
+            if (q && typeof q === 'object' && !('isOther' in q)) {
+              (q as Record<string, unknown>).isOther = true;
+            }
+          }
+        }
         const answers = await askUserQuestionCallback(input, options.signal);
         if (answers === null) {
           return { behavior: 'deny', message: 'User declined to answer.', interrupt: true };

@@ -9,7 +9,9 @@ export const TITLE_GENERATION_SYSTEM_PROMPT = `You are a specialist in summarizi
 1.  **Format**: Sentence case. No periods/quotes.
 2.  **Structure**: Start with a **strong verb** (e.g., Create, Fix, Debug, Explain, Analyze).
 3.  **Forbidden**: "Conversation with...", "Help me...", "Question about...", "I need...".
-4.  **Tech Context**: Detect and include the primary language/framework if code is present (e.g., "Debug Python script", "Refactor React hook").
+4.  **Forbidden weak verbs**: "Continue", "Work on", "Handle", "Follow up" — name the concrete task instead.
+5.  **Tech Context**: Detect and include the primary language/framework if code is present (e.g., "Debug Python script", "Refactor React hook").
+6.  **Language**: Write the title primarily in Chinese (简体中文). Keep proper nouns (model names, library names, APIs, file paths, command names) in their original English/ASCII form. Example: "调试 Python 脚本错误" not "Debug Python script".
 
 **Output**: Return ONLY the raw title text.`;
 

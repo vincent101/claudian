@@ -19,7 +19,7 @@ import {
 } from '../../../core/providers/types';
 import type { ChatRuntime } from '../../../core/runtime/ChatRuntime';
 import type { AutoTurnResult } from '../../../core/runtime/types';
-import type { ChatMessage, Conversation } from '../../../core/types';
+import type { ChatMessage, Conversation, ExitPlanModeDecision } from '../../../core/types';
 import { t } from '../../../i18n/i18n';
 import type ClaudianPlugin from '../../../main';
 import { SlashCommandDropdown } from '../../../shared/components/SlashCommandDropdown';
@@ -1635,21 +1635,39 @@ export function getTabTitle(tab: TabData, plugin: ClaudianPlugin): string {
 export function setupServiceCallbacks(tab: TabData, plugin: ClaudianPlugin): void {
   if (tab.service && tab.controllers.inputController) {
     tab.service.setApprovalCallback(
-      async (toolName, input, description, options) =>
-        await tab.controllers.inputController?.handleApprovalRequest(toolName, input, description, options)
-        ?? 'cancel'
+      async (toolName, input, description, options) => {
+        tab.state.beginAttention();
+        try {
+          return await tab.controllers.inputController?.handleApprovalRequest(toolName, input, description, options)
+            ?? 'cancel';
+        } finally {
+          tab.state.endAttention();
+        }
+      }
     );
     tab.service.setApprovalDismisser(
       () => tab.controllers.inputController?.dismissPendingApprovalPrompt()
     );
     tab.service.setAskUserQuestionCallback(
-      async (input, signal) =>
-        await tab.controllers.inputController?.handleAskUserQuestion(input, signal)
-        ?? null
+      async (input, signal) => {
+        tab.state.beginAttention();
+        try {
+          return await tab.controllers.inputController?.handleAskUserQuestion(input, signal)
+            ?? null;
+        } finally {
+          tab.state.endAttention();
+        }
+      }
     );
     tab.service.setExitPlanModeCallback(
       async (input, signal) => {
-        const decision = await tab.controllers.inputController?.handleExitPlanMode(input, signal) ?? null;
+        let decision: ExitPlanModeDecision | null;
+        tab.state.beginAttention();
+        try {
+          decision = await tab.controllers.inputController?.handleExitPlanMode(input, signal) ?? null;
+        } finally {
+          tab.state.endAttention();
+        }
         // Revert only on approve; feedback and cancel keep plan mode active.
         if (decision !== null && decision.type !== 'feedback') {
           // Only restore permission mode if still in plan mode — user may have toggled out via Shift+Tab
@@ -1671,6 +1689,11 @@ export function setupServiceCallbacks(tab: TabData, plugin: ClaudianPlugin): voi
         hasRunning: tab.services.subagentManager.hasRunningSubagents(),
       })
     );
+    // Fix 2 (通知直接销账): settle async subagents straight from live
+    // harness task-notifications (available on providers that support them).
+    tab.service.setSubagentNotificationHandler?.((taskId, status, result) => {
+      tab.services.subagentManager.handleTaskNotification(taskId, status, result);
+    });
     tab.service.setAutoTurnCallback((result: AutoTurnResult) => {
       renderAutoTriggeredTurn(tab, result);
     });

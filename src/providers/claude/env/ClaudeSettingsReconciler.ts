@@ -5,6 +5,7 @@ import { parseEnvironmentVariables } from '../../../utils/env';
 import { resolveClaudeModelSelection } from '../modelOptions';
 import { getClaudeProviderSettings, updateClaudeProviderSettings } from '../settings';
 import { normalizeVisibleModelVariant } from '../types/models';
+import { getClaudeState } from '../types/providerState';
 
 const ENV_HASH_MODEL_KEYS = [
   'ANTHROPIC_MODEL',
@@ -40,6 +41,13 @@ export const claudeSettingsReconciler: ProviderSettingsReconciler = {
     const invalidatedConversations: Conversation[] = [];
     for (const conv of conversations) {
       if (conv.sessionId) {
+        const state = getClaudeState(conv.providerState);
+        const preserved = [...new Set([
+          ...(state.previousProviderSessionIds || []),
+          state.providerSessionId,
+          conv.sessionId,
+        ].filter((id) => !!id))];
+        conv.providerState = { ...state, previousProviderSessionIds: preserved };
         conv.sessionId = null;
         invalidatedConversations.push(conv);
       }

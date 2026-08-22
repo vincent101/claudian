@@ -724,8 +724,12 @@ describe('types.ts', () => {
       expect(supportsXHighEffort('claude-opus-5')).toBe(true);
     });
 
-    it('returns false for non-opus models and older opus ids', () => {
-      expect(supportsXHighEffort('sonnet')).toBe(false);
+    it('returns true for sonnet family aliases', () => {
+      expect(supportsXHighEffort('sonnet')).toBe(true);
+      expect(supportsXHighEffort('sonnet[1m]')).toBe(true);
+    });
+
+    it('returns false for versioned non-opus models and older opus ids', () => {
       expect(supportsXHighEffort('claude-sonnet-4-5')).toBe(false);
       expect(supportsXHighEffort('claude-opus-4-6')).toBe(false);
     });

@@ -1552,12 +1552,16 @@ Only this is the final result.
         expect(manager.hasRunningSubagents()).toBe(false);
       });
 
-      it('returns true when pending async subagents exist', () => {
+      it('evicts pending async subagents without startedAt on first hook check (stale-hook patch, fixed by fix 4)', () => {
+        // stale-hook patch（2026-08-09 移植）：createAsyncTask 不设 startedAt，
+        // pending 条目首次 hasRunningSubagents 即被 STALE_MS 清理误删——
+        // 已知连带伤，原样保留，修复 4（pending 计时）落地后本测试应恢复 expect(true)。
         const { manager } = createManager();
         const parentEl = createMockEl();
         manager.handleTaskToolUse('task-1', { description: 'Background', run_in_background: true }, parentEl);
 
-        expect(manager.hasRunningSubagents()).toBe(true);
+        expect(manager.hasRunningSubagents()).toBe(false);
+        expect(manager.getByTaskId('task-1')).toBeUndefined();
       });
 
       it('returns true when active running subagents exist', () => {
@@ -1727,6 +1731,160 @@ Only this is the final result.
 
       expect(newUpdates.length).toBeGreaterThan(0);
       expect(newUpdates[newUpdates.length - 1].agentId).toBe('agent-new');
+    });
+  });
+
+  // ============================================
+  // Fix 2: Task Notification Settlement
+  // ============================================
+
+  describe('task notification settlement (fix 2)', () => {
+    const setupRunning = (manager: SubagentManager, parentEl: any, taskToolId: string, agentId: string) => {
+      manager.handleTaskToolUse(taskToolId, { description: 'Background', run_in_background: true }, parentEl);
+      manager.handleTaskToolResult(taskToolId, JSON.stringify({ agent_id: agentId }));
+    };
+
+    it('settles an active subagent from a completed notification', () => {
+      const { manager, updates } = createManager();
+      const parentEl = createMockEl();
+      setupRunning(manager, parentEl, 'task-1', 'agent-1');
+
+      expect(manager.hasRunningSubagents()).toBe(true);
+
+      const settled = manager.handleTaskNotification('agent-1', 'completed', 'all done');
+
+      expect(settled?.asyncStatus).toBe('completed');
+      expect(settled?.status).toBe('completed');
+      expect(settled?.result).toBe('all done');
+      expect(settled?.completedAt).toBeGreaterThan(0);
+      expect(manager.hasRunningSubagents()).toBe(false);
+      expect(manager.getByTaskId('task-1')).toBeUndefined();
+      expect(updates[updates.length - 1].status).toBe('completed');
+    });
+
+    it('settles a killed notification as error terminal state', () => {
+      const { manager } = createManager();
+      const parentEl = createMockEl();
+      setupRunning(manager, parentEl, 'task-k', 'agent-k');
+
+      const settled = manager.handleTaskNotification('agent-k', 'killed', null);
+
+      expect(settled?.asyncStatus).toBe('error');
+      expect(settled?.status).toBe('error');
+      expect(manager.hasRunningSubagents()).toBe(false);
+    });
+
+    it('settles a failed notification as error terminal state', () => {
+      const { manager } = createManager();
+      const parentEl = createMockEl();
+      setupRunning(manager, parentEl, 'task-f', 'agent-f');
+
+      const settled = manager.handleTaskNotification('agent-f', 'failed', 'boom');
+
+      expect(settled?.asyncStatus).toBe('error');
+      expect(settled?.result).toBe('boom');
+      expect(manager.hasRunningSubagents()).toBe(false);
+    });
+
+    it('treats notification status case-insensitively', () => {
+      const { manager } = createManager();
+      const parentEl = createMockEl();
+      setupRunning(manager, parentEl, 'task-c', 'agent-c');
+
+      const settled = manager.handleTaskNotification('agent-c', 'Completed');
+
+      expect(settled?.asyncStatus).toBe('completed');
+    });
+
+    it('is idempotent when no entry exists for the task-id', () => {
+      const { manager } = createManager();
+
+      expect(() => manager.handleTaskNotification('agent-unknown', 'completed', 'x')).not.toThrow();
+      expect(manager.handleTaskNotification('agent-unknown', 'completed', 'x')).toBeUndefined();
+    });
+
+    it('ignores non-terminal notification statuses', () => {
+      const { manager } = createManager();
+      const parentEl = createMockEl();
+      setupRunning(manager, parentEl, 'task-n', 'agent-n');
+
+      const settled = manager.handleTaskNotification('agent-n', 'running');
+
+      expect(settled).toBeUndefined();
+      expect(manager.getByTaskId('task-n')?.asyncStatus).toBe('running');
+      expect(manager.hasRunningSubagents()).toBe(true);
+    });
+
+    it('records an early notification and settles at promotion (second-complete race)', () => {
+      const { manager, updates } = createManager();
+      const parentEl = createMockEl();
+
+      // Notification arrives while the task is still pending (before promotion)
+      manager.handleTaskToolUse('task-race', { description: 'Background', run_in_background: true }, parentEl);
+      expect(manager.handleTaskNotification('agent-race', 'completed', 'fast result')).toBeUndefined();
+
+      // Still pending — not settled yet, but not forgotten
+      expect(manager.getByTaskId('task-race')?.asyncStatus).toBe('pending');
+
+      // Promotion arrives afterwards: settles immediately instead of running
+      manager.handleTaskToolResult('task-race', JSON.stringify({ agent_id: 'agent-race' }));
+
+      expect(manager.getByTaskId('task-race')).toBeUndefined();
+      expect(updates[updates.length - 1].asyncStatus).toBe('completed');
+      expect(updates[updates.length - 1].result).toBe('fast result');
+      expect(manager.hasRunningSubagents()).toBe(false);
+    });
+
+    it('records an early killed notification and settles as error at promotion', () => {
+      const { manager, updates } = createManager();
+      const parentEl = createMockEl();
+
+      manager.handleTaskToolUse('task-rk', { description: 'Background', run_in_background: true }, parentEl);
+      manager.handleTaskNotification('agent-rk', 'killed', null);
+
+      manager.handleTaskToolResult('task-rk', JSON.stringify({ agent_id: 'agent-rk' }));
+
+      expect(manager.getByTaskId('task-rk')).toBeUndefined();
+      expect(updates[updates.length - 1].asyncStatus).toBe('error');
+      expect(manager.hasRunningSubagents()).toBe(false);
+    });
+
+    it('bounds the seen-terminal short table (LRU eviction)', () => {
+      const { manager } = createManager();
+      const parentEl = createMockEl();
+
+      // 100 unknown early notifications fill the table; the 101st evicts the oldest
+      for (let i = 0; i < 101; i++) {
+        manager.handleTaskNotification(`agent-stale-${i}`, 'completed', null);
+      }
+
+      // agent-stale-0 was evicted: a later promotion for it stays running
+      manager.handleTaskToolUse('task-evicted', { description: 'Background', run_in_background: true }, parentEl);
+      manager.handleTaskToolResult('task-evicted', JSON.stringify({ agent_id: 'agent-stale-0' }));
+      expect(manager.getByTaskId('task-evicted')?.asyncStatus).toBe('running');
+
+      // agent-stale-100 is still in the table: promotion settles it
+      manager.handleTaskToolUse('task-fresh', { description: 'Background', run_in_background: true }, parentEl);
+      manager.handleTaskToolResult('task-fresh', JSON.stringify({ agent_id: 'agent-stale-100' }));
+      expect(manager.getByTaskId('task-fresh')).toBeUndefined();
+      // Only the deliberately-kept evicted entry remains running
+      expect(manager.getByTaskId('task-evicted')?.asyncStatus).toBe('running');
+    });
+
+    it('clears the seen-terminal short table on clear()', () => {
+      const { manager } = createManager();
+      const parentEl = createMockEl();
+
+      manager.handleTaskToolUse('task-cc', { description: 'Background', run_in_background: true }, parentEl);
+      manager.handleTaskNotification('agent-cc', 'completed', null);
+      manager.clear();
+
+      // Re-create the pending entry after clear: the short table must be empty,
+      // so promotion settles as running (no stale early-terminal settlement)
+      manager.handleTaskToolUse('task-cc', { description: 'Background', run_in_background: true }, parentEl);
+      manager.handleTaskToolResult('task-cc', JSON.stringify({ agent_id: 'agent-cc' }));
+      expect(manager.getByTaskId('task-cc')?.asyncStatus).toBe('running');
+      expect(manager.hasRunningSubagents()).toBe(true);
     });
   });
 });

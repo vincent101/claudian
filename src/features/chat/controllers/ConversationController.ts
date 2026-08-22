@@ -755,6 +755,7 @@ export class ConversationController {
       try {
         const newTitle = input.value.trim() || currentTitle;
         await this.deps.plugin.renameConversation(convId, newTitle);
+        await this.deps.plugin.updateConversation(convId, { titleGenerationStatus: undefined });
         this.updateHistoryDropdown();
       } catch {
         new Notice('Failed to rename conversation');
@@ -879,7 +880,11 @@ export class ConversationController {
   }
 
   /** Regenerates AI title for a conversation. */
-  async regenerateTitle(conversationId: string): Promise<void> {
+  async regenerateTitle(
+    conversationId: string,
+    options: { silent?: boolean } = {},
+  ): Promise<void> {
+    const { silent = false } = options;
     const { plugin } = this.deps;
     if (!plugin.settings.enableAutoTitleGeneration) return;
 
@@ -894,19 +899,52 @@ export class ConversationController {
     const firstUserMsg = fullConv.messages.find(m => m.role === 'user');
     if (!firstUserMsg) return;
 
-    const userContent = firstUserMsg.displayContent || firstUserMsg.content;
+    const isNoise = (text: string): boolean => {
+      if (!text) return true;
+      return /^This session is being continued/i.test(text) ||
+        /^\[Request interrupted by user/i.test(text) ||
+        /^<command-/i.test(text) ||
+        /^<local-command-caveat>/i.test(text);
+    };
+
+    const firstContent = (firstUserMsg.displayContent || firstUserMsg.content || '').slice(0, 300);
+    const userMsgs = fullConv.messages.filter(m => m.role === 'user');
+    const highInfoMsgs: string[] = [];
+    for (let i = userMsgs.length - 1; i >= 0 && highInfoMsgs.length < 5; i--) {
+      const text = userMsgs[i].displayContent || userMsgs[i].content || '';
+      if (!isNoise(text) && text.length >= 40) {
+        highInfoMsgs.push(text.slice(0, 250));
+      }
+    }
+    let recentExcerpt: string;
+    if (highInfoMsgs.length > 0) {
+      recentExcerpt = highInfoMsgs.join('\n- ');
+    } else {
+      const fallback = userMsgs.slice(-3).map(m => (m.displayContent || m.content || '').slice(0, 100));
+      recentExcerpt = fallback.join('\n- ');
+    }
+    const material = `Current title: "${fullConv.title || ''}"
+Return it unchanged if it still accurately summarizes the conversation below.
+
+First request:
+${firstContent}
+
+Recent messages:
+- ${recentExcerpt}`.slice(0, 1600);
 
     // Store current title to check if user renames during generation
     const expectedTitle = fullConv.title;
 
-    // Set pending status before starting generation
-    await plugin.updateConversation(conversationId, { titleGenerationStatus: 'pending' });
-    this.updateHistoryDropdown();
+    // Set pending status before starting generation (skipped in silent mode)
+    if (!silent) {
+      await plugin.updateConversation(conversationId, { titleGenerationStatus: 'pending' });
+      this.updateHistoryDropdown();
+    }
 
     // Fire async AI title generation
     await titleService.generateTitle(
       conversationId,
-      userContent,
+      material,
       async (convId, result) => {
         // Check if conversation still exists and user hasn't manually renamed
         const currentConv = await plugin.getConversationById(convId);
@@ -918,14 +956,12 @@ export class ConversationController {
         if (result.success && !userManuallyRenamed) {
           await plugin.renameConversation(convId, result.title);
           await plugin.updateConversation(convId, { titleGenerationStatus: 'success' });
-        } else if (!userManuallyRenamed) {
+          this.updateHistoryDropdown();
+        } else if (!silent && !userManuallyRenamed) {
           // Keep existing title, mark as failed (only if user hasn't renamed)
           await plugin.updateConversation(convId, { titleGenerationStatus: 'failed' });
-        } else {
-          // User manually renamed, clear the status (user's choice takes precedence)
-          await plugin.updateConversation(convId, { titleGenerationStatus: undefined });
+          this.updateHistoryDropdown();
         }
-        this.updateHistoryDropdown();
       }
     );
   }

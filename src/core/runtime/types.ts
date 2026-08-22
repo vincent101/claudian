@@ -96,6 +96,17 @@ export interface SubagentRuntimeState {
   hasRunning: boolean;
 }
 
+/**
+ * Fix 2 (通知直接销账): handler invoked when a harness task-notification
+ * arrives on the live message stream. taskId equals the agentId of the
+ * async subagent; status is the raw notification status string.
+ */
+export type SubagentTaskNotificationHandler = (
+  taskId: string,
+  status: string,
+  result?: string | null,
+) => void;
+
 export interface ChatTurnMetadata {
   userMessageId?: string;
   assistantMessageId?: string;

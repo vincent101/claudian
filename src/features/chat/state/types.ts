@@ -90,6 +90,10 @@ export interface ChatStateData {
 
   // Attention state (approval pending, error, etc.)
   needsAttention: boolean;
+  /** Nesting counter for begin/endAttention pairs (attention restored on last end). */
+  pendingAttentionCount: number;
+  /** Background tab finished streaming and awaits user review. */
+  needsReview: boolean;
 
   // Auto-scroll control during streaming
   autoScrollEnabled: boolean;

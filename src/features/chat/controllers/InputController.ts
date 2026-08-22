@@ -471,7 +471,14 @@ export class InputController {
         let planApprovalInvalidated = false;
         let shouldProcessQueuedMessage = true;
         if (planCompleted && !didCancelThisTurn) {
-          const { decision, invalidated } = await this.showPlanApproval();
+          let decision: PlanApprovalDecision | null;
+          let invalidated: boolean;
+          this.deps.state.beginAttention();
+          try {
+            ({ decision, invalidated } = await this.showPlanApproval());
+          } finally {
+            this.deps.state.endAttention();
+          }
 
           // Re-check invalidation after async approval prompt
           if (state.streamGeneration !== streamGeneration || invalidated) {
@@ -493,6 +500,19 @@ export class InputController {
           // Only clear resumeAtMessageId if enqueue succeeded; preserve checkpoint on failure for retry
           const saveExtras = didEnqueueToSdk ? { resumeAtMessageId: undefined } : undefined;
           await conversationController.save(true, saveExtras);
+
+          // Periodically refresh the AI title with recent context (every 10 user messages)
+          {
+            const convId = state.currentConversationId;
+            const userCount = state.messages.filter(m => m.role === 'user' && m.content).length;
+            if (plugin.settings.enableAutoTitleGeneration && convId && userCount > 0 && userCount % 10 === 0) {
+              const conv = await plugin.getConversationById(convId);
+              if (conv && (conv.titleGenerationStatus === 'success' || conv.titleGenerationStatus === 'failed')) {
+                conversationController.regenerateTitle(convId, { silent: true }).catch(() => {
+                });
+              }
+            }
+          }
 
           const userMsgIndex = state.messages.indexOf(userMsg);
           renderer.refreshActionButtons(userMsg, state.messages, userMsgIndex >= 0 ? userMsgIndex : undefined);

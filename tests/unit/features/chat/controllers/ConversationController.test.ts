@@ -1238,9 +1238,17 @@ describe('ConversationController - Title Generation', () => {
 
       await controller.regenerateTitle('conv-1');
 
+      const expectedMaterial = `Current title: "Old Title"
+Return it unchanged if it still accurately summarizes the conversation below.
+
+First request:
+Hello world!
+
+Recent messages:
+- Hello world!`;
       expect(mockTitleService.generateTitle).toHaveBeenCalledWith(
         'conv-1',
-        'Hello world!', // Uses displayContent
+        expectedMaterial,
         expect.any(Function)
       );
     });
@@ -1254,9 +1262,17 @@ describe('ConversationController - Title Generation', () => {
 
       await controller.regenerateTitle('conv-1');
 
+      const expectedMaterial = `Current title: "Old Title"
+Return it unchanged if it still accurately summarizes the conversation below.
+
+First request:
+Hello world
+
+Recent messages:
+- Hello world`;
       expect(mockTitleService.generateTitle).toHaveBeenCalledWith(
         'conv-1',
-        'Hello world',
+        expectedMaterial,
         expect.any(Function)
       );
     });
@@ -2190,7 +2206,7 @@ describe('ConversationController - regenerateTitle callback branches', () => {
     });
   });
 
-  it('should clear status when user manually renamed during generation', async () => {
+  it('should keep status untouched when user manually renamed during generation (status cleared later by finishRename)', async () => {
     (deps.plugin.getConversationById as jest.Mock).mockResolvedValue({
       id: 'conv-1',
       title: 'Original Title',
@@ -2217,9 +2233,11 @@ describe('ConversationController - regenerateTitle callback branches', () => {
 
     // Should NOT rename because user already renamed
     expect(deps.plugin.renameConversation).not.toHaveBeenCalled();
-    // Should clear the status since user's choice takes precedence
+    // Patched behavior: manual rename no longer clears status in the callback
+    // (finishRename owns clearing it); only the initial pending write happens.
+    expect(deps.plugin.updateConversation).toHaveBeenCalledTimes(1);
     expect(deps.plugin.updateConversation).toHaveBeenCalledWith('conv-1', {
-      titleGenerationStatus: undefined,
+      titleGenerationStatus: 'pending',
     });
   });
 

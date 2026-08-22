@@ -35,6 +35,8 @@ function createInitialState(): ChatStateData {
     ignoreUsageUpdates: false,
     currentTodos: null,
     needsAttention: false,
+    pendingAttentionCount: 0,
+    needsReview: false,
     autoScrollEnabled: true, // Default; controllers will override based on settings
     responseStartTime: null,
     flavorTimerInterval: null,
@@ -293,8 +295,34 @@ export class ChatState {
   }
 
   set needsAttention(value: boolean) {
+    if (this.state.needsAttention === value) return;
     this.state.needsAttention = value;
     this._callbacks.onAttentionChanged?.(value);
+  }
+
+  beginAttention(): void {
+    this.state.pendingAttentionCount = (this.state.pendingAttentionCount || 0) + 1;
+    if (this.state.pendingAttentionCount > 0) this.needsAttention = true;
+  }
+
+  endAttention(): void {
+    if (!this.state.pendingAttentionCount) {
+      this.needsAttention = false;
+      return;
+    }
+    this.state.pendingAttentionCount -= 1;
+    if (this.state.pendingAttentionCount <= 0) {
+      this.state.pendingAttentionCount = 0;
+      this.needsAttention = false;
+    }
+  }
+
+  get needsReview(): boolean {
+    return this.state.needsReview;
+  }
+
+  set needsReview(value: boolean) {
+    this.state.needsReview = value;
   }
 
   // ============================================

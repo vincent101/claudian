@@ -31,8 +31,8 @@ export class TitleGenerationService {
     const abortController = new AbortController();
     this.activeGenerations.set(conversationId, abortController);
 
-    const truncatedUser = this.truncateText(userMessage, 500);
-    const prompt = `User's request:\n"""\n${truncatedUser}\n"""\n\nGenerate a title for this conversation:`;
+    const truncatedUser = this.truncateText(userMessage, 2000);
+    const prompt = `Conversation excerpt:\n"""\n${truncatedUser}\n"""\n\nGenerate a title for this conversation:`;
 
     try {
       const result = await runColdStartQuery({

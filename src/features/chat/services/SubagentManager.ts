@@ -52,6 +52,11 @@ export class SubagentManager {
   private outputToolIdToAgentId: Map<string, string> = new Map();
   private asyncDomStates: Map<string, AsyncSubagentState> = new Map();
 
+  // Fix 2 (秒完成竞态缓解): task-id -> terminal payload for notifications that
+  // arrived before the pending -> active promotion. Bounded LRU.
+  private seenTerminalNotifications: Map<string, { status: string; result: string | null }> = new Map();
+  private static readonly SEEN_TERMINAL_NOTIFICATIONS_LIMIT = 100;
+
   private onStateChange: SubagentStateChangeCallback;
   private taskResultInterpreter: ProviderTaskResultInterpreter;
 
@@ -331,8 +336,95 @@ export class SubagentManager {
     this.activeAsyncSubagents.set(agentId, subagent);
     this.taskIdToAgentId.set(taskToolId, agentId);
 
+    // Fix 2 (秒完成竞态缓解): the completion notification may have arrived
+    // before this promotion. If we already saw a terminal status for this
+    // agentId, settle it as terminal instead of leaving it running forever.
+    const earlyTerminal = this.seenTerminalNotifications.get(agentId);
+    if (earlyTerminal) {
+      this.seenTerminalNotifications.delete(agentId);
+      this.settleActiveSubagent(subagent, agentId, earlyTerminal.status, earlyTerminal.result);
+      return;
+    }
+
     this.updateAsyncDomState(subagent);
     this.onStateChange(subagent);
+  }
+
+  // ============================================
+  // Fix 2: Task Notification Settlement
+  // ============================================
+
+  /**
+   * Fix 2 (通知直接销账): settles an async subagent from a harness
+   * task-notification. The notification is the authoritative terminal signal —
+   * arriving here settles the bookkeeping immediately, without waiting for a
+   * TaskOutput round-trip.
+   *
+   * Terminal statuses: completed / killed / failed (+ 'stopped', the structured
+   * SDK spelling of killed). Only active entries (key = agentId = task-id) are
+   * settled; pending entries (launch in flight) are recorded in the
+   * seen-terminal short table and settled at promotion time.
+   * Idempotent: unknown task-ids are tolerated silently.
+   * Returns the settled SubagentInfo, or undefined when nothing was settled.
+   */
+  public handleTaskNotification(taskId: string, status: string, result?: string | null): SubagentInfo | undefined {
+    const normalized = status.trim().toLowerCase();
+    if (
+      normalized !== 'completed' &&
+      normalized !== 'killed' &&
+      normalized !== 'failed' &&
+      normalized !== 'stopped'
+    ) {
+      return undefined; // non-terminal notification — ignore
+    }
+
+    const subagent = this.activeAsyncSubagents.get(taskId);
+    if (!subagent) {
+      // Notification arrived before promotion (or unknown task) — record for
+      // the promotion-time check. Unknown ids age out via the LRU bound.
+      this.rememberTerminalNotification(taskId, normalized, result);
+      return undefined;
+    }
+
+    this.settleActiveSubagent(subagent, taskId, normalized, result);
+    return subagent;
+  }
+
+  private settleActiveSubagent(
+    subagent: SubagentInfo,
+    agentId: string,
+    status: string,
+    result?: string | null
+  ): void {
+    const finalStatus: 'completed' | 'error' = status === 'completed' ? 'completed' : 'error';
+    const trimmedResult = typeof result === 'string' ? result.trim() : '';
+
+    subagent.asyncStatus = finalStatus;
+    subagent.status = finalStatus;
+    subagent.result = trimmedResult || subagent.result || `Task ${status}`;
+    subagent.completedAt = Date.now();
+
+    if (subagent.outputToolId) {
+      this.outputToolIdToAgentId.delete(subagent.outputToolId);
+    }
+    this.activeAsyncSubagents.delete(agentId);
+
+    this.updateAsyncDomState(subagent);
+    this.onStateChange(subagent);
+  }
+
+  private rememberTerminalNotification(taskId: string, status: string, result?: string | null): void {
+    // Refresh insertion order for LRU freshness, then evict the oldest entry.
+    this.seenTerminalNotifications.delete(taskId);
+    this.seenTerminalNotifications.set(taskId, {
+      status,
+      result: typeof result === 'string' ? result : null,
+    });
+    while (this.seenTerminalNotifications.size > SubagentManager.SEEN_TERMINAL_NOTIFICATIONS_LIMIT) {
+      const oldest = this.seenTerminalNotifications.keys().next().value;
+      if (oldest === undefined) break;
+      this.seenTerminalNotifications.delete(oldest);
+    }
   }
 
   public handleAgentOutputToolUse(toolCall: ToolCallInfo): void {
@@ -438,7 +530,21 @@ export class SubagentManager {
   // ============================================
 
   public hasRunningSubagents(): boolean {
-    // pendingAsyncSubagents: awaiting agent_id; activeAsyncSubagents: only holds running entries
+    // stale-hook patch（2026-08-09，自运行中 main.js 移植）：进程退出丢失状态的 agent 会永远卡在 Map 里，
+    // 导致 stop hook 永久 block。超过 STALE_MS 无生命的 "running" 条目视为僵尸清理放行；
+    // 真实活跃 agent（startedAt 距今 < 2h）仍正常拦截，保护语义保留。
+    const STALE_MS = 2 * 60 * 60 * 1000;
+    const now = Date.now();
+    const isLive = (s?: SubagentInfo): boolean => now - (s?.startedAt ?? 0) < STALE_MS;
+    for (const [id, s] of this.pendingAsyncSubagents) {
+      if (!isLive(s)) this.pendingAsyncSubagents.delete(id);
+    }
+    for (const [id, s] of this.activeAsyncSubagents) {
+      if (!isLive(s)) {
+        s.asyncStatus = 'orphaned';
+        this.activeAsyncSubagents.delete(id);
+      }
+    }
     return this.pendingAsyncSubagents.size > 0 || this.activeAsyncSubagents.size > 0;
   }
 
@@ -490,6 +596,7 @@ export class SubagentManager {
     this.taskIdToAgentId.clear();
     this.outputToolIdToAgentId.clear();
     this.asyncDomStates.clear();
+    this.seenTerminalNotifications.clear();
   }
 
   // ============================================
