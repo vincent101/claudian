@@ -140,7 +140,8 @@ function createMockPlugin(overrides: Record<string, unknown> = {}): any {
 
 function createTurn(text = 'hello', overrides: Partial<PreparedChatTurn> = {}): PreparedChatTurn {
   return {
-    request: { text },
+    turnId: `turn-${text}`,
+    request: { turnId: `turn-${text}`, text },
     persistedContent: text,
     prompt: text,
     isCompact: false,

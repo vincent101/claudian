@@ -689,6 +689,10 @@ export class InputController {
     return {
       displayContent: options.content,
       turnRequest: {
+        // Single-source user turn id: generated here (feature layer), passed
+        // unchanged through prepareTurn → runtime turn registry → message
+        // channel lease. The runtime must not regenerate it.
+        turnId: this.deps.generateId(),
         text: transformedText,
         images: options.images,
         currentNotePath: shouldSendCurrentNote && currentNotePath ? currentNotePath : undefined,

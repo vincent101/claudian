@@ -37,6 +37,7 @@ export function encodeClaudeTurn(
   const mcpMentions = mcpManager.extractMentions(persistedContent);
 
   return {
+    turnId: request.turnId,
     request,
     persistedContent,
     prompt: mcpManager.transformMentions(persistedContent),

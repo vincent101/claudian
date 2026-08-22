@@ -173,6 +173,7 @@ export class OpencodeChatRuntime implements ChatRuntime {
 
   prepareTurn(request: ChatTurnRequest): PreparedChatTurn {
     return {
+      turnId: request.turnId,
       isCompact: false,
       mcpMentions: request.enabledMcpServers ?? new Set(),
       persistedContent: '',

@@ -38,6 +38,13 @@ export interface ClaudeDynamicUpdateDeps {
   ensureReady: (options: ClaudeEnsureReadyOptions) => Promise<boolean>;
   setCurrentExternalContextPaths: (paths: string[]) => void;
   notifyFailure: (message: string) => void;
+  /** True while a turn holds the message channel lease (collecting/projecting). */
+  hasActiveTurn: () => boolean;
+  /**
+   * Register (or with null, clear) a config restart deferred until the active
+   * turn settles. The latest registration wins.
+   */
+  setDeferredRestart: (externalContextPaths: string[] | null) => void;
 }
 
 export async function applyClaudeDynamicUpdates(
@@ -175,6 +182,14 @@ export async function applyClaudeDynamicUpdates(
     return;
   }
 
+  // A turn is mid-flight on this query: rebuilding now would drop its stream.
+  // Register the latest config; the runtime executes it after the turn
+  // settles and the channel is idle (executeDeferredRestartIfAny).
+  if (deps.hasActiveTurn()) {
+    deps.setDeferredRestart(newExternalContextPaths);
+    return;
+  }
+
   const restarted = await deps.ensureReady({
     externalContextPaths: newExternalContextPaths,
     preserveHandlers: restartOptions?.preserveHandlers,
@@ -182,6 +197,9 @@ export async function applyClaudeDynamicUpdates(
   });
 
   if (restarted && deps.getPersistentQuery()) {
+    // The immediate restart applied the newest config — any older deferred
+    // registration is superseded.
+    deps.setDeferredRestart(null);
     await applyClaudeDynamicUpdates(deps, queryOptions, restartOptions, false);
   }
 }

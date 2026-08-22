@@ -3,7 +3,7 @@ import { encodeCodexTurn } from '@/providers/codex/prompt/encodeCodexTurn';
 
 describe('encodeCodexTurn', () => {
   it('should encode a basic text request', () => {
-    const request: ChatTurnRequest = { text: 'Hello world' };
+    const request: ChatTurnRequest = { turnId: 'turn-codex-basic', text: 'Hello world' };
     const result = encodeCodexTurn(request);
 
     expect(result.prompt).toBe('Hello world');
@@ -15,6 +15,7 @@ describe('encodeCodexTurn', () => {
 
   it('should include current note context', () => {
     const request: ChatTurnRequest = {
+      turnId: 'turn-codex',
       text: 'Fix this',
       currentNotePath: 'notes/todo.md',
     };
@@ -26,6 +27,7 @@ describe('encodeCodexTurn', () => {
 
   it('should include editor selection context', () => {
     const request: ChatTurnRequest = {
+      turnId: 'turn-codex',
       text: 'Explain this',
       editorSelection: {
         notePath: 'src/main.ts',
@@ -41,6 +43,7 @@ describe('encodeCodexTurn', () => {
 
   it('should use "current note" fallback when editor selection has default notePath', () => {
     const request: ChatTurnRequest = {
+      turnId: 'turn-codex',
       text: 'Explain this',
       editorSelection: {
         notePath: '',
@@ -55,6 +58,7 @@ describe('encodeCodexTurn', () => {
 
   it('should include browser selection context', () => {
     const request: ChatTurnRequest = {
+      turnId: 'turn-codex',
       text: 'Summarize',
       browserSelection: {
         source: 'chrome',
@@ -70,6 +74,7 @@ describe('encodeCodexTurn', () => {
 
   it('should include canvas selection context', () => {
     const request: ChatTurnRequest = {
+      turnId: 'turn-codex',
       text: 'Review',
       canvasSelection: {
         canvasPath: 'my-canvas.canvas',
@@ -84,6 +89,7 @@ describe('encodeCodexTurn', () => {
 
   it('should combine all context sections', () => {
     const request: ChatTurnRequest = {
+      turnId: 'turn-codex',
       text: 'Do something',
       currentNotePath: 'note.md',
       editorSelection: { notePath: 'note.md', mode: 'selection', selectedText: 'selected' },
@@ -101,6 +107,7 @@ describe('encodeCodexTurn', () => {
 
   it('should not include empty editor selection', () => {
     const request: ChatTurnRequest = {
+      turnId: 'turn-codex',
       text: 'Hello',
       editorSelection: { notePath: 'note.md', mode: 'none', selectedText: '' },
     };
@@ -111,6 +118,7 @@ describe('encodeCodexTurn', () => {
 
   it('should not include canvas selection with empty nodeIds', () => {
     const request: ChatTurnRequest = {
+      turnId: 'turn-codex',
       text: 'Hello',
       canvasSelection: { canvasPath: 'c.canvas', nodeIds: [] },
     };
@@ -121,34 +129,35 @@ describe('encodeCodexTurn', () => {
 
   describe('compact detection', () => {
     it('marks bare /compact as compact', () => {
-      const result = encodeCodexTurn({ text: '/compact' });
+      const result = encodeCodexTurn({ turnId: 'turn-codex', text: '/compact' });
       expect(result.isCompact).toBe(true);
       expect(result.prompt).toBe('/compact');
       expect(result.persistedContent).toBe('/compact');
     });
 
     it('marks /compact with trailing whitespace as compact', () => {
-      const result = encodeCodexTurn({ text: '/compact ' });
+      const result = encodeCodexTurn({ turnId: 'turn-codex', text: '/compact ' });
       expect(result.isCompact).toBe(true);
     });
 
     it('marks /compact with trailing text as compact (context still skipped)', () => {
-      const result = encodeCodexTurn({ text: '/compact extra args' });
+      const result = encodeCodexTurn({ turnId: 'turn-codex', text: '/compact extra args' });
       expect(result.isCompact).toBe(true);
     });
 
     it('is case-insensitive', () => {
-      const result = encodeCodexTurn({ text: '/Compact' });
+      const result = encodeCodexTurn({ turnId: 'turn-codex', text: '/Compact' });
       expect(result.isCompact).toBe(true);
     });
 
     it('does not treat "compact this" as compact', () => {
-      const result = encodeCodexTurn({ text: 'compact this' });
+      const result = encodeCodexTurn({ turnId: 'turn-codex', text: 'compact this' });
       expect(result.isCompact).toBe(false);
     });
 
     it('skips all context sections for compact turns', () => {
       const request: ChatTurnRequest = {
+      turnId: 'turn-codex',
         text: '/compact',
         currentNotePath: 'note.md',
         editorSelection: { notePath: 'src/main.ts', mode: 'selection', selectedText: 'code' },

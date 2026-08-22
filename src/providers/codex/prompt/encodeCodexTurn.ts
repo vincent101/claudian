@@ -9,6 +9,7 @@ export function encodeCodexTurn(request: ChatTurnRequest): PreparedChatTurn {
 
   if (isCompact) {
     return {
+      turnId: request.turnId,
       request,
       persistedContent: request.text,
       prompt: request.text,
@@ -48,6 +49,7 @@ export function encodeCodexTurn(request: ChatTurnRequest): PreparedChatTurn {
   const prompt = sections.join('');
 
   return {
+    turnId: request.turnId,
     request,
     persistedContent: request.text,
     prompt,

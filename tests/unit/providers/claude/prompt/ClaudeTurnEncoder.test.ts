@@ -16,10 +16,11 @@ describe('encodeClaudeTurn', () => {
   });
 
   it('should return PreparedChatTurn with correct shape', () => {
-    const request: ChatTurnRequest = { text: 'hello' };
+    const request: ChatTurnRequest = { turnId: 'turn-encoder-1', text: 'hello' };
     const result = encodeClaudeTurn(request, mcpManager);
 
     expect(result).toEqual({
+      turnId: 'turn-encoder-1',
       request,
       persistedContent: 'hello',
       prompt: 'hello',
@@ -29,22 +30,23 @@ describe('encodeClaudeTurn', () => {
   });
 
   it('should detect /compact command', () => {
-    const result = encodeClaudeTurn({ text: '/compact' }, mcpManager);
+    const result = encodeClaudeTurn({ turnId: 'turn-encoder', text: '/compact' }, mcpManager);
     expect(result.isCompact).toBe(true);
   });
 
   it('should detect /compact with arguments', () => {
-    const result = encodeClaudeTurn({ text: '/compact summarize' }, mcpManager);
+    const result = encodeClaudeTurn({ turnId: 'turn-encoder', text: '/compact summarize' }, mcpManager);
     expect(result.isCompact).toBe(true);
   });
 
   it('should not treat "compact" without slash as compact', () => {
-    const result = encodeClaudeTurn({ text: 'compact this' }, mcpManager);
+    const result = encodeClaudeTurn({ turnId: 'turn-encoder', text: 'compact this' }, mcpManager);
     expect(result.isCompact).toBe(false);
   });
 
   it('should skip all context appending when /compact', () => {
     const request: ChatTurnRequest = {
+      turnId: 'turn-encoder',
       text: '/compact',
       currentNotePath: 'notes/test.md',
       editorSelection: { notePath: 'test.md', mode: 'selection', selectedText: 'selected' } as any,
@@ -58,6 +60,7 @@ describe('encodeClaudeTurn', () => {
 
   it('should append current note context', () => {
     const request: ChatTurnRequest = {
+      turnId: 'turn-encoder',
       text: 'hello',
       currentNotePath: 'notes/test.md',
     };
@@ -69,6 +72,7 @@ describe('encodeClaudeTurn', () => {
 
   it('should append editor selection context', () => {
     const request: ChatTurnRequest = {
+      turnId: 'turn-encoder',
       text: 'explain this',
       editorSelection: {
         notePath: 'notes/test.md',
@@ -84,6 +88,7 @@ describe('encodeClaudeTurn', () => {
 
   it('should append browser selection context', () => {
     const request: ChatTurnRequest = {
+      turnId: 'turn-encoder',
       text: 'summarize',
       browserSelection: {
         source: 'surfing-view',
@@ -99,6 +104,7 @@ describe('encodeClaudeTurn', () => {
 
   it('should append canvas selection context', () => {
     const request: ChatTurnRequest = {
+      turnId: 'turn-encoder',
       text: 'explain this canvas',
       canvasSelection: {
         canvasPath: 'diagrams/overview.canvas',
@@ -118,7 +124,7 @@ describe('encodeClaudeTurn', () => {
     mcpManager.extractMentions.mockReturnValue(mentions);
     mcpManager.transformMentions.mockImplementation((text: string) => text + ' [transformed]');
 
-    const result = encodeClaudeTurn({ text: '@server-a hello' }, mcpManager);
+    const result = encodeClaudeTurn({ turnId: 'turn-encoder', text: '@server-a hello' }, mcpManager);
 
     expect(mcpManager.extractMentions).toHaveBeenCalledWith(result.persistedContent);
     expect(result.mcpMentions).toBe(mentions);
@@ -128,7 +134,7 @@ describe('encodeClaudeTurn', () => {
   });
 
   it('should handle request with no optional fields', () => {
-    const result = encodeClaudeTurn({ text: 'plain message' }, mcpManager);
+    const result = encodeClaudeTurn({ turnId: 'turn-encoder', text: 'plain message' }, mcpManager);
 
     expect(result.persistedContent).toBe('plain message');
     expect(result.prompt).toBe('plain message');
@@ -137,7 +143,7 @@ describe('encodeClaudeTurn', () => {
   });
 
   it('should preserve request reference in output', () => {
-    const request: ChatTurnRequest = { text: 'hello', images: [{ mediaType: 'image/png', data: 'abc' }] as any };
+    const request: ChatTurnRequest = { turnId: 'turn-encoder-img', text: 'hello', images: [{ mediaType: 'image/png', data: 'abc' }] as any };
     const result = encodeClaudeTurn(request, mcpManager);
 
     expect(result.request).toBe(request);

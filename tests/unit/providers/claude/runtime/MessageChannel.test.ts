@@ -40,10 +40,15 @@ function createImageUserMessage(data = 'image-data'): SDKUserMessage {
 describe('MessageChannel', () => {
   let channel: MessageChannel;
   let warnings: string[];
+  let dequeuedTurnIds: string[];
 
   beforeEach(() => {
     warnings = [];
-    channel = new MessageChannel((message) => warnings.push(message));
+    dequeuedTurnIds = [];
+    channel = new MessageChannel(
+      (message) => warnings.push(message),
+      (turnId) => dequeuedTurnIds.push(turnId),
+    );
   });
 
   afterEach(() => {
@@ -57,6 +62,7 @@ describe('MessageChannel', () => {
 
     it('should initially have no active turn', () => {
       expect(channel.isTurnActive()).toBe(false);
+      expect(channel.getActiveTurnId()).toBeNull();
     });
 
     it('should initially have empty queue', () => {
@@ -69,15 +75,15 @@ describe('MessageChannel', () => {
       const iterator = channel[Symbol.asyncIterator]();
 
       const firstPromise = iterator.next();
-      channel.enqueue(createTextUserMessage('first'));
+      channel.enqueue('turn-1', createTextUserMessage('first'));
       const first = await firstPromise;
 
       expect(first.value.message.content).toBe('first');
 
-      channel.enqueue(createTextUserMessage('second'));
-      channel.enqueue(createTextUserMessage('third'));
+      channel.enqueue('turn-2', createTextUserMessage('second'));
+      channel.enqueue('turn-3', createTextUserMessage('third'));
       channel.setSessionId('session-abc');
-      channel.onTurnComplete();
+      channel.completeTurn('turn-1');
 
       const merged = await iterator.next();
       expect(merged.value.message.content).toBe('second\n\nthird');
@@ -89,16 +95,16 @@ describe('MessageChannel', () => {
       const iterator = channel[Symbol.asyncIterator]();
 
       const firstPromise = iterator.next();
-      channel.enqueue(createTextUserMessage('first'));
+      channel.enqueue('turn-1', createTextUserMessage('first'));
       await firstPromise;
 
       const attachmentOne = createImageUserMessage('image-one');
       const attachmentTwo = createImageUserMessage('image-two');
 
-      channel.enqueue(attachmentOne);
-      channel.enqueue(attachmentTwo);
+      channel.enqueue('turn-2', attachmentOne);
+      channel.enqueue('turn-3', attachmentTwo);
 
-      channel.onTurnComplete();
+      channel.completeTurn('turn-1');
 
       const queued = await iterator.next();
       expect(queued.value.message.content).toEqual(attachmentTwo.message.content);
@@ -109,14 +115,14 @@ describe('MessageChannel', () => {
       const iterator = channel[Symbol.asyncIterator]();
 
       const firstPromise = iterator.next();
-      channel.enqueue(createTextUserMessage('first'));
+      channel.enqueue('turn-1', createTextUserMessage('first'));
       await firstPromise;
 
       const longText = 'x'.repeat(12000);
-      channel.enqueue(createTextUserMessage('short'));
-      channel.enqueue(createTextUserMessage(longText));
+      channel.enqueue('turn-2', createTextUserMessage('short'));
+      channel.enqueue('turn-3', createTextUserMessage(longText));
 
-      channel.onTurnComplete();
+      channel.completeTurn('turn-1');
 
       const merged = await iterator.next();
       expect(merged.value.message.content).toBe('short');
@@ -125,7 +131,7 @@ describe('MessageChannel', () => {
 
     it('delivers message when enqueue is called before next (no deadlock)', async () => {
       // Enqueue BEFORE calling next() - this used to cause a deadlock
-      channel.enqueue(createTextUserMessage('early message'));
+      channel.enqueue('turn-early', createTextUserMessage('early message'));
 
       // Now call next() - it should pick up the queued message
       const iterator = channel[Symbol.asyncIterator]();
@@ -138,8 +144,8 @@ describe('MessageChannel', () => {
     it('handles multiple enqueues before first next (queued separately)', async () => {
       // Enqueue multiple messages before any next() call
       // When turnActive=false, messages queue separately (no merging)
-      channel.enqueue(createTextUserMessage('first'));
-      channel.enqueue(createTextUserMessage('second'));
+      channel.enqueue('turn-a', createTextUserMessage('first'));
+      channel.enqueue('turn-b', createTextUserMessage('second'));
 
       const iterator = channel[Symbol.asyncIterator]();
 
@@ -149,7 +155,7 @@ describe('MessageChannel', () => {
       expect(first.value.message.content).toBe('first');
 
       // Complete turn so second message can be delivered
-      channel.onTurnComplete();
+      channel.completeTurn('turn-a');
 
       // Second next() gets second message
       const second = await iterator.next();
@@ -161,7 +167,7 @@ describe('MessageChannel', () => {
   describe('error handling', () => {
     it('throws error when enqueueing to closed channel', () => {
       channel.close();
-      expect(() => channel.enqueue(createTextUserMessage('test'))).toThrow('MessageChannel is closed');
+      expect(() => channel.enqueue('turn-1', createTextUserMessage('test'))).toThrow('MessageChannel is closed');
     });
   });
 
@@ -169,7 +175,7 @@ describe('MessageChannel', () => {
     it('drops newest messages when queue is full before consumer starts', () => {
       // Queue many messages before starting iteration (turnActive=false)
       for (let i = 0; i < 10; i++) {
-        channel.enqueue(createTextUserMessage(`msg-${i}`));
+        channel.enqueue(`turn-${i}`, createTextUserMessage(`msg-${i}`));
       }
 
       // Queue full warning should be triggered
@@ -201,22 +207,18 @@ describe('MessageChannel', () => {
 
       // Start a turn
       const firstPromise = iterator.next();
-      channel.enqueue(createTextUserMessage('first'));
+      channel.enqueue('turn-1', createTextUserMessage('first'));
       await firstPromise;
 
       // Fill queue during active turn - first text merges, then subsequent
-      // ones also merge. But since merge limit is 10000 chars, we need to
-      // fill the queue with non-text (attachment) + text to trigger overflow
-      channel.enqueue(createTextUserMessage('queued-text'));
+      // ones also merge. Attachments replace each other.
+      channel.enqueue('turn-2', createTextUserMessage('queued-text'));
 
       // Enqueue attachments to fill remaining queue slots
       for (let i = 0; i < 8; i++) {
-        channel.enqueue(createImageUserMessage(`img-${i}`));
+        channel.enqueue(`turn-img-${i}`, createImageUserMessage(`img-${i}`));
       }
 
-      // The 8th attachment should trigger overflow (text=1 + attachment=1 = 2 slots,
-      // but attachments replace each other, so text=1 + attachment=1 = 2 used.
-      // Additional image messages just replace the existing attachment slot)
       // The queue should have text + attachment = 2 items
       expect(channel.getQueueLength()).toBe(2);
     });
@@ -224,33 +226,34 @@ describe('MessageChannel', () => {
 
   describe('enqueue attachment before consumer starts (no active turn)', () => {
     it('queues attachment message when no turn is active and no consumer', () => {
-      channel.enqueue(createImageUserMessage('early-img'));
+      channel.enqueue('turn-1', createImageUserMessage('early-img'));
       expect(channel.getQueueLength()).toBe(1);
     });
   });
 
-  describe('onTurnComplete with queued messages and waiting consumer', () => {
+  describe('completeTurn with queued messages and waiting consumer', () => {
     it('delivers queued message to waiting consumer on turn complete', async () => {
       const iterator = channel[Symbol.asyncIterator]();
 
       // Deliver first message to start a turn
       const firstPromise = iterator.next();
-      channel.enqueue(createTextUserMessage('turn-1'));
+      channel.enqueue('turn-1', createTextUserMessage('turn-1'));
       await firstPromise;
 
       // Queue a message during active turn
-      channel.enqueue(createTextUserMessage('turn-2'));
+      channel.enqueue('turn-2', createTextUserMessage('turn-2'));
 
       // Start waiting for next message (consumer blocks)
       const secondPromise = iterator.next();
 
       // Complete the turn - should deliver queued message to waiting consumer
-      channel.onTurnComplete();
+      channel.completeTurn('turn-1');
 
       const result = await secondPromise;
       expect(result.done).toBe(false);
       expect(result.value.message.content).toBe('turn-2');
       expect(channel.isTurnActive()).toBe(true);
+      expect(channel.getActiveTurnId()).toBe('turn-2');
     });
   });
 
@@ -272,11 +275,10 @@ describe('MessageChannel', () => {
       };
 
       const firstPromise = iterator.next();
-      channel.enqueue(mixedMessage);
+      channel.enqueue('turn-1', mixedMessage);
       const result = await firstPromise;
 
-      // Text blocks should be joined with \n\n when no turn is active
-      // (delivered directly to consumer)
+      // Text blocks joined with \n\n when no turn is active (direct delivery)
       expect(result.value.message.content).toEqual(mixedMessage.message.content);
     });
 
@@ -285,7 +287,7 @@ describe('MessageChannel', () => {
 
       // Start a turn so messages get queued
       const firstPromise = iterator.next();
-      channel.enqueue(createTextUserMessage('first'));
+      channel.enqueue('turn-1', createTextUserMessage('first'));
       await firstPromise;
 
       // Enqueue a message with no content during active turn
@@ -298,9 +300,9 @@ describe('MessageChannel', () => {
         parent_tool_use_id: null,
         session_id: '',
       };
-      channel.enqueue(emptyMessage);
+      channel.enqueue('turn-2', emptyMessage);
 
-      channel.onTurnComplete();
+      channel.completeTurn('turn-1');
 
       const result = await iterator.next();
       expect(result.value.message.content).toBe('');
@@ -314,13 +316,13 @@ describe('MessageChannel', () => {
     });
 
     it('should clear queue on close', () => {
-      channel.enqueue(createTextUserMessage('test'));
+      channel.enqueue('turn-1', createTextUserMessage('test'));
       channel.close();
       expect(channel.getQueueLength()).toBe(0);
     });
 
     it('should reset channel state', () => {
-      channel.enqueue(createTextUserMessage('test'));
+      channel.enqueue('turn-1', createTextUserMessage('test'));
       channel.reset();
       expect(channel.getQueueLength()).toBe(0);
       expect(channel.isClosed()).toBe(false);
@@ -341,11 +343,10 @@ describe('MessageChannel', () => {
       const iterator = ch[Symbol.asyncIterator]();
 
       // Start a turn with a normal message
-      ch.enqueue(createTextUserMessage('initial'));
+      ch.enqueue('turn-1', createTextUserMessage('initial'));
       await iterator.next(); // consume → turn active
 
       // Enqueue a message with array content (text-only, no images)
-      // This goes through extractTextContent → filter/map/join path
       const arrayContentMessage: SDKUserMessage = {
         type: 'user',
         message: {
@@ -359,12 +360,11 @@ describe('MessageChannel', () => {
         session_id: '',
       };
 
-      ch.enqueue(arrayContentMessage);
+      ch.enqueue('turn-2', arrayContentMessage);
 
       // Complete turn so merged message is delivered
-      ch.onTurnComplete();
+      ch.completeTurn('turn-1');
       const result = await iterator.next();
-      // Text blocks should be extracted and joined with \n\n
       expect(result.value.message.content).toBe('Hello\n\nWorld');
     });
 
@@ -373,11 +373,9 @@ describe('MessageChannel', () => {
       const iterator = ch[Symbol.asyncIterator]();
 
       // Start a turn
-      ch.enqueue(createTextUserMessage('initial'));
+      ch.enqueue('turn-1', createTextUserMessage('initial'));
       await iterator.next(); // consume → turn active
 
-      // Enqueue array content with mixed blocks but NO images (so treated as text)
-      // Note: only blocks with type='text' should be extracted
       const mixedContentMessage: SDKUserMessage = {
         type: 'user',
         message: {
@@ -392,9 +390,9 @@ describe('MessageChannel', () => {
         session_id: '',
       };
 
-      ch.enqueue(mixedContentMessage);
+      ch.enqueue('turn-2', mixedContentMessage);
 
-      ch.onTurnComplete();
+      ch.completeTurn('turn-1');
       const result = await iterator.next();
       expect(result.value.message.content).toBe('Visible\n\nAlso Visible');
     });
@@ -405,7 +403,7 @@ describe('MessageChannel', () => {
       expect(channel.isTurnActive()).toBe(false);
 
       const iterator = channel[Symbol.asyncIterator]();
-      channel.enqueue(createTextUserMessage('test'));
+      channel.enqueue('turn-1', createTextUserMessage('test'));
 
       // Wait for message to be delivered
       const firstPromise = iterator.next();
@@ -413,9 +411,207 @@ describe('MessageChannel', () => {
 
       expect(result.done).toBe(false);
       expect(channel.isTurnActive()).toBe(true);
+      expect(channel.getActiveTurnId()).toBe('turn-1');
 
-      channel.onTurnComplete();
+      channel.completeTurn('turn-1');
       expect(channel.isTurnActive()).toBe(false);
+      expect(channel.getActiveTurnId()).toBeNull();
+    });
+  });
+
+  // ============================================
+  // S1 turn lease: external turns, dequeue lease, cancel, close reporting
+  // ============================================
+
+  describe('beginExternalTurn (auto turn lease)', () => {
+    it('acquires the lease when idle', () => {
+      const result = channel.beginExternalTurn('auto-1');
+      expect(result).toEqual({ ok: true });
+      expect(channel.getActiveTurnId()).toBe('auto-1');
+    });
+
+    it('fails without overwriting an active user turn', async () => {
+      const iterator = channel[Symbol.asyncIterator]();
+      const firstPromise = iterator.next();
+      channel.enqueue('user-1', createTextUserMessage('first'));
+      await firstPromise;
+
+      const result = channel.beginExternalTurn('auto-1');
+      expect(result).toEqual({ ok: false, code: 'active_turn_exists', activeTurnId: 'user-1' });
+      expect(channel.getActiveTurnId()).toBe('user-1');
+    });
+
+    it('fails when another external turn holds the lease', () => {
+      channel.beginExternalTurn('auto-1');
+      const result = channel.beginExternalTurn('auto-2');
+      expect(result).toEqual({ ok: false, code: 'active_turn_exists', activeTurnId: 'auto-1' });
+    });
+
+    it('external turn blocks user delivery until completed (mutual exclusion)', async () => {
+      channel.beginExternalTurn('auto-1');
+
+      // User message enqueued while an external turn is active → queued
+      channel.enqueue('user-1', createTextUserMessage('user msg'));
+      expect(channel.getQueueLength()).toBe(1);
+
+      const iterator = channel[Symbol.asyncIterator]();
+      const pending = iterator.next();
+
+      channel.completeTurn('auto-1');
+      const result = await pending;
+      expect(result.done).toBe(false);
+      expect(result.value.message.content).toBe('user msg');
+      expect(channel.getActiveTurnId()).toBe('user-1');
+    });
+  });
+
+  describe('completeTurn validation', () => {
+    it('rejects completion of a non-active turn id', async () => {
+      const iterator = channel[Symbol.asyncIterator]();
+      const firstPromise = iterator.next();
+      channel.enqueue('user-1', createTextUserMessage('first'));
+      await firstPromise;
+
+      const result = channel.completeTurn('other-turn');
+      expect(result).toEqual({ ok: false, code: 'turn_mismatch', activeTurnId: 'user-1' });
+      expect(channel.getActiveTurnId()).toBe('user-1');
+    });
+
+    it('reports unknown turn when no lease is held', () => {
+      const result = channel.completeTurn('user-1');
+      expect(result).toEqual({ ok: false, code: 'unknown_turn', activeTurnId: null });
+    });
+  });
+
+  describe('dequeue signs the lease (onTurnDequeued)', () => {
+    it('signs lease and fires callback on direct delivery to waiting consumer', async () => {
+      const iterator = channel[Symbol.asyncIterator]();
+      const pending = iterator.next();
+
+      channel.enqueue('user-1', createTextUserMessage('hello'));
+      await pending;
+
+      expect(channel.getActiveTurnId()).toBe('user-1');
+      expect(dequeuedTurnIds).toEqual(['user-1']);
+    });
+
+    it('signs lease and fires callback when next() picks up a queued item', async () => {
+      channel.enqueue('user-1', createTextUserMessage('hello'));
+
+      const iterator = channel[Symbol.asyncIterator]();
+      await iterator.next();
+
+      expect(channel.getActiveTurnId()).toBe('user-1');
+      expect(dequeuedTurnIds).toEqual(['user-1']);
+    });
+
+    it('fires for each queued item as the previous turn completes', async () => {
+      channel.enqueue('user-1', createTextUserMessage('one'));
+      channel.enqueue('user-2', createTextUserMessage('two'));
+
+      const iterator = channel[Symbol.asyncIterator]();
+      await iterator.next(); // user-1 dequeues
+
+      channel.completeTurn('user-1');
+      await iterator.next(); // user-2 dequeues
+
+      expect(dequeuedTurnIds).toEqual(['user-1', 'user-2']);
+    });
+  });
+
+  describe('canonical lease merging', () => {
+    it('text merge keeps the first turnId canonical and reports it', async () => {
+      const iterator = channel[Symbol.asyncIterator]();
+      const firstPromise = iterator.next();
+      channel.enqueue('user-1', createTextUserMessage('first'));
+      await firstPromise;
+
+      // user-2 opens a queued text item; user-3 merges into it and is told
+      // the canonical lease stayed with user-2.
+      const second = channel.enqueue('user-2', createTextUserMessage('second'));
+      expect(second).toEqual({ canonicalTurnId: 'user-2' });
+      const third = channel.enqueue('user-3', createTextUserMessage('third'));
+      expect(third).toEqual({ canonicalTurnId: 'user-2' });
+
+      channel.completeTurn('user-1');
+      const merged = await iterator.next();
+      expect(merged.value.message.content).toBe('second\n\nthird');
+      expect(channel.getActiveTurnId()).toBe('user-2');
+    });
+
+    it('attachment replace keeps the first turnId canonical', async () => {
+      const iterator = channel[Symbol.asyncIterator]();
+      const firstPromise = iterator.next();
+      channel.enqueue('user-1', createTextUserMessage('first'));
+      await firstPromise;
+
+      channel.enqueue('user-2', createImageUserMessage('img-1'));
+      const replaced = channel.enqueue('user-3', createImageUserMessage('img-2'));
+      expect(replaced).toEqual({ canonicalTurnId: 'user-2' });
+
+      channel.completeTurn('user-1');
+      const result = await iterator.next();
+      expect(result.value.message.content).toEqual(createImageUserMessage('img-2').message.content);
+      expect(channel.getActiveTurnId()).toBe('user-2');
+    });
+
+    it('non-merged queued items keep their own turnIds', () => {
+      channel.enqueue('user-1', createTextUserMessage('one'));
+      channel.enqueue('user-2', createTextUserMessage('two'));
+      expect(channel.getQueuedTurnIds()).toEqual(['user-1', 'user-2']);
+    });
+  });
+
+  describe('cancelQueuedTurn', () => {
+    it('removes the queued item for the given turn and returns true', () => {
+      channel.enqueue('user-1', createTextUserMessage('one'));
+      channel.enqueue('user-2', createTextUserMessage('two'));
+
+      expect(channel.cancelQueuedTurn('user-1')).toBe(true);
+      expect(channel.getQueuedTurnIds()).toEqual(['user-2']);
+    });
+
+    it('returns false for an unknown or already-cancelled turn', () => {
+      expect(channel.cancelQueuedTurn('nope')).toBe(false);
+      channel.enqueue('user-1', createTextUserMessage('one'));
+      channel.cancelQueuedTurn('user-1');
+      expect(channel.cancelQueuedTurn('user-1')).toBe(false);
+    });
+  });
+
+  describe('cancelAll', () => {
+    it('clears lease and queue, returning all affected turnIds', async () => {
+      const iterator = channel[Symbol.asyncIterator]();
+      const firstPromise = iterator.next();
+      channel.enqueue('user-1', createTextUserMessage('first'));
+      await firstPromise;
+
+      // Text items merge into one canonical lease; attachments stay separate.
+      channel.enqueue('user-2', createTextUserMessage('second'));
+      channel.enqueue('user-3', createTextUserMessage('third'));
+      channel.enqueue('user-4', createImageUserMessage('img'));
+
+      const ids = channel.cancelAll();
+      expect(ids).toEqual(['user-1', 'user-2', 'user-4']);
+      expect(channel.getActiveTurnId()).toBeNull();
+      expect(channel.getQueueLength()).toBe(0);
+      expect(channel.isClosed()).toBe(false);
+    });
+  });
+
+  describe('close turn reporting', () => {
+    it('returns active and queued turnIds for runtime settlement', async () => {
+      const iterator = channel[Symbol.asyncIterator]();
+      const firstPromise = iterator.next();
+      channel.enqueue('user-1', createTextUserMessage('first'));
+      await firstPromise;
+
+      channel.enqueue('user-2', createTextUserMessage('second'));
+
+      const ids = channel.close();
+      expect(ids).toEqual(['user-1', 'user-2']);
+      expect(channel.getActiveTurnId()).toBeNull();
+      expect(channel.getQueueLength()).toBe(0);
     });
   });
 });

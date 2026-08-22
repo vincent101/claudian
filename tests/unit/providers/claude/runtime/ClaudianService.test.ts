@@ -7,7 +7,7 @@ import type { McpServerManager } from '@/core/mcp/McpServerManager';
 import type ClaudianPlugin from '@/main';
 import { ClaudianService } from '@/providers/claude/runtime/ClaudeChatRuntime';
 import { MessageChannel } from '@/providers/claude/runtime/ClaudeMessageChannel';
-import { createResponseHandler } from '@/providers/claude/runtime/types';
+import { createResponseHandler, createRuntimeTurn } from '@/providers/claude/runtime/types';
 import * as envUtils from '@/utils/env';
 import * as sessionUtils from '@/utils/session';
 
@@ -24,6 +24,12 @@ describe('ClaudianService', () => {
   let mockPlugin: Partial<ClaudianPlugin>;
   let mockMcpManager: MockMcpServerManager;
   let service: ClaudianService;
+
+  function makeTestTurn(turnId = `test-turn-${Date.now()}-${Math.random().toString(36).slice(2)}`) {
+    const turn = createRuntimeTurn({ id: turnId, kind: 'user' });
+    (service as any).runtimeTurns.set(turnId, turn);
+    return turn;
+  }
 
   async function collectChunks(gen: AsyncGenerator<any>): Promise<any[]> {
     const chunks: any[] = [];
@@ -80,7 +86,7 @@ describe('ClaudianService', () => {
 
   describe('prepareTurn', () => {
     it('should return PreparedChatTurn with encoded prompt', () => {
-      const result = service.prepareTurn({ text: 'hello world' });
+      const result = service.prepareTurn({ turnId: 'turn-prepare-1', text: 'hello world' });
       expect(result.request.text).toBe('hello world');
       expect(result.prompt).toBe('hello world');
       expect(result.persistedContent).toBe('hello world');
@@ -90,6 +96,7 @@ describe('ClaudianService', () => {
 
     it('should append current note context', () => {
       const result = service.prepareTurn({
+        turnId: 'turn-prepare-2',
         text: 'explain this',
         currentNotePath: 'notes/test.md',
       });
@@ -99,6 +106,7 @@ describe('ClaudianService', () => {
 
     it('should detect /compact and skip context', () => {
       const result = service.prepareTurn({
+        turnId: 'turn-prepare-3',
         text: '/compact',
         currentNotePath: 'notes/test.md',
       });
@@ -108,7 +116,7 @@ describe('ClaudianService', () => {
 
     it('should extract MCP mentions', () => {
       (mockMcpManager.extractMentions as jest.Mock).mockReturnValue(new Set(['server-a']));
-      const result = service.prepareTurn({ text: '@server-a hello' });
+      const result = service.prepareTurn({ turnId: 'turn-prepare-4', text: '@server-a hello' });
       expect(result.mcpMentions).toEqual(new Set(['server-a']));
     });
   });
@@ -119,7 +127,7 @@ describe('ClaudianService', () => {
         { type: 'assistant', message: { content: [{ type: 'text', text: 'Hello!' }] } },
       ]);
 
-      const turn = service.prepareTurn({ text: 'hello' });
+      const turn = service.prepareTurn({ turnId: 'turn-hello', text: 'hello' });
       const chunks = await collectChunks(service.query(turn));
 
       const textChunks = chunks.filter(c => c.type === 'text');
@@ -132,7 +140,7 @@ describe('ClaudianService', () => {
         { type: 'assistant', message: { content: [{ type: 'text', text: 'Response' }] } },
       ]);
 
-      const turn = service.prepareTurn({ text: 'follow up' });
+      const turn = service.prepareTurn({ turnId: 'turn-followup', text: 'follow up' });
       const history = [
         { id: 'u1', role: 'user' as const, content: 'first', timestamp: 1 },
         { id: 'a1', role: 'assistant' as const, content: 'reply', timestamp: 2 },
@@ -1014,7 +1022,7 @@ describe('ClaudianService', () => {
 
       // Set up persistent query state
       (service as any).persistentQuery = { interrupt: jest.fn().mockResolvedValue(undefined) };
-      (service as any).messageChannel = { close: jest.fn() };
+      (service as any).messageChannel = { close: jest.fn().mockReturnValue([]), cancelAll: jest.fn().mockReturnValue([]) };
       (service as any).queryAbortController = { abort: jest.fn() };
       (service as any).responseHandlers = [handler1, handler2];
 
@@ -1029,7 +1037,7 @@ describe('ClaudianService', () => {
       const handler = createResponseHandler({ id: 'h1', onChunk: jest.fn(), onDone, onError: jest.fn() });
 
       (service as any).persistentQuery = { interrupt: jest.fn().mockResolvedValue(undefined) };
-      (service as any).messageChannel = { close: jest.fn() };
+      (service as any).messageChannel = { close: jest.fn().mockReturnValue([]), cancelAll: jest.fn().mockReturnValue([]) };
       (service as any).queryAbortController = { abort: jest.fn() };
       (service as any).responseHandlers = [handler];
 
@@ -1134,6 +1142,7 @@ describe('ClaudianService', () => {
     let handler: ReturnType<typeof createResponseHandler>;
     let onChunk: jest.Mock;
     let onDone: jest.Mock;
+    let routeTurn: ReturnType<typeof createRuntimeTurn>;
 
     beforeEach(() => {
       onChunk = jest.fn();
@@ -1145,10 +1154,14 @@ describe('ClaudianService', () => {
         onError: jest.fn(),
       });
       (service as any).responseHandlers = [handler];
-      (service as any).messageChannel = {
-        onTurnComplete: jest.fn(),
-        setSessionId: jest.fn(),
-      };
+      // Real channel + registered user turn holding the lease: routeMessage
+      // resolves the turn from the channel's activeTurnId.
+      const channel = new MessageChannel();
+      (service as any).messageChannel = channel;
+      routeTurn = createRuntimeTurn({ id: 'route-test-turn', kind: 'user' });
+      routeTurn.waiters.add(handler);
+      (service as any).runtimeTurns.set(routeTurn.id, routeTurn);
+      channel.beginExternalTurn(routeTurn.id);
     });
 
     it('should route session_init event and capture session', async () => {
@@ -1221,7 +1234,7 @@ describe('ClaudianService', () => {
 
       await (service as any).routeMessage(message);
 
-      expect((service as any).messageChannel.onTurnComplete).toHaveBeenCalled();
+      expect((service as any).messageChannel.getActiveTurnId()).toBeNull();
       expect(onDone).toHaveBeenCalled();
     });
 
@@ -1267,7 +1280,7 @@ describe('ClaudianService', () => {
 
       await (service as any).routeMessage(message);
 
-      expect(handler.sawStreamText).toBe(true);
+      expect(routeTurn.sawStreamText).toBe(true);
     });
 
     it('should not mark stream text seen for empty text deltas', async () => {
@@ -1278,7 +1291,7 @@ describe('ClaudianService', () => {
 
       await (service as any).routeMessage(message);
 
-      expect(handler.sawStreamText).toBe(false);
+      expect(routeTurn.sawStreamText).toBe(false);
     });
 
     it('should mark stream thinking seen only after a visible stream thinking chunk', async () => {
@@ -1289,7 +1302,7 @@ describe('ClaudianService', () => {
 
       await (service as any).routeMessage(message);
 
-      expect(handler.sawStreamThinking).toBe(true);
+      expect(routeTurn.sawStreamThinking).toBe(true);
     });
 
     it('should not mark stream thinking seen for empty thinking deltas', async () => {
@@ -1300,12 +1313,12 @@ describe('ClaudianService', () => {
 
       await (service as any).routeMessage(message);
 
-      expect(handler.sawStreamThinking).toBe(false);
+      expect(routeTurn.sawStreamThinking).toBe(false);
     });
 
     it('should skip duplicate text from assistant messages after stream text', async () => {
       // First, mark stream text as seen
-      handler.markStreamTextSeen();
+      routeTurn.sawStreamText = true;
 
       // Now send an assistant message with text content
       const message = {
@@ -1382,7 +1395,10 @@ describe('ClaudianService', () => {
     });
 
     it('should reset auto-turn stream-text dedup after a buffered turn completes', async () => {
+      // Clear the user turn lease so messages start SDK-initiated (auto) turns.
       (service as any).responseHandlers = [];
+      (service as any).runtimeTurns.clear();
+      (service as any).messageChannel = new MessageChannel();
       const autoTurnCallback = jest.fn();
       service.setAutoTurnCallback(autoTurnCallback);
 
@@ -1420,7 +1436,10 @@ describe('ClaudianService', () => {
     });
 
     it('should notify when auto-turn callback rendering fails', async () => {
+      // Clear the user turn lease so messages start SDK-initiated (auto) turns.
       (service as any).responseHandlers = [];
+      (service as any).runtimeTurns.clear();
+      (service as any).messageChannel = new MessageChannel();
       const callbackError = new Error('renderer exploded');
       service.setAutoTurnCallback(() => {
         throw callbackError;
@@ -1956,7 +1975,7 @@ describe('ClaudianService', () => {
     it('should close persistent query on non-pipe error when not shutting down', () => {
       const closeSpy = jest.spyOn(service, 'closePersistentQuery');
       (service as any).persistentQuery = { interrupt: jest.fn().mockResolvedValue(undefined) };
-      (service as any).messageChannel = { close: jest.fn() };
+      (service as any).messageChannel = { close: jest.fn().mockReturnValue([]), cancelAll: jest.fn().mockReturnValue([]) };
       (service as any).queryAbortController = { abort: jest.fn() };
       (service as any).shuttingDown = false;
 
@@ -2249,7 +2268,7 @@ describe('ClaudianService', () => {
       };
       (service as any).persistentQuery = mockPQ;
       (service as any).vaultPath = '/mock/vault/path';
-      (service as any).messageChannel = { close: jest.fn() };
+      (service as any).messageChannel = { close: jest.fn().mockReturnValue([]), cancelAll: jest.fn().mockReturnValue([]) };
       (service as any).queryAbortController = { abort: jest.fn() };
       (service as any).currentConfig = {
         model: 'claude-3-5-sonnet',
@@ -2292,10 +2311,12 @@ describe('ClaudianService', () => {
         onError: jest.fn(),
       });
       (service as any).responseHandlers = [handler];
-      (service as any).messageChannel = {
-        onTurnComplete: jest.fn(),
-        setSessionId: jest.fn(),
-      };
+      const channel = new MessageChannel();
+      (service as any).messageChannel = channel;
+      const turn = createRuntimeTurn({ id: 'handler-route-turn', kind: 'user' });
+      turn.waiters.add(handler);
+      (service as any).runtimeTurns.set(turn.id, turn);
+      channel.beginExternalTurn(turn.id);
 
       // Send a system init message with agents
       const message = {
@@ -2325,10 +2346,12 @@ describe('ClaudianService', () => {
         onError: jest.fn(),
       });
       (service as any).responseHandlers = [handler];
-      (service as any).messageChannel = {
-        onTurnComplete: jest.fn(),
-        setSessionId: jest.fn(),
-      };
+      const channel = new MessageChannel();
+      (service as any).messageChannel = channel;
+      const turn = createRuntimeTurn({ id: 'handler-route-turn', kind: 'user' });
+      turn.waiters.add(handler);
+      (service as any).runtimeTurns.set(turn.id, turn);
+      channel.beginExternalTurn(turn.id);
 
       const message = {
         type: 'system',
@@ -2354,10 +2377,12 @@ describe('ClaudianService', () => {
         onError: jest.fn(),
       });
       (service as any).responseHandlers = [handler];
-      (service as any).messageChannel = {
-        onTurnComplete: jest.fn(),
-        setSessionId: jest.fn(),
-      };
+      const channel = new MessageChannel();
+      (service as any).messageChannel = channel;
+      const turn = createRuntimeTurn({ id: 'handler-route-turn', kind: 'user' });
+      turn.waiters.add(handler);
+      (service as any).runtimeTurns.set(turn.id, turn);
+      channel.beginExternalTurn(turn.id);
 
       // Usage is extracted from assistant messages (not result messages)
       const message = {
@@ -2398,7 +2423,7 @@ describe('ClaudianService', () => {
 
       const chunks: any[] = [];
       for await (const chunk of (service as any).queryViaPersistent(
-        'test', undefined, '/mock/vault/path', '/usr/local/bin/claude'
+        'test', undefined, '/mock/vault/path', '/usr/local/bin/claude', undefined, makeTestTurn()
       )) {
         chunks.push(chunk);
       }
@@ -2444,7 +2469,7 @@ describe('ClaudianService', () => {
       // Set up handler to resolve immediately
       const gen = (service as any).queryViaPersistent(
         'test', undefined, '/mock/vault/path', '/usr/local/bin/claude',
-        { allowedTools: ['Read', 'Glob'] }
+        { allowedTools: ['Read', 'Glob'] }, makeTestTurn()
       );
 
       // The generator will hang waiting for handler.onDone, so we need to
@@ -2507,7 +2532,7 @@ describe('ClaudianService', () => {
 
       const chunks: any[] = [];
       for await (const chunk of (service as any).queryViaPersistent(
-        'test', undefined, '/mock/vault/path', '/usr/local/bin/claude'
+        'test', undefined, '/mock/vault/path', '/usr/local/bin/claude', undefined, makeTestTurn()
       )) {
         chunks.push(chunk);
       }
@@ -2556,7 +2581,7 @@ describe('ClaudianService', () => {
 
       const chunks: any[] = [];
       for await (const chunk of (service as any).queryViaPersistent(
-        'test', undefined, '/mock/vault/path', '/usr/local/bin/claude'
+        'test', undefined, '/mock/vault/path', '/usr/local/bin/claude', undefined, makeTestTurn()
       )) {
         chunks.push(chunk);
       }
@@ -2601,7 +2626,7 @@ describe('ClaudianService', () => {
 
       const chunks: any[] = [];
       for await (const chunk of (service as any).queryViaPersistent(
-        'test', undefined, '/mock/vault/path', '/usr/local/bin/claude'
+        'test', undefined, '/mock/vault/path', '/usr/local/bin/claude', undefined, makeTestTurn()
       )) {
         chunks.push(chunk);
       }
@@ -2642,7 +2667,7 @@ describe('ClaudianService', () => {
       jest.spyOn(service as any, 'applyDynamicUpdates').mockResolvedValue(undefined);
 
       const gen = (service as any).queryViaPersistent(
-        'test', undefined, '/mock/vault/path', '/usr/local/bin/claude'
+        'test', undefined, '/mock/vault/path', '/usr/local/bin/claude', undefined, makeTestTurn()
       );
 
       const iterPromise = gen.next();
@@ -2689,7 +2714,7 @@ describe('ClaudianService', () => {
       jest.spyOn(service as any, 'applyDynamicUpdates').mockResolvedValue(undefined);
 
       const gen = (service as any).queryViaPersistent(
-        'test', undefined, '/mock/vault/path', '/usr/local/bin/claude'
+        'test', undefined, '/mock/vault/path', '/usr/local/bin/claude', undefined, makeTestTurn()
       );
 
       const chunks: any[] = [];
@@ -2747,7 +2772,7 @@ describe('ClaudianService', () => {
       jest.spyOn(service as any, 'applyDynamicUpdates').mockResolvedValue(undefined);
 
       const gen = (service as any).queryViaPersistent(
-        'test', undefined, '/mock/vault/path', '/usr/local/bin/claude'
+        'test', undefined, '/mock/vault/path', '/usr/local/bin/claude', undefined, makeTestTurn()
       );
 
       const iterPromise = gen.next();
@@ -2996,7 +3021,7 @@ describe('ClaudianService', () => {
 
       const chunks: any[] = [];
       for await (const chunk of (service as any).queryViaSDK(
-        'hello', '/mock/vault/path', '/usr/local/bin/claude', undefined, { forceColdStart: true }
+        'hello', '/mock/vault/path', '/usr/local/bin/claude', undefined, { forceColdStart: true }, makeTestTurn()
       )) {
         chunks.push(chunk);
       }
@@ -3029,7 +3054,7 @@ describe('ClaudianService', () => {
       };
 
       (service as any).persistentQuery = mockPQ;
-      (service as any).messageChannel = { close: jest.fn(), enqueue: jest.fn(), onTurnComplete: jest.fn() };
+      (service as any).messageChannel = { close: jest.fn().mockReturnValue([]), cancelAll: jest.fn().mockReturnValue([]), enqueue: jest.fn(), getActiveTurnId: () => null, cancelQueuedTurn: jest.fn().mockReturnValue(false) };
       (service as any).queryAbortController = { abort: jest.fn() };
       (service as any).shuttingDown = false;
       (service as any).coldStartInProgress = false;
@@ -3084,7 +3109,7 @@ describe('ClaudianService', () => {
       };
 
       (service as any).persistentQuery = mockPQ;
-      (service as any).messageChannel = { close: jest.fn() };
+      (service as any).messageChannel = { close: jest.fn().mockReturnValue([]), cancelAll: jest.fn().mockReturnValue([]) };
       (service as any).queryAbortController = { abort: jest.fn() };
       (service as any).shuttingDown = false;
       (service as any).coldStartInProgress = false;
@@ -3135,7 +3160,7 @@ describe('ClaudianService', () => {
       };
 
       (service as any).persistentQuery = mockPQ;
-      (service as any).messageChannel = { close: jest.fn() };
+      (service as any).messageChannel = { close: jest.fn().mockReturnValue([]), cancelAll: jest.fn().mockReturnValue([]) };
       (service as any).queryAbortController = { abort: jest.fn() };
       (service as any).shuttingDown = false;
       (service as any).coldStartInProgress = false;
@@ -3191,7 +3216,7 @@ describe('ClaudianService', () => {
 
       // This PQ is the "old" one that the consumer will iterate
       (service as any).persistentQuery = oldMockPQ;
-      (service as any).messageChannel = { close: jest.fn() };
+      (service as any).messageChannel = { close: jest.fn().mockReturnValue([]), cancelAll: jest.fn().mockReturnValue([]) };
       (service as any).queryAbortController = { abort: jest.fn() };
       (service as any).shuttingDown = false;
       (service as any).coldStartInProgress = false;
@@ -3464,7 +3489,7 @@ describe('ClaudianService', () => {
         .mockResolvedValueOnce({ canRewind: true });
       const mockInterrupt = jest.fn().mockResolvedValue(undefined);
       (service as any).persistentQuery = { rewindFiles: mockRewindFiles, interrupt: mockInterrupt };
-      (service as any).messageChannel = { close: jest.fn() };
+      (service as any).messageChannel = { close: jest.fn().mockReturnValue([]), cancelAll: jest.fn().mockReturnValue([]) };
       (service as any).queryAbortController = { abort: jest.fn() };
       (service as any).shuttingDown = false;
 
@@ -3502,7 +3527,7 @@ describe('ClaudianService', () => {
         .mockResolvedValueOnce({ canRewind: false, error: 'Unexpected error' });
       const mockInterrupt = jest.fn().mockResolvedValue(undefined);
       (service as any).persistentQuery = { rewindFiles: mockRewindFiles, interrupt: mockInterrupt };
-      (service as any).messageChannel = { close: jest.fn() };
+      (service as any).messageChannel = { close: jest.fn().mockReturnValue([]), cancelAll: jest.fn().mockReturnValue([]) };
       (service as any).queryAbortController = { abort: jest.fn() };
       (service as any).shuttingDown = false;
 
@@ -3627,7 +3652,7 @@ describe('ClaudianService', () => {
 
   describe('normalizeTurnInvocation', () => {
     it('should route PreparedChatTurn with chatMessages as conversationHistory', () => {
-      const turn = service.prepareTurn({ text: 'hello' });
+      const turn = service.prepareTurn({ turnId: 'turn-hello', text: 'hello' });
       const chatMessages = [
         { id: 'u1', role: 'user' as const, content: 'first', timestamp: 1 },
         { id: 'a1', role: 'assistant' as const, content: 'reply', timestamp: 2 },
@@ -3641,7 +3666,7 @@ describe('ClaudianService', () => {
     });
 
     it('should route PreparedChatTurn with chatMessages and queryOptions', () => {
-      const turn = service.prepareTurn({ text: 'hello' });
+      const turn = service.prepareTurn({ turnId: 'turn-hello', text: 'hello' });
       const chatMessages = [
         { id: 'u1', role: 'user' as const, content: 'first', timestamp: 1 },
         { id: 'a1', role: 'assistant' as const, content: 'reply', timestamp: 2 },
@@ -3672,7 +3697,7 @@ describe('ClaudianService', () => {
     });
 
     it('should route empty array as undefined conversationHistory', () => {
-      const turn = service.prepareTurn({ text: 'hello' });
+      const turn = service.prepareTurn({ turnId: 'turn-hello', text: 'hello' });
 
       const result = (service as any).normalizeTurnInvocation(turn, []);
 
@@ -3709,4 +3734,353 @@ describe('ClaudianService', () => {
       expect((service as any).pendingResumeAt).toBeUndefined();
     });
   });
+
+  // ============================================
+  // S1 turn lease: turnId threading, external turns, protocol errors,
+  // deferred restart, canonical waiters
+  // ============================================
+
+  describe('S1 turn lease', () => {
+    /** Starts a real persistent query backed by the SDK mock and a real channel. */
+    async function startRealPersistentQuery() {
+      const startSpy = jest.spyOn(service as any, 'startPersistentQuery');
+      startSpy.mockImplementation(async (...args: unknown[]) => {
+        const [vaultPath, cliPath] = args as [string, string];
+        const channel = new MessageChannel(
+          undefined,
+          (turnId: string) => (service as any).handleTurnDequeued(turnId),
+        );
+        (service as any).messageChannel = channel;
+        (service as any).vaultPath = vaultPath;
+        (service as any).persistentQuery = sdkMock.query({
+          prompt: channel,
+          options: { cwd: vaultPath, pathToClaudeCodeExecutable: cliPath } as any,
+        });
+        (service as any).currentConfig = (service as any).buildPersistentQueryConfig(vaultPath, cliPath, []);
+        (service as any).startResponseConsumer();
+      });
+      await service.ensureReady();
+      return startSpy;
+    }
+
+    function channelOf(): MessageChannel {
+      return (service as any).messageChannel as MessageChannel;
+    }
+
+    describe('turnId threading (v4 acceptance 1)', () => {
+      it('threads the feature-layer turnId through RuntimeTurn and channel lease unchanged', async () => {
+        sdkMock.setMockMessages([
+          { type: 'assistant', message: { content: [{ type: 'text', text: 'Hi' }] } },
+        ]);
+        await startRealPersistentQuery();
+
+        const turn = service.prepareTurn({ turnId: 'user-thread-1', text: 'hello' });
+        expect(turn.turnId).toBe('user-thread-1');
+
+        const gen = service.query(turn);
+        const first = await gen.next();
+        expect(first.done).toBe(false);
+
+        // Same turnId in the runtime registry, on the channel lease, and in
+        // the queue of turns the runtime knows about. No second user id minted.
+        const channel = channelOf();
+        expect(channel.getActiveTurnId()).toBe('user-thread-1');
+        const registeredUserTurns = [...(service as any).runtimeTurns.keys()]
+          .filter((id: string) => !id.startsWith('auto-'));
+        expect(registeredUserTurns).toEqual(['user-thread-1']);
+
+        let next = await gen.next();
+        while (!next.done) {
+          next = await gen.next();
+        }
+        expect(channel.getActiveTurnId()).toBeNull();
+        expect((service as any).runtimeTurns.has('user-thread-1')).toBe(false);
+      });
+
+      it('rejects a duplicate in-flight turnId with a protocol error', async () => {
+        const turn = service.prepareTurn({ turnId: 'user-dup', text: 'hello' });
+        // Register a live turn with the same id to simulate an in-flight query.
+        (service as any).runtimeTurns.set('user-dup', createRuntimeTurn({ id: 'user-dup', kind: 'user' }));
+
+        const chunks = await collectChunks(service.query(turn));
+        expect(chunks[0]).toEqual({
+          type: 'error',
+          content: expect.stringContaining('already in flight'),
+        });
+        expect(chunks.some((c: any) => c.type === 'done')).toBe(false);
+      });
+
+      it('rejects an empty turnId with a protocol error', async () => {
+        const turn = service.prepareTurn({ text: 'hello' } as any);
+        const chunks = await collectChunks(service.query(turn));
+        expect(chunks[0]).toEqual({
+          type: 'error',
+          content: expect.stringContaining('non-empty turnId'),
+        });
+      });
+    });
+
+    describe('external auto turns (v4 acceptance 3)', () => {
+      beforeEach(() => {
+        (service as any).messageChannel = new MessageChannel(
+          undefined,
+          (turnId: string) => (service as any).handleTurnDequeued(turnId),
+        );
+        (service as any).responseHandlers = [];
+        (service as any).runtimeTurns.clear();
+      });
+
+      it('creates an auto turn, fires onAutoTurnStarted synchronously with its id, and holds the lease', async () => {
+        const started: any[] = [];
+        service.setOnAutoTurnStarted((event) => started.push({ ...event }));
+
+        await (service as any).routeMessage({
+          type: 'assistant',
+          message: { content: [{ type: 'text', text: 'Background done' }] },
+        });
+
+        expect(started).toHaveLength(1);
+        expect(typeof started[0].turnId).toBe('string');
+        expect(started[0].generation).toBe(0);
+        expect(channelOf().getActiveTurnId()).toBe(started[0].turnId);
+        expect((service as any).runtimeTurns.has(started[0].turnId)).toBe(true);
+      });
+
+      it('queues a user message while the auto turn holds the lease and delivers it after completion', async () => {
+        const autoCallback = jest.fn();
+        service.setAutoTurnCallback(autoCallback);
+
+        await (service as any).routeMessage({
+          type: 'assistant',
+          message: { content: [{ type: 'text', text: 'Background result' }] },
+        });
+        const autoTurnId = channelOf().getActiveTurnId()!;
+        expect(autoTurnId).toBeTruthy();
+
+        // User message arrives mid-auto-turn → queued behind the lease.
+        const userTurn = createRuntimeTurn({ id: 'user-waiting', kind: 'user' });
+        (service as any).runtimeTurns.set('user-waiting', userTurn);
+        const iterator = channelOf()[Symbol.asyncIterator]();
+        const pendingUser = iterator.next();
+        const enqueueResult = channelOf().enqueue('user-waiting', {
+          type: 'user',
+          message: { role: 'user', content: 'user msg' },
+          parent_tool_use_id: null,
+          session_id: '',
+        });
+        expect(enqueueResult).toEqual({ canonicalTurnId: 'user-waiting' });
+        expect(channelOf().getQueueLength()).toBe(1);
+
+        // Auto turn completes → adapter flush + lease release → user delivers.
+        await (service as any).routeMessage({
+          type: 'result',
+          subtype: 'success',
+          result: 'done',
+        });
+        expect(autoCallback).toHaveBeenCalledTimes(1);
+        expect(autoCallback.mock.calls[0][0].chunks[0]).toEqual(
+          expect.objectContaining({ type: 'text', content: 'Background result' }),
+        );
+        expect(channelOf().getActiveTurnId()).toBe('user-waiting');
+        const delivered = await pendingUser;
+        expect(delivered.value.message.content).toBe('user msg');
+      });
+    });
+
+    describe('protocol errors do not kill the consumer (v4 acceptance 4)', () => {
+      beforeEach(() => {
+        (service as any).messageChannel = new MessageChannel(
+          undefined,
+          (turnId: string) => (service as any).handleTurnDequeued(turnId),
+        );
+        (service as any).responseHandlers = [];
+        (service as any).runtimeTurns.clear();
+      });
+
+      it('dequeues an unregistered turn: releases the lease, keeps the consumer usable', async () => {
+        const channel = channelOf();
+        // Ghost queue item with no runtime turn behind it.
+        channel.enqueue('ghost-turn', {
+          type: 'user',
+          message: { role: 'user', content: 'ghost' },
+          parent_tool_use_id: null,
+          session_id: '',
+        });
+        const iterator = channel[Symbol.asyncIterator]();
+        const delivered = await iterator.next();
+        expect(delivered.value.message.content).toBe('ghost');
+        // handleTurnDequeued settled the unknown lease item and released it.
+        expect(channel.getActiveTurnId()).toBeNull();
+
+        // The next legal turn still flows through the same channel.
+        const turn = createRuntimeTurn({ id: 'user-after-ghost', kind: 'user' });
+        (service as any).runtimeTurns.set('user-after-ghost', turn);
+        const pending = iterator.next();
+        channel.enqueue('user-after-ghost', {
+          type: 'user',
+          message: { role: 'user', content: 'real msg' },
+          parent_tool_use_id: null,
+          session_id: '',
+        });
+        const next = await pending;
+        expect(next.value.message.content).toBe('real msg');
+        expect(channel.getActiveTurnId()).toBe('user-after-ghost');
+      });
+
+      it('completeTurn mismatch cancels the actual active turn and settles its waiters', async () => {
+        const channel = channelOf();
+        const onDone = jest.fn();
+        const handler = createResponseHandler({
+          id: 'mismatch-handler',
+          onChunk: jest.fn(),
+          onDone,
+          onError: jest.fn(),
+        });
+        const turn = createRuntimeTurn({ id: 'real-active', kind: 'user' });
+        turn.waiters.add(handler);
+        (service as any).runtimeTurns.set('real-active', turn);
+        channel.beginExternalTurn('real-active');
+
+        // Report completion for the WRONG turn id.
+        (service as any).completeChannelTurn('stale-turn');
+
+        // The actual lease holder got settled (onDone), and the lease is free.
+        expect(onDone).toHaveBeenCalled();
+        expect((service as any).runtimeTurns.has('real-active')).toBe(false);
+        expect(channel.getActiveTurnId()).toBeNull();
+      });
+
+      it('routeMessage survives a stale lease and still processes the message', async () => {
+        const channel = channelOf();
+        // Lease points at a turn the runtime no longer knows.
+        channel.beginExternalTurn('stale-active');
+
+        const started: any[] = [];
+        service.setOnAutoTurnStarted((event) => started.push({ ...event }));
+
+        await (service as any).routeMessage({
+          type: 'assistant',
+          message: { content: [{ type: 'text', text: 'Fresh content' }] },
+        });
+
+        // Stale lease released, a fresh auto turn took over, chunks buffered.
+        expect(started).toHaveLength(1);
+        const autoTurn = (service as any).runtimeTurns.get(started[0].turnId);
+        expect(autoTurn.chunks[0]).toEqual(
+          expect.objectContaining({ type: 'text', content: 'Fresh content' }),
+        );
+        expect(channel.getActiveTurnId()).toBe(started[0].turnId);
+      });
+    });
+
+    describe('deferred config restart (S1 restart preservation)', () => {
+      it('registers a deferred restart while a turn is active and executes it once idle', async () => {
+        await startRealPersistentQuery();
+        const channel = channelOf();
+        const ensureReadySpy = jest.spyOn(service, 'ensureReady');
+
+        // Simulate an active (collecting) turn holding the lease.
+        const turn = createRuntimeTurn({ id: 'user-defer', kind: 'user', phase: 'collecting' });
+        (service as any).runtimeTurns.set('user-defer', turn);
+        channel.beginExternalTurn('user-defer');
+
+        // Config change that requires a restart.
+        (mockPlugin.getResolvedProviderCliPath as jest.Mock).mockReturnValue('/new/path/to/claude');
+
+        await (service as any).applyDynamicUpdates({});
+
+        // Deferred, not executed: no force restart while the turn is active.
+        expect(ensureReadySpy).not.toHaveBeenCalled();
+        expect((service as any).deferredRestartPaths).toEqual([]);
+
+        // Turn settles → deferred restart executes.
+        await (service as any).settleTurnAtResult(turn);
+
+        expect(ensureReadySpy).toHaveBeenCalledWith(
+          expect.objectContaining({ force: true, externalContextPaths: [] }),
+        );
+        expect((service as any).deferredRestartPaths).toBeNull();
+      });
+
+      it('restarts immediately when no turn is active', async () => {
+        await startRealPersistentQuery();
+        const ensureReadySpy = jest.spyOn(service, 'ensureReady');
+
+        (mockPlugin.getResolvedProviderCliPath as jest.Mock).mockReturnValue('/new/path/to/claude');
+
+        await (service as any).applyDynamicUpdates({});
+
+        expect(ensureReadySpy).toHaveBeenCalledWith(
+          expect.objectContaining({ force: true }),
+        );
+        expect((service as any).deferredRestartPaths).toBeNull();
+      });
+    });
+
+    describe('canonical merged waiters', () => {
+      it('merged query handlers join the canonical turn and all settle on its result', async () => {
+        (service as any).messageChannel = new MessageChannel(
+          undefined,
+          (turnId: string) => (service as any).handleTurnDequeued(turnId),
+        );
+        const channel = channelOf();
+
+        // An active turn occupies the lease so later messages go to the queue.
+        const active = createRuntimeTurn({ id: 'user-active', kind: 'user', phase: 'collecting' });
+        (service as any).runtimeTurns.set('user-active', active);
+        channel.beginExternalTurn('user-active');
+
+        // First queued message opens the canonical text item (turnB).
+        const onDoneB = jest.fn();
+        const handlerB = createResponseHandler({
+          id: 'handler-b',
+          onChunk: jest.fn(),
+          onDone: onDoneB,
+          onError: jest.fn(),
+        });
+        const turnB = createRuntimeTurn({ id: 'user-canonical', kind: 'user' });
+        turnB.waiters.add(handlerB);
+        (service as any).runtimeTurns.set('user-canonical', turnB);
+        const enqueueB = channel.enqueue('user-canonical', {
+          type: 'user',
+          message: { role: 'user', content: 'first queued' },
+          parent_tool_use_id: null,
+          session_id: '',
+        });
+        expect(enqueueB.canonicalTurnId).toBe('user-canonical');
+
+        // Second queued text message merges into turnB's item; its handler
+        // joins turnB's waiters (the canonical merged lease).
+        const onDoneC = jest.fn();
+        const handlerC = createResponseHandler({
+          id: 'handler-c',
+          onChunk: jest.fn(),
+          onDone: onDoneC,
+          onError: jest.fn(),
+        });
+        const turnC = createRuntimeTurn({ id: 'user-merged', kind: 'user' });
+        turnC.waiters.add(handlerC);
+        (service as any).runtimeTurns.set('user-merged', turnC);
+        const enqueueC = channel.enqueue('user-merged', {
+          type: 'user',
+          message: { role: 'user', content: 'second queued' },
+          parent_tool_use_id: null,
+          session_id: '',
+        });
+        expect(enqueueC.canonicalTurnId).toBe('user-canonical');
+        turnC.mergedInto = 'user-canonical';
+        turnB.waiters.add(handlerC);
+
+        // Canonical result settles every merged waiter, not just its creator.
+        await (service as any).settleTurnAtResult(turnB);
+
+        expect(onDoneB).toHaveBeenCalled();
+        expect(onDoneC).toHaveBeenCalled();
+        // turnC's own registry entry is retracted with its generator cleanup.
+        (service as any).finishTurnFromGenerator(turnC, handlerC);
+        expect((service as any).runtimeTurns.has('user-merged')).toBe(false);
+      });
+    });
+  });
+
 });

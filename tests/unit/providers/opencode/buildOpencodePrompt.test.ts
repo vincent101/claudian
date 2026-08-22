@@ -3,6 +3,7 @@ import { buildOpencodePromptBlocks, buildOpencodePromptText } from '../../../../
 describe('buildOpencodePromptText', () => {
   it('appends Claudian XML context to the user query', () => {
     const prompt = buildOpencodePromptText({
+      turnId: 'turn-opencode',
       browserSelection: {
         selectedText: 'Browser quote',
         source: 'browser:https://example.com',
@@ -29,6 +30,7 @@ describe('buildOpencodePromptText', () => {
 
   it('does not auto-attach external context folders to the OpenCode prompt', () => {
     const prompt = buildOpencodePromptText({
+      turnId: 'turn-opencode',
       externalContextPaths: ['/tmp/project'],
       text: 'Summarize this',
     });
@@ -41,6 +43,7 @@ describe('buildOpencodePromptText', () => {
   it('rebuilds prior conversation context when a native session must be recreated', () => {
     const prompt = buildOpencodePromptText(
       {
+        turnId: 'turn-opencode',
         text: 'Continue with the fix',
       },
       [
@@ -68,6 +71,7 @@ describe('buildOpencodePromptText', () => {
 describe('buildOpencodePromptBlocks', () => {
   it('includes image attachments after the main text block', () => {
     const blocks = buildOpencodePromptBlocks({
+      turnId: 'turn-opencode',
       images: [{
         data: 'base64-image',
         id: 'img-1',

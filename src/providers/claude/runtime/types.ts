@@ -4,9 +4,15 @@ import type {
   SDKUserMessage,
 } from '@anthropic-ai/claude-agent-sdk';
 
-import type { ChatRuntimeEnsureReadyOptions } from '../../../core/runtime/types';
+import type {
+  ChatRuntimeEnsureReadyOptions,
+  ChatTurnMetadata,
+} from '../../../core/runtime/types';
 import type { ImageAttachment, StreamChunk } from '../../../core/types';
 import type { PermissionMode } from '../../../core/types/settings';
+import type { TransformStreamState } from '../stream/toolInputStreamState';
+import type { TransformUsageState } from '../stream/transformClaudeMessage';
+import { createTransformStreamState, createTransformUsageState } from '../stream/transformClaudeMessage';
 import type { ClaudeModel, EffortLevel } from '../types/models';
 
 export interface TextContentBlock {
@@ -32,15 +38,97 @@ export const MESSAGE_CHANNEL_CONFIG = {
 
 export interface PendingTextMessage {
   type: 'text';
+  turnId: string;
   content: string;
 }
 
 export interface PendingAttachmentMessage {
   type: 'attachment';
+  turnId: string;
   message: SDKUserMessage;
 }
 
 export type PendingMessage = PendingTextMessage | PendingAttachmentMessage;
+
+/** Channel lease operation outcome. Occupancy conflicts are reported, never thrown. */
+export type TurnChannelResult =
+  | { ok: true }
+  | {
+      ok: false;
+      code: 'active_turn_exists' | 'turn_mismatch' | 'unknown_turn';
+      activeTurnId: string | null;
+    };
+
+export interface EnqueueResult {
+  /** Turn id that owns the resulting queue item (first writer wins on text merge). */
+  canonicalTurnId: string;
+}
+
+/** Sync payload fired when the runtime starts an SDK-initiated (auto) turn. */
+export interface AutoTurnStartedEvent {
+  turnId: string;
+  generation: number;
+}
+
+export type RuntimeTurnKind = 'user' | 'auto';
+
+export type RuntimeTurnPhase =
+  | 'queued'
+  | 'collecting'
+  | 'projecting'
+  | 'settled'
+  | 'cancelled';
+
+/**
+ * Turn-scoped state. Replaces the runtime's global transform/usage/metadata
+ * buffers so that two overlapping turns (user + auto) never share state.
+ */
+export interface RuntimeTurn {
+  id: string;
+  kind: RuntimeTurnKind;
+  phase: RuntimeTurnPhase;
+  generation: number;
+  /** Buffered chunks for auto turns (no live consumer); empty for user turns. */
+  chunks: StreamChunk[];
+  metadata: ChatTurnMetadata;
+  bufferedUsage: Extract<StreamChunk, { type: 'usage' }> | null;
+  streamState: TransformStreamState;
+  usageState: TransformUsageState;
+  sawStreamText: boolean;
+  sawStreamThinking: boolean;
+  receivedChunk: boolean;
+  abortController: AbortController;
+  /** Live consumer handlers; all of them receive chunks and settlement. */
+  waiters: Set<ResponseHandler>;
+  /** Set when this turn's message merged into another turn's queue item. */
+  mergedInto: string | null;
+}
+
+export interface RuntimeTurnOptions {
+  id: string;
+  kind: RuntimeTurnKind;
+  phase?: RuntimeTurnPhase;
+}
+
+export function createRuntimeTurn(options: RuntimeTurnOptions): RuntimeTurn {
+  return {
+    id: options.id,
+    kind: options.kind,
+    phase: options.phase ?? 'queued',
+    generation: 0,
+    chunks: [],
+    metadata: {},
+    bufferedUsage: null,
+    streamState: createTransformStreamState(),
+    usageState: createTransformUsageState(),
+    sawStreamText: false,
+    sawStreamThinking: false,
+    receivedChunk: false,
+    abortController: new AbortController(),
+    waiters: new Set(),
+    mergedInto: null,
+  };
+}
 
 export interface ClosePersistentQueryOptions {
   preserveHandlers?: boolean;
