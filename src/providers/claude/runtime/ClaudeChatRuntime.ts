@@ -78,7 +78,7 @@ import {
 } from '../hooks/SubagentHooks';
 import { encodeClaudeTurn } from '../prompt/ClaudeTurnEncoder';
 import { isContextWindowEvent, isSessionInitEvent, isStreamChunk } from '../sdk/typeGuards';
-import type { TransformEvent } from '../sdk/types';
+import type { SessionInitEvent, TransformEvent } from '../sdk/types';
 import { getClaudeProviderSettings } from '../settings';
 import {
   transformSDKMessage,
@@ -133,6 +133,21 @@ function isChatMessageArray(value: unknown): value is ChatMessage[] {
 function isImageAttachmentArray(value: unknown): value is ImageAttachment[] {
   return Array.isArray(value) && value.length > 0 &&
     !!value[0] && typeof value[0] === 'object' && 'mediaType' in value[0] && 'data' in value[0];
+}
+
+/**
+ * Session-level control message (system/init at persistent-query start,
+ * compact_boundary, hook lifecycle, ...). These carry no result message, so
+ * they must never start an auto turn — an auto lease only releases at result
+ * (routeMessage → settleTurnAtResult), so an auto turn opened here would hang
+ * forever and deadlock the first queued user message. task_notification is
+ * excluded: it keeps the v4 §6 create-auto-turn-then-settle order.
+ */
+function isLeaselessSessionControlMessage(message: SDKMessage): boolean {
+  if ((message as { type?: string }).type !== 'system') {
+    return false;
+  }
+  return (message as { subtype?: string }).subtype !== 'task_notification';
 }
 
 export class ClaudianService implements ChatRuntime {
@@ -891,13 +906,16 @@ export class ClaudianService implements ChatRuntime {
    * Turn resolution (S1 turn lease):
    * 1. The channel's activeTurnId names the owning turn (a dequeued user
    *    message or an auto turn begun via beginExternalTurn).
-   * 2. No active lease → the SDK initiated a turn on its own (task-notification
-   *    delivery): ensureAutoTurn() creates the auto RuntimeTurn, signs the
-   *    external lease and fires onAutoTurnStarted synchronously — strictly
-   *    before the notification is dispatched.
-   * 3. A notification arriving under an existing lease is dispatched for
+   * 2. No active lease + session-level control message (system/init,
+   *    compact_boundary, ...) → side effects only via
+   *    applyLeaselessSystemMessage: no auto turn, no lease, no callbacks.
+   * 3. No active lease otherwise → the SDK initiated a turn on its own
+   *    (task-notification delivery): ensureAutoTurn() creates the auto
+   *    RuntimeTurn, signs the external lease and fires onAutoTurnStarted
+   *    synchronously — strictly before the notification is dispatched.
+   * 4. A notification arriving under an existing lease is dispatched for
    *    accounting only; a second lease is never created.
-   * 4. Chunks go to the owning turn's waiters; a turn without waiters buffers
+   * 5. Chunks go to the owning turn's waiters; a turn without waiters buffers
    *    chunks and flushes through the auto-turn callback adapter on result.
    */
   private async routeMessage(message: SDKMessage): Promise<void> {
@@ -912,6 +930,16 @@ export class ClaudianService implements ChatRuntime {
       // (which would flash isStreaming in the feature layer), drop it and
       // keep the consumer alive (S1 leftover #3).
       console.warn('[Claudian] trailing result without a turn lease; dropping');
+      return;
+    }
+
+    // Lease-less session-level control messages (system/init at persistent
+    // query start, compact_boundary mid-session) never start an auto turn:
+    // they carry no result, so the auto lease would never release and the
+    // first queued user message would deadlock (S1 regression). Session-level
+    // side effects still run on a throwaway transform state.
+    if (!turn && isLeaselessSessionControlMessage(message)) {
+      this.applyLeaselessSystemMessage(message);
       return;
     }
 
@@ -954,24 +982,7 @@ export class ClaudianService implements ChatRuntime {
       });
 
       if (isSessionInitEvent(event)) {
-        // Fork: suppress needsHistoryRebuild since SDK returns a different session ID by design
-        const wasFork = this.pendingForkSession;
-        this.sessionManager.captureSession(event.sessionId);
-        if (wasFork) {
-          this.sessionManager.clearHistoryRebuild();
-          this.pendingForkSession = false;
-        }
-        this.messageChannel?.setSessionId(event.sessionId);
-        if (event.agents) {
-          try { this.getAgentManager()?.setBuiltinAgentNames(event.agents); } catch { /* non-critical */ }
-        }
-        if (event.permissionMode && this.permissionModeSyncCallback) {
-          try { this.permissionModeSyncCallback(event.permissionMode); } catch { /* non-critical */ }
-        }
-        // Cache SDK commands on init (SDK already scans the vault).
-        // Pass the current query instance so late completions from a dead query
-        // cannot overwrite the active cache after a restart or shutdown.
-        void this.fetchAndCacheCommands(this.persistentQuery);
+        this.applySessionInitSideEffects(event);
       } else if (isContextWindowEvent(event)) {
         const usageChunk = this.updateBufferedUsageContextWindow(activeTurn, event.contextWindow);
         if (!usageChunk) {
@@ -1021,6 +1032,52 @@ export class ClaudianService implements ChatRuntime {
     if (isTurnCompleteMessage(message)) {
       await this.settleTurnAtResult(activeTurn);
     }
+  }
+
+  /**
+   * Lease-less session-level control message path: the message runs its
+   * session-level side effects on a throwaway transform state but never
+   * creates a RuntimeTurn, never signs the channel lease and never fires
+   * onAutoTurnStarted. Generated chunks have no consumer and are dropped with
+   * the scratch state — the transform only emits session_init (side effects
+   * applied) / compact_boundary separator (only meaningful in a live turn)
+   * for system messages; all other subtypes produce no output.
+   */
+  private applyLeaselessSystemMessage(message: SDKMessage): void {
+    const scratch = createRuntimeTurn({
+      id: `system-event-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+      kind: 'auto',
+      phase: 'collecting',
+    });
+
+    for (const event of transformSDKMessage(message, this.getTransformOptions(scratch))) {
+      if (isSessionInitEvent(event)) {
+        this.applySessionInitSideEffects(event);
+      }
+      // Everything else has no consumer — dropped with the scratch state.
+    }
+  }
+
+  /** Session-level side effects of a session_init event, shared by the leased and lease-less routing paths. */
+  private applySessionInitSideEffects(event: SessionInitEvent): void {
+    // Fork: suppress needsHistoryRebuild since SDK returns a different session ID by design
+    const wasFork = this.pendingForkSession;
+    this.sessionManager.captureSession(event.sessionId);
+    if (wasFork) {
+      this.sessionManager.clearHistoryRebuild();
+      this.pendingForkSession = false;
+    }
+    this.messageChannel?.setSessionId(event.sessionId);
+    if (event.agents) {
+      try { this.getAgentManager()?.setBuiltinAgentNames(event.agents); } catch { /* non-critical */ }
+    }
+    if (event.permissionMode && this.permissionModeSyncCallback) {
+      try { this.permissionModeSyncCallback(event.permissionMode); } catch { /* non-critical */ }
+    }
+    // Cache SDK commands on init (SDK already scans the vault).
+    // Pass the current query instance so late completions from a dead query
+    // cannot overwrite the active cache after a restart or shutdown.
+    void this.fetchAndCacheCommands(this.persistentQuery);
   }
 
   /** Returns the turn owning the channel lease, settling an unknown lease locally. */

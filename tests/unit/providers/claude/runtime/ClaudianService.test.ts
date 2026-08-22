@@ -3887,6 +3887,120 @@ describe('ClaudianService', () => {
       });
     });
 
+    describe('lease-less session control messages (S1 regression: first message dropped)', () => {
+      beforeEach(() => {
+        (service as any).messageChannel = new MessageChannel(
+          undefined,
+          (turnId: string) => (service as any).handleTurnDequeued(turnId),
+        );
+        (service as any).responseHandlers = [];
+        (service as any).runtimeTurns.clear();
+      });
+
+      it('system/init arriving with no lease (persistent query prewarm) starts no auto turn and holds no lease', async () => {
+        const started: any[] = [];
+        service.setOnAutoTurnStarted((event) => started.push({ ...event }));
+
+        await (service as any).routeMessage({
+          type: 'system',
+          subtype: 'init',
+          session_id: 'fresh-session-1',
+          agents: ['general-purpose'],
+          permissionMode: 'default',
+        });
+
+        // No auto turn: no lifecycle signal, no registry entry, no lease.
+        expect(started).toHaveLength(0);
+        expect([...(service as any).runtimeTurns.keys()]).toEqual([]);
+        expect(channelOf().getActiveTurnId()).toBeNull();
+        // Side effects still ran: session captured + channel session id synced.
+        expect(service.getSessionId()).toBe('fresh-session-1');
+        expect((channelOf() as any).currentSessionId).toBe('fresh-session-1');
+      });
+
+      it('a user message enqueued after the lease-less init dequeues immediately and signs the lease', async () => {
+        // New-session timing: persistent query started, init arrived with no lease.
+        await (service as any).routeMessage({
+          type: 'system',
+          subtype: 'init',
+          session_id: 'fresh-session-2',
+        });
+        expect(channelOf().getActiveTurnId()).toBeNull();
+
+        const channel = channelOf();
+        const userTurn = createRuntimeTurn({ id: 'user-first', kind: 'user' });
+        (service as any).runtimeTurns.set('user-first', userTurn);
+        const iterator = channel[Symbol.asyncIterator]();
+        const pendingUser = iterator.next();
+
+        const enqueueResult = channel.enqueue('user-first', {
+          type: 'user',
+          message: { role: 'user', content: 'first message' },
+          parent_tool_use_id: null,
+          session_id: '',
+        });
+        expect(enqueueResult).toEqual({ canonicalTurnId: 'user-first' });
+
+        // The message dequeues right away (no ghost lease blocking delivery).
+        const delivered = await pendingUser;
+        expect(delivered.done).toBe(false);
+        expect((delivered.value as any).message.content).toBe('first message');
+        expect(channel.getActiveTurnId()).toBe('user-first');
+        expect(channel.getQueueLength()).toBe(0);
+      });
+
+      it('compact_boundary arriving with no lease starts no auto turn and holds no lease', async () => {
+        const started: any[] = [];
+        service.setOnAutoTurnStarted((event) => started.push({ ...event }));
+
+        await (service as any).routeMessage({ type: 'system', subtype: 'compact_boundary' });
+
+        expect(started).toHaveLength(0);
+        expect([...(service as any).runtimeTurns.keys()]).toEqual([]);
+        expect(channelOf().getActiveTurnId()).toBeNull();
+      });
+
+      it('system task_notification with no lease still starts an auto turn before the notification is dispatched', async () => {
+        const started: any[] = [];
+        service.setOnAutoTurnStarted((event) => started.push({ ...event }));
+        const notifications: any[] = [];
+        service.setSubagentNotificationHandler((taskId, status, result) => {
+          notifications.push({ taskId, status, result });
+        });
+
+        await (service as any).routeMessage({
+          type: 'system',
+          subtype: 'task_notification',
+          task_id: 'agent-1',
+          status: 'completed',
+          summary: 'done',
+        });
+
+        // v4 §6 order preserved: the auto turn exists before the handler ran.
+        expect(started).toHaveLength(1);
+        expect(notifications).toEqual([
+          { taskId: 'agent-1', status: 'completed', result: 'done' },
+        ]);
+      });
+
+      it('system/init under an existing lease still merges into the active turn', async () => {
+        const channel = channelOf();
+        const turn = createRuntimeTurn({ id: 'user-lease', kind: 'user', phase: 'collecting' });
+        (service as any).runtimeTurns.set('user-lease', turn);
+        channel.beginExternalTurn('user-lease');
+
+        await (service as any).routeMessage({
+          type: 'system',
+          subtype: 'init',
+          session_id: 'mid-session-9',
+        });
+
+        expect(service.getSessionId()).toBe('mid-session-9');
+        expect(channel.getActiveTurnId()).toBe('user-lease');
+        expect((service as any).runtimeTurns.has('user-lease')).toBe(true);
+      });
+    });
+
     describe('protocol errors do not kill the consumer (v4 acceptance 4)', () => {
       beforeEach(() => {
         (service as any).messageChannel = new MessageChannel(
