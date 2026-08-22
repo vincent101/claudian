@@ -47,7 +47,7 @@ import type { BrowserSelectionController } from './BrowserSelectionController';
 import type { CanvasSelectionController } from './CanvasSelectionController';
 import type { ConversationController } from './ConversationController';
 import type { SelectionController } from './SelectionController';
-import type { StreamController } from './StreamController';
+import { createTurnProjectionContext, type StreamController, type TurnProjectionContext } from './StreamController';
 import type { TurnCoordinator } from './TurnCoordinator';
 
 const APPROVAL_OPTION_MAP: Record<string, ApprovalDecision> = {
@@ -115,6 +115,8 @@ export class InputController {
   private steerInFlight = false;
   private pendingSteerMessage: QueuedMessage | null = null;
   private activeStreamingAssistantMessage: ChatMessage | null = null;
+  /** Turn projection context of the in-flight turn (v3 §5.1); cleared on turn end. */
+  private activeTurnContext: TurnProjectionContext | null = null;
   private pendingProviderUserMessages: Array<{
     displayContent: string;
     persistedContent?: string;
@@ -325,6 +327,16 @@ export class InputController {
     state.addMessage(assistantMsg);
     this.activeStreamingAssistantMessage = assistantMsg;
     this.activateStreamingAssistantMessage(assistantMsg);
+    // v3 §5.1: explicit projection context — the data truth for this turn.
+    // message/renderTarget are refreshed per chunk because provider boundary
+    // chunks switch the active assistant message and its content element.
+    const turnContext = createTurnProjectionContext({
+      turnId,
+      message: assistantMsg,
+      renderTarget: state.currentContentEl,
+      generation: streamGeneration,
+    });
+    this.activeTurnContext = turnContext;
     this.pendingProviderUserMessages = [{
       displayContent,
       images: imagesForMessage,
@@ -352,6 +364,7 @@ export class InputController {
         state.isStreaming = false;
         this.getTurnCoordinator()?.finish(turnId);
         this.activeStreamingAssistantMessage = null;
+        this.activeTurnContext = null;
         this.resetProviderMessageBoundaryState();
         return;
       }
@@ -362,6 +375,7 @@ export class InputController {
       new Notice('Agent service not available. Please reload the plugin.');
       this.getTurnCoordinator()?.finish(turnId);
       this.activeStreamingAssistantMessage = null;
+      this.activeTurnContext = null;
       this.resetProviderMessageBoundaryState();
       return;
     }
@@ -407,10 +421,9 @@ export class InputController {
           continue;
         }
 
-        await streamController.handleStreamChunk(
-          chunk,
-          this.activeStreamingAssistantMessage ?? assistantMsg,
-        );
+        turnContext.message = this.activeStreamingAssistantMessage ?? assistantMsg;
+        turnContext.renderTarget = state.currentContentEl;
+        await streamController.handleStreamChunk(chunk, turnContext);
       }
     } catch (error) {
       const errorMsg = error instanceof Error ? error.message : 'Unknown error';
@@ -467,8 +480,8 @@ export class InputController {
 
         state.currentContentEl = null;
 
-        await streamController.finalizeCurrentThinkingBlock(finalAssistantMsg);
-        await streamController.finalizeCurrentTextBlock(finalAssistantMsg);
+        await streamController.finalizeCurrentThinkingBlock(finalAssistantMsg, turnContext);
+        await streamController.finalizeCurrentTextBlock(finalAssistantMsg, turnContext);
         this.deps.getSubagentManager().resetStreamingState();
 
         // Auto-hide completed todo panel on response end
@@ -588,6 +601,7 @@ export class InputController {
         this.getTurnCoordinator()?.finish(turnId);
 
         this.activeStreamingAssistantMessage = null;
+        this.activeTurnContext = null;
         this.resetProviderMessageBoundaryState();
       }
     }
@@ -980,8 +994,8 @@ export class InputController {
       if (shouldDiscardPlaceholder) {
         this.discardStreamingAssistantMessage(previousAssistant.id);
       } else {
-        await this.deps.streamController.finalizeCurrentThinkingBlock(previousAssistant);
-        await this.deps.streamController.finalizeCurrentTextBlock(previousAssistant);
+        await this.deps.streamController.finalizeCurrentThinkingBlock(previousAssistant, this.activeTurnContext ?? undefined);
+        await this.deps.streamController.finalizeCurrentTextBlock(previousAssistant, this.activeTurnContext ?? undefined);
       }
     }
     this.deps.streamController.hideThinkingIndicator();
@@ -1027,8 +1041,8 @@ export class InputController {
 
     const previousAssistant = this.activeStreamingAssistantMessage;
     if (previousAssistant) {
-      await this.deps.streamController.finalizeCurrentThinkingBlock(previousAssistant);
-      await this.deps.streamController.finalizeCurrentTextBlock(previousAssistant);
+      await this.deps.streamController.finalizeCurrentThinkingBlock(previousAssistant, this.activeTurnContext ?? undefined);
+      await this.deps.streamController.finalizeCurrentTextBlock(previousAssistant, this.activeTurnContext ?? undefined);
     }
 
     const assistantMessage: ChatMessage = {

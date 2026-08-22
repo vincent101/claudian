@@ -649,15 +649,28 @@ describe('InputController - Message Queue', () => {
       }));
       mockAgentService.steer = jest.fn().mockResolvedValue(true);
 
+      // The context object is reused across the turn; capture finalize
+      // routing at call time (its message field is overwritten later).
+      const finalizedThinkingMessageIds: string[] = [];
+      const finalizedTextMessageIds: string[] = [];
+      (deps.streamController.finalizeCurrentThinkingBlock as jest.Mock)
+        .mockImplementation(async (msg: any, _ctx: any) => { finalizedThinkingMessageIds.push(msg.id); });
+      (deps.streamController.finalizeCurrentTextBlock as jest.Mock)
+        .mockImplementation(async (msg: any, _ctx: any) => { finalizedTextMessageIds.push(msg.id); });
+
       let releaseSecondChunk: () => void = () => {
         throw new Error('Second chunk gate was not initialized');
       };
       const secondChunkGate = new Promise<void>((resolve) => {
         releaseSecondChunk = () => resolve();
       });
+      const routedMessageIds: string[] = [];
       const firstChunkHandled = new Promise<void>((resolve) => {
         let handledCount = 0;
-        (deps.streamController.handleStreamChunk as jest.Mock).mockImplementation(async () => {
+        (deps.streamController.handleStreamChunk as jest.Mock).mockImplementation(async (_chunk: unknown, ctx: any) => {
+          // The projection context is a single mutable object per turn; capture
+          // the routed message id at call time for assertions.
+          routedMessageIds.push(ctx.message.id);
           handledCount += 1;
           if (handledCount === 1) {
             resolve();
@@ -720,23 +733,24 @@ describe('InputController - Message Queue', () => {
         role: 'assistant',
       });
 
-      expect(deps.streamController.handleStreamChunk).toHaveBeenNthCalledWith(
-        1,
+      // The context object is reused across chunks; assert call-time message
+      // routing snapshots plus the chunk sequence.
+      const routedChunks = (deps.streamController.handleStreamChunk as jest.Mock).mock.calls
+        .map(([chunk]) => chunk);
+      expect(routedChunks).toEqual([
         { type: 'text', content: 'partial' },
-        firstAssistant,
-      );
-      expect(deps.streamController.handleStreamChunk).toHaveBeenNthCalledWith(
-        2,
         { type: 'thinking', content: 'thinking after steer' },
-        secondAssistant,
-      );
-      expect(deps.streamController.handleStreamChunk).toHaveBeenNthCalledWith(
-        3,
         { type: 'text', content: 'after steer' },
-        secondAssistant,
-      );
-      expect(deps.streamController.finalizeCurrentThinkingBlock).toHaveBeenCalledWith(firstAssistant);
-      expect(deps.streamController.finalizeCurrentTextBlock).toHaveBeenCalledWith(firstAssistant);
+        { type: 'done' },
+      ]);
+      expect(routedMessageIds).toEqual([
+        firstAssistant.id,
+        secondAssistant.id,
+        secondAssistant.id,
+        secondAssistant.id,
+      ]);
+      expect(finalizedThinkingMessageIds).toContain(firstAssistant.id);
+      expect(finalizedTextMessageIds).toContain(firstAssistant.id);
       expect(queueIndicatorEl.style.display).toBe('none');
     });
 
@@ -785,9 +799,9 @@ describe('InputController - Message Queue', () => {
           yield { type: 'done' };
         })();
       });
-      (deps.streamController.handleStreamChunk as jest.Mock).mockImplementation(async (chunk, msg) => {
+      (deps.streamController.handleStreamChunk as jest.Mock).mockImplementation(async (chunk, ctx: any) => {
         if (chunk.type === 'text') {
-          msg.content += chunk.content;
+          ctx.message.content += chunk.content;
         }
       });
 
@@ -834,8 +848,8 @@ describe('InputController - Message Queue', () => {
       expect(deps.streamController.handleStreamChunk).toHaveBeenCalledTimes(2);
       expect(deps.streamController.handleStreamChunk).toHaveBeenNthCalledWith(
         1,
-        { type: 'text', content: 'after steer' },
-        deps.state.messages[2],
+        { type: "text", content: "after steer" },
+        expect.objectContaining({ message: deps.state.messages[2] }),
       );
     });
   });
@@ -1148,9 +1162,9 @@ describe('InputController - Message Queue', () => {
         ])
       );
 
-      (deps.streamController.handleStreamChunk as jest.Mock).mockImplementation(async (chunk, msg) => {
+      (deps.streamController.handleStreamChunk as jest.Mock).mockImplementation(async (chunk, ctx: any) => {
         if (chunk.type === 'text') {
-          msg.content = chunk.content;
+          ctx.message.content = chunk.content;
         }
       });
 
@@ -1201,9 +1215,9 @@ describe('InputController - Message Queue', () => {
         ])
       );
 
-      (deps.streamController.handleStreamChunk as jest.Mock).mockImplementation(async (chunk, msg) => {
+      (deps.streamController.handleStreamChunk as jest.Mock).mockImplementation(async (chunk, ctx: any) => {
         if (chunk.type === 'text') {
-          msg.content = chunk.content;
+          ctx.message.content = chunk.content;
         }
       });
 
@@ -1232,9 +1246,9 @@ describe('InputController - Message Queue', () => {
         ])
       );
 
-      (deps.streamController.handleStreamChunk as jest.Mock).mockImplementation(async (chunk, msg) => {
+      (deps.streamController.handleStreamChunk as jest.Mock).mockImplementation(async (chunk, ctx: any) => {
         if (chunk.type === 'text') {
-          msg.content = chunk.content;
+          ctx.message.content = chunk.content;
         }
       });
 
@@ -1265,9 +1279,9 @@ describe('InputController - Message Queue', () => {
         ])
       );
 
-      (deps.streamController.handleStreamChunk as jest.Mock).mockImplementation(async (chunk, msg) => {
+      (deps.streamController.handleStreamChunk as jest.Mock).mockImplementation(async (chunk, ctx: any) => {
         if (chunk.type === 'text') {
-          msg.content = chunk.content;
+          ctx.message.content = chunk.content;
         }
       });
 
@@ -1300,9 +1314,9 @@ describe('InputController - Message Queue', () => {
         ])
       );
 
-      (deps.streamController.handleStreamChunk as jest.Mock).mockImplementation(async (chunk, msg) => {
+      (deps.streamController.handleStreamChunk as jest.Mock).mockImplementation(async (chunk, ctx: any) => {
         if (chunk.type === 'text') {
-          msg.content = chunk.content;
+          ctx.message.content = chunk.content;
         }
       });
 
@@ -1337,9 +1351,9 @@ describe('InputController - Message Queue', () => {
         ])
       );
 
-      (deps.streamController.handleStreamChunk as jest.Mock).mockImplementation(async (chunk, msg) => {
+      (deps.streamController.handleStreamChunk as jest.Mock).mockImplementation(async (chunk, ctx: any) => {
         if (chunk.type === 'text') {
-          msg.content = chunk.content;
+          ctx.message.content = chunk.content;
         }
       });
 
@@ -1374,9 +1388,9 @@ describe('InputController - Message Queue', () => {
         ])
       );
 
-      (deps.streamController.handleStreamChunk as jest.Mock).mockImplementation(async (chunk, msg) => {
+      (deps.streamController.handleStreamChunk as jest.Mock).mockImplementation(async (chunk, ctx: any) => {
         if (chunk.type === 'text') {
-          msg.content = chunk.content;
+          ctx.message.content = chunk.content;
         }
       });
 
@@ -2198,8 +2212,8 @@ describe('InputController - Message Queue', () => {
         createMockStream([{ type: 'text', content: 'Response' }, { type: 'done' }])
       );
 
-      (deps.streamController.handleStreamChunk as jest.Mock).mockImplementation(async (chunk, msg) => {
-        if (chunk.type === 'text') msg.content = chunk.content;
+      (deps.streamController.handleStreamChunk as jest.Mock).mockImplementation(async (chunk, ctx: any) => {
+        if (chunk.type === 'text') ctx.message.content = chunk.content;
       });
 
       inputEl = deps.getInputEl() as ReturnType<typeof createMockInputEl>;
@@ -2237,8 +2251,8 @@ describe('InputController - Message Queue', () => {
         createMockStream([{ type: 'text', content: 'Response' }, { type: 'done' }])
       );
 
-      (deps.streamController.handleStreamChunk as jest.Mock).mockImplementation(async (chunk, msg) => {
-        if (chunk.type === 'text') msg.content = chunk.content;
+      (deps.streamController.handleStreamChunk as jest.Mock).mockImplementation(async (chunk, ctx: any) => {
+        if (chunk.type === 'text') ctx.message.content = chunk.content;
       });
 
       inputEl = deps.getInputEl() as ReturnType<typeof createMockInputEl>;

@@ -280,36 +280,55 @@ export function createSubagentBlock(
   return state;
 }
 
+/**
+ * Data-layer merge of a tool call into a subagent record (no DOM).
+ * Domain-first projection (v3 §5.2): sync subagents without a DOM projector
+ * still record their tool calls through this pure merge.
+ */
+export function mergeSubagentToolCall(info: SubagentInfo, toolCall: ToolCallInfo): void {
+  const existingIndex = info.toolCalls.findIndex(tc => tc.id === toolCall.id);
+  if (existingIndex < 0) {
+    info.toolCalls.push(toolCall);
+    return;
+  }
+
+  const existingToolCall = info.toolCalls[existingIndex]!;
+  info.toolCalls[existingIndex] = {
+    ...existingToolCall,
+    ...toolCall,
+    input: {
+      ...existingToolCall.input,
+      ...toolCall.input,
+    },
+    result: toolCall.result ?? existingToolCall.result,
+    isExpanded: toolCall.isExpanded ?? existingToolCall.isExpanded,
+  };
+}
+
+/** Data-layer replacement of a settled tool call in a subagent record (no DOM). */
+export function applySubagentToolResult(info: SubagentInfo, toolId: string, toolCall: ToolCallInfo): void {
+  const idx = info.toolCalls.findIndex(tc => tc.id === toolId);
+  if (idx !== -1) {
+    info.toolCalls[idx] = toolCall;
+  }
+}
+
 export function addSubagentToolCall(
   state: SubagentState,
   toolCall: ToolCallInfo
 ): void {
   const existingIndex = state.info.toolCalls.findIndex(tc => tc.id === toolCall.id);
+  mergeSubagentToolCall(state.info, toolCall);
+
   if (existingIndex >= 0) {
-    const existingToolCall = state.info.toolCalls[existingIndex]!;
-    const mergedToolCall: ToolCallInfo = {
-      ...existingToolCall,
-      ...toolCall,
-      input: {
-        ...existingToolCall.input,
-        ...toolCall.input,
-      },
-      result: toolCall.result ?? existingToolCall.result,
-      isExpanded: toolCall.isExpanded ?? existingToolCall.isExpanded,
-    };
-
-    state.info.toolCalls[existingIndex] = mergedToolCall;
-
     const existingView = state.toolElements.get(toolCall.id);
     if (existingView) {
-      updateSubagentToolView(existingView, mergedToolCall);
+      updateSubagentToolView(existingView, state.info.toolCalls[existingIndex]!);
     }
 
     updateSyncHeaderAria(state);
     return;
   }
-
-  state.info.toolCalls.push(toolCall);
 
   const toolView = createSubagentToolView(state.toolsContainerEl, toolCall);
   state.toolElements.set(toolCall.id, toolView);
@@ -322,10 +341,7 @@ export function updateSubagentToolResult(
   toolId: string,
   toolCall: ToolCallInfo
 ): void {
-  const idx = state.info.toolCalls.findIndex(tc => tc.id === toolId);
-  if (idx !== -1) {
-    state.info.toolCalls[idx] = toolCall;
-  }
+  applySubagentToolResult(state.info, toolId, toolCall);
 
   const toolView = state.toolElements.get(toolId);
   if (!toolView) {

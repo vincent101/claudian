@@ -14,12 +14,14 @@ import type {
 import { extractFinalResultFromSubagentJsonl } from '../../../utils/subagentJsonl';
 import {
   addSubagentToolCall,
+  applySubagentToolResult,
   type AsyncSubagentState,
   createAsyncSubagentBlock,
   createSubagentBlock,
   finalizeAsyncSubagent,
   finalizeSubagentBlock,
   markAsyncSubagentOrphaned,
+  mergeSubagentToolCall,
   type SubagentState,
   updateAsyncSubagentRunning,
   updateSubagentToolResult,
@@ -30,19 +32,22 @@ export type SubagentStateChangeCallback = (subagent: SubagentInfo) => void;
 
 export type HandleTaskResult =
   | { action: 'buffered' }
-  | { action: 'created_sync'; subagentState: SubagentState }
-  | { action: 'created_async'; info: SubagentInfo; domState: AsyncSubagentState }
+  | { action: 'created_sync'; info: SubagentInfo; domState?: SubagentState }
+  | { action: 'created_async'; info: SubagentInfo; domState?: AsyncSubagentState }
   | { action: 'label_updated' };
 
 export type RenderPendingResult =
-  | { mode: 'sync'; subagentState: SubagentState }
-  | { mode: 'async'; info: SubagentInfo; domState: AsyncSubagentState };
+  | { mode: 'sync'; info: SubagentInfo; domState?: SubagentState }
+  | { mode: 'async'; info: SubagentInfo; domState?: AsyncSubagentState };
 
 export class SubagentManager {
   private static readonly TRUSTED_OUTPUT_EXT = '.output';
   private static readonly TRUSTED_TMP_ROOTS = SubagentManager.resolveTrustedTmpRoots();
 
-  private syncSubagents: Map<string, SubagentState> = new Map();
+  /** Domain truth for live sync subagents (v3 §5.2): id → SubagentInfo. */
+  private syncSubagentRecords: Map<string, SubagentInfo> = new Map();
+  /** Optional DOM projector cache for sync subagents; entries share the domain info object. */
+  private syncDomStates: Map<string, SubagentState> = new Map();
   private pendingTasks: Map<string, PendingToolCall> = new Map();
   private _spawnedThisStream = 0;
 
@@ -83,29 +88,37 @@ export class SubagentManager {
   /**
    * Handles an Agent tool_use chunk with minimal buffering to determine sync vs async.
    * Returns a typed result so StreamController can update messages accordingly.
+   *
+   * Domain-first (v3 §5.2): a known `run_in_background` mode creates the domain
+   * entry immediately even without a parent element; only mode-unknown tasks
+   * are buffered as pending.
    */
   public handleTaskToolUse(
     taskToolId: string,
     taskInput: Record<string, unknown>,
     currentContentEl: HTMLElement | null
   ): HandleTaskResult {
-    // Already rendered as sync → update label (no parentEl needed)
-    const existingSyncState = this.syncSubagents.get(taskToolId);
-    if (existingSyncState) {
-      this.updateSubagentLabel(existingSyncState.wrapperEl, existingSyncState.info, taskInput);
+    // Already created as sync → update label on domain record (+ DOM if attached)
+    const existingSyncRecord = this.syncSubagentRecords.get(taskToolId);
+    if (existingSyncRecord) {
+      const existingSyncState = this.syncDomStates.get(taskToolId);
+      this.updateSubagentLabel(
+        existingSyncRecord,
+        taskInput,
+        existingSyncState?.wrapperEl ?? null
+      );
       return { action: 'label_updated' };
     }
 
-    // Already rendered as async → update label (no parentEl needed)
-    const existingAsyncState = this.asyncDomStates.get(taskToolId);
-    if (existingAsyncState) {
-      this.updateSubagentLabel(existingAsyncState.wrapperEl, existingAsyncState.info, taskInput);
-      // Sync to canonical SubagentInfo so status transitions don't revert updates
-      const canonical = this.getByTaskId(taskToolId);
-      if (canonical && canonical !== existingAsyncState.info) {
-        if (taskInput.description) canonical.description = taskInput.description as string;
-        if (taskInput.prompt) canonical.prompt = taskInput.prompt as string;
-      }
+    // Already created as async → update label on domain record (+ DOM if attached)
+    const existingAsyncRecord = this.getByTaskId(taskToolId);
+    if (existingAsyncRecord && existingAsyncRecord.mode === 'async') {
+      const existingAsyncState = this.asyncDomStates.get(taskToolId);
+      this.updateSubagentLabel(
+        existingAsyncRecord,
+        taskInput,
+        existingAsyncState?.wrapperEl ?? null
+      );
       return { action: 'label_updated' };
     }
 
@@ -126,23 +139,10 @@ export class SubagentManager {
         const result = this.renderPendingTask(taskToolId, currentContentEl);
         if (result) {
           return result.mode === 'sync'
-            ? { action: 'created_sync', subagentState: result.subagentState }
+            ? { action: 'created_sync', info: result.info, domState: result.domState }
             : { action: 'created_async', info: result.info, domState: result.domState };
         }
       }
-      return { action: 'buffered' };
-    }
-
-    // New Task without a content element — buffer for later rendering
-    if (!currentContentEl) {
-      const toolCall: ToolCallInfo = {
-        id: taskToolId,
-        name: TOOL_TASK,
-        input: taskInput || {},
-        status: 'running',
-        isExpanded: false,
-      };
-      this.pendingTasks.set(taskToolId, { toolCall, parentEl: null });
       return { action: 'buffered' };
     }
 
@@ -178,6 +178,8 @@ export class SubagentManager {
    * Renders a buffered pending task. Called when a child chunk or tool_result
    * confirms the task is sync, or when run_in_background becomes known.
    * Uses the optional parentEl override, falling back to the stored parentEl.
+   * Domain-first (v3 §5.2): resolves and records the domain entry even
+   * without a DOM target.
    */
   public renderPendingTask(
     toolId: string,
@@ -188,7 +190,6 @@ export class SubagentManager {
 
     const input = pending.toolCall.input;
     const targetEl = parentElOverride ?? pending.parentEl;
-    if (!targetEl) return null;
 
     this.pendingTasks.delete(toolId);
 
@@ -203,7 +204,7 @@ export class SubagentManager {
         const result = this.createSyncTask(pending.toolCall.id, input, targetEl);
         if (result.action === 'created_sync') {
           this._spawnedThisStream++;
-          return { mode: 'sync', subagentState: result.subagentState };
+          return { mode: 'sync', info: result.info, domState: result.domState };
         }
       }
     } catch {
@@ -217,6 +218,9 @@ export class SubagentManager {
    * Resolves a pending Task when its own tool_result arrives.
    * If mode is still unknown, infer async from task result shape (agent_id/agentId),
    * otherwise fall back to sync so it never remains pending indefinitely.
+   * Domain-first (v3 §5.2): infers the mode and creates the domain entry even
+   * without a DOM target — the caller then processes the same tool_result
+   * against the new entry.
    */
   public renderPendingTaskFromTaskResult(
     toolId: string,
@@ -230,7 +234,6 @@ export class SubagentManager {
 
     const input = pending.toolCall.input;
     const targetEl = parentElOverride ?? pending.parentEl;
-    if (!targetEl) return null;
 
     const explicitMode = this.resolveTaskMode(input);
     const taskResultText = extractToolResultContent(taskResult, { fallbackIndent: 2 });
@@ -250,7 +253,7 @@ export class SubagentManager {
         const result = this.createSyncTask(pending.toolCall.id, input, targetEl);
         if (result.action === 'created_sync') {
           this._spawnedThisStream++;
-          return { mode: 'sync', subagentState: result.subagentState };
+          return { mode: 'sync', info: result.info, domState: result.domState };
         }
       }
     } catch {
@@ -264,14 +267,20 @@ export class SubagentManager {
   // Sync Subagent Operations
   // ============================================
 
-  public getSyncSubagent(toolId: string): SubagentState | undefined {
-    return this.syncSubagents.get(toolId);
+  /** Domain record for a live sync subagent (DOM projector optional). */
+  public getSyncSubagent(toolId: string): SubagentInfo | undefined {
+    return this.syncSubagentRecords.get(toolId);
   }
 
   public addSyncToolCall(parentToolUseId: string, toolCall: ToolCallInfo): void {
-    const subagentState = this.syncSubagents.get(parentToolUseId);
-    if (!subagentState) return;
-    addSubagentToolCall(subagentState, toolCall);
+    const record = this.syncSubagentRecords.get(parentToolUseId);
+    if (!record) return;
+    const domState = this.syncDomStates.get(parentToolUseId);
+    if (domState) {
+      addSubagentToolCall(domState, toolCall);
+      return;
+    }
+    mergeSubagentToolCall(record, toolCall);
   }
 
   public updateSyncToolResult(
@@ -279,9 +288,14 @@ export class SubagentManager {
     toolId: string,
     toolCall: ToolCallInfo
   ): void {
-    const subagentState = this.syncSubagents.get(parentToolUseId);
-    if (!subagentState) return;
-    updateSubagentToolResult(subagentState, toolId, toolCall);
+    const record = this.syncSubagentRecords.get(parentToolUseId);
+    if (!record) return;
+    const domState = this.syncDomStates.get(parentToolUseId);
+    if (domState) {
+      updateSubagentToolResult(domState, toolId, toolCall);
+      return;
+    }
+    applySubagentToolResult(record, toolId, toolCall);
   }
 
   public finalizeSyncSubagent(
@@ -290,15 +304,23 @@ export class SubagentManager {
     isError: boolean,
     toolUseResult?: unknown
   ): SubagentInfo | null {
-    const subagentState = this.syncSubagents.get(toolId);
-    if (!subagentState) return null;
+    const record = this.syncSubagentRecords.get(toolId);
+    if (!record) return null;
 
     const resultText = extractToolResultContent(result, { fallbackIndent: 2 });
     const extractedResult = this.extractAgentResult(resultText, '', toolUseResult);
-    finalizeSubagentBlock(subagentState, extractedResult, isError);
-    this.syncSubagents.delete(toolId);
+    const domState = this.syncDomStates.get(toolId);
+    if (domState) {
+      finalizeSubagentBlock(domState, extractedResult, isError);
+    } else {
+      // Domain-only terminal transition (v3 §5.2): no projector attached.
+      record.status = isError ? 'error' : 'completed';
+      record.result = extractedResult;
+    }
+    this.syncSubagentRecords.delete(toolId);
+    this.syncDomStates.delete(toolId);
 
-    return subagentState.info;
+    return record;
   }
 
   // ============================================
@@ -346,7 +368,7 @@ export class SubagentManager {
       return;
     }
 
-    this.updateAsyncDomState(subagent);
+    this.projectAsyncSubagentState(subagent);
     this.onStateChange(subagent);
   }
 
@@ -409,7 +431,7 @@ export class SubagentManager {
     }
     this.activeAsyncSubagents.delete(agentId);
 
-    this.updateAsyncDomState(subagent);
+    this.projectAsyncSubagentState(subagent);
     this.onStateChange(subagent);
   }
 
@@ -491,7 +513,7 @@ export class SubagentManager {
     if (agentId) this.activeAsyncSubagents.delete(agentId);
     this.outputToolIdToAgentId.delete(toolId);
 
-    this.updateAsyncDomState(subagent);
+    this.projectAsyncSubagentState(subagent);
     this.onStateChange(subagent);
     return subagent;
   }
@@ -521,7 +543,7 @@ export class SubagentManager {
    * hydrating tool calls from SDK sidecar files) without changing lifecycle state.
    */
   public refreshAsyncSubagent(subagent: SubagentInfo): void {
-    this.updateAsyncDomState(subagent);
+    this.projectAsyncSubagentState(subagent);
     this.onStateChange(subagent);
   }
 
@@ -561,7 +583,8 @@ export class SubagentManager {
   }
 
   public resetStreamingState(): void {
-    this.syncSubagents.clear();
+    this.syncSubagentRecords.clear();
+    this.syncDomStates.clear();
     this.pendingTasks.clear();
   }
 
@@ -589,7 +612,8 @@ export class SubagentManager {
   }
 
   public clear(): void {
-    this.syncSubagents.clear();
+    this.syncSubagentRecords.clear();
+    this.syncDomStates.clear();
     this.pendingTasks.clear();
     this.pendingAsyncSubagents.clear();
     this.activeAsyncSubagents.clear();
@@ -597,6 +621,61 @@ export class SubagentManager {
     this.outputToolIdToAgentId.clear();
     this.asyncDomStates.clear();
     this.seenTerminalNotifications.clear();
+  }
+
+  // ============================================
+  // Deferred Projection Attach
+  // ============================================
+
+  /**
+   * Attaches a DOM projector to an existing domain record (v3 §5.2): renders
+   * the current state in one pass when the tab becomes visible or after a
+   * reload. No-op when no live domain record exists for the task (settled
+   * entries already live in the message data).
+   */
+  public attachProjection(taskId: string, parentEl: HTMLElement): void {
+    const syncRecord = this.syncSubagentRecords.get(taskId);
+    if (syncRecord) {
+      if (this.syncDomStates.has(taskId)) return;
+      const state = createSubagentBlock(parentEl, taskId, {
+        description: syncRecord.description,
+        prompt: syncRecord.prompt,
+      });
+      state.info = syncRecord;
+      for (const toolCall of syncRecord.toolCalls) {
+        addSubagentToolCall(state, {
+          ...toolCall,
+          input: { ...toolCall.input },
+        });
+      }
+      this.syncDomStates.set(taskId, state);
+      return;
+    }
+
+    const asyncRecord = this.getByTaskId(taskId);
+    if (asyncRecord && asyncRecord.mode === 'async' && !this.asyncDomStates.has(taskId)) {
+      const domState = createAsyncSubagentBlock(parentEl, taskId, {
+        description: asyncRecord.description,
+        prompt: asyncRecord.prompt,
+      });
+      domState.info = asyncRecord;
+      this.asyncDomStates.set(taskId, domState);
+
+      switch (asyncRecord.asyncStatus) {
+        case 'running':
+          updateAsyncSubagentRunning(domState, asyncRecord.agentId || '');
+          break;
+        case 'completed':
+        case 'error':
+          finalizeAsyncSubagent(domState, asyncRecord.result || '', asyncRecord.asyncStatus === 'error');
+          break;
+        case 'orphaned':
+          markAsyncSubagentOrphaned(domState);
+          break;
+        default:
+          break; // 'pending' — initial block state already matches
+      }
+    }
   }
 
   // ============================================
@@ -608,7 +687,7 @@ export class SubagentManager {
     subagent.status = 'error';
     subagent.result = 'Conversation ended before task completed';
     subagent.completedAt = Date.now();
-    this.updateAsyncDomState(subagent);
+    this.projectAsyncSubagentState(subagent);
     this.onStateChange(subagent);
   }
 
@@ -618,7 +697,7 @@ export class SubagentManager {
     subagent.result = errorResult;
     subagent.completedAt = Date.now();
     this.pendingAsyncSubagents.delete(taskToolId);
-    this.updateAsyncDomState(subagent);
+    this.projectAsyncSubagentState(subagent);
     this.onStateChange(subagent);
   }
 
@@ -626,20 +705,42 @@ export class SubagentManager {
   // Private: Task Creation
   // ============================================
 
+  /**
+   * Creates a sync subagent domain record. The DOM block is an optional
+   * projection (v3 §5.2): a null parentEl still creates the domain entry.
+   */
   private createSyncTask(
     taskToolId: string,
     taskInput: Record<string, unknown>,
-    parentEl: HTMLElement
+    parentEl: HTMLElement | null
   ): HandleTaskResult {
-    const subagentState = createSubagentBlock(parentEl, taskToolId, taskInput);
-    this.syncSubagents.set(taskToolId, subagentState);
-    return { action: 'created_sync', subagentState };
+    let info: SubagentInfo;
+    if (parentEl) {
+      const subagentState = createSubagentBlock(parentEl, taskToolId, taskInput);
+      this.syncDomStates.set(taskToolId, subagentState);
+      info = subagentState.info;
+    } else {
+      info = {
+        id: taskToolId,
+        description: (taskInput.description as string) || 'Subagent task',
+        prompt: (taskInput.prompt as string) || '',
+        status: 'running',
+        toolCalls: [],
+        isExpanded: false,
+      };
+    }
+    this.syncSubagentRecords.set(taskToolId, info);
+    return { action: 'created_sync', info };
   }
 
+  /**
+   * Creates an async subagent domain entry. The DOM block is an optional
+   * projection (v3 §5.2): a null parentEl still creates the pending entry.
+   */
   private createAsyncTask(
     taskToolId: string,
     taskInput: Record<string, unknown>,
-    parentEl: HTMLElement
+    parentEl: HTMLElement | null
   ): HandleTaskResult {
     const description = (taskInput.description as string) || 'Background task';
     const prompt = (taskInput.prompt as string) || '';
@@ -657,26 +758,31 @@ export class SubagentManager {
 
     this.pendingAsyncSubagents.set(taskToolId, info);
 
-    const domState = createAsyncSubagentBlock(parentEl, taskToolId, taskInput);
-    this.asyncDomStates.set(taskToolId, domState);
+    if (parentEl) {
+      const domState = createAsyncSubagentBlock(parentEl, taskToolId, taskInput);
+      // Projector references the domain record so later transitions stay in sync.
+      domState.info = info;
+      this.asyncDomStates.set(taskToolId, domState);
+    }
 
-    return { action: 'created_async', info, domState };
+    return { action: 'created_async', info };
   }
 
   // ============================================
   // Private: Label Update
   // ============================================
 
+  /** Updates description/prompt on the domain record; DOM label refresh is optional. */
   private updateSubagentLabel(
-    wrapperEl: HTMLElement,
     info: SubagentInfo,
-    newInput: Record<string, unknown>
+    newInput: Record<string, unknown>,
+    wrapperEl: HTMLElement | null
   ): void {
     if (!newInput || Object.keys(newInput).length === 0) return;
     const description = (newInput.description as string) || '';
     if (description) {
       info.description = description;
-      const labelEl = wrapperEl.querySelector('.claudian-subagent-label') as HTMLElement | null;
+      const labelEl = wrapperEl?.querySelector('.claudian-subagent-label') as HTMLElement | null;
       if (labelEl) {
         const truncated = description.length > 40 ? description.substring(0, 40) + '...' : description;
         labelEl.setText(truncated);
@@ -685,7 +791,7 @@ export class SubagentManager {
     const prompt = (newInput.prompt as string) || '';
     if (prompt) {
       info.prompt = prompt;
-      const promptEl = wrapperEl.querySelector('.claudian-subagent-prompt-text') as HTMLElement | null;
+      const promptEl = wrapperEl?.querySelector('.claudian-subagent-prompt-text') as HTMLElement | null;
       if (promptEl) {
         promptEl.setText(prompt);
       }
@@ -817,7 +923,12 @@ export class SubagentManager {
   // Private: Async DOM State Updates
   // ============================================
 
-  private updateAsyncDomState(subagent: SubagentInfo): void {
+  /**
+   * Optional DOM projector (v3 §5.2): silently skips when no projector is
+   * attached — the domain transition and onStateChange have already happened
+   * before this is called.
+   */
+  private projectAsyncSubagentState(subagent: SubagentInfo): void {
     // Find DOM state by task ID first, then by agentId
     let asyncState = this.asyncDomStates.get(subagent.id);
 

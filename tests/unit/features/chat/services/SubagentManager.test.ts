@@ -39,6 +39,16 @@ jest.mock('@/features/chat/rendering/SubagentRenderer', () => ({
   })),
   addSubagentToolCall: jest.fn(),
   updateSubagentToolResult: jest.fn(),
+  mergeSubagentToolCall: jest.fn().mockImplementation((info: any, toolCall: any) => {
+    // Real merge semantics for the domain-only path (push or replace by id)
+    const idx = info.toolCalls.findIndex((tc: any) => tc.id === toolCall.id);
+    if (idx === -1) info.toolCalls.push(toolCall);
+    else info.toolCalls[idx] = toolCall;
+  }),
+  applySubagentToolResult: jest.fn().mockImplementation((info: any, toolId: string, toolCall: any) => {
+    const idx = info.toolCalls.findIndex((tc: any) => tc.id === toolId);
+    if (idx !== -1) info.toolCalls[idx] = toolCall;
+  }),
   finalizeSubagentBlock: jest.fn(),
   updateAsyncSubagentRunning: jest.fn(),
   finalizeAsyncSubagent: jest.fn(),
@@ -938,7 +948,7 @@ Only this is the final result.
       );
 
       expect(result.action).toBe('created_sync');
-      expect((result as any).subagentState.info.id).toBe('task-sync');
+      expect((result as any).info.id).toBe('task-sync');
     });
 
     it('returns created_async for run_in_background=true', () => {
@@ -1062,8 +1072,8 @@ Only this is the final result.
       );
 
       expect(result.action).toBe('created_sync');
-      expect((result as any).subagentState.info.description).toBe('Initial description');
-      expect((result as any).subagentState.info.prompt).toBe('latest prompt');
+      expect((result as any).info.description).toBe('Initial description');
+      expect((result as any).info.prompt).toBe('latest prompt');
       expect(manager.hasPendingTask('task-1')).toBe(false);
     });
 
@@ -1111,31 +1121,31 @@ Only this is the final result.
       expect(manager.subagentsSpawnedThisStream).toBe(1);
     });
 
-    it('returns null and keeps task pending when targetEl is null', () => {
+    it('creates sync domain entry without DOM when targetEl is null (v3 §5.2)', () => {
       const { manager } = createManager();
 
-      // Buffer with null parentEl (no content element)
+      // Buffer with null parentEl (mode unknown)
       manager.handleTaskToolUse('task-1', { prompt: 'test' }, null);
       expect(manager.hasPendingTask('task-1')).toBe(true);
 
-      // Try to render without override — both parentEl and override are null
+      // Resolve without override — no DOM target, but the domain entry is
+      // still created instead of staying pending
       const result = manager.renderPendingTask('task-1');
-      expect(result).toBeNull();
-      expect(manager.hasPendingTask('task-1')).toBe(true);
-      expect(manager.subagentsSpawnedThisStream).toBe(0);
+      expect(result).not.toBeNull();
+      expect(result?.mode).toBe('sync');
+      expect(manager.hasPendingTask('task-1')).toBe(false);
+      expect(manager.getSyncSubagent('task-1')?.id).toBe('task-1');
+      expect(manager.subagentsSpawnedThisStream).toBe(1);
     });
 
-    it('renders buffered async task with parentEl override', () => {
+    it('creates async domain entry without DOM when run_in_background is known', () => {
       const { manager } = createManager();
-      const overrideEl = createMockEl();
 
-      // Buffer with null parentEl so the task stays pending despite run_in_background being known
-      manager.handleTaskToolUse('task-1', { prompt: 'test', run_in_background: true }, null);
-      expect(manager.hasPendingTask('task-1')).toBe(true);
-
-      const result = manager.renderPendingTask('task-1', overrideEl);
-      expect(result).not.toBeNull();
-      expect(result?.mode).toBe('async');
+      // Mode known + null parentEl: domain entry is created immediately (v3 §5.2)
+      const result = manager.handleTaskToolUse('task-1', { prompt: 'test', run_in_background: true }, null);
+      expect(result.action).toBe('created_async');
+      expect(manager.hasPendingTask('task-1')).toBe(false);
+      expect(manager.getByTaskId('task-1')?.asyncStatus).toBe('pending');
     });
 
     it('does not increment spawned counter when rendering throws', () => {
@@ -1211,22 +1221,27 @@ Only this is the final result.
 
     it('honors explicit async mode from input even without task-result markers', () => {
       const { manager } = createManager();
-      const parentEl = createMockEl();
 
-      manager.handleTaskToolUse(
+      // Domain-first (v3 §5.2): explicit run_in_background=true creates the
+      // async domain entry immediately even without a DOM target, so the
+      // tool_result is processed through the async path instead of pending.
+      const created = manager.handleTaskToolUse(
         'task-1',
         { prompt: 'test', run_in_background: true },
         null
       );
+      expect(created.action).toBe('created_async');
+      expect(manager.isPendingAsyncTask('task-1')).toBe(true);
+
       const result = manager.renderPendingTaskFromTaskResult(
         'task-1',
         '{"foo":"bar"}',
         false,
-        parentEl
+        null
       );
 
-      expect(result).not.toBeNull();
-      expect(result?.mode).toBe('async');
+      expect(result).toBeNull();
+      expect(manager.isPendingAsyncTask('task-1')).toBe(true);
     });
 
     it('infers async from toolUseResult markers when task-result text has no agent id', () => {
@@ -1356,9 +1371,9 @@ Only this is the final result.
 
       manager.handleTaskToolUse('task-1', { run_in_background: false }, parentEl);
 
-      const state = manager.getSyncSubagent('task-1');
-      expect(state).toBeDefined();
-      expect(state?.info.id).toBe('task-1');
+      const record = manager.getSyncSubagent('task-1');
+      expect(record).toBeDefined();
+      expect(record?.id).toBe('task-1');
     });
 
     it('adds tool call to sync subagent', () => {
@@ -1888,3 +1903,184 @@ Only this is the final result.
     });
   });
 });
+
+  // ============================================
+  // Detached DOM domain lifecycle (v3 §5.2 / S3)
+  // ============================================
+  describe('detached DOM domain lifecycle (v3 §5.2)', () => {
+    beforeEach(() => {
+      jest.clearAllMocks();
+    });
+
+    it('runs an async Task through pending → running → terminal without any DOM', () => {
+      const {
+        createAsyncSubagentBlock,
+        updateAsyncSubagentRunning,
+        finalizeAsyncSubagent,
+      } = jest.requireMock('@/features/chat/rendering/SubagentRenderer');
+      const { manager, updates } = createManager();
+
+      // Task tool_use with no DOM target — mode known, domain entry created
+      const created = manager.handleTaskToolUse(
+        'task-1',
+        { description: 'Background', run_in_background: true },
+        null
+      );
+      expect(created.action).toBe('created_async');
+      expect(manager.getByTaskId('task-1')?.asyncStatus).toBe('pending');
+
+      // Task tool_result with agent_id — promoted to active/running
+      manager.handleTaskToolResult('task-1', JSON.stringify({ agent_id: 'agent-1' }));
+      const running = manager.getByTaskId('task-1');
+      expect(running?.asyncStatus).toBe('running');
+      expect(running?.agentId).toBe('agent-1');
+
+      // Terminal notification settles domain state and fires onStateChange
+      const settled = manager.handleTaskNotification('agent-1', 'completed', 'all done');
+      expect(settled?.asyncStatus).toBe('completed');
+      expect(settled?.status).toBe('completed');
+      expect(manager.hasRunningSubagents()).toBe(false);
+      expect(updates[updates.length - 1].status).toBe('completed');
+
+      // Zero renderer calls across the whole lifecycle
+      expect(createAsyncSubagentBlock).not.toHaveBeenCalled();
+      expect(updateAsyncSubagentRunning).not.toHaveBeenCalled();
+      expect(finalizeAsyncSubagent).not.toHaveBeenCalled();
+    });
+
+    it('creates and finalizes a sync Task domain record without DOM', () => {
+      const {
+        createSubagentBlock,
+        addSubagentToolCall,
+        finalizeSubagentBlock,
+      } = jest.requireMock('@/features/chat/rendering/SubagentRenderer');
+      const { manager } = createManager();
+
+      const created = manager.handleTaskToolUse(
+        'task-1',
+        { description: 'Sync work', run_in_background: false },
+        null
+      );
+      expect(created.action).toBe('created_sync');
+      const record = manager.getSyncSubagent('task-1');
+      expect(record?.status).toBe('running');
+      expect(record?.toolCalls).toEqual([]);
+
+      // Child tool call lands in the domain record (no DOM)
+      const toolCall: ToolCallInfo = {
+        id: 'read-1',
+        name: 'Read',
+        input: { file_path: 'a.md' },
+        status: 'running',
+        isExpanded: false,
+      };
+      manager.addSyncToolCall('task-1', toolCall);
+      expect(manager.getSyncSubagent('task-1')?.toolCalls).toHaveLength(1);
+
+      // Terminal: finalize returns the domain record with settled state
+      const finalized = manager.finalizeSyncSubagent('task-1', 'done output', false);
+      expect(finalized?.status).toBe('completed');
+      expect(finalized?.result).toBe('done output');
+      expect(manager.getSyncSubagent('task-1')).toBeUndefined();
+
+      expect(createSubagentBlock).not.toHaveBeenCalled();
+      expect(addSubagentToolCall).not.toHaveBeenCalled();
+      expect(finalizeSubagentBlock).not.toHaveBeenCalled();
+    });
+
+    it('resolves a mode-unknown pending Task from its tool_result without DOM', () => {
+      const { manager } = createManager();
+
+      // Mode unknown → buffered pending
+      manager.handleTaskToolUse('task-1', { prompt: 'work' }, null);
+      expect(manager.hasPendingTask('task-1')).toBe(true);
+
+      // Own tool_result arrives without a DOM target — mode must still be
+      // inferred and the domain entry created (no early return)
+      const result = manager.renderPendingTaskFromTaskResult('task-1', '{"foo":"bar"}', false, null);
+      expect(result?.mode).toBe('sync');
+      expect(manager.hasPendingTask('task-1')).toBe(false);
+      expect(manager.getSyncSubagent('task-1')?.id).toBe('task-1');
+    });
+
+    it('attachProjection renders a running async Task from the domain record in one pass', () => {
+      const {
+        createAsyncSubagentBlock,
+        updateAsyncSubagentRunning,
+      } = jest.requireMock('@/features/chat/rendering/SubagentRenderer');
+      const { manager } = createManager();
+      const parentEl = createMockEl();
+
+      manager.handleTaskToolUse(
+        'task-1',
+        { description: 'Background', run_in_background: true },
+        null
+      );
+      manager.handleTaskToolResult('task-1', JSON.stringify({ agent_id: 'agent-1' }));
+      expect(createAsyncSubagentBlock).not.toHaveBeenCalled();
+
+      manager.attachProjection('task-1', parentEl);
+
+      expect(createAsyncSubagentBlock).toHaveBeenCalledWith(parentEl, 'task-1', expect.anything());
+      expect(updateAsyncSubagentRunning).toHaveBeenCalledWith(expect.anything(), 'agent-1');
+    });
+
+    it('attachProjection replays sync tool calls and later updates go through the projector', () => {
+      const {
+        createSubagentBlock,
+        addSubagentToolCall,
+        updateSubagentToolResult,
+      } = jest.requireMock('@/features/chat/rendering/SubagentRenderer');
+      const { manager } = createManager();
+      const parentEl = createMockEl();
+
+      manager.handleTaskToolUse('task-1', { description: 'Sync', run_in_background: false }, null);
+      const toolCall: ToolCallInfo = {
+        id: 'read-1',
+        name: 'Read',
+        input: { file_path: 'a.md' },
+        status: 'running',
+        isExpanded: false,
+      };
+      manager.addSyncToolCall('task-1', toolCall);
+      expect(addSubagentToolCall).not.toHaveBeenCalled();
+
+      manager.attachProjection('task-1', parentEl);
+
+      expect(createSubagentBlock).toHaveBeenCalledWith(parentEl, 'task-1', expect.anything());
+      // Replay of the accumulated tool call
+      expect(addSubagentToolCall).toHaveBeenCalledTimes(1);
+
+      // After attach, subsequent updates flow through the DOM projector
+      const settledToolCall: ToolCallInfo = { ...toolCall, status: 'completed', result: 'ok' };
+      manager.updateSyncToolResult('task-1', 'read-1', settledToolCall);
+      expect(updateSubagentToolResult).toHaveBeenCalledTimes(1);
+    });
+
+    it('attachProjection is a no-op for tasks without a live domain record', () => {
+      const {
+        createSubagentBlock,
+        createAsyncSubagentBlock,
+      } = jest.requireMock('@/features/chat/rendering/SubagentRenderer');
+      const { manager } = createManager();
+      const parentEl = createMockEl();
+
+      expect(() => manager.attachProjection('unknown', parentEl)).not.toThrow();
+      expect(createSubagentBlock).not.toHaveBeenCalled();
+      expect(createAsyncSubagentBlock).not.toHaveBeenCalled();
+    });
+
+    it('domain transitions fire onStateChange even when no projector is attached', () => {
+      const { manager, updates } = createManager();
+
+      manager.handleTaskToolUse(
+        'task-1',
+        { description: 'Background', run_in_background: true },
+        null
+      );
+      manager.handleTaskToolResult('task-1', JSON.stringify({ agent_id: 'agent-1' }));
+      manager.handleTaskNotification('agent-1', 'failed', 'boom');
+
+      expect(updates.some((u) => u.status === 'error')).toBe(true);
+    });
+  });

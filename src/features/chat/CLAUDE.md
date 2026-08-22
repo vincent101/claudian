@@ -105,11 +105,21 @@ Tabs stay cold until the first send. The tab wiring exposes `ensureServiceInitia
 
 ```typescript
 const preparedTurn = runtime.prepareTurn(request);
+const turnContext = createTurnProjectionContext({ turnId, message, renderTarget, generation });
 
 for await (const chunk of runtime.query(preparedTurn, history)) {
-  streamController.handleStreamChunk(chunk);
+  turnContext.message = activeAssistantMessage;
+  turnContext.renderTarget = state.currentContentEl;
+  streamController.handleStreamChunk(chunk, turnContext);
 }
 ```
+
+Domain-first projection (S3): `TurnProjectionContext` is the data truth for a
+turn — message content, toolCalls, contentBlocks and subagent domain records
+are always updated; DOM rendering happens only when `renderTarget` is set.
+`SubagentManager` keeps sync/async `SubagentInfo` maps as the domain truth with
+DOM states as an optional projector cache (`attachProjection(taskId, parentEl)`
+attaches one later and renders the current state in a single pass).
 
 ### Auto-Scroll
 

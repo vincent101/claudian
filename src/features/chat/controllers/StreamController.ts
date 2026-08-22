@@ -74,6 +74,44 @@ export interface StreamControllerDeps {
   getAgentService?: () => ChatRuntime | null;
 }
 
+/**
+ * Explicit per-turn projection context (v3 §5.1): the data truth for one
+ * turn's projection, replacing implicit reads of the global ChatState
+ * current* fields. Domain data (message content, toolCalls, contentBlocks,
+ * subagent records) is always updated; DOM rendering happens only when
+ * renderTarget is set. `message`/`renderTarget` are refreshed per chunk when
+ * provider boundary chunks switch the active assistant message.
+ */
+export interface TurnProjectionContext {
+  turnId: string;
+  message: ChatMessage;
+  renderTarget: HTMLElement | null;
+  /** Text accumulated for the current assistant message (data layer). */
+  textBuffer: string;
+  /** Thinking accumulated for the current assistant message (data layer). */
+  thinkingBuffer: string;
+  /** Tool ids registered this turn that have not been rendered/settled yet. */
+  pendingToolIds: Set<string>;
+  generation: number;
+}
+
+export function createTurnProjectionContext(init: {
+  turnId: string;
+  message: ChatMessage;
+  renderTarget: HTMLElement | null;
+  generation: number;
+}): TurnProjectionContext {
+  return {
+    turnId: init.turnId,
+    message: init.message,
+    renderTarget: init.renderTarget,
+    textBuffer: '',
+    thinkingBuffer: '',
+    pendingToolIds: new Set<string>(),
+    generation: init.generation,
+  };
+}
+
 export class StreamController {
   private static readonly ASYNC_SUBAGENT_RESULT_RETRY_DELAYS_MS = [200, 600, 1500] as const;
 
@@ -88,6 +126,9 @@ export class StreamController {
   private isThinkingRenderRunning = false;
   private pendingToolOutputFrames = new Map<string, ScheduledAnimationFrame>();
   private pendingScrollFrame: ScheduledAnimationFrame | null = null;
+
+  /** Context of the turn currently streaming through handleStreamChunk (v3 §5.1). */
+  private activeContext: TurnProjectionContext | null = null;
 
   // Provider lifecycle agent tracking (spawn → wait/close lifecycle)
   private lifecycleSubagentStates = new Map<string, SubagentState>(); // spawn callId → SubagentState
@@ -113,39 +154,49 @@ export class StreamController {
   // Stream Chunk Handling
   // ============================================
 
-  async handleStreamChunk(chunk: StreamChunk, msg: ChatMessage): Promise<void> {
+  async handleStreamChunk(chunk: StreamChunk, context: TurnProjectionContext): Promise<void> {
     const { state } = this.deps;
+    this.activeContext = context;
+    const msg = context.message;
 
     switch (chunk.type) {
       case 'thinking':
         // Flush pending tools before rendering new content type
         this.flushPendingTools();
-        if (state.currentTextEl) {
-          await this.finalizeCurrentTextBlock(msg);
+        if (state.currentTextEl || context.textBuffer) {
+          await this.finalizeCurrentTextBlock(msg, context);
         }
-        await this.appendThinking(chunk.content);
+        // Thinking always accumulates in the context buffer (data layer)
+        context.thinkingBuffer += chunk.content;
+        if (context.renderTarget) {
+          await this.appendThinking(chunk.content);
+        }
         break;
 
       case 'text':
         // Flush pending tools before rendering new content type
         this.flushPendingTools();
-        if (state.currentThinkingState) {
-          await this.finalizeCurrentThinkingBlock(msg);
+        if (state.currentThinkingState || context.thinkingBuffer) {
+          await this.finalizeCurrentThinkingBlock(msg, context);
         }
+        // Text always lands in message data (data layer)
         msg.content += chunk.content;
-        await this.appendText(chunk.content);
+        context.textBuffer += chunk.content;
+        if (context.renderTarget) {
+          await this.appendText(chunk.content);
+        }
         break;
 
       case 'tool_use': {
-        if (state.currentThinkingState) {
-          await this.finalizeCurrentThinkingBlock(msg);
+        if (state.currentThinkingState || context.thinkingBuffer) {
+          await this.finalizeCurrentThinkingBlock(msg, context);
         }
-        await this.finalizeCurrentTextBlock(msg);
+        await this.finalizeCurrentTextBlock(msg, context);
 
         if (isSubagentToolName(chunk.name)) {
           // Flush pending tools before Agent
           this.flushPendingTools();
-          this.handleTaskToolUseViaManager(chunk, msg);
+          this.handleTaskToolUseViaManager(chunk, msg, context);
           break;
         }
 
@@ -156,7 +207,7 @@ export class StreamController {
 
         const subagentLifecycleAdapter = this.getSubagentLifecycleAdapter(chunk.name);
         if (subagentLifecycleAdapter?.isSpawnTool(chunk.name)) {
-          this.handleProviderSubagentSpawn(chunk, msg, subagentLifecycleAdapter);
+          this.handleProviderSubagentSpawn(chunk, msg, context, subagentLifecycleAdapter);
           break;
         }
         if (subagentLifecycleAdapter?.isHiddenTool(chunk.name)) {
@@ -164,34 +215,47 @@ export class StreamController {
           break;
         }
 
-        this.handleRegularToolUse(chunk, msg);
+        this.handleRegularToolUse(chunk, msg, context);
         break;
       }
 
       case 'tool_result': {
-        await this.handleToolResult(chunk, msg);
+        await this.handleToolResult(chunk, msg, context);
         break;
       }
 
       case 'subagent_tool_use':
       case 'subagent_tool_result':
-        await this.handleSubagentChunk(chunk, msg);
+        await this.handleSubagentChunk(chunk, msg, context);
         break;
 
       case 'tool_output':
         this.handleToolOutput(chunk, msg);
         break;
 
-      case 'notice':
+      case 'notice': {
+        // Normalized text block first (data layer), optional DOM after (v3 §5.1)
         this.flushPendingTools();
-        await this.appendText(`\n\n⚠️ **${chunk.level === 'warning' ? 'Blocked' : 'Notice'}:** ${chunk.content}`);
+        const noticeText = `\n\n⚠️ **${chunk.level === 'warning' ? 'Blocked' : 'Notice'}:** ${chunk.content}`;
+        msg.content += noticeText;
+        context.textBuffer += noticeText;
+        if (context.renderTarget) {
+          await this.appendText(noticeText);
+        }
         break;
+      }
 
-      case 'error':
-        // Flush pending tools before rendering error message
+      case 'error': {
+        // Normalized text block first (data layer), optional DOM after (v3 §5.1)
         this.flushPendingTools();
-        await this.appendText(`\n\n❌ **Error:** ${chunk.content}`);
+        const errorText = `\n\n❌ **Error:** ${chunk.content}`;
+        msg.content += errorText;
+        context.textBuffer += errorText;
+        if (context.renderTarget) {
+          await this.appendText(errorText);
+        }
         break;
+      }
 
       case 'done':
         // Flush any remaining pending tools
@@ -200,10 +264,10 @@ export class StreamController {
 
       case 'context_compacted': {
         this.flushPendingTools();
-        if (state.currentThinkingState) {
-          await this.finalizeCurrentThinkingBlock(msg);
+        if (state.currentThinkingState || context.thinkingBuffer) {
+          await this.finalizeCurrentThinkingBlock(msg, context);
         }
-        await this.finalizeCurrentTextBlock(msg);
+        await this.finalizeCurrentTextBlock(msg, context);
         msg.contentBlocks = msg.contentBlocks || [];
         msg.contentBlocks.push({ type: 'context_compacted' });
         this.renderCompactBoundary();
@@ -211,6 +275,8 @@ export class StreamController {
       }
 
       case 'usage': {
+        // Usage is DOM-independent (v3 §5.1): always updates the scoped
+        // conversation state, subject to session/subagent guards.
         // Skip usage updates from other sessions or when flagged (during session reset)
         const currentSessionId = this.deps.getAgentService?.()?.getSessionId() ?? null;
         const chunkSessionId = chunk.sessionId ?? null;
@@ -247,10 +313,13 @@ export class StreamController {
   /**
    * Handles regular tool_use chunks by buffering them.
    * Tools are rendered when flushPendingTools is called (on next content type or tool_result).
+   * Data layer (toolCalls/contentBlocks) is always updated; the DOM buffer is
+   * only filled when the turn has a render target (v3 §5.1).
    */
   private handleRegularToolUse(
     chunk: { type: 'tool_use'; id: string; name: string; input: Record<string, unknown> },
-    msg: ChatMessage
+    msg: ChatMessage,
+    context: TurnProjectionContext
   ): void {
     const { state } = this.deps;
 
@@ -321,11 +390,12 @@ export class StreamController {
       this.capturePlanFilePath(chunk.input);
     }
 
-    // Buffer the tool call instead of rendering immediately
-    if (state.currentContentEl) {
+    // Data-layer registration always happens; the DOM render buffer is optional
+    context.pendingToolIds.add(chunk.id);
+    if (context.renderTarget) {
       state.pendingTools.set(chunk.id, {
         toolCall,
-        parentEl: state.currentContentEl,
+        parentEl: context.renderTarget,
       });
       this.showThinkingIndicator();
     }
@@ -381,6 +451,7 @@ export class StreamController {
     }
 
     state.pendingTools.clear();
+    this.activeContext?.pendingToolIds.clear();
   }
 
   /**
@@ -401,6 +472,7 @@ export class StreamController {
       renderToolCall(parentEl, toolCall, state.toolCallElements);
     }
     state.pendingTools.delete(toolId);
+    this.activeContext?.pendingToolIds.delete(toolId);
   }
 
   private handleToolOutput(
@@ -430,10 +502,9 @@ export class StreamController {
   private handleProviderSubagentSpawn(
     chunk: { type: 'tool_use'; id: string; name: string; input: Record<string, unknown> },
     msg: ChatMessage,
+    context: TurnProjectionContext,
     adapter: ProviderSubagentLifecycleAdapter,
   ): void {
-    const { state } = this.deps;
-
     const toolCall: ToolCallInfo = {
       id: chunk.id,
       name: chunk.name,
@@ -446,12 +517,12 @@ export class StreamController {
     msg.contentBlocks = msg.contentBlocks || [];
     msg.contentBlocks.push({ type: 'tool_use', toolId: chunk.id });
 
-    // Render as subagent block immediately
-    if (state.currentContentEl) {
+    // Render as subagent block immediately (optional DOM projection)
+    if (context.renderTarget) {
       this.flushPendingTools();
       const subagentInfo = adapter.buildSubagentInfo(toolCall, msg.toolCalls);
 
-      const subagentState = createSubagentBlock(state.currentContentEl, chunk.id, {
+      const subagentState = createSubagentBlock(context.renderTarget, chunk.id, {
         description: subagentInfo.description,
         prompt: subagentInfo.prompt,
       });
@@ -557,19 +628,20 @@ export class StreamController {
 
   private async handleToolResult(
     chunk: { type: 'tool_result'; id: string; content: string; isError?: boolean; toolUseResult?: SDKToolUseResult },
-    msg: ChatMessage
+    msg: ChatMessage,
+    context: TurnProjectionContext
   ): Promise<void> {
     const { state, subagentManager } = this.deps;
     const normalizedContent = this.normalizeToolResultContent(chunk.content);
 
     // Resolve pending Task before processing result.
     if (subagentManager.hasPendingTask(chunk.id)) {
-      this.renderPendingTaskFromTaskResultViaManager(chunk, msg);
+      this.renderPendingTaskFromTaskResultViaManager(chunk, msg, context);
     }
 
     // Check if it's a sync subagent result
-    const subagentState = subagentManager.getSyncSubagent(chunk.id);
-    if (subagentState) {
+    const syncSubagent = subagentManager.getSyncSubagent(chunk.id);
+    if (syncSubagent) {
       this.finalizeSubagent(chunk, msg);
       return;
     }
@@ -597,6 +669,8 @@ export class StreamController {
     }
 
     const existingToolCall = msg.toolCalls?.find(tc => tc.id === chunk.id);
+    // The tool call is settled by this result in every path below.
+    context.pendingToolIds.delete(chunk.id);
 
     // Regular tool result
     const isBlocked = isBlockedToolResult(normalizedContent, chunk.isError);
@@ -668,27 +742,33 @@ export class StreamController {
     void this.scheduleCurrentTextRender();
   }
 
-  async finalizeCurrentTextBlock(msg?: ChatMessage): Promise<void> {
+  async finalizeCurrentTextBlock(msg?: ChatMessage, context?: TurnProjectionContext): Promise<void> {
     const { state, renderer } = this.deps;
     await this.flushPendingTextRender();
 
-    if (msg && state.currentTextContent) {
+    // DOM turns read the render buffer; detached turns read the context buffer
+    // (v3 §5.1) — text always lands in contentBlocks.
+    const textContent = state.currentTextContent || context?.textBuffer || '';
+    if (msg && textContent) {
       if (
         state.currentTextEl
         && this.shouldDeferMathRendering()
-        && hasStreamingMathDelimiters(state.currentTextContent)
+        && hasStreamingMathDelimiters(textContent)
       ) {
-        await renderer.renderContent(state.currentTextEl, state.currentTextContent);
+        await renderer.renderContent(state.currentTextEl, textContent);
       }
       msg.contentBlocks = msg.contentBlocks || [];
-      msg.contentBlocks.push({ type: 'text', content: state.currentTextContent });
+      msg.contentBlocks.push({ type: 'text', content: textContent });
       // Copy button added here (not during streaming) to match history-loaded messages
       if (state.currentTextEl) {
-        renderer.addTextCopyButton(state.currentTextEl, state.currentTextContent);
+        renderer.addTextCopyButton(state.currentTextEl, textContent);
       }
     }
     state.currentTextEl = null;
     state.currentTextContent = '';
+    if (context) {
+      context.textBuffer = '';
+    }
   }
 
   private scheduleCurrentTextRender(): Promise<void> {
@@ -817,28 +897,41 @@ export class StreamController {
     void this.scheduleCurrentThinkingRender();
   }
 
-  async finalizeCurrentThinkingBlock(msg?: ChatMessage): Promise<void> {
+  async finalizeCurrentThinkingBlock(msg?: ChatMessage, context?: TurnProjectionContext): Promise<void> {
     const { state, renderer } = this.deps;
-    if (!state.currentThinkingState) return;
+    const thinkingState = state.currentThinkingState;
+    // Detached turns have no thinking DOM state; the context buffer is the
+    // data truth (v3 §5.1) and always lands in contentBlocks.
+    if (!thinkingState && !context?.thinkingBuffer) return;
     await this.flushPendingThinkingRender();
 
-    const thinkingState = state.currentThinkingState;
-    if (this.getStreamingRenderOptions(thinkingState.content)) {
-      await renderer.renderContent(thinkingState.contentEl, thinkingState.content);
-    }
+    if (thinkingState) {
+      if (this.getStreamingRenderOptions(thinkingState.content)) {
+        await renderer.renderContent(thinkingState.contentEl, thinkingState.content);
+      }
 
-    const durationSeconds = finalizeThinkingBlock(thinkingState);
+      const durationSeconds = finalizeThinkingBlock(thinkingState);
 
-    if (msg && thinkingState.content) {
+      if (msg && thinkingState.content) {
+        msg.contentBlocks = msg.contentBlocks || [];
+        msg.contentBlocks.push({
+          type: 'thinking',
+          content: thinkingState.content,
+          durationSeconds,
+        });
+      }
+    } else if (msg && context?.thinkingBuffer) {
       msg.contentBlocks = msg.contentBlocks || [];
       msg.contentBlocks.push({
         type: 'thinking',
-        content: thinkingState.content,
-        durationSeconds,
+        content: context.thinkingBuffer,
       });
     }
 
     state.currentThinkingState = null;
+    if (context) {
+      context.thinkingBuffer = '';
+    }
   }
 
   private scheduleCurrentThinkingRender(): Promise<void> {
@@ -928,16 +1021,17 @@ export class StreamController {
   /** Delegates Agent tool_use to SubagentManager and updates message based on result. */
   private handleTaskToolUseViaManager(
     chunk: { type: 'tool_use'; id: string; name: string; input: Record<string, unknown> },
-    msg: ChatMessage
+    msg: ChatMessage,
+    context: TurnProjectionContext
   ): void {
-    const { state, subagentManager } = this.deps;
+    const { subagentManager } = this.deps;
     this.ensureTaskToolCall(msg, chunk.id, chunk.input);
 
-    const result = subagentManager.handleTaskToolUse(chunk.id, chunk.input, state.currentContentEl);
+    const result = subagentManager.handleTaskToolUse(chunk.id, chunk.input, context.renderTarget);
 
     switch (result.action) {
       case 'created_sync':
-        this.recordSubagentInMessage(msg, result.subagentState.info, chunk.id);
+        this.recordSubagentInMessage(msg, result.info, chunk.id);
         this.showThinkingIndicator();
         break;
       case 'created_async':
@@ -953,36 +1047,33 @@ export class StreamController {
   }
 
   /** Renders a pending Agent tool call via SubagentManager and updates message. */
-  private renderPendingTaskViaManager(toolId: string, msg: ChatMessage): void {
-    const result = this.deps.subagentManager.renderPendingTask(toolId, this.deps.state.currentContentEl);
+  private renderPendingTaskViaManager(
+    toolId: string,
+    msg: ChatMessage,
+    context: TurnProjectionContext
+  ): void {
+    const result = this.deps.subagentManager.renderPendingTask(toolId, context.renderTarget);
     if (!result) return;
 
-    if (result.mode === 'sync') {
-      this.recordSubagentInMessage(msg, result.subagentState.info, toolId);
-    } else {
-      this.recordSubagentInMessage(msg, result.info, toolId, 'async');
-    }
+    this.recordSubagentInMessage(msg, result.info, toolId, result.mode === 'async' ? 'async' : undefined);
   }
 
   /** Resolves a pending Agent tool call when its own tool_result arrives. */
   private renderPendingTaskFromTaskResultViaManager(
     chunk: { id: string; content: string; isError?: boolean; toolUseResult?: unknown },
-    msg: ChatMessage
+    msg: ChatMessage,
+    context: TurnProjectionContext
   ): void {
     const result = this.deps.subagentManager.renderPendingTaskFromTaskResult(
       chunk.id,
       chunk.content,
       chunk.isError || false,
-      this.deps.state.currentContentEl,
+      context.renderTarget,
       chunk.toolUseResult
     );
     if (!result) return;
 
-    if (result.mode === 'sync') {
-      this.recordSubagentInMessage(msg, result.subagentState.info, chunk.id);
-    } else {
-      this.recordSubagentInMessage(msg, result.info, chunk.id, 'async');
-    }
+    this.recordSubagentInMessage(msg, result.info, chunk.id, result.mode === 'async' ? 'async' : undefined);
   }
 
   private recordSubagentInMessage(
@@ -1011,18 +1102,19 @@ export class StreamController {
   private async handleSubagentChunk(
     chunk: Extract<StreamChunk, { type: 'subagent_tool_use' | 'subagent_tool_result' }>,
     msg: ChatMessage,
+    context: TurnProjectionContext,
   ): Promise<void> {
     const parentToolUseId = chunk.subagentId;
     const { subagentManager } = this.deps;
 
     // If parent Agent call is still pending, child chunk confirms it's sync - render now
     if (subagentManager.hasPendingTask(parentToolUseId)) {
-      this.renderPendingTaskViaManager(parentToolUseId, msg);
+      this.renderPendingTaskViaManager(parentToolUseId, msg, context);
     }
 
-    const subagentState = subagentManager.getSyncSubagent(parentToolUseId);
+    const syncSubagent = subagentManager.getSyncSubagent(parentToolUseId);
 
-    if (!subagentState) {
+    if (!syncSubagent) {
       return;
     }
 
@@ -1041,7 +1133,7 @@ export class StreamController {
       }
 
       case 'subagent_tool_result': {
-        const toolCall = subagentState.info.toolCalls.find((tc: ToolCallInfo) => tc.id === chunk.id);
+        const toolCall = syncSubagent.toolCalls.find((tc: ToolCallInfo) => tc.id === chunk.id);
         if (toolCall) {
           const normalizedContent = this.normalizeToolResultContent(chunk.content);
           const isBlocked = isBlockedToolResult(normalizedContent, chunk.isError);
@@ -1498,6 +1590,7 @@ export class StreamController {
     this.cancelPendingToolOutputRenders();
     this.cancelPendingScroll();
     this.hideThinkingIndicator();
+    this.activeContext = null;
     state.currentContentEl = null;
     state.currentTextEl = null;
     state.currentTextContent = '';
