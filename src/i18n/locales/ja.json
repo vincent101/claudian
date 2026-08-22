@@ -62,6 +62,10 @@
       "expandOutput": "コマンド出力を展開",
       "running": "実行中...",
       "copyFailed": "クリップボードへのコピーに失敗しました"
+    },
+    "notifications": {
+      "needsAttention": "Tab {index} \"{title}\" needs your response",
+      "streamComplete": "Tab {index} \"{title}\" finished. Ready for review."
     }
   },
   "settings": {
@@ -282,6 +286,10 @@
     "deferMathRenderingDuringStreaming": {
       "name": "ストリーミング中の数式レンダリングを遅延",
       "desc": "応答のストリーミング中は生の LaTeX を表示し、各テキストブロックの完了時に一度だけ数式をレンダリングします。"
+    },
+    "desktopNotifications": {
+      "name": "Desktop notifications",
+      "desc": "Show a system notification when a background tab needs your response or finishes streaming."
     },
     "chatViewPlacement": {
       "name": "Claudian を開く場所",

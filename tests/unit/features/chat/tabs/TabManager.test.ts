@@ -2930,3 +2930,123 @@ describe('TabManager - buildForkTitle', () => {
     expect(updateCall.title).toBe('Fork: My Chat (#1) 4');
   });
 });
+
+describe('TabManager - Desktop Notifications', () => {
+  const createdNotifications: Array<{ title: string; body?: string; silent?: boolean }> = [];
+
+  class MockNotification {
+    static permission: NotificationPermission = 'granted';
+    constructor(title: string, options?: { body?: string; silent?: boolean }) {
+      createdNotifications.push({ title, body: options?.body, silent: options?.silent });
+    }
+  }
+
+  beforeAll(() => {
+    (globalThis as unknown as Record<string, unknown>).Notification = MockNotification;
+  });
+
+  afterAll(() => {
+    delete (globalThis as unknown as Record<string, unknown>).Notification;
+  });
+
+  beforeEach(() => {
+    createdNotifications.length = 0;
+  });
+
+  async function setupWithTabs(tabCount: number) {
+    jest.clearAllMocks();
+    const callbacksByTab = new Map<string, any>();
+    const tabs: any[] = [];
+    mockCreateTab.mockImplementation((opts: any) => {
+      const tab = createMockTabData({ id: `notify-tab-${tabs.length + 1}` });
+      callbacksByTab.set(tab.id, opts);
+      tabs.push(tab);
+      return tab;
+    });
+
+    const manager = new TabManager(
+      createMockPlugin(),
+      createMockMcpManager(),
+      createMockEl(),
+      createMockView()
+    );
+    for (let i = 0; i < tabCount; i++) {
+      await manager.createTab();
+    }
+    // First tab becomes the active tab; the rest stay in the background.
+    await manager.switchToTab(tabs[0].id);
+
+    return { manager, callbacksByTab, tabs };
+  }
+
+  it('notifies when a background tab starts needing attention', async () => {
+    const { callbacksByTab, tabs } = await setupWithTabs(2);
+
+    callbacksByTab.get(tabs[1].id)!.onAttentionChanged(true);
+
+    expect(createdNotifications).toHaveLength(1);
+    expect(createdNotifications[0]).toEqual({
+      title: 'Claudian',
+      body: 'Tab 2 "Test Tab" needs your response',
+      silent: true,
+    });
+  });
+
+  it('does not notify when the active tab needs attention', async () => {
+    const { callbacksByTab, tabs } = await setupWithTabs(2);
+
+    callbacksByTab.get(tabs[0].id)!.onAttentionChanged(true);
+
+    expect(createdNotifications).toHaveLength(0);
+  });
+
+  it('does not notify when attention clears on a background tab', async () => {
+    const { callbacksByTab, tabs } = await setupWithTabs(2);
+
+    callbacksByTab.get(tabs[1].id)!.onAttentionChanged(false);
+
+    expect(createdNotifications).toHaveLength(0);
+  });
+
+  it('notifies when a background tab finishes streaming without cancel', async () => {
+    const { callbacksByTab, tabs } = await setupWithTabs(2);
+    tabs[1].state.cancelRequested = false;
+
+    callbacksByTab.get(tabs[1].id)!.onStreamingChanged(false);
+
+    expect(createdNotifications).toHaveLength(1);
+    expect(createdNotifications[0]).toEqual({
+      title: 'Claudian',
+      body: 'Tab 2 "Test Tab" finished. Ready for review.',
+      silent: true,
+    });
+    expect(tabs[1].state.needsReview).toBe(true);
+  });
+
+  it('does not notify when a background tab finishes via user cancel', async () => {
+    const { callbacksByTab, tabs } = await setupWithTabs(2);
+    tabs[1].state.cancelRequested = true;
+
+    callbacksByTab.get(tabs[1].id)!.onStreamingChanged(false);
+
+    expect(createdNotifications).toHaveLength(0);
+    // Cancel-ended streams do not mark the tab for review either.
+    expect(tabs[1].state.needsReview).toBe(false);
+  });
+
+  it('does not notify when the active tab finishes streaming', async () => {
+    const { callbacksByTab, tabs } = await setupWithTabs(2);
+
+    callbacksByTab.get(tabs[0].id)!.onStreamingChanged(false);
+
+    expect(createdNotifications).toHaveLength(0);
+  });
+
+  it('does not notify when a background tab starts streaming', async () => {
+    const { callbacksByTab, tabs } = await setupWithTabs(2);
+
+    callbacksByTab.get(tabs[1].id)!.onStreamingChanged(true);
+
+    expect(createdNotifications).toHaveLength(0);
+  });
+});

@@ -62,6 +62,10 @@
       "expandOutput": "Befehlsausgabe ausklappen",
       "running": "Wird ausgeführt...",
       "copyFailed": "Kopieren in die Zwischenablage fehlgeschlagen"
+    },
+    "notifications": {
+      "needsAttention": "Tab {index} \"{title}\" needs your response",
+      "streamComplete": "Tab {index} \"{title}\" finished. Ready for review."
     }
   },
   "settings": {
@@ -282,6 +286,10 @@
     "deferMathRenderingDuringStreaming": {
       "name": "Mathe-Rendering während Streaming aufschieben",
       "desc": "LaTeX während des Streamings roh anzeigen und Mathematik einmal rendern, wenn der Textblock abgeschlossen ist."
+    },
+    "desktopNotifications": {
+      "name": "Desktop notifications",
+      "desc": "Show a system notification when a background tab needs your response or finishes streaming."
     },
     "chatViewPlacement": {
       "name": "Claudian öffnen in",

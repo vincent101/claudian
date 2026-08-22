@@ -62,6 +62,10 @@
       "expandOutput": "Развернуть вывод команды",
       "running": "Выполняется...",
       "copyFailed": "Не удалось скопировать в буфер обмена"
+    },
+    "notifications": {
+      "needsAttention": "Tab {index} \"{title}\" needs your response",
+      "streamComplete": "Tab {index} \"{title}\" finished. Ready for review."
     }
   },
   "settings": {
@@ -282,6 +286,10 @@
     "deferMathRenderingDuringStreaming": {
       "name": "Отложить рендеринг формул во время потока",
       "desc": "Показывать исходный LaTeX во время потоковой передачи и рендерить формулы один раз после завершения каждого текстового блока."
+    },
+    "desktopNotifications": {
+      "name": "Desktop notifications",
+      "desc": "Show a system notification when a background tab needs your response or finishes streaming."
     },
     "chatViewPlacement": {
       "name": "Открывать Claudian в",

@@ -62,6 +62,10 @@
       "expandOutput": "Expandir la salida del comando",
       "running": "Ejecutando...",
       "copyFailed": "No se pudo copiar al portapapeles"
+    },
+    "notifications": {
+      "needsAttention": "Tab {index} \"{title}\" needs your response",
+      "streamComplete": "Tab {index} \"{title}\" finished. Ready for review."
     }
   },
   "settings": {
@@ -282,6 +286,10 @@
     "deferMathRenderingDuringStreaming": {
       "name": "Diferir renderizado matemático durante streaming",
       "desc": "Mostrar LaTeX sin procesar mientras se transmite la respuesta y renderizar las fórmulas una vez al completar cada bloque de texto."
+    },
+    "desktopNotifications": {
+      "name": "Desktop notifications",
+      "desc": "Show a system notification when a background tab needs your response or finishes streaming."
     },
     "chatViewPlacement": {
       "name": "Abrir Claudian en",

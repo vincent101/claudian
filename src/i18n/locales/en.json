@@ -62,6 +62,10 @@
       "expandOutput": "Expand command output",
       "running": "Running...",
       "copyFailed": "Failed to copy to clipboard"
+    },
+    "notifications": {
+      "needsAttention": "Tab {index} \"{title}\" needs your response",
+      "streamComplete": "Tab {index} \"{title}\" finished. Ready for review."
     }
   },
   "settings": {
@@ -282,6 +286,10 @@
     "deferMathRenderingDuringStreaming": {
       "name": "Defer math rendering during streaming",
       "desc": "Show raw LaTeX while responses stream, then render math once when each text block completes."
+    },
+    "desktopNotifications": {
+      "name": "Desktop notifications",
+      "desc": "Show a system notification when a background tab needs your response or finishes streaming."
     },
     "chatViewPlacement": {
       "name": "Open Claudian in",

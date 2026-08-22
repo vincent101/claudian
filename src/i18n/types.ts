@@ -44,6 +44,10 @@ export type TranslationKey =
   | 'chat.bangBash.running'
   | 'chat.bangBash.copyFailed'
 
+  // Chat - Desktop notifications
+  | 'chat.notifications.needsAttention'
+  | 'chat.notifications.streamComplete'
+
   // Chat - Fork
   | 'chat.fork.ariaLabel'
   | 'chat.fork.chooseTarget'
@@ -223,6 +227,8 @@ export type TranslationKey =
   | 'settings.enableAutoScroll.desc'
   | 'settings.deferMathRenderingDuringStreaming.name'
   | 'settings.deferMathRenderingDuringStreaming.desc'
+  | 'settings.desktopNotifications.name'
+  | 'settings.desktopNotifications.desc'
   | 'settings.chatViewPlacement.name'
   | 'settings.chatViewPlacement.desc'
   | 'settings.chatViewPlacement.rightSidebar'

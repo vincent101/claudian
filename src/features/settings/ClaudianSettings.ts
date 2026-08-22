@@ -270,6 +270,18 @@ export class ClaudianSettingTab extends PluginSettingTab {
           })
       );
 
+    new Setting(container)
+      .setName(t('settings.desktopNotifications.name'))
+      .setDesc(t('settings.desktopNotifications.desc'))
+      .addToggle((toggle) =>
+        toggle
+          .setValue(this.plugin.settings.desktopNotifications ?? true)
+          .onChange(async (value) => {
+            this.plugin.settings.desktopNotifications = value;
+            await this.plugin.saveSettings();
+          })
+      );
+
     // --- Conversations ---
 
     new Setting(container).setName(t('settings.conversations')).setHeading();

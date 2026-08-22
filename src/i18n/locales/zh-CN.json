@@ -62,6 +62,10 @@
       "expandOutput": "展开命令输出",
       "running": "运行中...",
       "copyFailed": "复制到剪贴板失败"
+    },
+    "notifications": {
+      "needsAttention": "Tab {index}「{title}」需要你回应",
+      "streamComplete": "Tab {index}「{title}」已完成，待检查"
     }
   },
   "settings": {
@@ -282,6 +286,10 @@
     "deferMathRenderingDuringStreaming": {
       "name": "流式传输时延迟渲染数学公式",
       "desc": "响应流式传输时显示原始 LaTeX，并在每个文本块完成后只渲染一次数学公式。"
+    },
+    "desktopNotifications": {
+      "name": "桌面系统通知",
+      "desc": "后台标签页需要回应或回复完成时发送系统通知。"
     },
     "chatViewPlacement": {
       "name": "Claudian 打开位置",

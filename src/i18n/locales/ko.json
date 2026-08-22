@@ -62,6 +62,10 @@
       "expandOutput": "명령 출력 펼치기",
       "running": "실행 중...",
       "copyFailed": "클립보드에 복사하지 못했습니다"
+    },
+    "notifications": {
+      "needsAttention": "Tab {index} \"{title}\" needs your response",
+      "streamComplete": "Tab {index} \"{title}\" finished. Ready for review."
     }
   },
   "settings": {
@@ -282,6 +286,10 @@
     "deferMathRenderingDuringStreaming": {
       "name": "스트리밍 중 수식 렌더링 지연",
       "desc": "응답이 스트리밍되는 동안 원본 LaTeX를 표시하고 각 텍스트 블록이 완료되면 수식을 한 번 렌더링합니다."
+    },
+    "desktopNotifications": {
+      "name": "Desktop notifications",
+      "desc": "Show a system notification when a background tab needs your response or finishes streaming."
     },
     "chatViewPlacement": {
       "name": "Claudian 열 위치",

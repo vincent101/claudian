@@ -62,6 +62,10 @@
       "expandOutput": "展開指令輸出",
       "running": "執行中...",
       "copyFailed": "複製到剪貼簿失敗"
+    },
+    "notifications": {
+      "needsAttention": "Tab {index}「{title}」需要你回應",
+      "streamComplete": "Tab {index}「{title}」已完成，待檢查"
     }
   },
   "settings": {
@@ -282,6 +286,10 @@
     "deferMathRenderingDuringStreaming": {
       "name": "串流傳輸時延遲渲染數學公式",
       "desc": "回應串流傳輸時顯示原始 LaTeX，並在每個文字區塊完成後只渲染一次數學公式。"
+    },
+    "desktopNotifications": {
+      "name": "桌面系統通知",
+      "desc": "背景分頁需要回應或回覆完成時發送系統通知。"
     },
     "chatViewPlacement": {
       "name": "Claudian 開啟位置",

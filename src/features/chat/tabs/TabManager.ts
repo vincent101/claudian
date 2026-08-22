@@ -13,6 +13,7 @@ import type { Conversation, SlashCommand } from '../../../core/types';
 import { t } from '../../../i18n/i18n';
 import type ClaudianPlugin from '../../../main';
 import { chooseForkTarget } from '../../../shared/modals/ForkTargetModal';
+import { type DesktopNotificationKind,notifyBackgroundTabStateChange } from './desktopNotifier';
 import { getTabProviderId } from './providerResolution';
 import {
   activateTab,
@@ -106,6 +107,24 @@ export class TabManager implements TabManagerInterface {
     return Math.max(MIN_TABS, Math.min(MAX_TABS, settingsValue));
   }
 
+  /**
+   * Fires a desktop notification for a background tab state edge.
+   * The index is the 1-based position the tab bar shows for this tab.
+   */
+  private notifyBackgroundTab(tab: TabData, kind: DesktopNotificationKind): void {
+    const tabIndex = Array.from(this.tabs.keys()).indexOf(tab.id) + 1;
+    if (tabIndex === 0) {
+      return;
+    }
+
+    notifyBackgroundTabStateChange({
+      plugin: this.plugin,
+      kind,
+      tabIndex,
+      tabTitle: getTabTitle(tab, this.plugin),
+    });
+  }
+
   constructor(
     plugin: ClaudianPlugin,
     containerEl: HTMLElement,
@@ -183,6 +202,7 @@ export class TabManager implements TabManagerInterface {
       onStreamingChanged: (isStreaming) => {
         if (!isStreaming && tab.id !== this.activeTabId && !tab.state.cancelRequested) {
           tab.state.needsReview = true;
+          this.notifyBackgroundTab(tab, 'streamComplete');
         }
         this.callbacks.onTabStreamingChanged?.(tab.id, isStreaming);
       },
@@ -190,6 +210,9 @@ export class TabManager implements TabManagerInterface {
         this.callbacks.onTabTitleChanged?.(tab.id, title);
       },
       onAttentionChanged: (needsAttention) => {
+        if (needsAttention && tab.id !== this.activeTabId) {
+          this.notifyBackgroundTab(tab, 'needsAttention');
+        }
         this.callbacks.onTabAttentionChanged?.(tab.id, needsAttention);
       },
       onConversationIdChanged: (conversationId) => {
