@@ -167,6 +167,18 @@ function isTaskNotificationMessage(message: SDKMessage): boolean {
   return record['type'] === 'system' && record['subtype'] === 'task_notification';
 }
 
+/**
+ * Ghost auto turn guard: the only message kinds that legitimately begin an
+ * SDK-initiated turn. assistant content (and streaming deltas) are turn
+ * content; everything else trailing a settled turn (queue-operation records,
+ * bookkeeping kinds) is not — starting an auto turn on them would deadlock
+ * the lease (no result ever follows).
+ */
+function isAutoTurnStartMessage(message: SDKMessage): boolean {
+  const type = (message as { type?: string }).type;
+  return type === 'assistant' || type === 'stream_event';
+}
+
 export class ClaudianService implements ChatRuntime {
   readonly providerId = CLAUDE_PROVIDER_CAPABILITIES.providerId;
   private plugin: ClaudianPlugin;
@@ -986,6 +998,22 @@ export class ClaudianService implements ChatRuntime {
     // likely than the ~49% ghost-lease hang this branch removes.
     if (!turn && isTaskNotificationMessage(message)) {
       this.dispatchTaskNotification(message);
+      return;
+    }
+
+    // Ghost auto turn guard (0823 console-logging evidence): only genuine turn
+    // content may start an auto turn. Non-content traffic that arrives without
+    // a lease — queue-operation records, unknown message kinds trailing a
+    // settled user turn — would create an auto turn that never sees a result,
+    // permanently holding the channel + feature lease (tab stuck "running",
+    // next message queues, ESC dead, reload required). The race depends on
+    // millisecond ordering between result settlement and the trailing message,
+    // which is why it appeared intermittent.
+    if (!turn && !isAutoTurnStartMessage(message)) {
+      console.warn('[Claudian] non-turn message arrived with no lease; dropping', {
+        type: (message as { type?: string }).type,
+        subtype: (message as { subtype?: string }).subtype ?? null,
+      });
       return;
     }
 

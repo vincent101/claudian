@@ -4007,6 +4007,51 @@ describe('ClaudianService', () => {
         ]);
       });
 
+      it('a non-notification queue-operation with no lease starts no auto turn (ghost guard)', async () => {
+        // Ghost auto turn guard (0823 evidence): trailing queue-operation
+        // records after a settled user turn must not open an auto turn whose
+        // result never arrives — the millisecond race between result
+        // settlement and the trailing record is what made the hang intermittent.
+        const started: any[] = [];
+        service.setOnAutoTurnStarted((event) => started.push({ ...event }));
+
+        await (service as any).routeMessage({
+          type: 'queue-operation',
+          operation: 'enqueue',
+          content: 'just a queue record, not a notification',
+        });
+
+        expect(started).toHaveLength(0);
+        expect([...(service as any).runtimeTurns.keys()]).toEqual([]);
+        expect(channelOf().getActiveTurnId()).toBeNull();
+      });
+
+      it('an unknown message kind with no lease is dropped without starting an auto turn', async () => {
+        const started: any[] = [];
+        service.setOnAutoTurnStarted((event) => started.push({ ...event }));
+
+        await (service as any).routeMessage({ type: 'progress', subtype: 'bookkeeping' });
+
+        expect(started).toHaveLength(0);
+        expect([...(service as any).runtimeTurns.keys()]).toEqual([]);
+        expect(channelOf().getActiveTurnId()).toBeNull();
+      });
+
+      it('an assistant message with no lease still opens the auto turn (guard whitelist regression)', async () => {
+        const started: any[] = [];
+        service.setOnAutoTurnStarted((event) => started.push({ ...event }));
+
+        await (service as any).routeMessage({
+          type: 'assistant',
+          message: { role: 'assistant', content: [{ type: 'text', text: 'hi' }] },
+          parent_tool_use_id: null,
+          session_id: '',
+        });
+
+        expect(started).toHaveLength(1);
+        expect(channelOf().getActiveTurnId()).toBe(started[0].turnId);
+      });
+
       it('a user message enqueued after a lease-less pure notification dequeues immediately and signs the lease', async () => {
         // Ghost-lease regression core: the pure notification must not leave a
         // lease behind, or the next user message dead-waits on it forever.
