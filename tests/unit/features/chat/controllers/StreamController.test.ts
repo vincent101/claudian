@@ -2595,3 +2595,111 @@ describe('StreamController - Turn-lease hotfix (fix 3: cancellable render flush)
     expect(msg2.contentBlocks).toContainEqual({ type: 'text', content: 'new turn' });
   });
 });
+
+describe('StreamController - Turn-lease hotfix follow-up (cancellable finalize render)', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    deps = createMockDeps();
+    controller = new StreamController(deps);
+    deps.state.currentContentEl = createMockEl();
+  });
+
+  afterEach(() => {
+    deps.state.resetStreamingState();
+  });
+
+  it('settles a hung math-deferred text finalize render on cancel and completes finalize', async () => {
+    // The finalize-time renderContent (math-deferred path) never settles.
+    (deps.renderer.renderContent as jest.Mock).mockImplementation(
+      () => new Promise<void>(() => {})
+    );
+    deps.state.currentTextEl = createMockEl();
+    deps.state.currentTextContent = 'answer $x^2$';
+
+    const msg = createTestMessage();
+    const context = ctx(msg);
+    const finalize = controller.finalizeCurrentTextBlock(msg, context);
+    let settled = false;
+    void finalize.then(() => { settled = true; });
+    await Promise.resolve();
+    await Promise.resolve();
+    // The finalize is parked on the hung render promise.
+    expect(settled).toBe(false);
+
+    controller.invalidateRenderFlush();
+    await finalize;
+
+    expect(settled).toBe(true);
+    // Data integrity: contentBlocks capture and state cleanup still run.
+    expect(msg.contentBlocks).toContainEqual({ type: 'text', content: 'answer $x^2$' });
+    expect(deps.state.currentTextEl).toBeNull();
+    expect(deps.state.currentTextContent).toBe('');
+    expect(context.textBuffer).toBe('');
+  });
+
+  it('settles a hung thinking finalize render on cancel and completes finalize', async () => {
+    (deps.renderer.renderContent as jest.Mock).mockImplementation(
+      () => new Promise<void>(() => {})
+    );
+    deps.state.currentThinkingState = {
+      content: 'reasoning $x$',
+      container: createMockEl(),
+      contentEl: createMockEl(),
+      startTime: Date.now(),
+    } as any;
+
+    const msg = createTestMessage();
+    const context = ctx(msg);
+    const finalize = controller.finalizeCurrentThinkingBlock(msg, context);
+    let settled = false;
+    void finalize.then(() => { settled = true; });
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(settled).toBe(false);
+
+    controller.invalidateRenderFlush();
+    await finalize;
+
+    expect(settled).toBe(true);
+    expect(msg.contentBlocks).toContainEqual(
+      expect.objectContaining({ type: 'thinking', content: 'reasoning $x$' })
+    );
+    expect(deps.state.currentThinkingState).toBeNull();
+    expect(context.thinkingBuffer).toBe('');
+  });
+
+  it('skips the finalize render wait when invalidation already fired', async () => {
+    (deps.renderer.renderContent as jest.Mock).mockImplementation(
+      () => new Promise<void>(() => {})
+    );
+    deps.state.currentTextEl = createMockEl();
+    deps.state.currentTextContent = 'cancelled math $x$';
+
+    controller.invalidateRenderFlush();
+
+    const msg = createTestMessage();
+    const finalize = controller.finalizeCurrentTextBlock(msg, ctx(msg));
+    // Pre-invalidated: renderContent never settles, so finalize completing at
+    // all (instead of timing out) proves it skipped the render wait.
+    await finalize;
+
+    // The render was issued but dropped, and data finalize still completed.
+    expect(deps.renderer.renderContent).toHaveBeenCalled();
+    expect(msg.contentBlocks).toContainEqual({ type: 'text', content: 'cancelled math $x$' });
+    expect(deps.state.currentTextEl).toBeNull();
+  });
+
+  it('keeps the normal finalize render path when no invalidation occurs', async () => {
+    (deps.renderer.renderContent as jest.Mock).mockResolvedValue(undefined);
+    const textEl = createMockEl();
+    deps.state.currentTextEl = textEl;
+    deps.state.currentTextContent = 'plain math $x$';
+
+    const msg = createTestMessage();
+    await controller.finalizeCurrentTextBlock(msg, ctx(msg));
+
+    expect(deps.renderer.renderContent).toHaveBeenCalledWith(textEl, 'plain math $x$');
+    expect(msg.contentBlocks).toContainEqual({ type: 'text', content: 'plain math $x$' });
+    expect(deps.state.currentTextEl).toBeNull();
+  });
+});

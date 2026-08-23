@@ -177,6 +177,26 @@ export class StreamController {
     };
   }
 
+  /**
+   * Turn-scoped cancellable await for finalize-time renderContent calls: the
+   * math-deferred finalize path runs outside the scheduled flush pipeline and
+   * has no pending-render promise of its own, so a cancelled turn must not
+   * block finalize on renderer DOM state it no longer owns. Loser promise is
+   * dropped — the data finalize below still runs on either outcome.
+   */
+  private async awaitRenderCancelable(render: Promise<void>): Promise<'rendered' | 'invalidated'> {
+    if (this.renderFlushInvalidated) return 'invalidated';
+    const invalidation = this.waitForRenderFlushInvalidation();
+    try {
+      return await Promise.race([
+        Promise.resolve(render).then(() => 'rendered' as const),
+        invalidation.promise.then(() => 'invalidated' as const),
+      ]);
+    } finally {
+      invalidation.dispose();
+    }
+  }
+
   /** Turn id of the turn whose flushes are in flight, for lease-phase logging. */
   private activeFlushTurnId(): string {
     return this.activeContext?.turnId ?? 'unknown';
@@ -799,7 +819,15 @@ export class StreamController {
         && this.shouldDeferMathRendering()
         && hasStreamingMathDelimiters(textContent)
       ) {
-        await renderer.renderContent(state.currentTextEl, textContent);
+        // Cancellable finalize render (fix 3 follow-up): the math-deferred
+        // renderContent has no pending-render promise of its own, so it must
+        // join the same turn-scoped invalidation as flushPendingTextRender.
+        const turnId = this.activeFlushTurnId();
+        console.debug('[Claudian] projection.finalizeRender.begin', { turnId, kind: 'text' });
+        const outcome = await this.awaitRenderCancelable(
+          renderer.renderContent(state.currentTextEl, textContent)
+        );
+        console.debug('[Claudian] projection.finalizeRender.end', { turnId, kind: 'text', outcome });
       }
       msg.contentBlocks = msg.contentBlocks || [];
       msg.contentBlocks.push({ type: 'text', content: textContent });
@@ -972,7 +1000,14 @@ export class StreamController {
 
     if (thinkingState) {
       if (this.getStreamingRenderOptions(thinkingState.content)) {
-        await renderer.renderContent(thinkingState.contentEl, thinkingState.content);
+        // Cancellable finalize render (fix 3 follow-up) — same turn-scoped
+        // invalidation as flushPendingThinkingRender.
+        const turnId = this.activeFlushTurnId();
+        console.debug('[Claudian] projection.finalizeRender.begin', { turnId, kind: 'thinking' });
+        const outcome = await this.awaitRenderCancelable(
+          renderer.renderContent(thinkingState.contentEl, thinkingState.content)
+        );
+        console.debug('[Claudian] projection.finalizeRender.end', { turnId, kind: 'thinking', outcome });
       }
 
       const durationSeconds = finalizeThinkingBlock(thinkingState);
