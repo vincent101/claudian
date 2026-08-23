@@ -2489,3 +2489,109 @@ describe('StreamController - Detached DOM projection', () => {
     expect(deps.state.usage).toEqual(usage);
   });
 });
+
+describe('StreamController - Turn-lease hotfix (fix 3: cancellable render flush)', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    jest.useFakeTimers();
+    deps = createMockDeps();
+    controller = new StreamController(deps);
+    deps.state.currentContentEl = createMockEl();
+  });
+
+  afterEach(() => {
+    deps.state.resetStreamingState();
+    jest.useRealTimers();
+  });
+
+  it('settles a hung text render flush on cancel and completes finalize', async () => {
+    // The render pipeline never settles: renderContent hangs forever.
+    (deps.renderer.renderContent as jest.Mock).mockImplementation(
+      () => new Promise<void>(() => {})
+    );
+    deps.state.currentTextEl = createMockEl();
+
+    await controller.appendText('tail block');
+    // Fire the scheduled render frame so renderPendingText is stuck inside
+    // the hung renderContent await.
+    jest.advanceTimersByTime(16);
+    await Promise.resolve();
+
+    const msg = createTestMessage();
+    const finalize = controller.finalizeCurrentTextBlock(msg, ctx(msg));
+    let settled = false;
+    void finalize.then(() => { settled = true; });
+    await Promise.resolve();
+    await Promise.resolve();
+    // The flush is parked on the hung render promise.
+    expect(settled).toBe(false);
+
+    // Cancel / lifecycle invalidation must actively settle the flush.
+    controller.invalidateRenderFlush();
+    await finalize;
+
+    expect(settled).toBe(true);
+    // The data layer still captured the full text for persistence.
+    expect(msg.contentBlocks).toContainEqual({ type: 'text', content: 'tail block' });
+  });
+
+  it('settles a hung thinking render flush on cancel and completes finalize', async () => {
+    (deps.renderer.renderContent as jest.Mock).mockImplementation(
+      () => new Promise<void>(() => {})
+    );
+
+    await controller.appendThinking('deep thought');
+    jest.advanceTimersByTime(16);
+    await Promise.resolve();
+
+    const msg = createTestMessage();
+    const finalize = controller.finalizeCurrentThinkingBlock(msg, ctx(msg));
+    let settled = false;
+    void finalize.then(() => { settled = true; });
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(settled).toBe(false);
+
+    controller.invalidateRenderFlush();
+    await finalize;
+
+    expect(settled).toBe(true);
+    expect(msg.contentBlocks).toContainEqual(
+      expect.objectContaining({ type: 'thinking', content: 'deep thought' })
+    );
+  });
+
+  it('drops a pending render immediately when invalidation already fired, and a new scope restores normal flushes', async () => {
+    (deps.renderer.renderContent as jest.Mock).mockResolvedValue(undefined);
+    deps.state.currentTextEl = createMockEl();
+
+    controller.invalidateRenderFlush();
+
+    await controller.appendText('cancelled tail');
+    const msg = createTestMessage();
+    const finalize = controller.finalizeCurrentTextBlock(msg, ctx(msg));
+    let settled = false;
+    void finalize.then(() => { settled = true; });
+    // Pre-invalidated: the flush must complete without waiting for the frame.
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(settled).toBe(true);
+    await finalize;
+    expect(msg.contentBlocks).toContainEqual({ type: 'text', content: 'cancelled tail' });
+
+    // A new user turn opens a fresh scope: flushes wait for the render again.
+    controller.beginRenderFlushScope();
+    deps.state.currentTextEl = createMockEl();
+    await controller.appendText('new turn');
+    const msg2 = createTestMessage();
+    const finalize2 = controller.finalizeCurrentTextBlock(msg2, ctx(msg2));
+    let settled2 = false;
+    void finalize2.then(() => { settled2 = true; });
+    // Frame not fired yet → the flush is still parked.
+    expect(settled2).toBe(false);
+    jest.advanceTimersByTime(16);
+    await finalize2;
+    expect(settled2).toBe(true);
+    expect(msg2.contentBlocks).toContainEqual({ type: 'text', content: 'new turn' });
+  });
+});

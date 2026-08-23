@@ -270,8 +270,30 @@ export class InputController {
     // feature lease must be taken before any user/assistant DOM is created
     // (v3 §3) so a racing auto turn cannot interleave.
     const turnId = this.deps.generateId();
-    this.getTurnCoordinator()?.beginUserTurn(turnId, streamGeneration);
+    const turnCoordinator = this.getTurnCoordinator();
+    if (turnCoordinator && !turnCoordinator.beginUserTurn(turnId, streamGeneration)) {
+      // Fail-fast (turn-lease hotfix): the lease was lost between the
+      // isBusy() gate above and here — queue behind the winner instead of
+      // creating UI/runtime turn state for a lease this send does not own.
+      // isStreaming stays true: the lease winner owns it now.
+      state.queuedMessage = this.mergeQueuedMessages(state.queuedMessage, {
+        content,
+        images: hasImages ? [...(imageContextManager?.getAttachedImages() || [])] : undefined,
+        editorContext: selectionController.getContext(),
+        browserContext: browserSelectionController?.getContext() ?? null,
+        canvasContext: canvasSelectionController.getContext(),
+      });
+      imageContextManager?.clearImages();
+      this.updateQueueIndicator();
+      return;
+    }
 
+    // Turn-scoped render flushes (turn-lease hotfix): a fresh scope so a
+    // cancel/invalidation from a previous turn cannot drop this turn's
+    // pending renders.
+    streamController.beginRenderFlushScope?.();
+
+    try {
     // Hide welcome message when sending first message
     const welcomeEl = this.deps.getWelcomeEl();
     if (welcomeEl) {
@@ -362,10 +384,6 @@ export class InputController {
         new Notice('Failed to initialize agent service. Please try again.');
         streamController.hideThinkingIndicator();
         state.isStreaming = false;
-        this.getTurnCoordinator()?.finish(turnId);
-        this.activeStreamingAssistantMessage = null;
-        this.activeTurnContext = null;
-        this.resetProviderMessageBoundaryState();
         return;
       }
     }
@@ -373,10 +391,6 @@ export class InputController {
     const agentService = this.getAgentService();
     if (!agentService) {
       new Notice('Agent service not available. Please reload the plugin.');
-      this.getTurnCoordinator()?.finish(turnId);
-      this.activeStreamingAssistantMessage = null;
-      this.activeTurnContext = null;
-      this.resetProviderMessageBoundaryState();
       return;
     }
 
@@ -582,7 +596,10 @@ export class InputController {
                 // unhandled rejection if an unexpected error slips through.
               });
             } else if (shouldProcessQueuedMessage) {
-              this.processQueuedMessage();
+              // Queue drain is single-owner (turn-lease hotfix): release()
+              // is the only pump — it validates the settled turn against the
+              // current conversation/lifecycle and pumps exactly once.
+              this.getTurnCoordinator()?.release(turnId);
             }
           }
         }
@@ -604,6 +621,26 @@ export class InputController {
         this.activeTurnContext = null;
         this.resetProviderMessageBoundaryState();
       }
+    }
+    } finally {
+      // Outer protective lease (turn-lease hotfix fix 1): covers every await
+      // from beginUserTurn() to the end of the turn — title generation,
+      // service init, checkpoint restore, query, projection and save. Any
+      // rejection here previously leaked the feature lease (isBusy() stuck
+      // true, all future sends dead-ended in the queue).
+      this.getTurnCoordinator()?.finish(turnId);
+
+      // Defensive cleanup for paths that never reached the cleanup body
+      // (title/init rejection): only when no newer turn took over the
+      // stream generation — a newer turn owns the flag and the DOM then.
+      if (state.streamGeneration === streamGeneration && state.isStreaming) {
+        state.isStreaming = false;
+        streamController.hideThinkingIndicator();
+      }
+
+      this.activeStreamingAssistantMessage = null;
+      this.activeTurnContext = null;
+      this.resetProviderMessageBoundaryState();
     }
   }
 
@@ -1168,6 +1205,9 @@ export class InputController {
     const { state, streamController } = this.deps;
     if (!state.isStreaming) return;
     state.cancelRequested = true;
+    // Settle any pending render flush now (fix 3): the generator's finalize
+    // must not hang on a render promise for a turn the user just cancelled.
+    streamController.invalidateRenderFlush?.();
     // Restore queued message to input instead of discarding
     this.restorePendingMessagesToInput();
     this.getAgentService()?.cancel();

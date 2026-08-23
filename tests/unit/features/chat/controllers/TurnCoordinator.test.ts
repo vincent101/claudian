@@ -172,4 +172,51 @@ describe('TurnCoordinator - feature turn lease (S2)', () => {
       expect(coordinator.canProjectAutoTurn()).toBe(false);
     });
   });
+
+  describe('turn-lease hotfix', () => {
+    it('pumps exactly once when the same turn is released repeatedly (fix 5)', () => {
+      const { coordinator, processQueuedMessage } = createDeps();
+      coordinator.beginAutoTurn('auto-1', 0);
+      coordinator.finish('auto-1');
+      coordinator.release('auto-1');
+      coordinator.release('auto-1');
+      coordinator.release('auto-1');
+      expect(processQueuedMessage).toHaveBeenCalledTimes(1);
+    });
+
+    it('pumps exactly once for a repeated user-turn release (fix 4 + fix 5)', () => {
+      const { coordinator, processQueuedMessage } = createDeps();
+      coordinator.beginUserTurn('user-1', 1);
+      coordinator.finish('user-1');
+      coordinator.release('user-1');
+      coordinator.release('user-1');
+      expect(processQueuedMessage).toHaveBeenCalledTimes(1);
+    });
+
+    it('cancelTurnFromRuntime clears only the matching lease and keeps the settled record (fix 6)', () => {
+      const { coordinator, processQueuedMessage } = createDeps();
+      coordinator.beginUserTurn('user-1', 1);
+      expect(coordinator.cancelTurnFromRuntime('user-1')).toBe(true);
+      expect(coordinator.isBusy()).toBe(false);
+      // A late release from the same turn still pumps — exactly once.
+      coordinator.release('user-1');
+      coordinator.release('user-1');
+      expect(processQueuedMessage).toHaveBeenCalledTimes(1);
+    });
+
+    it('cancelTurnFromRuntime ignores a foreign turnId', () => {
+      const { coordinator } = createDeps();
+      coordinator.beginUserTurn('user-1', 1);
+      expect(coordinator.cancelTurnFromRuntime('user-other')).toBe(false);
+      expect(coordinator.isBusy()).toBe(true);
+    });
+
+    it('cancelTurnFromRuntime clears an auto lease and drops isStreaming', () => {
+      const { coordinator, state } = createDeps();
+      coordinator.beginAutoTurn('auto-1', 0);
+      expect(coordinator.cancelTurnFromRuntime('auto-1')).toBe(true);
+      expect(coordinator.isBusy()).toBe(false);
+      expect(state.isStreaming).toBe(false);
+    });
+  });
 });

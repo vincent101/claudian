@@ -3318,4 +3318,102 @@ describe('InputController - Message Queue', () => {
       expect(mockAgentService.query).toHaveBeenCalledTimes(1);
     });
   });
+
+  describe('Turn-lease hotfix (fix 1/2/4)', () => {
+    let controller: InputController;
+    let deps: ReturnType<typeof createSendableDeps>;
+    let inputEl: ReturnType<typeof createMockInputEl>;
+    let coordinator: TurnCoordinator;
+    let pump: jest.Mock;
+
+    beforeEach(() => {
+      jest.clearAllMocks();
+      deps = createSendableDeps();
+      inputEl = deps.getInputEl() as ReturnType<typeof createMockInputEl>;
+      pump = jest.fn();
+      coordinator = new TurnCoordinator({
+        state: deps.state,
+        getConversationId: () => deps.state.currentConversationId,
+        processQueuedMessage: pump,
+      });
+      (deps as any).getTurnCoordinator = () => coordinator;
+      (deps as any).mockAgentService.query = jest.fn().mockImplementation(() =>
+        createMockStream([{ type: 'done' }]),
+      );
+      controller = new InputController(deps);
+    });
+
+    it('releases the feature lease when title generation rejects (fix 1)', async () => {
+      (deps.plugin.renameConversation as jest.Mock).mockRejectedValue(new Error('disk full'));
+
+      inputEl.value = 'first message';
+
+      await expect(controller.sendMessage()).rejects.toThrow('disk full');
+
+      expect(coordinator.isBusy()).toBe(false);
+      expect(deps.state.isStreaming).toBe(false);
+    });
+
+    it('releases the feature lease when ensureServiceInitialized rejects (fix 1)', async () => {
+      deps.ensureServiceInitialized = () => Promise.reject(new Error('init boom'));
+
+      inputEl.value = 'first message';
+
+      await expect(controller.sendMessage()).rejects.toThrow('init boom');
+
+      expect(coordinator.isBusy()).toBe(false);
+      expect(deps.state.isStreaming).toBe(false);
+      // No runtime turn was ever created.
+      expect((deps as any).mockAgentService.query).not.toHaveBeenCalled();
+    });
+
+    it('fail-fasts into the queue without creating a turn when beginUserTurn is refused (fix 2)', async () => {
+      // Simulate the lease being lost between the isBusy() gate and
+      // beginUserTurn() (defensive branch — the window is synchronous today).
+      jest.spyOn(coordinator, 'isBusy').mockReturnValue(false);
+      jest.spyOn(coordinator, 'beginUserTurn').mockReturnValue(false);
+
+      inputEl.value = 'raced message';
+
+      await controller.sendMessage();
+
+      expect(deps.state.queuedMessage).toEqual(
+        expect.objectContaining({ content: 'raced message' }),
+      );
+      expect(deps.state.messages).toHaveLength(0);
+      expect((deps as any).mockAgentService.query).not.toHaveBeenCalled();
+      // isStreaming stays true: the lease winner (auto/user turn) owns it now.
+    });
+
+    it('drains the queued message through TurnCoordinator.release exactly once at turn end (fix 4)', async () => {
+      inputEl.value = 'first message';
+      const turnIdPromise = controller.sendMessage();
+
+      // A follow-up arrives while the turn is streaming: it queues.
+      await turnIdPromise;
+
+      // The turn-end pump went through release() (the coordinator owns it),
+      // not through a direct processQueuedMessage call.
+      expect(pump).toHaveBeenCalledTimes(1);
+
+      // The settled record was consumed: a repeated release must not re-pump.
+      const request = ((deps as any).mockAgentService.prepareTurn as jest.Mock).mock.calls[0][0];
+      coordinator.release(request.turnId);
+      expect(pump).toHaveBeenCalledTimes(1);
+    });
+
+    it('cancelStreaming settles pending render flushes (fix 3 wiring)', () => {
+      const invalidateRenderFlush = jest.fn();
+      (deps as any).streamController = {
+        ...deps.streamController,
+        invalidateRenderFlush,
+      } as any;
+      controller = new InputController(deps);
+
+      deps.state.isStreaming = true;
+      controller.cancelStreaming();
+
+      expect(invalidateRenderFlush).toHaveBeenCalledTimes(1);
+    });
+  });
 });

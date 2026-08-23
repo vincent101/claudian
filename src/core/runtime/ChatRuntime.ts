@@ -66,6 +66,13 @@ export interface ChatRuntime {
   setOnAutoTurnFinished?(callback: ((turnId: string) => void) | null): void;
   setOnAutoTurnReleased?(callback: ((turnId: string) => void) | null): void;
   setOnAutoTurnCancelled?(callback: ((event: AutoTurnCancelledEvent) => void) | null): void;
+  /**
+   * Turn-lease hotfix fix 6 (providers with a message-queue channel only):
+   * fired when a queued message dequeues for a turn the runtime no longer
+   * knows — the feature layer conditionally cancels its lease for the same
+   * turnId so runtime and feature leases cannot drift apart.
+   */
+  setOnUnregisteredTurnDequeued?(callback: ((turnId: string) => void) | null): void;
   consumeTurnMetadata(): ChatTurnMetadata;
 
   buildSessionUpdates(params: {

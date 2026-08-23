@@ -790,6 +790,8 @@ export class CodexChatRuntime implements ChatRuntime {
   setOnAutoTurnFinished(_callback: ((turnId: string) => void) | null): void {}
   setOnAutoTurnReleased(_callback: ((turnId: string) => void) | null): void {}
   setOnAutoTurnCancelled(_callback: ((event: AutoTurnCancelledEvent) => void) | null): void {}
+  // Turn-lease hotfix fix 6: Codex has no channel-queued turns — no-op.
+  setOnUnregisteredTurnDequeued(_callback: ((turnId: string) => void) | null): void {}
 
   buildSessionUpdates(params: {
     conversation: Conversation | null;

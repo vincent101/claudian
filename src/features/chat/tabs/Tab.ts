@@ -1269,8 +1269,15 @@ export function initializeTabControllers(
       getMcpServerSelector: () => ui.mcpServerSelector,
       getExternalContextSelector: () => ui.externalContextSelector,
       clearQueuedMessage: () => tab.controllers.inputController?.clearQueuedMessage(),
-      /** S2 lifecycle cancellation: feature lease generation++ on reset/switch. */
-      invalidateTurnLifecycle: () => tab.controllers.turnCoordinator?.invalidateLifecycle(),
+      /**
+       * S2 lifecycle cancellation: feature lease generation++ on reset/switch.
+       * Also settles pending render flushes (turn-lease hotfix fix 3) so a
+       * finalize in flight cannot hang on DOM state of the old lifecycle.
+       */
+      invalidateTurnLifecycle: () => {
+        tab.controllers.turnCoordinator?.invalidateLifecycle();
+        tab.controllers.streamController?.invalidateRenderFlush();
+      },
       getTitleGenerationService: () => services.titleGenerationService,
       getStatusPanel: () => ui.statusPanel,
       getAgentService: () => tab.service, // Use tab's service instead of plugin's
@@ -1735,6 +1742,11 @@ export function setupServiceCallbacks(tab: TabData, plugin: ClaudianPlugin): voi
     });
     tab.service.setOnAutoTurnCancelled?.((event) => {
       tab.controllers.turnCoordinator?.cancelAutoTurn(event.turnId, event.generation);
+    });
+    // Turn-lease hotfix fix 6: the runtime lost a turn that dequeued — clear
+    // the feature lease for the same turnId so the layers cannot drift.
+    tab.service.setOnUnregisteredTurnDequeued?.((turnId) => {
+      tab.controllers.turnCoordinator?.cancelTurnFromRuntime(turnId);
     });
     tab.service.setPermissionModeSyncCallback((sdkMode) => {
       const mode = sdkMode === 'bypassPermissions' || sdkMode === 'yolo'

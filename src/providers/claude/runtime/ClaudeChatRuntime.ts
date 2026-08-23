@@ -232,6 +232,12 @@ export class ClaudianService implements ChatRuntime {
   private _onAutoTurnReleased: ((turnId: string) => void) | null = null;
   /** S2 lifecycle: feature clears its auto lease only (v3 §4.2). */
   private _onAutoTurnCancelled: ((event: AutoTurnCancelledEvent) => void) | null = null;
+  /**
+   * Turn-lease hotfix fix 6: a queued message dequeued for a turn the runtime
+   * no longer knows — the feature layer conditionally cancels its lease for
+   * the same turnId so the two layers cannot drift apart.
+   */
+  private _onUnregisteredTurnDequeued: ((turnId: string) => void) | null = null;
 
   // S1 turn-lease base: live turn registry keyed by turnId. All transform,
   // usage, metadata and dedup state lives on the turn, never on the runtime.
@@ -1244,6 +1250,12 @@ export class ClaudianService implements ChatRuntime {
    * the released signal that lets the UI queue proceed.
    */
   private async settleTurnAtResult(turn: RuntimeTurn): Promise<void> {
+    console.debug('[Claudian] runtime.result', {
+      turnId: turn.id,
+      kind: turn.kind,
+      waiters: turn.waiters.size,
+      generation: turn.generation,
+    });
     turn.phase = 'projecting';
 
     if (turn.waiters.size > 0) {
@@ -1306,6 +1318,13 @@ export class ClaudianService implements ChatRuntime {
       // (cancelled earlier). Release the item and continue with the next.
       console.warn('[Claudian] dequeued message for unregistered turn; releasing', { turnId });
       this.completeChannelTurn(turnId);
+      // Fix 6: the feature layer may still hold the lease for this turnId —
+      // notify it so both layers settle for the same turn instead of drifting.
+      try {
+        this._onUnregisteredTurnDequeued?.(turnId);
+      } catch (error) {
+        console.warn('[Claudian] onUnregisteredTurnDequeued callback failed', error);
+      }
       return;
     }
     if (turn.phase === 'queued') {
@@ -1464,9 +1483,12 @@ export class ClaudianService implements ChatRuntime {
       return;
     }
     this.deferredRestartPaths = null;
+    console.debug('[Claudian] deferredRestart.begin', { turnId: exemptTurnId ?? null, paths });
     try {
       await this.ensureReady({ force: true, externalContextPaths: paths });
+      console.debug('[Claudian] deferredRestart.end', { turnId: exemptTurnId ?? null, ok: true });
     } catch (error) {
+      console.debug('[Claudian] deferredRestart.end', { turnId: exemptTurnId ?? null, ok: false });
       console.warn('[Claudian] deferred restart failed; next query will retry', error);
     }
   }
@@ -2052,6 +2074,11 @@ export class ClaudianService implements ChatRuntime {
 
       yield { type: 'done' };
     } finally {
+      console.debug('[Claudian] generator.finally', {
+        turnId: turn.id,
+        phase: turn.phase,
+        kind: turn.kind,
+      });
       this.unregisterResponseHandler(handlerId);
       this.currentAllowedTools = null;
       this.finishTurnFromGenerator(turn, handler);
@@ -2481,6 +2508,11 @@ export class ClaudianService implements ChatRuntime {
   /** S2 (v3 §4.2): feature clears only the cancelled turn's state. */
   setOnAutoTurnCancelled(callback: ((event: AutoTurnCancelledEvent) => void) | null): void {
     this._onAutoTurnCancelled = callback;
+  }
+
+  /** Turn-lease hotfix fix 6: notify the feature layer on an unregistered dequeue. */
+  setOnUnregisteredTurnDequeued(callback: ((turnId: string) => void) | null): void {
+    this._onUnregisteredTurnDequeued = callback;
   }
 
   private createApprovalCallback(): CanUseTool {

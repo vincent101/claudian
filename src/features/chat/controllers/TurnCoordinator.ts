@@ -1,6 +1,15 @@
 import type { ChatState } from '../state/ChatState';
 
 /**
+ * Turn-lease phase logging (turn-lease hotfix). console.debug level and one
+ * line per node so a stuck turn can be localized from the user console by
+ * matching begin/end pairs; prefix `[Claudian]` keeps filtering cheap.
+ */
+function logLease(node: string, detail: Record<string, unknown>): void {
+  console.debug(`[Claudian] ${node}`, detail);
+}
+
+/**
  * Feature-layer turn being arbitrated. `generation` is the feature
  * streamGeneration for user turns and the runtime turn generation for auto
  * turns; `conversationId`/`lifecycleGeneration` pin the lease to the
@@ -61,6 +70,7 @@ export class TurnCoordinator {
    */
   beginUserTurn(turnId: string, streamGeneration: number): boolean {
     if (this.active) {
+      logLease('feature.begin', { turnId, kind: 'user', generation: streamGeneration, ok: false, busyWith: this.active.turnId });
       return false;
     }
     this.active = {
@@ -70,6 +80,7 @@ export class TurnCoordinator {
       conversationId: this.deps.getConversationId(),
       lifecycleGeneration: this.lifecycleGeneration,
     };
+    logLease('feature.begin', { turnId, kind: 'user', generation: streamGeneration, ok: true });
     return true;
   }
 
@@ -79,6 +90,7 @@ export class TurnCoordinator {
    */
   beginAutoTurn(turnId: string, runtimeGeneration: number): boolean {
     if (this.active) {
+      logLease('feature.begin', { turnId, kind: 'auto', generation: runtimeGeneration, ok: false, busyWith: this.active.turnId });
       return false;
     }
     this.active = {
@@ -89,6 +101,7 @@ export class TurnCoordinator {
       lifecycleGeneration: this.lifecycleGeneration,
     };
     this.deps.state.isStreaming = true;
+    logLease('feature.begin', { turnId, kind: 'auto', generation: runtimeGeneration, ok: true });
     return true;
   }
 
@@ -107,7 +120,7 @@ export class TurnCoordinator {
    * v4 §3.1 step 3 (finishFeatureTurn): clears the lease and, for auto turns,
    * drops isStreaming. Never calls processQueuedMessage — release does that.
    */
-  finish(turnId: string): boolean {
+  finish(turnId: string, reason?: string): boolean {
     if (!this.active || this.active.turnId !== turnId) {
       return false;
     }
@@ -121,6 +134,7 @@ export class TurnCoordinator {
     if (turn.kind === 'auto' && this.deps.state.isStreaming) {
       this.deps.state.isStreaming = false;
     }
+    logLease('feature.finish', { turnId, kind: turn.kind, ...(reason ? { reason } : {}) });
     return true;
   }
 
@@ -133,19 +147,43 @@ export class TurnCoordinator {
   release(turnId: string): void {
     if (this.active) {
       // A new turn already owns the lease; it will release the queue itself.
+      logLease('feature.release', { turnId, pumped: false, reason: 'lease-busy', activeTurnId: this.active.turnId });
       return;
     }
     const record = this.settled;
     if (!record || record.turnId !== turnId) {
+      logLease('feature.release', { turnId, pumped: false, reason: record ? 'turn-mismatch' : 'no-settled-record' });
       return;
     }
     if (record.lifecycleGeneration !== this.lifecycleGeneration) {
+      logLease('feature.release', { turnId, pumped: false, reason: 'lifecycle-stale' });
       return;
     }
     if (record.conversationId !== this.deps.getConversationId()) {
+      logLease('feature.release', { turnId, pumped: false, reason: 'conversation-switched' });
       return;
     }
+    // Consume the settled record before pumping: a second release for the
+    // same turn (runtime callback + generator finally, or a replayed
+    // callback) must not pump the queue twice.
+    this.settled = null;
+    logLease('feature.release', { turnId, pumped: true });
+    logLease('queue.pump', { source: 'release', turnId });
     this.deps.processQueuedMessage();
+  }
+
+  /**
+   * Runtime-side compensation (unregistered dequeue): the runtime no longer
+   * knows this turn, so its feature lease can never be released through the
+   * normal generator finally. Clear only this turn's lease — the settled
+   * record stays so a late release from the same turn still pumps the queue
+   * exactly once.
+   */
+  cancelTurnFromRuntime(turnId: string): boolean {
+    if (!this.active || this.active.turnId !== turnId) {
+      return false;
+    }
+    return this.finish(turnId, 'unregistered-dequeue');
   }
 
   /**

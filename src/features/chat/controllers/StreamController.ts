@@ -127,6 +127,15 @@ export class StreamController {
   private pendingToolOutputFrames = new Map<string, ScheduledAnimationFrame>();
   private pendingScrollFrame: ScheduledAnimationFrame | null = null;
 
+  /**
+   * Render-flush invalidation (turn-lease hotfix fix 3): set by cancel /
+   * lifecycle invalidation so a finalize can never hang forever on a pending
+   * render promise whose DOM state a cancelled turn no longer owns. The flag
+   * is per user-turn scope — a new send starts a fresh scope.
+   */
+  private renderFlushInvalidated = false;
+  private renderFlushInvalidationWaiters = new Set<() => void>();
+
   /** Context of the turn currently streaming through handleStreamChunk (v3 §5.1). */
   private activeContext: TurnProjectionContext | null = null;
 
@@ -136,6 +145,41 @@ export class StreamController {
 
   constructor(deps: StreamControllerDeps) {
     this.deps = deps;
+  }
+
+  /** Opens a fresh render-flush scope at user-turn start (InputController.sendMessage). */
+  beginRenderFlushScope(): void {
+    this.renderFlushInvalidated = false;
+  }
+
+  /**
+   * Cancel/lifecycle invalidation: settle every pending render-flush await,
+   * dropping the pending render instead of waiting on DOM state a cancelled
+   * turn no longer owns. No timeout is used — a timed release could let old
+   * and new turn projections run concurrently.
+   */
+  invalidateRenderFlush(): void {
+    this.renderFlushInvalidated = true;
+    const waiters = [...this.renderFlushInvalidationWaiters];
+    this.renderFlushInvalidationWaiters.clear();
+    for (const settle of waiters) {
+      settle();
+    }
+  }
+
+  private waitForRenderFlushInvalidation(): { promise: Promise<void>; dispose: () => void } {
+    let settle!: () => void;
+    const promise = new Promise<void>(resolve => { settle = resolve; });
+    this.renderFlushInvalidationWaiters.add(settle);
+    return {
+      promise,
+      dispose: () => { this.renderFlushInvalidationWaiters.delete(settle); },
+    };
+  }
+
+  /** Turn id of the turn whose flushes are in flight, for lease-phase logging. */
+  private activeFlushTurnId(): string {
+    return this.activeContext?.turnId ?? 'unknown';
   }
 
   private getActiveProviderId(): ProviderId {
@@ -798,7 +842,28 @@ export class StreamController {
       void this.renderPendingText();
     }
 
-    await pendingRender;
+    const turnId = this.activeFlushTurnId();
+    console.debug('[Claudian] projection.textFlush.begin', { turnId });
+    // Turn-scoped cancellable await (fix 3): cancel/lifecycle invalidation
+    // settles this flush and drops the pending render — the flush must never
+    // depend on global DOM render state a cancelled turn no longer owns.
+    if (this.renderFlushInvalidated) {
+      this.cancelPendingTextRender();
+      console.debug('[Claudian] projection.textFlush.end', { turnId, dropped: true, reason: 'pre-invalidated' });
+      return;
+    }
+    const invalidation = this.waitForRenderFlushInvalidation();
+    try {
+      await Promise.race([pendingRender, invalidation.promise]);
+    } finally {
+      invalidation.dispose();
+    }
+    if (this.renderFlushInvalidated && this.pendingTextRenderPromise === pendingRender) {
+      this.cancelPendingTextRender();
+      console.debug('[Claudian] projection.textFlush.end', { turnId, dropped: true, reason: 'invalidated' });
+      return;
+    }
+    console.debug('[Claudian] projection.textFlush.end', { turnId });
   }
 
   private async renderPendingText(): Promise<void> {
@@ -961,7 +1026,26 @@ export class StreamController {
       void this.renderPendingThinking();
     }
 
-    await pendingRender;
+    const turnId = this.activeFlushTurnId();
+    console.debug('[Claudian] projection.thinkingFlush.begin', { turnId });
+    // Turn-scoped cancellable await (fix 3) — mirrors flushPendingTextRender.
+    if (this.renderFlushInvalidated) {
+      this.cancelPendingThinkingRender();
+      console.debug('[Claudian] projection.thinkingFlush.end', { turnId, dropped: true, reason: 'pre-invalidated' });
+      return;
+    }
+    const invalidation = this.waitForRenderFlushInvalidation();
+    try {
+      await Promise.race([pendingRender, invalidation.promise]);
+    } finally {
+      invalidation.dispose();
+    }
+    if (this.renderFlushInvalidated && this.pendingThinkingRenderPromise === pendingRender) {
+      this.cancelPendingThinkingRender();
+      console.debug('[Claudian] projection.thinkingFlush.end', { turnId, dropped: true, reason: 'invalidated' });
+      return;
+    }
+    console.debug('[Claudian] projection.thinkingFlush.end', { turnId });
   }
 
   private async renderPendingThinking(): Promise<void> {
