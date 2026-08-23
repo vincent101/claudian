@@ -1841,13 +1841,37 @@ Only this is the final result.
       // Still pending — not settled yet, but not forgotten
       expect(manager.getByTaskId('task-race')?.asyncStatus).toBe('pending');
 
-      // Promotion arrives afterwards: settles immediately instead of running
-      manager.handleTaskToolResult('task-race', JSON.stringify({ agent_id: 'agent-race' }));
+      // Promotion arrives afterwards: settles immediately instead of running,
+      // and returns the early-settled record so the caller can hydrate it
+      const earlySettled = manager.handleTaskToolResult(
+        'task-race',
+        JSON.stringify({ agent_id: 'agent-race' })
+      );
 
+      expect(earlySettled?.asyncStatus).toBe('completed');
+      expect(earlySettled?.agentId).toBe('agent-race');
+      expect(earlySettled?.result).toBe('fast result');
       expect(manager.getByTaskId('task-race')).toBeUndefined();
       expect(updates[updates.length - 1].asyncStatus).toBe('completed');
       expect(updates[updates.length - 1].result).toBe('fast result');
       expect(manager.hasRunningSubagents()).toBe(false);
+    });
+
+    it('returns undefined from handleTaskToolResult on non-early-settle paths', () => {
+      const { manager } = createManager();
+      const parentEl = createMockEl();
+
+      // No pending entry at all
+      expect(manager.handleTaskToolResult('task-none', 'x')).toBeUndefined();
+
+      // Normal promotion (no prior notification): running, not early-settled
+      manager.handleTaskToolUse('task-norm', { description: 'Background', run_in_background: true }, parentEl);
+      expect(manager.handleTaskToolResult('task-norm', JSON.stringify({ agent_id: 'agent-norm' }))).toBeUndefined();
+      expect(manager.getByTaskId('task-norm')?.asyncStatus).toBe('running');
+
+      // Launch error path
+      manager.handleTaskToolUse('task-err', { description: 'Background', run_in_background: true }, parentEl);
+      expect(manager.handleTaskToolResult('task-err', 'launch failed', true)).toBeUndefined();
     });
 
     it('records an early killed notification and settles as error at promotion', () => {

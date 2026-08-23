@@ -2068,6 +2068,118 @@ describe("StreamController - Text Content", () => {
 
       warnSpy.mockRestore();
     });
+
+    it('early notification then promotion hydrates via the tool_result path (秒完成竞态)', async () => {
+      const runtime = deps.getAgentService!() as any;
+      const msg = seedTaskMessage('task-e1');
+      const { manager } = setupRealManager();
+
+      manager.handleTaskToolUse(
+        'task-e1',
+        { description: 'Background', prompt: 'work', run_in_background: true },
+        null
+      );
+
+      // Notification arrives before promotion: recorded in the short table, no hydration yet
+      controller.handleAsyncSubagentNotification('agent-e1', 'completed', 'done fast');
+      expect(runtime.loadSubagentToolCalls).not.toHaveBeenCalled();
+
+      runtime.loadSubagentToolCalls.mockResolvedValue([
+        { id: 'tool-1', name: 'Read', input: { file_path: 'a.md' }, status: 'completed', result: 'content', isExpanded: false },
+      ]);
+      runtime.loadSubagentFinalResult.mockResolvedValue('done fast');
+
+      // Promotion arrives via the Agent tool_result chain and early-settles
+      await controller.handleStreamChunk(
+        { type: 'tool_result', id: 'task-e1', content: JSON.stringify({ agent_id: 'agent-e1' }) },
+        ctx(msg)
+      );
+
+      // Settlement is synchronous
+      expect(manager.hasRunningSubagents()).toBe(false);
+
+      await flushAsync();
+
+      expect(runtime.loadSubagentToolCalls).toHaveBeenCalledWith('agent-e1');
+      expect(runtime.loadSubagentFinalResult).toHaveBeenCalledWith('agent-e1');
+      const record = msg.toolCalls![0].subagent!;
+      expect(record.asyncStatus).toBe('completed');
+      expect(record.toolCalls).toHaveLength(1);
+      expect(record.toolCalls[0].id).toBe('tool-1');
+      expect(msg.toolCalls![0].status).toBe('completed');
+    });
+
+    it('normal promotion does not hydrate; a later notification hydrates exactly once', async () => {
+      const runtime = deps.getAgentService!() as any;
+      const msg = seedTaskMessage('task-e2');
+      const { manager } = setupRealManager();
+      runtime.loadSubagentToolCalls.mockResolvedValue([
+        { id: 'tool-1', name: 'Read', input: { file_path: 'a.md' }, status: 'completed', result: 'content', isExpanded: false },
+      ]);
+      runtime.loadSubagentFinalResult.mockResolvedValue('late final');
+
+      manager.handleTaskToolUse(
+        'task-e2',
+        { description: 'Background', prompt: 'work', run_in_background: true },
+        null
+      );
+
+      // Promotion with no prior notification: stays running, never hydrates
+      await controller.handleStreamChunk(
+        { type: 'tool_result', id: 'task-e2', content: JSON.stringify({ agent_id: 'agent-e2' }) },
+        ctx(msg)
+      );
+      await flushAsync();
+
+      expect(runtime.loadSubagentToolCalls).not.toHaveBeenCalled();
+      expect(manager.getByTaskId('task-e2')?.asyncStatus).toBe('running');
+
+      // Notification arrives after promotion: notification entry settles + hydrates
+      controller.handleAsyncSubagentNotification('agent-e2', 'completed', 'done');
+      await flushAsync();
+
+      expect(runtime.loadSubagentToolCalls).toHaveBeenCalledTimes(1);
+      expect(runtime.loadSubagentToolCalls).toHaveBeenCalledWith('agent-e2');
+      const record = msg.toolCalls![0].subagent!;
+      expect(record.asyncStatus).toBe('completed');
+      expect(record.toolCalls).toHaveLength(1);
+    });
+
+    it('duplicate notification after an early-settled hydration adds no duplicate entries', async () => {
+      const runtime = deps.getAgentService!() as any;
+      const msg = seedTaskMessage('task-e3');
+      const { manager } = setupRealManager();
+      runtime.loadSubagentToolCalls.mockResolvedValue([
+        { id: 'tool-1', name: 'Read', input: { file_path: 'a.md' }, status: 'completed', result: 'content', isExpanded: false },
+      ]);
+      runtime.loadSubagentFinalResult.mockResolvedValue('final');
+
+      manager.handleTaskToolUse(
+        'task-e3',
+        { description: 'Background', prompt: 'work', run_in_background: true },
+        null
+      );
+      controller.handleAsyncSubagentNotification('agent-e3', 'completed', 'done');
+      await controller.handleStreamChunk(
+        { type: 'tool_result', id: 'task-e3', content: JSON.stringify({ agent_id: 'agent-e3' }) },
+        ctx(msg)
+      );
+      await flushAsync();
+
+      expect(runtime.loadSubagentToolCalls).toHaveBeenCalledTimes(1);
+      const record = msg.toolCalls![0].subagent!;
+      expect(record.toolCalls).toHaveLength(1);
+
+      // Duplicate terminal notification for the already-settled agent: no second hydration
+      controller.handleAsyncSubagentNotification('agent-e3', 'completed', 'done');
+      await flushAsync();
+
+      expect(runtime.loadSubagentToolCalls).toHaveBeenCalledTimes(1);
+      expect(record.toolCalls).toHaveLength(1);
+      expect(record.toolCalls[0].id).toBe('tool-1');
+      expect(record.asyncStatus).toBe('completed');
+      expect(manager.hasRunningSubagents()).toBe(false);
+    });
   });
 
   describe('Tool header update on input re-dispatch', () => {

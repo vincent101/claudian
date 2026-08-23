@@ -327,19 +327,25 @@ export class SubagentManager {
   // Async Subagent Lifecycle
   // ============================================
 
+  /**
+   * Returns the early-settled SubagentInfo when the promotion consumed a
+   * seen terminal notification (秒完成竞态) — the caller then runs the same
+   * sidecar hydration as the notification entry. Undefined in every other
+   * path, including error transitions and normal promotion to running.
+   */
   public handleTaskToolResult(
     taskToolId: string,
     result: unknown,
     isError?: boolean,
     toolUseResult?: unknown
-  ): void {
+  ): SubagentInfo | undefined {
     const subagent = this.pendingAsyncSubagents.get(taskToolId);
-    if (!subagent) return;
+    if (!subagent) return undefined;
     const resultText = extractToolResultContent(result, { fallbackIndent: 2 });
 
     if (isError) {
       this.transitionToError(subagent, taskToolId, resultText || 'Task failed to start');
-      return;
+      return undefined;
     }
 
     const agentId = this.taskResultInterpreter.extractAgentId(toolUseResult) ?? this.parseAgentId(resultText);
@@ -347,7 +353,7 @@ export class SubagentManager {
     if (!agentId) {
       const truncatedResult = resultText.length > 100 ? resultText.substring(0, 100) + '...' : resultText;
       this.transitionToError(subagent, taskToolId, `Failed to parse agent_id. Result: ${truncatedResult}`);
-      return;
+      return undefined;
     }
 
     subagent.asyncStatus = 'running';
@@ -365,11 +371,12 @@ export class SubagentManager {
     if (earlyTerminal) {
       this.seenTerminalNotifications.delete(agentId);
       this.settleActiveSubagent(subagent, agentId, earlyTerminal.status, earlyTerminal.result);
-      return;
+      return subagent;
     }
 
     this.projectAsyncSubagentState(subagent);
     this.onStateChange(subagent);
+    return undefined;
   }
 
   // ============================================

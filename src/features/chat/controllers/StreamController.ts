@@ -1327,7 +1327,24 @@ export class StreamController {
       return false;
     }
 
-    subagentManager.handleTaskToolResult(chunk.id, chunk.content, chunk.isError, chunk.toolUseResult);
+    const earlySettled = subagentManager.handleTaskToolResult(
+      chunk.id,
+      chunk.content,
+      chunk.isError,
+      chunk.toolUseResult
+    );
+    // 秒完成竞态: a terminal notification arrived before this promotion, so
+    // the settle happened here instead of the notification entry — run the
+    // same sidecar hydration the notification entry would have. Merge-by-id
+    // keeps this idempotent against any later duplicate notification.
+    if (earlySettled) {
+      void this.hydrateAsyncSubagentToolCalls(earlySettled).catch((error) => {
+        console.warn('[Claudian] async subagent early-settle hydration failed', {
+          taskToolId: chunk.id,
+          error,
+        });
+      });
+    }
     return true;
   }
 
