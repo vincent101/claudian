@@ -2552,6 +2552,46 @@ describe('InputController - Message Queue', () => {
       await expect(exitPlanPromise).resolves.toBeNull();
       expect(inputContainerEl.style.display).toBe('');
     });
+
+    it('should settle ask-user-question immediately with null when signal is already aborted', async () => {
+      const parentEl = createMockEl();
+      const inputContainerEl = createMockEl();
+      (inputContainerEl as any).parentElement = parentEl;
+      deps.getInputContainerEl = () => inputContainerEl as any;
+
+      controller = new InputController(deps);
+
+      const abortController = new AbortController();
+      abortController.abort();
+
+      const askPromise = controller.handleAskUserQuestion(
+        { questions: [{ question: 'Select one option', options: ['A', 'B'] }] },
+        abortController.signal,
+      );
+
+      // Promise settles as "no user response" without rendering a card
+      await expect(askPromise).resolves.toBeNull();
+      expect(parentEl.querySelector('.claudian-ask-question-inline')).toBeNull();
+      expect(inputContainerEl.style.display).toBe('');
+    });
+
+    it('should settle exit-plan-mode immediately with null when signal is already aborted', async () => {
+      const parentEl = createMockEl();
+      const inputContainerEl = createMockEl();
+      (inputContainerEl as any).parentElement = parentEl;
+      deps.getInputContainerEl = () => inputContainerEl as any;
+
+      controller = new InputController(deps);
+
+      const abortController = new AbortController();
+      abortController.abort();
+
+      const exitPlanPromise = controller.handleExitPlanMode({}, abortController.signal);
+
+      await expect(exitPlanPromise).resolves.toBeNull();
+      expect(parentEl.querySelector('.claudian-plan-approval-inline')).toBeNull();
+      expect(inputContainerEl.style.display).toBe('');
+    });
   });
 
   describe('handleInstructionSubmit', () => {

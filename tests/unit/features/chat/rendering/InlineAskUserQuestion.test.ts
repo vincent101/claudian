@@ -473,6 +473,29 @@ describe('InlineAskUserQuestion', () => {
   });
 
   describe('abort lifecycle', () => {
+    it('resolves null immediately and renders nothing when signal is already aborted', () => {
+      const controller = new AbortController();
+      controller.abort();
+      const input = makeInput([{ question: 'Q', options: ['A'] }]);
+      const { container, resolve } = renderWidget(input, controller.signal);
+
+      expect(resolve).toHaveBeenCalledTimes(1);
+      expect(resolve).toHaveBeenCalledWith(null);
+      // No interaction card DOM was built
+      expect(findRoot(container)).toBeNull();
+    });
+
+    it('does not double-resolve when an already-aborted signal widget is destroyed', () => {
+      const controller = new AbortController();
+      controller.abort();
+      const input = makeInput([{ question: 'Q', options: ['A'] }]);
+      const { resolve, widget } = renderWidget(input, controller.signal);
+
+      expect(resolve).toHaveBeenCalledTimes(1);
+      widget.destroy();
+      expect(resolve).toHaveBeenCalledTimes(1);
+    });
+
     it('resolves null when signal is aborted', () => {
       const controller = new AbortController();
       const input = makeInput([{ question: 'Q', options: ['A'] }]);

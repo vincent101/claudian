@@ -42,6 +42,14 @@ export class InlineExitPlanMode {
   }
 
   render(): void {
+    // AbortSignal fires its event only once; a signal aborted before the
+    // listener registration below would never fire, leaving the interaction
+    // promise pending forever and leaking the tab attention count.
+    if (this.signal?.aborted) {
+      this.handleResolve(null);
+      return;
+    }
+
     this.rootEl = this.containerEl.createDiv({ cls: 'claudian-plan-approval-inline' });
 
     const titleEl = this.rootEl.createDiv({ cls: 'claudian-plan-inline-title' });

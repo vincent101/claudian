@@ -172,6 +172,24 @@ describe('InlineExitPlanMode', () => {
     expect(resolve).toHaveBeenCalledWith({ type: 'feedback', text: 'Please revise the plan' });
   });
 
+  it('resolves null immediately and renders nothing when signal is already aborted', () => {
+    const container = createMockEl();
+    const resolve = jest.fn();
+    const controller = new AbortController();
+    controller.abort();
+
+    const widget = new InlineExitPlanMode(container, {}, resolve, controller.signal);
+    widget.render();
+
+    expect(resolve).toHaveBeenCalledTimes(1);
+    expect(resolve).toHaveBeenCalledWith(null);
+    // No interaction card DOM was built
+    expect(findRoot(container)).toBeNull();
+
+    widget.destroy();
+    expect(resolve).toHaveBeenCalledTimes(1);
+  });
+
   it('resolves null on abort and does not resolve twice', () => {
     const container = createMockEl();
     const resolve = jest.fn();
