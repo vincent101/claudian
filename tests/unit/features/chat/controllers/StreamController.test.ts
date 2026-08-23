@@ -17,6 +17,7 @@ import {
   type StreamControllerDeps,
   type TurnProjectionContext,
 } from '@/features/chat/controllers/StreamController';
+import { SubagentManager } from '@/features/chat/services/SubagentManager';
 import { ChatState } from '@/features/chat/state/ChatState';
 import { DEFAULT_CODEX_PRIMARY_MODEL } from '@/providers/codex/types/models';
 
@@ -1761,7 +1762,10 @@ describe("StreamController - Text Content", () => {
         ctx(msg)
       );
 
-      expect(runtime.loadSubagentToolCalls).not.toHaveBeenCalled();
+      // Tool calls are always re-read now (merge-by-id); the empty read leaves
+      // the existing entries untouched.
+      expect(runtime.loadSubagentToolCalls).toHaveBeenCalledTimes(1);
+      expect(completedSubagent.toolCalls).toHaveLength(1);
       expect(runtime.loadSubagentFinalResult).toHaveBeenCalledWith('agent-2');
       expect(completedSubagent.result).toBe('Recovered final result from sidecar');
       expect(deps.subagentManager.refreshAsyncSubagent).toHaveBeenCalledWith(completedSubagent);
@@ -1803,7 +1807,7 @@ describe("StreamController - Text Content", () => {
         ctx(msg)
       );
 
-      expect(runtime.loadSubagentToolCalls).not.toHaveBeenCalled();
+      expect(runtime.loadSubagentToolCalls).toHaveBeenCalledTimes(1);
       expect(runtime.loadSubagentFinalResult).toHaveBeenCalledTimes(1);
       expect(deps.subagentManager.refreshAsyncSubagent).not.toHaveBeenCalled();
 
@@ -1852,17 +1856,217 @@ describe("StreamController - Text Content", () => {
         ctx(msg)
       );
 
-      expect(runtime.loadSubagentToolCalls).not.toHaveBeenCalled();
+      expect(runtime.loadSubagentToolCalls).toHaveBeenCalledTimes(1);
       expect(runtime.loadSubagentFinalResult).toHaveBeenCalledTimes(1);
       expect(deps.subagentManager.refreshAsyncSubagent).not.toHaveBeenCalled();
 
       jest.advanceTimersByTime(200);
       await Promise.resolve();
       await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
 
+      // Retry re-reads tool details too, not just the final result.
+      expect(runtime.loadSubagentToolCalls).toHaveBeenCalledTimes(2);
       expect(runtime.loadSubagentFinalResult).toHaveBeenCalledTimes(2);
       expect(completedSubagent.result).toBe('Recovered final result after delayed flush');
       expect(deps.subagentManager.refreshAsyncSubagent).toHaveBeenCalledWith(completedSubagent);
+    });
+  });
+
+  describe('async subagent notification hydration (terminal notification entry)', () => {
+    /** Real SubagentManager wired to the controller, mirroring Tab.ts (no DOM projector). */
+    function setupRealManager() {
+      const stateChanges: any[] = [];
+      const manager = new SubagentManager((subagent) => {
+        stateChanges.push(subagent);
+        controller.onAsyncSubagentStateChange(subagent);
+      });
+      deps.subagentManager = manager as any;
+      return { manager, stateChanges };
+    }
+
+    function launchActiveSubagent(manager: SubagentManager, taskToolId: string, agentId: string): void {
+      manager.handleTaskToolUse(
+        taskToolId,
+        { description: 'Background', prompt: 'work', run_in_background: true },
+        null
+      );
+      manager.handleTaskToolResult(taskToolId, JSON.stringify({ agent_id: agentId }));
+    }
+
+    function seedTaskMessage(taskToolId: string): ChatMessage {
+      const msg = createTestMessage();
+      msg.toolCalls = [{
+        id: taskToolId,
+        name: TOOL_TASK,
+        input: {},
+        status: 'running',
+        isExpanded: false,
+      }];
+      deps.state.messages = [msg];
+      deps.state.currentContentEl = createMockEl();
+      return msg;
+    }
+
+    async function flushAsync(): Promise<void> {
+      for (let i = 0; i < 6; i++) {
+        await Promise.resolve();
+      }
+    }
+
+    it('terminal notification settles the subagent and hydrates tool details without any TaskOutput', async () => {
+      const runtime = deps.getAgentService!() as any;
+      const msg = seedTaskMessage('task-n1');
+      const { manager } = setupRealManager();
+      launchActiveSubagent(manager, 'task-n1', 'agent-n1');
+      expect(manager.hasRunningSubagents()).toBe(true);
+
+      runtime.loadSubagentToolCalls.mockResolvedValue([
+        { id: 'tool-1', name: 'Read', input: { file_path: 'a.md' }, status: 'completed', result: 'content', isExpanded: false },
+      ]);
+      runtime.loadSubagentFinalResult.mockResolvedValue('all done');
+
+      controller.handleAsyncSubagentNotification('agent-n1', 'completed', 'all done');
+
+      // Settlement is synchronous (c5ad19d accounting unchanged)
+      expect(manager.hasRunningSubagents()).toBe(false);
+
+      await flushAsync();
+
+      expect(runtime.loadSubagentToolCalls).toHaveBeenCalledWith('agent-n1');
+      expect(runtime.loadSubagentFinalResult).toHaveBeenCalledWith('agent-n1');
+      const record = msg.toolCalls![0].subagent!;
+      expect(record.asyncStatus).toBe('completed');
+      expect(record.toolCalls).toHaveLength(1);
+      expect(record.toolCalls[0].id).toBe('tool-1');
+      // Message projection picked up the terminal state
+      expect(msg.toolCalls![0].status).toBe('completed');
+    });
+
+    it('TaskOutput after a settled notification neither duplicates tool details nor revives the record', async () => {
+      const runtime = deps.getAgentService!() as any;
+      const msg = seedTaskMessage('task-n2');
+      const { manager } = setupRealManager();
+      launchActiveSubagent(manager, 'task-n2', 'agent-n2');
+
+      runtime.loadSubagentToolCalls.mockResolvedValue([
+        { id: 'tool-1', name: 'Read', input: { file_path: 'a.md' }, status: 'completed', result: 'content', isExpanded: false },
+        { id: 'tool-2', name: 'Bash', input: { command: 'ls' }, status: 'completed', result: 'ok', isExpanded: false },
+      ]);
+      runtime.loadSubagentFinalResult.mockResolvedValue('Final from sidecar');
+
+      controller.handleAsyncSubagentNotification('agent-n2', 'completed', 'done');
+      await flushAsync();
+
+      const record = msg.toolCalls![0].subagent!;
+      expect(record.toolCalls).toHaveLength(2);
+      expect(record.result).toBe('Final from sidecar');
+
+      // TaskOutput tool_use arrives after the settle — no active record to link
+      manager.handleAgentOutputToolUse({
+        id: 'out-1', name: TOOL_AGENT_OUTPUT, input: { task_id: 'agent-n2' }, status: 'running', isExpanded: false,
+      });
+      expect(manager.isLinkedAgentOutputTool('out-1')).toBe(false);
+
+      await controller.handleStreamChunk(
+        { type: 'tool_result', id: 'out-1', content: JSON.stringify({ result: 'done' }) },
+        ctx(msg)
+      );
+
+      expect(runtime.loadSubagentToolCalls).toHaveBeenCalledTimes(1);
+      expect(record.toolCalls.map((tc) => tc.id)).toEqual(['tool-1', 'tool-2']);
+      expect(record.result).toBe('Final from sidecar');
+      expect(manager.getByTaskId('task-n2')).toBeUndefined();
+      expect(manager.hasRunningSubagents()).toBe(false);
+    });
+
+    it('retry re-reads merge late-flushed tool calls by id and refresh existing entries', async () => {
+      const runtime = deps.getAgentService!() as any;
+      const msg = seedTaskMessage('task-n3');
+      const { manager } = setupRealManager();
+      launchActiveSubagent(manager, 'task-n3', 'agent-n3');
+
+      runtime.loadSubagentToolCalls
+        .mockResolvedValueOnce([
+          { id: 'tool-a', name: 'Read', input: { file_path: 'a.md' }, status: 'running', isExpanded: false },
+        ])
+        .mockResolvedValueOnce([
+          { id: 'tool-a', name: 'Read', input: { file_path: 'a.md' }, status: 'completed', result: 'content', isExpanded: false },
+          { id: 'tool-b', name: 'Bash', input: { command: 'ls' }, status: 'completed', result: 'ok', isExpanded: false },
+        ]);
+      runtime.loadSubagentFinalResult
+        .mockResolvedValueOnce(null) // sidecar not flushed yet → retry scheduled
+        .mockResolvedValueOnce('Final after late flush');
+
+      controller.handleAsyncSubagentNotification('agent-n3', 'completed', 'placeholder');
+      await flushAsync();
+
+      const record = msg.toolCalls![0].subagent!;
+      expect(record.toolCalls).toHaveLength(1);
+      expect(record.toolCalls[0].status).toBe('running');
+
+      jest.advanceTimersByTime(200);
+      await flushAsync();
+
+      expect(record.toolCalls).toHaveLength(2);
+      expect(record.toolCalls.map((tc) => tc.id)).toEqual(['tool-a', 'tool-b']);
+      // Known entry refreshed in place by id, not duplicated
+      expect(record.toolCalls[0].status).toBe('completed');
+      expect(record.toolCalls[0].result).toBe('content');
+      expect(record.result).toBe('Final after late flush');
+    });
+
+    it('repeated and non-terminal notifications stay idempotent', async () => {
+      const runtime = deps.getAgentService!() as any;
+      seedTaskMessage('task-n4');
+      const { manager } = setupRealManager();
+      launchActiveSubagent(manager, 'task-n4', 'agent-n4');
+
+      runtime.loadSubagentToolCalls.mockResolvedValue([]);
+      runtime.loadSubagentFinalResult.mockResolvedValue('done');
+
+      controller.handleAsyncSubagentNotification('agent-n4', 'completed', 'done');
+      await flushAsync();
+      expect(runtime.loadSubagentToolCalls).toHaveBeenCalledTimes(1);
+
+      // Duplicate notification for the already-settled task-id: no-op
+      expect(() => controller.handleAsyncSubagentNotification('agent-n4', 'completed', 'done')).not.toThrow();
+      await flushAsync();
+      expect(runtime.loadSubagentToolCalls).toHaveBeenCalledTimes(1);
+
+      // Non-terminal statuses never trigger settlement or hydration
+      controller.handleAsyncSubagentNotification('agent-n4', 'running');
+      await flushAsync();
+      expect(runtime.loadSubagentToolCalls).toHaveBeenCalledTimes(1);
+    });
+
+    it('settlement and hydration failures are contained as diagnostics', async () => {
+      const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
+      seedTaskMessage('task-n5');
+      const { manager } = setupRealManager();
+      launchActiveSubagent(manager, 'task-n5', 'agent-n5');
+      const runtime = deps.getAgentService!() as any;
+      runtime.loadSubagentToolCalls.mockRejectedValue(new Error('sidecar read failed'));
+
+      expect(() => controller.handleAsyncSubagentNotification('agent-n5', 'completed', 'done')).not.toThrow();
+      await flushAsync();
+      expect(warnSpy).toHaveBeenCalledWith(
+        '[Claudian] async subagent notification hydration failed',
+        expect.objectContaining({ taskId: 'agent-n5' })
+      );
+
+      // Synchronous manager failure is contained too
+      (deps.subagentManager as any).handleTaskNotification = jest.fn(() => {
+        throw new Error('boom');
+      });
+      expect(() => controller.handleAsyncSubagentNotification('agent-x', 'completed', null)).not.toThrow();
+      expect(warnSpy).toHaveBeenCalledWith(
+        '[Claudian] async subagent notification settlement failed',
+        expect.objectContaining({ taskId: 'agent-x' })
+      );
+
+      warnSpy.mockRestore();
     });
   });
 

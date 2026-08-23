@@ -1715,10 +1715,19 @@ export function setupServiceCallbacks(tab: TabData, plugin: ClaudianPlugin): voi
         hasRunning: tab.services.subagentManager.hasRunningSubagents(),
       })
     );
-    // Fix 2 (通知直接销账): settle async subagents straight from live
-    // harness task-notifications (available on providers that support them).
+    // Fix 2 (通知直接销账) + 0823 工具明细修复: terminal task-notifications go
+    // through the StreamController entry so the settled subagent is hydrated
+    // from the sidecar immediately — a settled record without a TaskOutput
+    // round-trip would otherwise never show its tool details.
     tab.service.setSubagentNotificationHandler?.((taskId, status, result) => {
-      tab.services.subagentManager.handleTaskNotification(taskId, status, result);
+      const streamController = tab.controllers.streamController;
+      if (streamController) {
+        streamController.handleAsyncSubagentNotification(taskId, status, result);
+      } else {
+        // Defensive fallback: keep the c5ad19d settle-only accounting alive
+        // even if the controller is not wired yet.
+        tab.services.subagentManager.handleTaskNotification(taskId, status, result);
+      }
     });
     tab.service.setAutoTurnCallback((result: AutoTurnResult) => {
       // S2 lifecycle guard: a cancelled/switched-away auto turn must not

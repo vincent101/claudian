@@ -1350,6 +1350,37 @@ export class StreamController {
     return isLinked || handled !== undefined;
   }
 
+  /**
+   * Terminal-notification entry for async subagents: settles the bookkeeping
+   * via SubagentManager (c5ad19d semantics unchanged — settle-only, no lease,
+   * no auto turn), then immediately hydrates tool details from the SDK
+   * sidecar. Without this entry, a settled subagent that never gets a
+   * TaskOutput round-trip shows Prompt + Result but no tool details, because
+   * the settle itself removes the record the TaskOutput hydration path needs.
+   * Fire-and-observe: failures are diagnostics only and must never break the
+   * runtime notification loop that calls back into here.
+   */
+  handleAsyncSubagentNotification(taskId: string, status: string, result?: string | null): void {
+    try {
+      const settled = this.deps.subagentManager.handleTaskNotification(taskId, status, result);
+      if (settled) {
+        void this.hydrateAsyncSubagentToolCalls(settled).catch((error) => {
+          console.warn('[Claudian] async subagent notification hydration failed', {
+            taskId,
+            status,
+            error,
+          });
+        });
+      }
+    } catch (error) {
+      console.warn('[Claudian] async subagent notification settlement failed', {
+        taskId,
+        status,
+        error,
+      });
+    }
+  }
+
   private async hydrateAsyncSubagentToolCalls(subagent: SubagentInfo | undefined): Promise<void> {
     if (!subagent) return;
     if (subagent.mode !== 'async') return;
@@ -1363,8 +1394,7 @@ export class StreamController {
 
     const { hasHydrated, finalResultHydrated } = await this.tryHydrateAsyncSubagent(
       subagent,
-      runtime,
-      true
+      runtime
     );
 
     if (hasHydrated) {
@@ -1376,25 +1406,24 @@ export class StreamController {
     }
   }
 
+  /**
+   * One hydration pass: re-reads tool calls AND final result from the sidecar
+   * on every call. Tool calls merge by id (never frozen after a partial first
+   * read); retries re-read both because the sidecar may flush late content
+   * between reads.
+   */
   private async tryHydrateAsyncSubagent(
     subagent: SubagentInfo,
-    runtime: ChatRuntime,
-    hydrateToolCalls: boolean
+    runtime: ChatRuntime
   ): Promise<{ hasHydrated: boolean; finalResultHydrated: boolean }> {
     let hasHydrated = false;
     let finalResultHydrated = false;
 
-    if (hydrateToolCalls && !subagent.toolCalls?.length) {
-      const recoveredToolCalls = await runtime.loadSubagentToolCalls?.(
-        subagent.agentId || ''
-      ) ?? [];
-      if (recoveredToolCalls.length > 0) {
-        subagent.toolCalls = recoveredToolCalls.map((toolCall) => ({
-          ...toolCall,
-          input: { ...toolCall.input },
-        }));
-        hasHydrated = true;
-      }
+    const recoveredToolCalls = await runtime.loadSubagentToolCalls?.(
+      subagent.agentId || ''
+    ) ?? [];
+    if (recoveredToolCalls.length > 0 && this.mergeSubagentToolCallsById(subagent, recoveredToolCalls)) {
+      hasHydrated = true;
     }
 
     const recoveredFinalResult = await runtime.loadSubagentFinalResult?.(
@@ -1409,6 +1438,65 @@ export class StreamController {
     }
 
     return { hasHydrated, finalResultHydrated };
+  }
+
+  /**
+   * Merges a fresh sidecar read into the subagent record by tool id: keeps
+   * existing order and UI state, appends entries not seen before, and
+   * refreshes fields of known entries when the sidecar carries more data.
+   * Returns whether anything changed — unchanged re-reads stay invisible so
+   * repeated hydration is idempotent.
+   */
+  private mergeSubagentToolCallsById(subagent: SubagentInfo, recovered: ToolCallInfo[]): boolean {
+    const existing = subagent.toolCalls ?? [];
+    const byId = new Map(existing.map((toolCall) => [toolCall.id, toolCall]));
+    let changed = false;
+
+    for (const incoming of recovered) {
+      const current = byId.get(incoming.id);
+      if (!current) {
+        byId.set(incoming.id, { ...incoming, input: { ...incoming.input } });
+        changed = true;
+        continue;
+      }
+      if (this.mergeToolCallFields(current, incoming)) {
+        changed = true;
+      }
+    }
+
+    if (changed) {
+      subagent.toolCalls = Array.from(byId.values());
+    }
+    return changed;
+  }
+
+  /** Sidecar read wins on richer data; the existing entry keeps its identity and UI state. */
+  private mergeToolCallFields(current: ToolCallInfo, incoming: ToolCallInfo): boolean {
+    let changed = false;
+
+    let inputChanged = false;
+    for (const key of Object.keys(incoming.input ?? {})) {
+      if (current.input?.[key] !== incoming.input[key]) {
+        inputChanged = true;
+        break;
+      }
+    }
+    if (inputChanged) {
+      current.input = { ...(current.input ?? {}), ...incoming.input };
+      changed = true;
+    }
+
+    if (incoming.status && incoming.status !== current.status) {
+      current.status = incoming.status;
+      changed = true;
+    }
+
+    if (typeof incoming.result === 'string' && incoming.result !== current.result) {
+      current.result = incoming.result;
+      changed = true;
+    }
+
+    return changed;
   }
 
   private scheduleAsyncSubagentResultRetry(
@@ -1434,10 +1522,12 @@ export class StreamController {
     const asyncStatus = subagent.asyncStatus ?? subagent.status;
     if (asyncStatus !== 'completed' && asyncStatus !== 'error') return;
 
+    // Retry re-reads tool details too (not just the final result): the sidecar
+    // may flush late tool events between reads, and merge-by-id makes the
+    // re-read idempotent.
     const { hasHydrated, finalResultHydrated } = await this.tryHydrateAsyncSubagent(
       subagent,
-      runtime,
-      false
+      runtime
     );
     if (hasHydrated) {
       this.deps.subagentManager.refreshAsyncSubagent(subagent);

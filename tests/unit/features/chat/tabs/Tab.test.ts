@@ -1431,6 +1431,44 @@ describe('Tab - Service Callbacks', () => {
       return { tab, addMessageSpy, renderStoredMessage, scrollToBottom, autoTurnCallback };
     }
 
+    it('routes subagent task notifications through the StreamController hydration entry', () => {
+      const plugin = createMockPlugin();
+      const tab = createTab(createMockOptions({ plugin }));
+      tab.controllers.inputController = {} as any;
+      const handleAsyncSubagentNotification = jest.fn();
+      const handleTaskNotification = jest.fn();
+      tab.controllers.streamController = { handleAsyncSubagentNotification } as any;
+      tab.services.subagentManager = {
+        hasRunningSubagents: jest.fn().mockReturnValue(false),
+        handleTaskNotification,
+      } as any;
+
+      const service = {
+        setApprovalCallback: jest.fn(),
+        setApprovalDismisser: jest.fn(),
+        setAskUserQuestionCallback: jest.fn(),
+        setExitPlanModeCallback: jest.fn(),
+        setSubagentHookProvider: jest.fn(),
+        setSubagentNotificationHandler: jest.fn(),
+        setAutoTurnCallback: jest.fn(),
+        setPermissionModeSyncCallback: jest.fn(),
+      };
+      tab.service = service as any;
+
+      setupServiceCallbacks(tab, plugin);
+
+      const notify = service.setSubagentNotificationHandler.mock.calls[0][0];
+      notify('agent-1', 'completed', 'done');
+      expect(handleAsyncSubagentNotification).toHaveBeenCalledWith('agent-1', 'completed', 'done');
+      // Settlement happens inside the controller entry, not directly here
+      expect(handleTaskNotification).not.toHaveBeenCalled();
+
+      // Defensive fallback: controller missing → settle-only keeps accounting alive
+      (tab.controllers as { streamController: unknown }).streamController = null;
+      notify('agent-2', 'completed', 'done');
+      expect(handleTaskNotification).toHaveBeenCalledWith('agent-2', 'completed', 'done');
+    });
+
     it('renders tool-only auto-triggered turns with a placeholder assistant message', () => {
       const { addMessageSpy, renderStoredMessage, scrollToBottom, autoTurnCallback } = setupAutoTurnTest();
 
