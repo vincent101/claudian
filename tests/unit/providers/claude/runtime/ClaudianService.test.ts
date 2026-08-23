@@ -3960,7 +3960,7 @@ describe('ClaudianService', () => {
         expect(channelOf().getActiveTurnId()).toBeNull();
       });
 
-      it('system task_notification with no lease still starts an auto turn before the notification is dispatched', async () => {
+      it('system task_notification with no lease settles the accounting only: no auto turn, no lease', async () => {
         const started: any[] = [];
         service.setOnAutoTurnStarted((event) => started.push({ ...event }));
         const notifications: any[] = [];
@@ -3976,11 +3976,145 @@ describe('ClaudianService', () => {
           summary: 'done',
         });
 
-        // v4 §6 order preserved: the auto turn exists before the handler ran.
-        expect(started).toHaveLength(1);
+        // Pure notification: no ghost auto turn, no lease (hotfix/notify-lease).
+        expect(started).toHaveLength(0);
+        expect([...(service as any).runtimeTurns.keys()]).toEqual([]);
+        expect(channelOf().getActiveTurnId()).toBeNull();
         expect(notifications).toEqual([
           { taskId: 'agent-1', status: 'completed', result: 'done' },
         ]);
+      });
+
+      it('queue-operation task-notification with no lease settles the accounting only: no auto turn, no lease', async () => {
+        const started: any[] = [];
+        service.setOnAutoTurnStarted((event) => started.push({ ...event }));
+        const notifications: any[] = [];
+        service.setSubagentNotificationHandler((taskId, status, result) => {
+          notifications.push({ taskId, status, result });
+        });
+
+        await (service as any).routeMessage({
+          type: 'queue-operation',
+          operation: 'enqueue',
+          content: '<task-notification><task-id>agent-2</task-id><status>completed</status><result>Background done</result></task-notification>',
+        });
+
+        expect(started).toHaveLength(0);
+        expect([...(service as any).runtimeTurns.keys()]).toEqual([]);
+        expect(channelOf().getActiveTurnId()).toBeNull();
+        expect(notifications).toEqual([
+          { taskId: 'agent-2', status: 'completed', result: 'Background done' },
+        ]);
+      });
+
+      it('a user message enqueued after a lease-less pure notification dequeues immediately and signs the lease', async () => {
+        // Ghost-lease regression core: the pure notification must not leave a
+        // lease behind, or the next user message dead-waits on it forever.
+        service.setSubagentNotificationHandler(() => {});
+        await (service as any).routeMessage({
+          type: 'system',
+          subtype: 'task_notification',
+          task_id: 'agent-1',
+          status: 'completed',
+          summary: 'done',
+        });
+        expect(channelOf().getActiveTurnId()).toBeNull();
+
+        const channel = channelOf();
+        const userTurn = createRuntimeTurn({ id: 'user-after-notify', kind: 'user' });
+        (service as any).runtimeTurns.set('user-after-notify', userTurn);
+        const iterator = channel[Symbol.asyncIterator]();
+        const pendingUser = iterator.next();
+
+        const enqueueResult = channel.enqueue('user-after-notify', {
+          type: 'user',
+          message: { role: 'user', content: 'next message' },
+          parent_tool_use_id: null,
+          session_id: '',
+        });
+        expect(enqueueResult).toEqual({ canonicalTurnId: 'user-after-notify' });
+
+        const delivered = await pendingUser;
+        expect(delivered.done).toBe(false);
+        expect((delivered.value as any).message.content).toBe('next message');
+        expect(channel.getActiveTurnId()).toBe('user-after-notify');
+        expect(channel.getQueueLength()).toBe(0);
+      });
+
+      it('notification followed by a continuation: the assistant message opens the auto turn and the result releases the lease', async () => {
+        const started: any[] = [];
+        service.setOnAutoTurnStarted((event) => started.push({ ...event }));
+        const autoCallback = jest.fn();
+        service.setAutoTurnCallback(autoCallback);
+        const notifications: any[] = [];
+        service.setSubagentNotificationHandler((taskId, status, result) => {
+          notifications.push({ taskId, status, result });
+        });
+
+        // Notification first: settled, no lease.
+        await (service as any).routeMessage({
+          type: 'system',
+          subtype: 'task_notification',
+          task_id: 'agent-3',
+          status: 'completed',
+          summary: 'done',
+        });
+        expect(channelOf().getActiveTurnId()).toBeNull();
+
+        // Continuation arrives (the ~51% case): opens its own auto turn.
+        await (service as any).routeMessage({
+          type: 'assistant',
+          message: { content: [{ type: 'text', text: 'Continuation payload' }] },
+        });
+        expect(started).toHaveLength(1);
+        const autoTurnId = channelOf().getActiveTurnId()!;
+        expect(autoTurnId).toBe(started[0].turnId);
+
+        // Result settles the auto turn and releases the lease.
+        await (service as any).routeMessage({
+          type: 'result',
+          subtype: 'success',
+          result: 'continuation done',
+        });
+        expect(autoCallback).toHaveBeenCalledTimes(1);
+        expect(autoCallback.mock.calls[0][0].chunks[0]).toEqual(
+          expect.objectContaining({ type: 'text', content: 'Continuation payload' }),
+        );
+        expect(channelOf().getActiveTurnId()).toBeNull();
+        expect((service as any).runtimeTurns.has(autoTurnId)).toBe(false);
+        expect(notifications).toEqual([
+          { taskId: 'agent-3', status: 'completed', result: 'done' },
+        ]);
+      });
+
+      it('task-notification under an existing lease is dispatched for accounting only and keeps the lease', async () => {
+        const started: any[] = [];
+        service.setOnAutoTurnStarted((event) => started.push({ ...event }));
+        const notifications: any[] = [];
+        service.setSubagentNotificationHandler((taskId, status, result) => {
+          notifications.push({ taskId, status, result });
+        });
+
+        const channel = channelOf();
+        const turn = createRuntimeTurn({ id: 'user-lease', kind: 'user', phase: 'collecting' });
+        (service as any).runtimeTurns.set('user-lease', turn);
+        channel.beginExternalTurn('user-lease');
+
+        await (service as any).routeMessage({
+          type: 'system',
+          subtype: 'task_notification',
+          task_id: 'agent-4',
+          status: 'completed',
+          summary: 'done',
+        });
+
+        // Existing behavior: accounting ran, the owning lease is untouched.
+        expect(notifications).toEqual([
+          { taskId: 'agent-4', status: 'completed', result: 'done' },
+        ]);
+        expect(started).toHaveLength(0);
+        expect(channel.getActiveTurnId()).toBe('user-lease');
+        expect((service as any).runtimeTurns.has('user-lease')).toBe(true);
       });
 
       it('system/init under an existing lease still merges into the active turn', async () => {

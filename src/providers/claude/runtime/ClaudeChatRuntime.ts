@@ -141,13 +141,30 @@ function isImageAttachmentArray(value: unknown): value is ImageAttachment[] {
  * they must never start an auto turn — an auto lease only releases at result
  * (routeMessage → settleTurnAtResult), so an auto turn opened here would hang
  * forever and deadlock the first queued user message. task_notification is
- * excluded: it keeps the v4 §6 create-auto-turn-then-settle order.
+ * excluded: it is routed by isTaskNotificationMessage instead (settle-only,
+ * no auto turn — see routeMessage).
  */
 function isLeaselessSessionControlMessage(message: SDKMessage): boolean {
   if ((message as { type?: string }).type !== 'system') {
     return false;
   }
   return (message as { subtype?: string }).subtype !== 'task_notification';
+}
+
+/**
+ * Harness task-notification shapes Fix 2 settles: queue-operation envelopes
+ * carrying a <task-notification> XML payload, and the SDK's typed
+ * system/subtype=task_notification spelling. Mirrors the shape check in
+ * dispatchTaskNotification — keep the two in sync.
+ */
+function isTaskNotificationMessage(message: SDKMessage): boolean {
+  const record = message as Record<string, unknown>;
+  if (record['type'] === 'queue-operation') {
+    return record['operation'] === 'enqueue'
+      && typeof record['content'] === 'string'
+      && (record['content'] as string).includes('<task-notification>');
+  }
+  return record['type'] === 'system' && record['subtype'] === 'task_notification';
 }
 
 export class ClaudianService implements ChatRuntime {
@@ -909,13 +926,19 @@ export class ClaudianService implements ChatRuntime {
    * 2. No active lease + session-level control message (system/init,
    *    compact_boundary, ...) → side effects only via
    *    applyLeaselessSystemMessage: no auto turn, no lease, no callbacks.
-   * 3. No active lease otherwise → the SDK initiated a turn on its own
-   *    (task-notification delivery): ensureAutoTurn() creates the auto
-   *    RuntimeTurn, signs the external lease and fires onAutoTurnStarted
-   *    synchronously — strictly before the notification is dispatched.
-   * 4. A notification arriving under an existing lease is dispatched for
+   * 3. No active lease + task-notification → settle-only: the notification
+   *    is dispatched for accounting and dropped; no auto turn, no lease.
+   *    A pure notification (~49% of deliveries, measured 0823 over 1383
+   *    transcript occurrences) never sees a result, so an auto turn opened
+   *    here would hold the lease forever — tab stuck "running", queued user
+   *    messages dead-waiting (ghost auto turn, fbd4de8 regression).
+   * 4. No active lease otherwise → the SDK initiated a turn on its own
+   *    (notification continuation, Stop-hook follow-up): ensureAutoTurn()
+   *    creates the auto RuntimeTurn, signs the external lease and fires
+   *    onAutoTurnStarted synchronously.
+   * 5. A notification arriving under an existing lease is dispatched for
    *    accounting only; a second lease is never created.
-   * 5. Chunks go to the owning turn's waiters; a turn without waiters buffers
+   * 6. Chunks go to the owning turn's waiters; a turn without waiters buffers
    *    chunks and flushes through the auto-turn callback adapter on result.
    */
   private async routeMessage(message: SDKMessage): Promise<void> {
@@ -940,6 +963,23 @@ export class ClaudianService implements ChatRuntime {
     // side effects still run on a throwaway transform state.
     if (!turn && isLeaselessSessionControlMessage(message)) {
       this.applyLeaselessSystemMessage(message);
+      return;
+    }
+
+    // Lease-less pure task-notification (hotfix/notify-lease): settle-only.
+    // ~49% of notification deliveries (measured 0823 over 1383 transcript
+    // occurrences) never see a result, so an auto turn opened here would
+    // hold the lease forever (ghost auto turn → tab stuck "running",
+    // queued user messages dead-waiting). Dispatch the accounting and
+    // return without a lease; a continuation turn (the other ~51%) opens
+    // its own auto turn on its first assistant/stream message below.
+    // Known trade-off (accepted; pending-auto barrier in S4+S5 refines):
+    // a user message sent in the narrow window right after the notification
+    // may sign the lease before the continuation's first message and
+    // mis-attribute the continuation chunks to the user turn — far less
+    // likely than the ~49% ghost-lease hang this branch removes.
+    if (!turn && isTaskNotificationMessage(message)) {
+      this.dispatchTaskNotification(message);
       return;
     }
 
