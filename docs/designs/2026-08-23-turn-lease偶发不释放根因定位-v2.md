@@ -98,3 +98,11 @@ Claudian 在 SDK 已输出回复后偶发保留 feature 层 `TurnCoordinator` le
 **埋点处置决策**：14 处 `console.debug` 为取证期临时埋点（DevTools debug 级默认隐藏，量级按块边界触发不刷屏）。观察稳定后随 S4+S5 大修移除；若复发，日志自动报出卡点。
 
 **已知残余风险（复发时第一排查点）**：flush await 已可取消，但 finalize 体内 flush 之后的直接 `await renderer.renderContent(...)`（StreamController.ts 数学渲染延迟路径、thinking finalize 路径）不受 invalidation 保护——若日志出现 `projection.*.end` 已打而 turn 仍卡，落此处。次排查点：cleanup 阶段（isStreaming 已 false、lease 仍在）的 finalize 挂起仅会话切换可解。
+
+## 终章：同根因三发作确诊（0823 深夜，本系列收官）
+
+六项修复+finalize 渲染保护部署后，console 全程埋点（Obsidian CLI `dev:console` 读取）抓到最终真相：用户轮 result 正常结算、feature.finish 正常执行的**同一毫秒**，一条尾随的 queue-operation 记录（非轮次内容）以无主状态到达 → ensureAutoTurn 误建 auto turn 抢占 feature 锁（`ok:true`）→ 该 turn 永无 result → 锁永挂。auto 创建与用户锁释放的**毫秒级竞态**决定抢占成败——即全部"偶发"的真相。
+
+**重新定性**：轮次挂死家族三发作（fbd4de8 的 init、c5ad19d 的纯通知、本例尾随记录）为**同一病根**——"无主消息一律建 auto turn"。前两次修复是发作部位治理；根治为 `isAutoTurnStartMessage` 白名单（commit 99dca6b）：仅 `assistant`/`stream_event` 可开轮，其余无主消息丢弃+warn。fbd4de8（init 副作用）与 c5ad19d（通知销账）保留——各承载独立必需功能，与白名单三道门分工。
+
+**复盘教训**（已入 AI_MEMORY `0823-2`）：同族症状第 2 次发作即应停止打补丁、先上埋点找共同病根——纯通知修复时已有 49% 数据暗示"建轮条件太宽"却未深挖。
