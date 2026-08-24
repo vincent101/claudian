@@ -246,6 +246,25 @@ describe('MessageChannel', () => {
       // The queue should have text + attachment = 2 items
       expect(channel.getQueueLength()).toBe(2);
     });
+
+    it('reports a dropped signal when the queue is full of attachments and a text message has nothing to merge into', () => {
+      // Fill the queue before any consumer exists — each item is separate
+      // (no merging in the no-consumer branch).
+      for (let i = 0; i < 8; i++) {
+        channel.enqueue(`turn-att-${i}`, createImageUserMessage(`img-${i}`));
+      }
+      expect(channel.getQueueLength()).toBe(8);
+
+      // An auto turn acquires the lease without draining the queue, leaving
+      // it full with no text item for a late text message to merge into.
+      const lease = channel.beginExternalTurn('auto-1');
+      expect(lease.ok).toBe(true);
+
+      const dropped = channel.enqueue('turn-text', createTextUserMessage('late text'));
+      expect(dropped).toEqual({ canonicalTurnId: 'turn-text', dropped: true });
+      expect(warnings.some(w => w.includes('Queue full'))).toBe(true);
+      expect(channel.getQueueLength()).toBe(8);
+    });
   });
 
   describe('enqueue attachment before consumer starts (no active turn)', () => {

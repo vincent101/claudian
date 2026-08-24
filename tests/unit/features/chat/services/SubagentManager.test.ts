@@ -462,6 +462,43 @@ describe('SubagentManager', () => {
 
       expect(manager.getByTaskId('task-map')?.agentId).toBe('agent-map');
     });
+
+    describe('taskIdToAgentId index cleanup on settle', () => {
+      it('clears the index entry when a task notification settles the agent', () => {
+        const { manager } = createManager();
+        const parentEl = createMockEl();
+
+        manager.handleTaskToolUse('task-idx-1', { description: 'Background', run_in_background: true }, parentEl);
+        manager.handleTaskToolResult('task-idx-1', JSON.stringify({ agent_id: 'agent-idx-1' }));
+        expect((manager as any).taskIdToAgentId.size).toBe(1);
+
+        const settled = manager.handleTaskNotification('agent-idx-1', 'completed', 'done');
+        expect(settled?.asyncStatus).toBe('completed');
+        expect((manager as any).taskIdToAgentId.size).toBe(0);
+        expect(manager.getByTaskId('task-idx-1')).toBeUndefined();
+      });
+
+      it('clears the index entry when a TaskOutput round-trip settles the agent', () => {
+        const { manager } = createManager();
+        const parentEl = createMockEl();
+
+        manager.handleTaskToolUse('task-idx-2', { description: 'Background', run_in_background: true }, parentEl);
+        manager.handleTaskToolResult('task-idx-2', JSON.stringify({ agent_id: 'agent-idx-2' }));
+        manager.handleAgentOutputToolUse({
+          id: 'out-idx-2', name: 'AgentOutput',
+          input: { task_id: 'agent-idx-2' }, status: 'running', isExpanded: false,
+        });
+        expect((manager as any).taskIdToAgentId.size).toBe(1);
+
+        const settled = manager.handleAgentOutputToolResult(
+          'out-idx-2', 'result text', false,
+          { status: 'completed', content: [{ type: 'text', text: 'Done' }] }
+        );
+        expect(settled?.asyncStatus).toBe('completed');
+        expect((manager as any).taskIdToAgentId.size).toBe(0);
+        expect(manager.getByTaskId('task-idx-2')).toBeUndefined();
+      });
+    });
   });
 
   // ============================================

@@ -437,9 +437,26 @@ export class SubagentManager {
       this.outputToolIdToAgentId.delete(subagent.outputToolId);
     }
     this.activeAsyncSubagents.delete(agentId);
+    this.removeTaskIdIndexEntries(agentId);
 
     this.projectAsyncSubagentState(subagent);
     this.onStateChange(subagent);
+  }
+
+  /**
+   * Drops taskIdToAgentId entries pointing at a settled agent. The index
+   * exists so getByTaskId can resolve a live agent's record; past settlement
+   * the entries are unreachable dead weight (getByTaskId already returns
+   * undefined via the empty active map). SubagentInfo does not carry its
+   * taskToolId, so resolve by value scan — one entry per live agent, settles
+   * are rare, full clears happen on orphanAllActive/clear anyway.
+   */
+  private removeTaskIdIndexEntries(agentId: string): void {
+    for (const [taskToolId, mappedAgentId] of this.taskIdToAgentId) {
+      if (mappedAgentId === agentId) {
+        this.taskIdToAgentId.delete(taskToolId);
+      }
+    }
   }
 
   private rememberTerminalNotification(taskId: string, status: string, result?: string | null): void {
@@ -517,7 +534,10 @@ export class SubagentManager {
     subagent.result = extractedResult;
     subagent.completedAt = Date.now();
 
-    if (agentId) this.activeAsyncSubagents.delete(agentId);
+    if (agentId) {
+      this.activeAsyncSubagents.delete(agentId);
+      this.removeTaskIdIndexEntries(agentId);
+    }
     this.outputToolIdToAgentId.delete(toolId);
 
     this.projectAsyncSubagentState(subagent);

@@ -114,6 +114,13 @@ export function createTurnProjectionContext(init: {
 
 export class StreamController {
   private static readonly ASYNC_SUBAGENT_RESULT_RETRY_DELAYS_MS = [200, 600, 1500] as const;
+  /** After the initial fast-retry sequence, poll the sidecar at this interval
+   *  while the agent is still running, so tool calls appear incrementally. */
+  private static readonly ASYNC_SUBAGENT_RUNNING_POLL_MS = 2000;
+  /** Cap total attempts (~30 min at 2s interval) — bounds zombie poll chains
+   *  whose agents never reach terminal state AND are never orphaned. Normal
+   *  long agents are stopped by terminal/orphaned, not by this cap. */
+  private static readonly ASYNC_SUBAGENT_MAX_ATTEMPTS = 900;
 
   private deps: StreamControllerDeps;
   private pendingTextRenderFrame: ScheduledAnimationFrame | null = null;
@@ -138,6 +145,13 @@ export class StreamController {
 
   /** Context of the turn currently streaming through handleStreamChunk (v3 §5.1). */
   private activeContext: TurnProjectionContext | null = null;
+  /** Tracks which async agents have a live sidecar poll chain (timer pending
+   *  or mid-tick). Entries are added when a chain starts (running state change
+   *  or terminal hydration with no existing chain) and released only when that
+   *  chain stops (terminal with final result / orphaned / attempt cap /
+   *  exception) — never by the state-change callback itself, so a
+   *  still-pending chain is always visible to the dedup checks. */
+  private asyncRetryScheduled: Set<string> = new Set();
 
   // Provider lifecycle agent tracking (spawn → wait/close lifecycle)
   private lifecycleSubagentStates = new Map<string, SubagentState>(); // spawn callId → SubagentState
@@ -1418,7 +1432,17 @@ export class StreamController {
       this.deps.subagentManager.refreshAsyncSubagent(subagent);
     }
 
-    if (!finalResultHydrated) {
+    if (!finalResultHydrated && !this.asyncRetryScheduled.has(subagent.agentId)
+        && typeof runtime.loadSubagentToolCalls === 'function') {
+      // A poll chain is already scheduled for this agent (running-phase chain
+      // whose next tick observes the terminal status and concludes on its
+      // own) — starting a second one here would double-read the sidecar until
+      // the final result flushes. Only agents without a chain (e.g. 秒完成
+      // early-settle before any running callback) start one from here.
+      // The loadSubagentToolCalls guard mirrors onAsyncSubagentStateChange:
+      // runtimes without sidecar reads (non-Claude) must not start a chain
+      // that would spin on empty reads until the cap.
+      this.asyncRetryScheduled.add(subagent.agentId);
       this.scheduleAsyncSubagentResultRetry(subagent, runtime, 0);
     }
   }
@@ -1522,9 +1546,17 @@ export class StreamController {
     attempt: number
   ): void {
     if (!subagent.agentId) return;
-    if (attempt >= StreamController.ASYNC_SUBAGENT_RESULT_RETRY_DELAYS_MS.length) return;
+    if (attempt >= StreamController.ASYNC_SUBAGENT_MAX_ATTEMPTS) {
+      // Cap reached: the chain ends here, so release the schedule slot —
+      // otherwise the registration leaks and blocks nothing (agent ids are
+      // unique) while growing the Set forever.
+      this.asyncRetryScheduled.delete(subagent.agentId);
+      return;
+    }
 
-    const delay = StreamController.ASYNC_SUBAGENT_RESULT_RETRY_DELAYS_MS[attempt];
+    const delay = attempt < StreamController.ASYNC_SUBAGENT_RESULT_RETRY_DELAYS_MS.length
+      ? StreamController.ASYNC_SUBAGENT_RESULT_RETRY_DELAYS_MS[attempt]
+      : StreamController.ASYNC_SUBAGENT_RUNNING_POLL_MS;
     setTimeout(() => {
       void this.retryAsyncSubagentResult(subagent, runtime, attempt);
     }, delay);
@@ -1536,22 +1568,56 @@ export class StreamController {
     attempt: number
   ): Promise<void> {
     if (!subagent.agentId) return;
-    const asyncStatus = subagent.asyncStatus ?? subagent.status;
-    if (asyncStatus !== 'completed' && asyncStatus !== 'error') return;
+    try {
+      const asyncStatus = subagent.asyncStatus ?? subagent.status;
+      // Orphaned (conversation switched / tab destroyed) → stop immediately:
+      // do NOT hydrate or refresh — the tab/conversation that owned this agent
+      // no longer exists; touching its state is at best wasted and at worst
+      // writes into the newly-switched conversation.
+      if (asyncStatus === 'orphaned') {
+        this.asyncRetryScheduled.delete(subagent.agentId);
+        return;
+      }
 
-    // Retry re-reads tool details too (not just the final result): the sidecar
-    // may flush late tool events between reads, and merge-by-id makes the
-    // re-read idempotent.
-    const { hasHydrated, finalResultHydrated } = await this.tryHydrateAsyncSubagent(
-      subagent,
-      runtime
-    );
-    if (hasHydrated) {
-      this.deps.subagentManager.refreshAsyncSubagent(subagent);
-    }
+      // Terminal + final result obtained → stop polling.
+      const isTerminal = asyncStatus === 'completed' || asyncStatus === 'error';
+      if (isTerminal) {
+        // Even at terminal, re-read once more for late sidecar content, then stop
+        // unless finalResult is still missing.
+        const { hasHydrated, finalResultHydrated } = await this.tryHydrateAsyncSubagent(
+          subagent,
+          runtime
+        );
+        if (hasHydrated) {
+          this.deps.subagentManager.refreshAsyncSubagent(subagent);
+        }
+        if (finalResultHydrated) {
+          // Chain concludes here — release the schedule slot (registration is
+          // chain-owned; the state-change callback no longer clears it).
+          this.asyncRetryScheduled.delete(subagent.agentId);
+          return;
+        }
+        this.scheduleAsyncSubagentResultRetry(subagent, runtime, attempt + 1);
+        return;
+      }
 
-    if (!finalResultHydrated) {
+      // Running: poll the sidecar so tool calls appear incrementally.
+      const { hasHydrated } = await this.tryHydrateAsyncSubagent(subagent, runtime);
+      if (hasHydrated) {
+        this.deps.subagentManager.refreshAsyncSubagent(subagent);
+      }
       this.scheduleAsyncSubagentResultRetry(subagent, runtime, attempt + 1);
+    } catch (error) {
+      // Defensive containment: the sidecar reads swallow their own errors,
+      // but the DOM projection chain (refreshAsyncSubagent) can still throw.
+      // Stop the chain and release its slot — a broken chain must not leave
+      // an unhandled rejection or a zombie registration behind.
+      console.warn('[Claudian] async subagent result retry failed', {
+        agentId: subagent.agentId,
+        attempt,
+        error,
+      });
+      this.asyncRetryScheduled.delete(subagent.agentId);
     }
   }
 
@@ -1559,6 +1625,23 @@ export class StreamController {
   onAsyncSubagentStateChange(subagent: SubagentInfo): void {
     this.updateSubagentInMessages(subagent);
     this.scrollToBottom();
+    // Kick off sidecar polling when the agent enters 'running' so tool calls
+    // appear incrementally instead of all at once on completion.
+    const runtime = this.deps.getAgentService?.();
+    if (runtime && subagent.agentId) {
+      const status = subagent.asyncStatus ?? subagent.status;
+      if (status === 'running' && !this.asyncRetryScheduled.has(subagent.agentId)
+          && typeof runtime.loadSubagentToolCalls === 'function') {
+        this.asyncRetryScheduled.add(subagent.agentId);
+        this.scheduleAsyncSubagentResultRetry(subagent, runtime, 0);
+      }
+      // Terminal states do NOT clear the registration here: the settle path
+      // fires this callback synchronously BEFORE the notification hydration
+      // runs, so clearing would make the hydration-path dedup check miss and
+      // start a second chain alongside the still-pending one. The chain owns
+      // its registration and releases it when it actually stops (terminal
+      // with final result / orphaned / attempt cap / exception).
+    }
   }
 
   private updateSubagentInMessages(subagent: SubagentInfo): void {

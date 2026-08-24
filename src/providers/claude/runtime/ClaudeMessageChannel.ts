@@ -198,7 +198,7 @@ export class MessageChannel implements AsyncIterable<SDKUserMessage> {
     // No existing text - add new
     if (this.queue.length >= MESSAGE_CHANNEL_CONFIG.MAX_QUEUED_MESSAGES) {
       this.onWarning(`[MessageChannel] Queue full (${MESSAGE_CHANNEL_CONFIG.MAX_QUEUED_MESSAGES}), dropping newest`);
-      return { canonicalTurnId: turnId };
+      return { canonicalTurnId: turnId, dropped: true };
     }
     this.queue.push({ type: 'text', turnId, content: textContent });
     return { canonicalTurnId: turnId };

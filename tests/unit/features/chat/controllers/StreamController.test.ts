@@ -2180,6 +2180,101 @@ describe("StreamController - Text Content", () => {
       expect(record.asyncStatus).toBe('completed');
       expect(manager.hasRunningSubagents()).toBe(false);
     });
+
+    it('a terminal notification does not start a second chain while the running-phase poll chain is still scheduled', async () => {
+      const runtime = deps.getAgentService!() as any;
+      const msg = seedTaskMessage('task-x2');
+      const { manager } = setupRealManager();
+      launchActiveSubagent(manager, 'task-x2', 'agent-x2');
+      // Running-phase poll chain scheduled at +200ms; Set = {agent-x2}
+
+      runtime.loadSubagentToolCalls.mockResolvedValue([]);
+      runtime.loadSubagentFinalResult
+        .mockResolvedValueOnce(null) // notification hydration: final missing
+        .mockResolvedValueOnce(null) // chain tick (attempt 0): still missing
+        .mockResolvedValueOnce('final flushed'); // chain tick (attempt 1)
+
+      controller.handleAsyncSubagentNotification('agent-x2', 'completed', 'placeholder');
+      await flushAsync();
+
+      // Notification hydration read once; the still-scheduled running chain
+      // kept its registration, so the hydration path started no second chain.
+      expect(runtime.loadSubagentToolCalls).toHaveBeenCalledTimes(1);
+      expect((controller as any).asyncRetryScheduled.has('agent-x2')).toBe(true);
+
+      jest.advanceTimersByTime(200); // chain tick, attempt 0
+      await flushAsync();
+      expect(runtime.loadSubagentToolCalls).toHaveBeenCalledTimes(2);
+
+      jest.advanceTimersByTime(600); // chain tick, attempt 1 → final obtained
+      await flushAsync();
+      expect(runtime.loadSubagentToolCalls).toHaveBeenCalledTimes(3);
+
+      // Chain concluded: registration released, no further polling
+      expect((controller as any).asyncRetryScheduled.has('agent-x2')).toBe(false);
+      jest.advanceTimersByTime(4000);
+      await flushAsync();
+      expect(runtime.loadSubagentToolCalls).toHaveBeenCalledTimes(3);
+      const record = msg.toolCalls![0].subagent!;
+      expect(record.result).toBe('final flushed');
+    });
+
+    it('a projection failure during a poll tick stops the chain and clears its registration', async () => {
+      const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
+      const runtime = deps.getAgentService!() as any;
+      seedTaskMessage('task-x1');
+      const { manager } = setupRealManager();
+      launchActiveSubagent(manager, 'task-x1', 'agent-x1');
+
+      runtime.loadSubagentToolCalls.mockResolvedValue([
+        { id: 'tool-1', name: 'Read', input: { file_path: 'a.md' }, status: 'running', isExpanded: false },
+      ]);
+      runtime.loadSubagentFinalResult.mockResolvedValue(null);
+      jest.spyOn(manager, 'refreshAsyncSubagent').mockImplementation(() => {
+        throw new Error('DOM projection failed');
+      });
+
+      jest.advanceTimersByTime(200);
+      await flushAsync();
+
+      expect(warnSpy).toHaveBeenCalledWith(
+        '[Claudian] async subagent result retry failed',
+        expect.objectContaining({ agentId: 'agent-x1' })
+      );
+      expect((controller as any).asyncRetryScheduled.has('agent-x1')).toBe(false);
+
+      // Chain stopped: no further sidecar reads
+      jest.advanceTimersByTime(4000);
+      await flushAsync();
+      expect(runtime.loadSubagentToolCalls).toHaveBeenCalledTimes(1);
+
+      warnSpy.mockRestore();
+    });
+
+    it('releases the chain registration and stops polling when the attempt cap is reached', async () => {
+      const runtime = deps.getAgentService!() as any;
+      seedTaskMessage('task-x3');
+      const { manager } = setupRealManager();
+      launchActiveSubagent(manager, 'task-x3', 'agent-x3');
+
+      runtime.loadSubagentToolCalls.mockResolvedValue([]);
+      runtime.loadSubagentFinalResult.mockResolvedValue(null);
+
+      // Agent stuck running with no sidecar content: the chain polls until
+      // the attempt cap. Delays are 200/600/1500 then 2000 per tick, so 900
+      // advances of 2000ms cover all 900 attempts.
+      expect((controller as any).asyncRetryScheduled.has('agent-x3')).toBe(true);
+      for (let i = 0; i < 900; i++) {
+        jest.advanceTimersByTime(2000);
+        await flushAsync();
+      }
+      expect(runtime.loadSubagentToolCalls).toHaveBeenCalledTimes(900);
+      expect((controller as any).asyncRetryScheduled.has('agent-x3')).toBe(false);
+
+      jest.advanceTimersByTime(10000);
+      await flushAsync();
+      expect(runtime.loadSubagentToolCalls).toHaveBeenCalledTimes(900);
+    });
   });
 
   describe('Tool header update on input re-dispatch', () => {
