@@ -87,3 +87,10 @@ Claudian 在 15:20 热修后，异步 subagent 卡片由“Prompt + 工具明细
 - **c8d079d**：秒完成竞态补齐——`handleTaskToolResult` 的 early-terminal 分支返回 early-settled 信号，由 `handleAsyncTaskToolResult` 对该记录调用同款 hydration，堵"通知先于转正到达"的窗口
 
 实测：0824 派 5 步慢速 agent，运行中卡片逐步冒工具行（Bash/Read 交替），完成后卡片含完整工具列表+Result——恢复到事故前水平。
+
+
+## 续章：运行中实时显示（0825 落地）
+
+完成时补齐（8883b66/c8d079d）解决了"看不到"但仍有"运行期空白、完成时全冒"的延迟。根因：retry 链 gating 在 `asyncStatus !== 'completed'` 时直接 return（运行中不读 sidecar）——上游即如此，非本工程回归（更早 CC SDK 同步运行 Agent 时活动流入主流，SDK 异步化后只能靠 sidecar 轮询）。
+
+**62a38f0**：去掉运行中 gating + `onAsyncSubagentStateChange` 在 running 时启动轮询链（每 2s 读 sidecar 增量、按 tool id 合并、终态收口停止，上限 900 次≈30 分钟兜底）。Set 注册所有权从状态回调移至链自持（通知 settle 同步删 Set 会让防重检查恒失效——实施 agent 发现的时序矛盾）。实测：运行中工具行每 2 秒逐条冒出。

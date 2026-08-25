@@ -100,8 +100,9 @@ tags: [architect, claudian, bug-fix, stop-hook]
 - **阶段 2 S4+S5（61f7692）**：❌ 部署失败回滚（切 tab 消息消失+排队卡死），整体放弃
 - **四层热修（全部已部署）**：fbd4de8 首消息丢弃（init 建轮锁通道）→ c5ad19d 纯通知幽灵租约 → cc27faf 交互计数泄漏（他 session 交付）→ 0133ab7 六项锁链修复+埋点
 - **根因确诊（0823 深夜）**：轮次挂死家族=同病根三发作（无主消息一律建 auto turn）——fbd4de8/c5ad19d 治的是发作部位，99dca6b 幽灵守卫（auto turn 启动白名单：仅 assistant/stream_event）根治；bbb431f 补 finalize 渲染挂起保护。console 埋点链（Obsidian CLI dev:console 读取）是确诊关键
-- **工具明细修复（0823 深夜~0824）**：8883b66 通知入口补齐 hydration（销账后立即补读工具明细）+ c8d079d 秒完成竞态补齐（early-settled 记录回流同款 hydration）——subagent 运行中工具明细实时显示恢复，0824 实测验证
-- **当前线上**：hotfix/notify-lease@c8d079d，完整修复链部署，功能正常
+- **工具明细修复（0823 深夜~0824）**：8883b66 通知入口补齐 hydration + c8d079d 秒完成竞态补齐——完成时工具明细补齐恢复，0824 验证
+- **运行中实时轮询（0825）**：62a38f0——运行中每 2 秒轮询 sidecar 增量显示工具明细（此前仅完成时一次性补齐）；五连修健壮性收口（异常兜底/双链合并/超限清注册/enqueue 漏报 dropped——真实挂起路径/taskId 索引泄漏）；reviewer 复核 Set 生命周期自洽。0825 终验：运行中逐行实时冒出
+- **当前线上**：hotfix/notify-lease@62a38f0，功能完整（含运行中实时显示）
 - **S4+S5 方向**：v4 部分前提失效，v3 经价值审查暂缓（8883b66 已覆盖核心诉求、复杂度失衡）——未来按流式协议方向重起
 - **远程仓库**：源码已 fork 到 vincent101/claudian（origin），hotfix/notify-lease 分支已推送，bundle 冷备在 release backup-0824
 - **遗留**：网关"有首事件无终态"空流变体（0823 20:12 req 7270905e，200 透传无终态）待 model_proxy 线补修
