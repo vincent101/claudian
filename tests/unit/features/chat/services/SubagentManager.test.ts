@@ -1625,6 +1625,31 @@ Only this is the final result.
         expect(manager.hasRunningSubagents()).toBe(true);
       });
 
+      it('stale running agents settle through the unified orphan chain, not a silent status flip', () => {
+        const { manager, updates } = createManager();
+        const parentEl = createMockEl();
+        manager.handleTaskToolUse('task-stale', { description: 'Background', run_in_background: true }, parentEl);
+        manager.handleTaskToolResult('task-stale', JSON.stringify({ agent_id: 'agent-stale' }));
+        const running = manager.getByTaskId('task-stale')!;
+        expect((manager as any).taskIdToAgentId.size).toBe(1);
+
+        // Simulate a 2h+ old agent (process lost its state)
+        running.startedAt = Date.now() - 3 * 60 * 60 * 1000;
+
+        expect(manager.hasRunningSubagents()).toBe(false);
+
+        // Full terminal chain instead of a silent asyncStatus truncation
+        expect(running.asyncStatus).toBe('orphaned');
+        expect(running.status).toBe('error');
+        expect(running.result).toBe('Conversation ended before task completed');
+        expect(running.completedAt).toBeGreaterThan(0);
+        // onStateChange fired so poll chains observe 'orphaned' and stop
+        expect(updates[updates.length - 1].asyncStatus).toBe('orphaned');
+        // taskId index entry dropped with the transition
+        expect((manager as any).taskIdToAgentId.size).toBe(0);
+        expect(manager.getByTaskId('task-stale')).toBeUndefined();
+      });
+
       it('returns false when all subagents have completed', () => {
         const { manager } = createManager();
         const parentEl = createMockEl();

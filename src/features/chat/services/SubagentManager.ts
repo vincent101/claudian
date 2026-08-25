@@ -590,7 +590,13 @@ export class SubagentManager {
     }
     for (const [id, s] of this.activeAsyncSubagents) {
       if (!isLive(s)) {
-        s.asyncStatus = 'orphaned';
+        // Route through the unified terminal chain instead of a silent
+        // asyncStatus flip: the record needs status/result/completedAt, DOM
+        // projection, onStateChange (poll chains observe 'orphaned' and
+        // stop), and taskId index cleanup — same as any other terminal path.
+        // No re-entry risk: onStateChange's running branch only schedules
+        // chains for 'running', and the schedule Set dedupes by agentId.
+        this.markOrphaned(s);
         this.activeAsyncSubagents.delete(id);
       }
     }
@@ -714,6 +720,11 @@ export class SubagentManager {
     subagent.status = 'error';
     subagent.result = 'Conversation ended before task completed';
     subagent.completedAt = Date.now();
+    // Index entries for a dead agent are unreachable dead weight; drop them
+    // with the state transition so callers need not each remember to.
+    if (subagent.agentId) {
+      this.removeTaskIdIndexEntries(subagent.agentId);
+    }
     this.projectAsyncSubagentState(subagent);
     this.onStateChange(subagent);
   }

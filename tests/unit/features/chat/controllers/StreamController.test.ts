@@ -2251,6 +2251,66 @@ describe("StreamController - Text Content", () => {
       warnSpy.mockRestore();
     });
 
+    it('running-phase polls hydrate tool calls but never read or write the final result', async () => {
+      const runtime = deps.getAgentService!() as any;
+      const msg = seedTaskMessage('task-r1');
+      const { manager } = setupRealManager();
+      launchActiveSubagent(manager, 'task-r1', 'agent-r1');
+
+      runtime.loadSubagentToolCalls.mockResolvedValue([
+        { id: 'tool-1', name: 'Read', input: { file_path: 'a.md' }, status: 'completed', result: 'content', isExpanded: false },
+      ]);
+      // Sidecar mid-run assistant text: extractFinalResultFromSubagentJsonl
+      // returns the latest assistant text, which mid-run is progress
+      // narration — the running path must not read it at all.
+      runtime.loadSubagentFinalResult.mockResolvedValue('正在检查文件');
+
+      jest.advanceTimersByTime(200); // running chain tick, attempt 0
+      await flushAsync();
+      jest.advanceTimersByTime(600); // attempt 1, still running
+      await flushAsync();
+
+      const record = msg.toolCalls![0].subagent!;
+      expect(record.toolCalls).toHaveLength(1);
+      expect(record.toolCalls[0].id).toBe('tool-1');
+      // Mid-run assistant text never pollutes result
+      expect(record.result).toBeUndefined();
+      // Running polls skip the final-result sidecar read entirely
+      expect(runtime.loadSubagentFinalResult).not.toHaveBeenCalled();
+
+      // Terminal: the final result is read and written once
+      runtime.loadSubagentFinalResult.mockResolvedValue('Final answer');
+      controller.handleAsyncSubagentNotification('agent-r1', 'completed', 'done');
+      await flushAsync();
+      expect(record.result).toBe('Final answer');
+      expect(runtime.loadSubagentFinalResult).toHaveBeenCalledTimes(1);
+    });
+
+    it('re-read tool input with identical content but fresh object references does not trigger a refresh', async () => {
+      const runtime = deps.getAgentService!() as any;
+      seedTaskMessage('task-r2');
+      const { manager } = setupRealManager();
+      launchActiveSubagent(manager, 'task-r2', 'agent-r2');
+      const refreshSpy = jest.spyOn(manager, 'refreshAsyncSubagent');
+
+      // Two independent sidecar reads returning equal-by-value input (fresh
+      // nested objects from JSON.parse) must not flag a change.
+      const readToolCalls = () => ([
+        { id: 'tool-a', name: 'Read', input: { file_path: 'a.md', nested: { lines: [1, 2] } }, status: 'running', isExpanded: false },
+      ]);
+      runtime.loadSubagentToolCalls
+        .mockResolvedValueOnce(readToolCalls())
+        .mockResolvedValueOnce(readToolCalls());
+
+      jest.advanceTimersByTime(200); // first poll: new entry → refresh
+      await flushAsync();
+      expect(refreshSpy).toHaveBeenCalledTimes(1);
+
+      jest.advanceTimersByTime(600); // second poll: identical content → no refresh
+      await flushAsync();
+      expect(refreshSpy).toHaveBeenCalledTimes(1);
+    });
+
     it('releases the chain registration and stops polling when the attempt cap is reached', async () => {
       const runtime = deps.getAgentService!() as any;
       seedTaskMessage('task-x3');

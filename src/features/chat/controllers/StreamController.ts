@@ -1424,14 +1424,21 @@ export class StreamController {
   }
 
   /**
-   * One hydration pass: re-reads tool calls AND final result from the sidecar
-   * on every call. Tool calls merge by id (never frozen after a partial first
-   * read); retries re-read both because the sidecar may flush late content
-   * between reads.
+   * One hydration pass: re-reads tool calls from the sidecar on every call;
+   * the final result is only read when includeFinalResult is set (terminal
+   * paths). Running-phase polls must NOT read it: extractFinalResultFrom-
+   * SubagentJsonl returns the latest assistant text, which mid-run is
+   * progress narration ("正在检查文件" etc.) — writing it into subagent.result
+   * early flickers the UI, and a terminal-race poll could pre-settle
+   * finalResultHydrated and stop the chain before the real result lands.
+   * Tool calls merge by id (never frozen after a partial first read);
+   * terminal retries re-read the final result because the sidecar may flush
+   * late content between reads.
    */
   private async tryHydrateAsyncSubagent(
     subagent: SubagentInfo,
-    runtime: ChatRuntime
+    runtime: ChatRuntime,
+    options: { includeFinalResult?: boolean } = {}
   ): Promise<{ hasHydrated: boolean; finalResultHydrated: boolean }> {
     let hasHydrated = false;
     let finalResultHydrated = false;
@@ -1443,14 +1450,16 @@ export class StreamController {
       hasHydrated = true;
     }
 
-    const recoveredFinalResult = await runtime.loadSubagentFinalResult?.(
-      subagent.agentId || ''
-    ) ?? null;
-    if (recoveredFinalResult && recoveredFinalResult.trim().length > 0) {
-      finalResultHydrated = true;
-      if (recoveredFinalResult !== subagent.result) {
-        subagent.result = recoveredFinalResult;
-        hasHydrated = true;
+    if (options.includeFinalResult !== false) {
+      const recoveredFinalResult = await runtime.loadSubagentFinalResult?.(
+        subagent.agentId || ''
+      ) ?? null;
+      if (recoveredFinalResult && recoveredFinalResult.trim().length > 0) {
+        finalResultHydrated = true;
+        if (recoveredFinalResult !== subagent.result) {
+          subagent.result = recoveredFinalResult;
+          hasHydrated = true;
+        }
       }
     }
 
@@ -1493,7 +1502,10 @@ export class StreamController {
 
     let inputChanged = false;
     for (const key of Object.keys(incoming.input ?? {})) {
-      if (current.input?.[key] !== incoming.input[key]) {
+      // Deep value compare: each sidecar read re-parses JSON into fresh
+      // nested objects, so reference inequality would flag identical content
+      // as changed and force a DOM rebuild on every poll tick.
+      if (!this.inputValueEquals(current.input?.[key], incoming.input[key])) {
         inputChanged = true;
         break;
       }
@@ -1514,6 +1526,30 @@ export class StreamController {
     }
 
     return changed;
+  }
+
+  /**
+   * Structural equality for tool input values. Inputs are small JSON data, so
+   * recursion cost is negligible; reference identity short-circuits the
+   * common same-object case.
+   */
+  private inputValueEquals(a: unknown, b: unknown): boolean {
+    if (a === b) return true;
+    if (Array.isArray(a) && Array.isArray(b)) {
+      return a.length === b.length && a.every((item, index) => this.inputValueEquals(item, b[index]));
+    }
+    if (a !== null && b !== null && typeof a === 'object' && typeof b === 'object') {
+      const aKeys = Object.keys(a as Record<string, unknown>);
+      const bKeys = Object.keys(b as Record<string, unknown>);
+      if (aKeys.length !== bKeys.length) return false;
+      return aKeys.every((key) =>
+        this.inputValueEquals(
+          (a as Record<string, unknown>)[key],
+          (b as Record<string, unknown>)[key]
+        )
+      );
+    }
+    return false;
   }
 
   private scheduleAsyncSubagentResultRetry(
@@ -1577,8 +1613,13 @@ export class StreamController {
         return;
       }
 
-      // Running: poll the sidecar so tool calls appear incrementally.
-      const { hasHydrated } = await this.tryHydrateAsyncSubagent(subagent, runtime);
+      // Running: poll the sidecar so tool calls appear incrementally. The
+      // final result is not read here — see tryHydrateAsyncSubagent.
+      const { hasHydrated } = await this.tryHydrateAsyncSubagent(
+        subagent,
+        runtime,
+        { includeFinalResult: false }
+      );
       if (hasHydrated) {
         this.deps.subagentManager.refreshAsyncSubagent(subagent);
       }
