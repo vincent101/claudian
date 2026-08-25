@@ -105,7 +105,7 @@ tags: [architect, claudian, bug-fix, stop-hook]
 - **当前线上**：hotfix/notify-lease@62a38f0，功能完整（含运行中实时显示）
 - **S4+S5 方向**：v4 部分前提失效，v3 经价值审查暂缓（8883b66 已覆盖核心诉求、复杂度失衡）——未来按流式协议方向重起
 - **远程仓库**：源码已 fork 到 vincent101/claudian（origin），hotfix/notify-lease 分支已推送，bundle 冷备在 release backup-0824
-- **遗留**：网关"有首事件无终态"空流变体（0823 20:12 req 7270905e，200 透传无终态）待 model_proxy 线补修
+- **遗留（已闭环 0825）**：网关"有首事件无终态"空流变体——model_proxy 线已修复（转显式错误回报 SDK）；插件侧三层消化（CLI 重试→crash recovery→错误明示+锁干净释放）已就绪，无需配合改动。另：0825 展开 state 保留落地（6b24f11），Claudian 侧待办清零
 
 ## 关联
 
