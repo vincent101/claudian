@@ -461,11 +461,9 @@ function renderAsyncContentLikeSync(
   setPromptText(promptSection.bodyEl, subagent.prompt || '');
 
   const toolsContainerEl = contentEl.createDiv({ cls: 'claudian-subagent-tools' });
-  for (const originalToolCall of subagent.toolCalls) {
-    const toolCall: ToolCallInfo = {
-      ...originalToolCall,
-      input: { ...originalToolCall.input },
-    };
+  // Pass domain entries directly: createSubagentToolView writes isExpanded back
+  // to the tool call, so toggles survive the next full content rebuild.
+  for (const toolCall of subagent.toolCalls) {
     createSubagentToolView(toolsContainerEl, toolCall);
   }
 

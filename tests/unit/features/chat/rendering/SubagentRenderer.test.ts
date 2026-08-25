@@ -402,6 +402,101 @@ describe('Async Subagent Renderer', () => {
     expect(contentText).toContain('Conversation ended before task completed');
   });
 
+  describe('tool expansion persistence across rebuilds', () => {
+    const findToolWrapper = (root: MockElement, toolId: string): MockElement => {
+      const visit = (node: MockElement): MockElement | null => {
+        if (node.dataset?.toolId === toolId) return node;
+        for (const child of node.children) {
+          const found = visit(child);
+          if (found) return found;
+        }
+        return null;
+      };
+      return visit(root) as MockElement;
+    };
+
+    const getToolHeader = (toolWrapper: MockElement): MockElement =>
+      toolWrapper.children.find(child => child.hasClass('claudian-subagent-tool-header')) as MockElement;
+
+    const getToolContent = (toolWrapper: MockElement): MockElement =>
+      toolWrapper.children.find(child => child.hasClass('claudian-subagent-tool-content')) as MockElement;
+
+    const toolA: ToolCallInfo = {
+      id: 'tool-a',
+      name: 'Read',
+      input: { file_path: 'a.md' },
+      status: 'running',
+      isExpanded: false,
+    };
+
+    it('writes the toggle back to the domain tool call', () => {
+      const state = createAsyncSubagentBlock(parentEl as any, 'task-1', { description: 'Background job' });
+      state.info.toolCalls.push({ ...toolA });
+      updateAsyncSubagentRunning(state, 'agent-1');
+
+      getToolHeader(findToolWrapper(state.contentEl as any, 'tool-a')).click();
+
+      expect(state.info.toolCalls[0].isExpanded).toBe(true);
+    });
+
+    it('keeps tool A expanded when a rebuild adds tool B', () => {
+      const state = createAsyncSubagentBlock(parentEl as any, 'task-2', { description: 'Background job' });
+      state.info.toolCalls.push({ ...toolA });
+      updateAsyncSubagentRunning(state, 'agent-2');
+
+      getToolHeader(findToolWrapper(state.contentEl as any, 'tool-a')).click();
+
+      state.info.toolCalls.push({
+        id: 'tool-b',
+        name: 'Grep',
+        input: { pattern: 'x' },
+        status: 'running',
+        isExpanded: false,
+      });
+      updateAsyncSubagentRunning(state, 'agent-2');
+
+      const wrapperA = findToolWrapper(state.contentEl as any, 'tool-a');
+      const wrapperB = findToolWrapper(state.contentEl as any, 'tool-b');
+      expect(getToolHeader(wrapperA).getAttribute('aria-expanded')).toBe('true');
+      expect(getToolContent(wrapperA).style.display).toBe('block');
+      expect(getToolHeader(wrapperB).getAttribute('aria-expanded')).toBe('false');
+      expect(getToolContent(wrapperB).style.display).toBe('none');
+      expect(state.info.toolCalls[0].isExpanded).toBe(true);
+      expect(state.info.toolCalls[1].isExpanded).toBe(false);
+    });
+
+    it('keeps expansion through finalizeAsyncSubagent rebuild', () => {
+      const state = createAsyncSubagentBlock(parentEl as any, 'task-3', { description: 'Background job' });
+      state.info.toolCalls.push({ ...toolA, status: 'completed', result: 'A result' });
+      updateAsyncSubagentRunning(state, 'agent-3');
+
+      getToolHeader(findToolWrapper(state.contentEl as any, 'tool-a')).click();
+
+      finalizeAsyncSubagent(state, 'all done', false);
+
+      const wrapperA = findToolWrapper(state.contentEl as any, 'tool-a');
+      expect(getToolHeader(wrapperA).getAttribute('aria-expanded')).toBe('true');
+      expect(getToolContent(wrapperA).style.display).toBe('block');
+      expect(state.info.toolCalls[0].isExpanded).toBe(true);
+      expect(getTextByClass(state.contentEl as any, 'claudian-subagent-result-output')[0]).toBe('all done');
+    });
+
+    it('keeps expansion through markAsyncSubagentOrphaned rebuild', () => {
+      const state = createAsyncSubagentBlock(parentEl as any, 'task-4', { description: 'Background job' });
+      state.info.toolCalls.push({ ...toolA });
+      updateAsyncSubagentRunning(state, 'agent-4');
+
+      getToolHeader(findToolWrapper(state.contentEl as any, 'tool-a')).click();
+
+      markAsyncSubagentOrphaned(state);
+
+      const wrapperA = findToolWrapper(state.contentEl as any, 'tool-a');
+      expect(getToolHeader(wrapperA).getAttribute('aria-expanded')).toBe('true');
+      expect(getToolContent(wrapperA).style.display).toBe('block');
+      expect(state.info.toolCalls[0].isExpanded).toBe(true);
+    });
+  });
+
   describe('renderStoredAsyncSubagent', () => {
     it('should return wrapper element', () => {
       const subagent: SubagentInfo = {
