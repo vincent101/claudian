@@ -198,22 +198,14 @@ export class StreamController {
    * block finalize on renderer DOM state it no longer owns. Loser promise is
    * dropped — the data finalize below still runs on either outcome.
    */
-  private async awaitRenderCancelable(render: Promise<void>): Promise<'rendered' | 'invalidated'> {
-    if (this.renderFlushInvalidated) return 'invalidated';
+  private async awaitRenderCancelable(render: Promise<void>): Promise<void> {
+    if (this.renderFlushInvalidated) return;
     const invalidation = this.waitForRenderFlushInvalidation();
     try {
-      return await Promise.race([
-        Promise.resolve(render).then(() => 'rendered' as const),
-        invalidation.promise.then(() => 'invalidated' as const),
-      ]);
+      await Promise.race([render, invalidation.promise]);
     } finally {
       invalidation.dispose();
     }
-  }
-
-  /** Turn id of the turn whose flushes are in flight, for lease-phase logging. */
-  private activeFlushTurnId(): string {
-    return this.activeContext?.turnId ?? 'unknown';
   }
 
   private getActiveProviderId(): ProviderId {
@@ -836,12 +828,9 @@ export class StreamController {
         // Cancellable finalize render (fix 3 follow-up): the math-deferred
         // renderContent has no pending-render promise of its own, so it must
         // join the same turn-scoped invalidation as flushPendingTextRender.
-        const turnId = this.activeFlushTurnId();
-        console.debug('[Claudian] projection.finalizeRender.begin', { turnId, kind: 'text' });
-        const outcome = await this.awaitRenderCancelable(
+        await this.awaitRenderCancelable(
           renderer.renderContent(state.currentTextEl, textContent)
         );
-        console.debug('[Claudian] projection.finalizeRender.end', { turnId, kind: 'text', outcome });
       }
       msg.contentBlocks = msg.contentBlocks || [];
       msg.contentBlocks.push({ type: 'text', content: textContent });
@@ -884,14 +873,11 @@ export class StreamController {
       void this.renderPendingText();
     }
 
-    const turnId = this.activeFlushTurnId();
-    console.debug('[Claudian] projection.textFlush.begin', { turnId });
     // Turn-scoped cancellable await (fix 3): cancel/lifecycle invalidation
     // settles this flush and drops the pending render — the flush must never
     // depend on global DOM render state a cancelled turn no longer owns.
     if (this.renderFlushInvalidated) {
       this.cancelPendingTextRender();
-      console.debug('[Claudian] projection.textFlush.end', { turnId, dropped: true, reason: 'pre-invalidated' });
       return;
     }
     const invalidation = this.waitForRenderFlushInvalidation();
@@ -902,10 +888,8 @@ export class StreamController {
     }
     if (this.renderFlushInvalidated && this.pendingTextRenderPromise === pendingRender) {
       this.cancelPendingTextRender();
-      console.debug('[Claudian] projection.textFlush.end', { turnId, dropped: true, reason: 'invalidated' });
       return;
     }
-    console.debug('[Claudian] projection.textFlush.end', { turnId });
   }
 
   private async renderPendingText(): Promise<void> {
@@ -1016,12 +1000,9 @@ export class StreamController {
       if (this.getStreamingRenderOptions(thinkingState.content)) {
         // Cancellable finalize render (fix 3 follow-up) — same turn-scoped
         // invalidation as flushPendingThinkingRender.
-        const turnId = this.activeFlushTurnId();
-        console.debug('[Claudian] projection.finalizeRender.begin', { turnId, kind: 'thinking' });
-        const outcome = await this.awaitRenderCancelable(
+        await this.awaitRenderCancelable(
           renderer.renderContent(thinkingState.contentEl, thinkingState.content)
         );
-        console.debug('[Claudian] projection.finalizeRender.end', { turnId, kind: 'thinking', outcome });
       }
 
       const durationSeconds = finalizeThinkingBlock(thinkingState);
@@ -1075,12 +1056,9 @@ export class StreamController {
       void this.renderPendingThinking();
     }
 
-    const turnId = this.activeFlushTurnId();
-    console.debug('[Claudian] projection.thinkingFlush.begin', { turnId });
     // Turn-scoped cancellable await (fix 3) — mirrors flushPendingTextRender.
     if (this.renderFlushInvalidated) {
       this.cancelPendingThinkingRender();
-      console.debug('[Claudian] projection.thinkingFlush.end', { turnId, dropped: true, reason: 'pre-invalidated' });
       return;
     }
     const invalidation = this.waitForRenderFlushInvalidation();
@@ -1091,10 +1069,8 @@ export class StreamController {
     }
     if (this.renderFlushInvalidated && this.pendingThinkingRenderPromise === pendingRender) {
       this.cancelPendingThinkingRender();
-      console.debug('[Claudian] projection.thinkingFlush.end', { turnId, dropped: true, reason: 'invalidated' });
       return;
     }
-    console.debug('[Claudian] projection.thinkingFlush.end', { turnId });
   }
 
   private async renderPendingThinking(): Promise<void> {

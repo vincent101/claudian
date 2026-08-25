@@ -1278,12 +1278,6 @@ export class ClaudianService implements ChatRuntime {
    * the released signal that lets the UI queue proceed.
    */
   private async settleTurnAtResult(turn: RuntimeTurn): Promise<void> {
-    console.debug('[Claudian] runtime.result', {
-      turnId: turn.id,
-      kind: turn.kind,
-      waiters: turn.waiters.size,
-      generation: turn.generation,
-    });
     turn.phase = 'projecting';
 
     if (turn.waiters.size > 0) {
@@ -1511,12 +1505,9 @@ export class ClaudianService implements ChatRuntime {
       return;
     }
     this.deferredRestartPaths = null;
-    console.debug('[Claudian] deferredRestart.begin', { turnId: exemptTurnId ?? null, paths });
     try {
       await this.ensureReady({ force: true, externalContextPaths: paths });
-      console.debug('[Claudian] deferredRestart.end', { turnId: exemptTurnId ?? null, ok: true });
     } catch (error) {
-      console.debug('[Claudian] deferredRestart.end', { turnId: exemptTurnId ?? null, ok: false });
       console.warn('[Claudian] deferred restart failed; next query will retry', error);
     }
   }
@@ -2102,11 +2093,6 @@ export class ClaudianService implements ChatRuntime {
 
       yield { type: 'done' };
     } finally {
-      console.debug('[Claudian] generator.finally', {
-        turnId: turn.id,
-        phase: turn.phase,
-        kind: turn.kind,
-      });
       this.unregisterResponseHandler(handlerId);
       this.currentAllowedTools = null;
       this.finishTurnFromGenerator(turn, handler);
