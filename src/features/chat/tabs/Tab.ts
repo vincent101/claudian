@@ -18,13 +18,13 @@ import {
   DEFAULT_CHAT_PROVIDER_ID,
 } from '../../../core/providers/types';
 import type { ChatRuntime } from '../../../core/runtime/ChatRuntime';
-import type { AutoTurnResult } from '../../../core/runtime/types';
 import type { ChatMessage, Conversation, ExitPlanModeDecision } from '../../../core/types';
 import { t } from '../../../i18n/i18n';
 import type ClaudianPlugin from '../../../main';
 import { SlashCommandDropdown } from '../../../shared/components/SlashCommandDropdown';
 import { getEnhancedPath } from '../../../utils/env';
 import { getVaultPath } from '../../../utils/path';
+import { AutoTurnProjectionController } from '../controllers/AutoTurnProjectionController';
 import { BrowserSelectionController } from '../controllers/BrowserSelectionController';
 import { CanvasSelectionController } from '../controllers/CanvasSelectionController';
 import { ConversationController } from '../controllers/ConversationController';
@@ -398,6 +398,7 @@ export function createTab(options: TabCreateOptions): TabData {
     serviceInitialized: false,
     state,
     controllers: {
+      autoTurnProjectionController: null,
       selectionController: null,
       browserSelectionController: null,
       canvasSelectionController: null,
@@ -1276,6 +1277,7 @@ export function initializeTabControllers(
        */
       invalidateTurnLifecycle: () => {
         tab.controllers.turnCoordinator?.invalidateLifecycle();
+        tab.controllers.autoTurnProjectionController?.invalidate();
         tab.controllers.streamController?.invalidateRenderFlush();
       },
       getTitleGenerationService: () => services.titleGenerationService,
@@ -1339,6 +1341,20 @@ export function initializeTabControllers(
     state,
     getConversationId: () => state.currentConversationId,
     processQueuedMessage: () => tab.controllers.inputController?.processQueuedMessage(),
+  });
+
+  tab.controllers.autoTurnProjectionController = new AutoTurnProjectionController({
+    state,
+    renderer: tab.renderer,
+    streamController: tab.controllers.streamController,
+    conversationController: tab.controllers.conversationController,
+    turnCoordinator: tab.controllers.turnCoordinator,
+    subagentManager: services.subagentManager,
+    getConversationId: () => state.currentConversationId,
+    isTabConnected: () => tab.lifecycleState !== 'closing' && tab.dom.contentEl.isConnected,
+    generateId: generateMessageId,
+    notify: message => { new Notice(message); },
+    recordDiagnostic: event => tab.service?.recordAutoTurnDiagnostic?.(event),
   });
 
   tab.controllers.inputController = new InputController({
@@ -1596,6 +1612,7 @@ export async function destroyTab(tab: TabData): Promise<void> {
   // callbacks cannot write into the torn-down tab, and the lease is cleared
   // without triggering the queued-message pump.
   tab.controllers.turnCoordinator?.invalidateLifecycle();
+  tab.controllers.autoTurnProjectionController?.invalidate();
 
   tab.controllers.selectionController?.stop();
   tab.controllers.selectionController?.clear();
@@ -1729,28 +1746,29 @@ export function setupServiceCallbacks(tab: TabData, plugin: ClaudianPlugin): voi
         tab.services.subagentManager.handleTaskNotification(taskId, status, result);
       }
     });
-    tab.service.setAutoTurnCallback((result: AutoTurnResult) => {
-      // S2 lifecycle guard: a cancelled/switched-away auto turn must not
-      // write stale messages into the (possibly new) conversation.
-      const coordinator = tab.controllers.turnCoordinator;
-      if (coordinator && !coordinator.canProjectAutoTurn()) {
-        return;
-      }
-      renderAutoTriggeredTurn(tab, result);
-    });
-    // S2 auto-turn lifecycle (v4 §3.1): the runtime signals lease start,
-    // finish and release in fixed order; the coordinator owns the lease.
+    // Providers without live auto chunks retain their legacy callback; Claude
+    // registers the live callback below, so its runtime never buffers/double-projects.
+    tab.service.setAutoTurnCallback(() => {});
     tab.service.setOnAutoTurnStarted?.((event) => {
-      tab.controllers.turnCoordinator?.beginAutoTurn(event.turnId, event.generation);
+      return tab.controllers.autoTurnProjectionController?.started(event) ?? false;
     });
-    tab.service.setOnAutoTurnFinished?.((turnId) => {
-      tab.controllers.turnCoordinator?.finish(turnId);
+    tab.service.setOnAutoTurnChunk?.(async (event) => {
+      await tab.controllers.autoTurnProjectionController?.chunk(event);
+    });
+    tab.service.setOnAutoTurnFinished?.(async (event) => {
+      await tab.controllers.autoTurnProjectionController?.finished(event);
     });
     tab.service.setOnAutoTurnReleased?.((turnId) => {
+      tab.service?.recordAutoTurnDiagnostic?.({ phase: 'lease_release', turnId, leaseKind: 'auto' });
       tab.controllers.turnCoordinator?.release(turnId);
     });
     tab.service.setOnAutoTurnCancelled?.((event) => {
-      tab.controllers.turnCoordinator?.cancelAutoTurn(event.turnId, event.generation);
+      tab.controllers.autoTurnProjectionController?.cancelled(event);
+    });
+    tab.service.setOnEmbeddedExternal?.(async (event) => {
+      await tab.controllers.autoTurnProjectionController?.projectEmbeddedExternal(event);
+      tab.state.hasPendingConversationSave = true;
+      await tab.controllers.conversationController?.save(false);
     });
     // Turn-lease hotfix fix 6: the runtime lost a turn that dequeued — clear
     // the feature lease for the same turnId so the layers cannot drift.
@@ -1778,45 +1796,6 @@ export function setupServiceCallbacks(tab: TabData, plugin: ClaudianPlugin): voi
 
 function generateMessageId(): string {
   return `msg-${Date.now()}-${Math.random().toString(36).substring(2, 9)}`;
-}
-
-/**
- * Renders an auto-triggered turn (e.g., agent response to task-notification)
- * that arrives after the main handler has completed.
- */
-function renderAutoTriggeredTurn(tab: TabData, result: AutoTurnResult): void {
-  if (!tab.dom.contentEl.isConnected) {
-    return;
-  }
-
-  const { chunks, metadata } = result;
-  const hasToolActivity = chunks.some(
-    chunk => chunk.type === 'tool_use' || chunk.type === 'tool_result'
-  );
-  let textContent = '';
-
-  for (const chunk of chunks) {
-    if (chunk.type === 'text') {
-      textContent += chunk.content;
-    }
-  }
-
-  if (!textContent.trim() && !hasToolActivity) return;
-
-  const content = textContent.trim() || '(background task completed)';
-
-  const assistantMsg: ChatMessage = {
-    id: metadata.assistantMessageId ?? generateMessageId(),
-    role: 'assistant',
-    content,
-    timestamp: Date.now(),
-    contentBlocks: [{ type: 'text', content }],
-    ...(metadata.assistantMessageId && { assistantMessageId: metadata.assistantMessageId }),
-  };
-
-  tab.state.addMessage(assistantMsg);
-  tab.renderer?.renderStoredMessage(assistantMsg);
-  tab.renderer?.scrollToBottom();
 }
 
 export function updatePlanModeUI(tab: TabData, plugin: ClaudianPlugin, mode: string): void {

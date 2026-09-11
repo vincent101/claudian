@@ -4,6 +4,9 @@ import type {
   ApprovalCallback,
   AskUserQuestionCallback,
   AutoTurnCancelledEvent,
+  AutoTurnChunkEvent,
+  AutoTurnDiagnosticEvent,
+  AutoTurnFinishedEvent,
   AutoTurnResult,
   AutoTurnStartedEvent,
   ChatRewindResult,
@@ -39,6 +42,8 @@ export interface ChatRuntime {
   ): AsyncGenerator<StreamChunk>;
   steer?(turn: PreparedChatTurn): Promise<boolean>;
   cancel(): void;
+  beginUserTurnProjection?(turnId: string): void;
+  completeUserTurnProjection?(turnId: string): Promise<void>;
   resetSession(): void;
   getSessionId(): string | null;
   consumeSessionInvalidation(): boolean;
@@ -62,10 +67,13 @@ export interface ChatRuntime {
    * (feature lease cleared) → released (queued UI message may proceed) — with
    * cancelled replacing finished/released on the cancellation path.
    */
-  setOnAutoTurnStarted?(callback: ((event: AutoTurnStartedEvent) => void) | null): void;
-  setOnAutoTurnFinished?(callback: ((turnId: string) => void) | null): void;
+  setOnAutoTurnStarted?(callback: ((event: AutoTurnStartedEvent) => unknown) | null): void;
+  setOnAutoTurnChunk?(callback: ((event: AutoTurnChunkEvent) => Promise<void>) | null): void;
+  setOnAutoTurnFinished?(callback: ((event: AutoTurnFinishedEvent) => Promise<void>) | null): void;
   setOnAutoTurnReleased?(callback: ((turnId: string) => void) | null): void;
   setOnAutoTurnCancelled?(callback: ((event: AutoTurnCancelledEvent) => void) | null): void;
+  setOnEmbeddedExternal?(callback: ((event: AutoTurnStartedEvent) => Promise<void>) | null): void;
+  recordAutoTurnDiagnostic?(event: AutoTurnDiagnosticEvent): void;
   /**
    * Turn-lease hotfix fix 6 (providers with a message-queue channel only):
    * fired when a queued message dequeues for a turn the runtime no longer

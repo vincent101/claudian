@@ -3,6 +3,7 @@ import type { Component, WorkspaceLeaf } from 'obsidian';
 import type { InstructionRefineService, ProviderId, TitleGenerationService } from '../../../core/providers/types';
 import type { ChatRuntime } from '../../../core/runtime/ChatRuntime';
 import type { SlashCommandDropdown } from '../../../shared/components/SlashCommandDropdown';
+import type { AutoTurnProjectionController } from '../controllers/AutoTurnProjectionController';
 import type { BrowserSelectionController } from '../controllers/BrowserSelectionController';
 import type { CanvasSelectionController } from '../controllers/CanvasSelectionController';
 import type { ConversationController } from '../controllers/ConversationController';
@@ -102,6 +103,7 @@ export function generateTabId(): TabId {
  * Each tab has its own set of controllers for independent operation.
  */
 export interface TabControllers {
+  autoTurnProjectionController: AutoTurnProjectionController | null;
   selectionController: SelectionController | null;
   browserSelectionController: BrowserSelectionController | null;
   canvasSelectionController: CanvasSelectionController | null;

@@ -11,6 +11,7 @@ import { extractContentBeforeXmlContext } from '../../../utils/context';
 import { extractDiffData } from '../../../utils/diff';
 import { isCompactionCanceledStderr, isInterruptSignalText } from '../../../utils/interrupt';
 import { extractToolResultContent } from '../sdk/toolResultContent';
+import { extractExternalDisplayContent } from '../transcript/ClaudeTranscriptTurnMapper';
 import type {
   AsyncSubagentResult,
   SDKNativeContentBlock,
@@ -44,6 +45,19 @@ function isRebuiltContextContent(textContent: string): boolean {
 
 function extractDisplayContent(textContent: string): string | undefined {
   return extractContentBeforeXmlContext(textContent);
+}
+
+function externalSourceLabel(sdkMsg: SDKNativeMessage): string {
+  switch (sdkMsg.origin?.kind) {
+    case 'peer':
+      return sdkMsg.origin.name ? `Peer · ${sdkMsg.origin.name}` : 'Peer';
+    case 'channel':
+      return sdkMsg.origin.server ? `Channel · ${sdkMsg.origin.server}` : 'Channel';
+    case 'coordinator':
+      return 'Coordinator';
+    default:
+      return '';
+  }
 }
 
 function extractImages(content: string | SDKNativeContentBlock[] | undefined): ImageAttachment[] | undefined {
@@ -149,6 +163,15 @@ function mapContentBlocks(content: string | SDKNativeContentBlock[] | undefined)
   return blocks.length > 0 ? blocks : undefined;
 }
 
+const DISPLAYABLE_EXTERNAL_KINDS = new Set(['peer', 'channel', 'coordinator']);
+
+export function isDisplayableExternalUser(sdkMsg: SDKNativeMessage): boolean {
+  if (sdkMsg.type !== 'user' || 'toolUseResult' in sdkMsg || 'sourceToolUseID' in sdkMsg) return false;
+  if (!DISPLAYABLE_EXTERNAL_KINDS.has(sdkMsg.origin?.kind ?? '')) return false;
+  if (!sdkMsg.uuid && !sdkMsg.origin?.msg_id) return false;
+  return extractExternalDisplayContent(sdkMsg) !== undefined;
+}
+
 export function parseSDKMessageToChat(
   sdkMsg: SDKNativeMessage,
   toolResults?: Map<string, { content: string; isError: boolean }>,
@@ -180,7 +203,10 @@ export function parseSDKMessageToChat(
   }
 
   const content = sdkMsg.message?.content;
-  const textContent = extractTextContent(content);
+  const externalContent = isDisplayableExternalUser(sdkMsg)
+    ? extractExternalDisplayContent(sdkMsg)
+    : undefined;
+  const textContent = externalContent ?? extractTextContent(content);
   const images = sdkMsg.type === 'user' ? extractImages(content) : undefined;
 
   const hasToolUse = Array.isArray(content) && content.some(block => block.type === 'tool_use');
@@ -190,20 +216,26 @@ export function parseSDKMessageToChat(
   }
 
   const timestamp = sdkMsg.timestamp ? new Date(sdkMsg.timestamp).getTime() : Date.now();
+  const externalId = externalContent ? (sdkMsg.uuid ?? sdkMsg.origin?.msg_id) : undefined;
   const commandNameMatch = sdkMsg.type === 'user'
     ? textContent.match(/<command-name>(\/[^<]+)<\/command-name>/)
     : null;
 
   let displayContent: string | undefined;
   if (sdkMsg.type === 'user') {
-    displayContent = commandNameMatch ? commandNameMatch[1] : extractDisplayContent(textContent);
+    if (externalContent) {
+      const label = externalSourceLabel(sdkMsg);
+      displayContent = label ? `${label}\n\n${externalContent}` : externalContent;
+    } else {
+      displayContent = commandNameMatch ? commandNameMatch[1] : extractDisplayContent(textContent);
+    }
   }
 
   const isInterrupt = sdkMsg.type === 'user' && isInterruptSignalText(textContent);
   const isRebuiltContext = sdkMsg.type === 'user' && isRebuiltContextContent(textContent);
 
   return {
-    id: sdkMsg.uuid || `sdk-${timestamp}-${Math.random().toString(36).slice(2)}`,
+    id: externalId || sdkMsg.uuid || `sdk-${timestamp}-${Math.random().toString(36).slice(2)}`,
     role: sdkMsg.type,
     content: textContent,
     displayContent,
@@ -211,7 +243,7 @@ export function parseSDKMessageToChat(
     toolCalls: sdkMsg.type === 'assistant' ? extractToolCalls(content, toolResults) : undefined,
     contentBlocks: sdkMsg.type === 'assistant' ? mapContentBlocks(content) : undefined,
     images,
-    ...(sdkMsg.type === 'user' && sdkMsg.uuid && { userMessageId: sdkMsg.uuid }),
+    ...(sdkMsg.type === 'user' && (externalId ?? sdkMsg.uuid) && { userMessageId: externalId ?? sdkMsg.uuid }),
     ...(sdkMsg.type === 'assistant' && sdkMsg.uuid && { assistantMessageId: sdkMsg.uuid }),
     ...(isInterrupt && { isInterrupt: true }),
     ...(isRebuiltContext && { isRebuiltContext: true }),
@@ -315,7 +347,10 @@ export function isSystemInjectedMessage(sdkMsg: SDKNativeMessage): boolean {
   if (sdkMsg.type !== 'user') {
     return false;
   }
-  if ('toolUseResult' in sdkMsg || 'sourceToolUseID' in sdkMsg || !!sdkMsg.isMeta) {
+  if ('toolUseResult' in sdkMsg || 'sourceToolUseID' in sdkMsg) {
+    return true;
+  }
+  if (sdkMsg.isMeta && !isDisplayableExternalUser(sdkMsg)) {
     return true;
   }
 

@@ -133,16 +133,61 @@ export interface AutoTurnResult {
  * starts an SDK-initiated (auto) turn; the feature layer takes its exclusive
  * turn lease here (v4 §6: strictly before the notification is dispatched).
  */
+export type AutoTurnSource =
+  | { kind: 'peer'; label?: string }
+  | { kind: 'channel'; label?: string }
+  | { kind: 'coordinator' }
+  | { kind: 'notification-continuation' }
+  | { kind: 'assistant-continuation' };
+
 export interface AutoTurnStartedEvent {
   turnId: string;
   generation: number;
+  source: AutoTurnSource;
+  /** Sanitized user-visible text; never contains transport/control metadata. */
+  displayContent?: string;
+  transcriptUserId?: string;
+  replay?: boolean;
 }
 
-/** Fired when a runtime cancels an SDK-initiated (auto) turn (v3 §4.2). */
+export interface AutoTurnChunkEvent {
+  turnId: string;
+  generation: number;
+  chunk: StreamChunk;
+  transcriptIdentity?: string;
+  replay?: boolean;
+}
+
+export interface AutoTurnDiagnosticEvent {
+  phase: 'tick_start' | 'tick_end' | 'map' | 'lease_begin' | 'lease_finish' | 'lease_release'
+    | 'render_start' | 'render_end' | 'save_start' | 'save_end' | 'save_timeout' | 'callback_error';
+  turnId?: string;
+  generation?: number;
+  leaseKind?: 'user' | 'auto';
+  batchBytes?: number;
+  batchLines?: number;
+  elapsedMs?: number;
+  errorName?: string;
+}
+
+export interface AutoTurnFinishedEvent {
+  turnId: string;
+  generation: number;
+  metadata: ChatTurnMetadata;
+  replay?: boolean;
+}
+
+/**
+ * Fired when a runtime cancels an SDK-initiated (auto) turn (v3 §4.2).
+ * `interrupted` marks a turn terminated without an end marker (transcript
+ * replaced / observer stopped mid-turn): the projection must not report
+ * completion (v6 §4.3 crash semantics).
+ */
 export interface AutoTurnCancelledEvent {
   turnId: string;
   generation: number;
   reason: string;
+  interrupted?: boolean;
 }
 
 export type {

@@ -288,10 +288,28 @@ export class InputController {
       return;
     }
 
+    let hostProjectionRuntime: ChatRuntime | null = null;
+    const registerHostProjection = (): void => {
+      const runtime = this.getAgentService();
+      if (!runtime || runtime === hostProjectionRuntime) return;
+      runtime.beginUserTurnProjection?.(turnId);
+      runtime.recordAutoTurnDiagnostic?.({
+        phase: 'lease_begin', turnId, generation: streamGeneration, leaseKind: 'user',
+      });
+      hostProjectionRuntime = runtime;
+    };
+    // Existing runtimes register synchronously with the feature lease. Cold
+    // starts retain turnId in this closure and register immediately after init.
+    registerHostProjection();
+
     // Turn-scoped render flushes (turn-lease hotfix): a fresh scope so a
     // cancel/invalidation from a previous turn cannot drop this turn's
     // pending renders.
     streamController.beginRenderFlushScope?.();
+
+    let shouldReleaseUserTurn = false;
+    let deferredAutoSendContent: string | null = null;
+    let deferredNewSessionPlan: string | null = null;
 
     try {
     // Hide welcome message when sending first message
@@ -393,6 +411,7 @@ export class InputController {
       new Notice('Agent service not available. Please reload the plugin.');
       return;
     }
+    registerHostProjection();
 
     // Restore pendingResumeAt from persisted conversation state (survives plugin reload)
     const conversationIdForSend = state.currentConversationId;
@@ -518,15 +537,6 @@ export class InputController {
           }
         }
 
-        // finishFeatureTurn (v4 §3.1 step 3): projection cleanup is complete —
-        // release the feature lease here, BEFORE the plan-approval prompt,
-        // save, title refresh and auto-send/pump below. Every one of those is
-        // an await that may throw; a finish placed after them would leak the
-        // lease and permanently block new sends (isBusy() stays true). The
-        // auto-send path also needs the lease gone to send immediately
-        // instead of dead-ending in the queuedMessage branch.
-        this.getTurnCoordinator()?.finish(turnId);
-
         // Provider-agnostic post-plan approval: show UI and await decision before save/auto-send
         let planAutoSendContent: string | null = null;
         let planApprovalInvalidated = false;
@@ -580,26 +590,16 @@ export class InputController {
 
           // Auto-implement takes precedence over both approve-new-session and queued input
           if (planAutoSendContent) {
-            this.deps.getInputEl().value = planAutoSendContent;
-            this.sendMessage().catch(() => {});
+            deferredAutoSendContent = planAutoSendContent;
           } else {
-            // approve-new-session: create fresh conversation and send plan content
-            // Must be inside the invalidation guard — if the tab was closed or
-            // conversation switched, we must not create a new session on stale state.
+            // Record successors only; the runtime acknowledgement must promote
+            // any pending external turn before another user turn can start.
             const planContent = state.pendingNewSessionPlan;
             if (planContent) {
               state.pendingNewSessionPlan = null;
-              await conversationController.createNew();
-              this.deps.getInputEl().value = planContent;
-              this.sendMessage().catch(() => {
-                // sendMessage() handles its own errors internally; this prevents
-                // unhandled rejection if an unexpected error slips through.
-              });
+              deferredNewSessionPlan = planContent;
             } else if (shouldProcessQueuedMessage) {
-              // Queue drain is single-owner (turn-lease hotfix): release()
-              // is the only pump — it validates the settled turn against the
-              // current conversation/lifecycle and pumps exactly once.
-              this.getTurnCoordinator()?.release(turnId);
+              shouldReleaseUserTurn = true;
             }
           }
         }
@@ -610,13 +610,6 @@ export class InputController {
         this.updateQueueIndicator();
       }
       } finally {
-        // finishFeatureTurn (v4 §3.1 step 3), guaranteed: the
-        // non-invalidated branch already finished before its throwing
-        // awaits; this inner finally covers the invalidated path, an early
-        // skip, and any rejection in between. A second finish for an
-        // already-cleared lease is a harmless no-op.
-        this.getTurnCoordinator()?.finish(turnId);
-
         this.activeStreamingAssistantMessage = null;
         this.activeTurnContext = null;
         this.resetProviderMessageBoundaryState();
@@ -629,6 +622,9 @@ export class InputController {
       // rejection here previously leaked the feature lease (isBusy() stuck
       // true, all future sends dead-ended in the queue).
       this.getTurnCoordinator()?.finish(turnId);
+      this.getAgentService()?.recordAutoTurnDiagnostic?.({
+        phase: 'lease_finish', turnId, generation: streamGeneration, leaseKind: 'user',
+      });
 
       // Defensive cleanup for paths that never reached the cleanup body
       // (title/init rejection): only when no newer turn took over the
@@ -641,6 +637,29 @@ export class InputController {
       this.activeStreamingAssistantMessage = null;
       this.activeTurnContext = null;
       this.resetProviderMessageBoundaryState();
+
+      const runtime = this.getAgentService();
+      try {
+        await runtime?.completeUserTurnProjection?.(turnId);
+      } catch {
+        // Best-effort acknowledgement: a failing observer handoff must not
+        // break the turn-cleanup path (matches runtime callback isolation).
+      }
+
+      if (shouldReleaseUserTurn) {
+        this.getAgentService()?.recordAutoTurnDiagnostic?.({
+          phase: 'lease_release', turnId, generation: streamGeneration, leaseKind: 'user',
+        });
+        this.getTurnCoordinator()?.release(turnId);
+      }
+      if (deferredNewSessionPlan) {
+        await conversationController.createNew();
+        this.deps.getInputEl().value = deferredNewSessionPlan;
+        this.sendMessage().catch(() => {});
+      } else if (deferredAutoSendContent) {
+        this.deps.getInputEl().value = deferredAutoSendContent;
+        this.sendMessage().catch(() => {});
+      }
     }
   }
 

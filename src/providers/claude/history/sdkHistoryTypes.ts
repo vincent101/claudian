@@ -14,10 +14,30 @@ export interface SDKNativeMessage {
   uuid?: string;
   timestamp?: string;
   requestId?: string;
+  isSidechain?: boolean;
+  isReplay?: boolean;
+  promptSource?: string;
+  shouldQuery?: boolean;
+  origin?: {
+    kind?: string;
+    body?: unknown;
+    name?: string;
+    server?: string;
+    msg_id?: string;
+    [key: string]: unknown;
+  };
   message?: {
+    id?: string;
     role?: string;
     content?: string | SDKNativeContentBlock[];
     model?: string;
+    stop_reason?: string | null;
+    usage?: {
+      input_tokens?: number;
+      output_tokens?: number;
+      cache_creation_input_tokens?: number;
+      cache_read_input_tokens?: number;
+    };
   };
   subtype?: string;
   duration_ms?: number;

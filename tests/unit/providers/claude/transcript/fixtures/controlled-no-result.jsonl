@@ -1,0 +1,5 @@
+{"type":"user","uuid":"controlled-user","isSidechain":false,"origin":{"kind":"coordinator"},"message":{"role":"user","content":"controlled probe"}}
+{"type":"assistant","uuid":"controlled-text","isSidechain":false,"message":{"id":"controlled-message-1","role":"assistant","content":[{"type":"text","text":"probe start"}],"stop_reason":"tool_use"}}
+{"type":"assistant","uuid":"controlled-tool","isSidechain":false,"message":{"id":"controlled-message-1","role":"assistant","content":[{"type":"tool_use","id":"controlled-tool-1","name":"Bash","input":{"command":"sleep 1"}}],"stop_reason":"tool_use"}}
+{"type":"user","uuid":"controlled-result","isSidechain":false,"message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"controlled-tool-1","content":"ok","is_error":false}]}}
+{"type":"assistant","uuid":"controlled-end","isSidechain":false,"message":{"id":"controlled-message-2","role":"assistant","content":[{"type":"text","text":"probe end"}],"stop_reason":"end_turn"}}

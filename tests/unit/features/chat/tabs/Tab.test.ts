@@ -1390,47 +1390,6 @@ describe('Tab - Destruction', () => {
 
 describe('Tab - Service Callbacks', () => {
   describe('setupServiceCallbacks', () => {
-    function setupAutoTurnTest() {
-      const plugin = createMockPlugin();
-      const tab = createTab(createMockOptions({ plugin }));
-      const addMessageSpy = jest.spyOn(tab.state, 'addMessage');
-      const renderStoredMessage = jest.fn();
-      const scrollToBottom = jest.fn();
-
-      Object.defineProperty(tab.dom.contentEl, 'isConnected', {
-        value: true,
-        writable: true,
-        configurable: true,
-      });
-
-      tab.renderer = { renderStoredMessage, scrollToBottom } as any;
-      tab.controllers.inputController = {
-        handleApprovalRequest: jest.fn(),
-        dismissPendingApproval: jest.fn(),
-        handleAskUserQuestion: jest.fn(),
-        handleExitPlanMode: jest.fn(),
-      } as any;
-      tab.services.subagentManager = {
-        hasRunningSubagents: jest.fn().mockReturnValue(false),
-      } as any;
-
-      const service = {
-        setApprovalCallback: jest.fn(),
-        setApprovalDismisser: jest.fn(),
-        setAskUserQuestionCallback: jest.fn(),
-        setExitPlanModeCallback: jest.fn(),
-        setSubagentHookProvider: jest.fn(),
-        setAutoTurnCallback: jest.fn(),
-        setPermissionModeSyncCallback: jest.fn(),
-      };
-      tab.service = service as any;
-
-      setupServiceCallbacks(tab, plugin);
-
-      const autoTurnCallback = service.setAutoTurnCallback.mock.calls[0][0];
-      return { tab, addMessageSpy, renderStoredMessage, scrollToBottom, autoTurnCallback };
-    }
-
     it('routes subagent task notifications through the StreamController hydration entry', () => {
       const plugin = createMockPlugin();
       const tab = createTab(createMockOptions({ plugin }));
@@ -1469,40 +1428,47 @@ describe('Tab - Service Callbacks', () => {
       expect(handleTaskNotification).toHaveBeenCalledWith('agent-2', 'completed', 'done');
     });
 
-    it('renders tool-only auto-triggered turns with a placeholder assistant message', () => {
-      const { addMessageSpy, renderStoredMessage, scrollToBottom, autoTurnCallback } = setupAutoTurnTest();
-
-      autoTurnCallback({
-        chunks: [
-          { type: 'tool_result', id: 'task-1', content: 'done' },
-        ],
-        metadata: {},
+    it('wires a live auto-turn chunk projector instead of waiting for the result callback', () => {
+      const plugin = createMockPlugin();
+      const tab = createTab(createMockOptions({ plugin }));
+      tab.controllers.inputController = {} as any;
+      tab.controllers.streamController = {
+        beginRenderFlushScope: jest.fn(),
+        handleStreamChunk: jest.fn().mockResolvedValue(undefined),
+        showThinkingIndicator: jest.fn(),
+        hideThinkingIndicator: jest.fn(),
+        finalizeCurrentThinkingBlock: jest.fn().mockResolvedValue(undefined),
+        finalizeCurrentTextBlock: jest.fn().mockResolvedValue(undefined),
+        resetStreamingState: jest.fn(),
+      } as any;
+      tab.controllers.conversationController = { save: jest.fn().mockResolvedValue(undefined) } as any;
+      tab.controllers.turnCoordinator = new TurnCoordinator({
+        state: tab.state,
+        getConversationId: () => tab.state.currentConversationId,
+        processQueuedMessage: () => {},
       });
+      tab.renderer = { addMessage: jest.fn(), removeMessage: jest.fn() } as any;
+      Object.defineProperty(tab.dom.contentEl, 'isConnected', { value: true, configurable: true });
 
-      expect(addMessageSpy).toHaveBeenCalledWith(
-        expect.objectContaining({
-          role: 'assistant',
-          content: '(background task completed)',
-        })
-      );
-      expect(renderStoredMessage).toHaveBeenCalled();
-      expect(scrollToBottom).toHaveBeenCalled();
-    });
+      const service = {
+        setApprovalCallback: jest.fn(),
+        setApprovalDismisser: jest.fn(),
+        setAskUserQuestionCallback: jest.fn(),
+        setExitPlanModeCallback: jest.fn(),
+        setSubagentHookProvider: jest.fn(),
+        setAutoTurnCallback: jest.fn(),
+        setOnAutoTurnStarted: jest.fn(),
+        setOnAutoTurnChunk: jest.fn(),
+        setOnAutoTurnFinished: jest.fn(),
+        setOnAutoTurnReleased: jest.fn(),
+        setOnAutoTurnCancelled: jest.fn(),
+        setPermissionModeSyncCallback: jest.fn(),
+      };
+      tab.service = service as any;
 
-    it('skips auto-triggered rendering after the tab DOM is detached', () => {
-      const { tab, addMessageSpy, renderStoredMessage, scrollToBottom, autoTurnCallback } = setupAutoTurnTest();
+      setupServiceCallbacks(tab, plugin);
 
-      (tab.dom.contentEl as any).isConnected = false;
-      autoTurnCallback({
-        chunks: [
-          { type: 'text', content: 'Background result' },
-        ],
-        metadata: {},
-      });
-
-      expect(addMessageSpy).not.toHaveBeenCalled();
-      expect(renderStoredMessage).not.toHaveBeenCalled();
-      expect(scrollToBottom).not.toHaveBeenCalled();
+      expect(service.setOnAutoTurnChunk).toHaveBeenCalledWith(expect.any(Function));
     });
 
     it('wires the auto-turn lifecycle callbacks through the TurnCoordinator (S2)', () => {
@@ -1515,6 +1481,11 @@ describe('Tab - Service Callbacks', () => {
         getConversationId: () => tab.state.currentConversationId,
         processQueuedMessage,
       });
+      tab.controllers.autoTurnProjectionController = {
+        started: jest.fn((event) => tab.controllers.turnCoordinator?.beginAutoTurn(event.turnId, event.generation)),
+        finished: jest.fn(async (event) => { tab.controllers.turnCoordinator?.finish(event.turnId); }),
+        cancelled: jest.fn((event) => tab.controllers.turnCoordinator?.cancelAutoTurn(event.turnId, event.generation)),
+      } as any;
 
       const service = {
         setApprovalCallback: jest.fn(),
@@ -1524,6 +1495,7 @@ describe('Tab - Service Callbacks', () => {
         setSubagentHookProvider: jest.fn(),
         setAutoTurnCallback: jest.fn(),
         setOnAutoTurnStarted: jest.fn(),
+        setOnAutoTurnChunk: jest.fn(),
         setOnAutoTurnFinished: jest.fn(),
         setOnAutoTurnReleased: jest.fn(),
         setOnAutoTurnCancelled: jest.fn(),
@@ -1535,13 +1507,13 @@ describe('Tab - Service Callbacks', () => {
 
       // started → lease taken, isStreaming on
       const started = service.setOnAutoTurnStarted.mock.calls[0][0];
-      started({ turnId: 'auto-1', generation: 0 });
+      started({ turnId: 'auto-1', generation: 0, source: { kind: 'assistant-continuation' } });
       expect(tab.controllers.turnCoordinator.isBusy()).toBe(true);
       expect(tab.state.isStreaming).toBe(true);
 
       // finished → lease cleared without pumping the queue
       const finished = service.setOnAutoTurnFinished.mock.calls[0][0];
-      finished('auto-1');
+      void finished({ turnId: 'auto-1', generation: 0, metadata: {} });
       expect(tab.controllers.turnCoordinator.isBusy()).toBe(false);
       expect(tab.state.isStreaming).toBe(false);
       expect(processQueuedMessage).not.toHaveBeenCalled();
@@ -1552,7 +1524,7 @@ describe('Tab - Service Callbacks', () => {
       expect(processQueuedMessage).toHaveBeenCalledTimes(1);
 
       // cancelled (stale generation) → no-op; fresh generation clears the lease
-      started({ turnId: 'auto-2', generation: 3 });
+      started({ turnId: 'auto-2', generation: 3, source: { kind: 'assistant-continuation' } });
       const cancelled = service.setOnAutoTurnCancelled.mock.calls[0][0];
       cancelled({ turnId: 'auto-2', generation: 3 });
       expect(tab.controllers.turnCoordinator.isBusy()).toBe(true);
@@ -1560,52 +1532,6 @@ describe('Tab - Service Callbacks', () => {
       expect(tab.controllers.turnCoordinator.isBusy()).toBe(false);
     });
 
-    it('drops the legacy adapter projection once the lifecycle is invalidated (S2)', () => {
-      const plugin = createMockPlugin();
-      const tab = createTab(createMockOptions({ plugin }));
-      const addMessageSpy = jest.spyOn(tab.state, 'addMessage');
-
-      Object.defineProperty(tab.dom.contentEl, 'isConnected', {
-        value: true,
-        writable: true,
-        configurable: true,
-      });
-      tab.renderer = { renderStoredMessage: jest.fn(), scrollToBottom: jest.fn() } as any;
-      tab.controllers.inputController = {} as any;
-      tab.controllers.turnCoordinator = new TurnCoordinator({
-        state: tab.state,
-        getConversationId: () => tab.state.currentConversationId,
-        processQueuedMessage: () => {},
-      });
-      const service = {
-        setApprovalCallback: jest.fn(),
-        setApprovalDismisser: jest.fn(),
-        setAskUserQuestionCallback: jest.fn(),
-        setExitPlanModeCallback: jest.fn(),
-        setSubagentHookProvider: jest.fn(),
-        setAutoTurnCallback: jest.fn(),
-        setPermissionModeSyncCallback: jest.fn(),
-      };
-      tab.service = service as any;
-      setupServiceCallbacks(tab, plugin);
-      const autoTurnCallback = service.setAutoTurnCallback.mock.calls[0][0];
-
-      // Auto lease current → projection allowed.
-      tab.controllers.turnCoordinator.beginAutoTurn('auto-1', 0);
-      autoTurnCallback({
-        chunks: [{ type: 'text', content: 'live projection' }],
-        metadata: {},
-      });
-      expect(addMessageSpy).toHaveBeenCalledTimes(1);
-
-      // Tab destroyed / conversation switched → stale projection dropped.
-      tab.controllers.turnCoordinator.invalidateLifecycle();
-      autoTurnCallback({
-        chunks: [{ type: 'text', content: 'stale projection' }],
-        metadata: {},
-      });
-      expect(addMessageSpy).toHaveBeenCalledTimes(1);
-    });
   });
 });
 

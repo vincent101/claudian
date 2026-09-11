@@ -93,8 +93,9 @@ export interface RuntimeTurn {
   kind: RuntimeTurnKind;
   phase: RuntimeTurnPhase;
   generation: number;
-  /** Buffered chunks for auto turns (no live consumer); empty for user turns. */
+  /** Buffered chunks for legacy delivery or the suffix after live projection fails. */
   chunks: StreamChunk[];
+  liveProjectionFailed: boolean;
   metadata: ChatTurnMetadata;
   bufferedUsage: Extract<StreamChunk, { type: 'usage' }> | null;
   streamState: TransformStreamState;
@@ -122,6 +123,7 @@ export function createRuntimeTurn(options: RuntimeTurnOptions): RuntimeTurn {
     phase: options.phase ?? 'queued',
     generation: 0,
     chunks: [],
+    liveProjectionFailed: false,
     metadata: {},
     bufferedUsage: null,
     streamState: createTransformStreamState(),
