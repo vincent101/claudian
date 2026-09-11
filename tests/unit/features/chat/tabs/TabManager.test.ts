@@ -20,6 +20,15 @@ const mockInitializeTabControllers = jest.fn();
 const mockInitializeTabService = jest.fn().mockResolvedValue(undefined);
 const mockSetupServiceCallbacks = jest.fn();
 const mockRenderTabHydrationPlaceholder = jest.fn();
+const mockCleanupTabRuntime = jest.fn(
+  (tab: { service: any; serviceInitialized: boolean }) => {
+    if (tab.service && typeof tab.service.cleanup === 'function') {
+      tab.service.cleanup();
+    }
+    tab.service = null;
+    tab.serviceInitialized = false;
+  },
+);
 const mockWireTabInputEvents = jest.fn();
 const mockGetTabTitle = jest.fn().mockReturnValue('Test Tab');
 const mockCreateChatRuntime = jest.fn();
@@ -38,13 +47,7 @@ jest.mock('@/features/chat/tabs/Tab', () => ({
   renderTabHydrationPlaceholder: (...args: any[]) => mockRenderTabHydrationPlaceholder(...args),
   wireTabInputEvents: (...args: any[]) => mockWireTabInputEvents(...args),
   getTabTitle: (...args: any[]) => mockGetTabTitle(...args),
-  cleanupTabRuntime: (tab: { service: any; serviceInitialized: boolean }) => {
-    if (tab.service && typeof tab.service.cleanup === 'function') {
-      tab.service.cleanup();
-    }
-    tab.service = null;
-    tab.serviceInitialized = false;
-  },
+  cleanupTabRuntime: (tab: any) => mockCleanupTabRuntime(tab),
 }));
 
 const mockChooseForkTarget = jest.fn();
@@ -486,6 +489,92 @@ describe('TabManager - Tab Lifecycle', () => {
 
       expect(tab1?.hydrationState).not.toBe('READY');
       expect(tab2?.hydrationState).toBe('READY');
+    });
+
+    it('cleans up the runtime created during setupServiceCallbacks when hydration turns stale', async () => {
+      jest.useFakeTimers();
+      // Gate initializeTabService so tab1 stays suspended after setupServiceCallbacks
+      // while the switch to tab2 makes its hydration stale.
+      let resolveInit!: () => void;
+      const initGate = new Promise<void>((resolve) => { resolveInit = resolve; });
+      mockInitializeTabService.mockReturnValueOnce(initGate);
+      const manager = createManager({
+        callbacks,
+        tabFactory: (n) => createMockTabData({
+          id: `tab-${n}`,
+          conversationId: `conv-${n}`,
+          hydrationState: 'SHELL',
+          controllers: {
+            conversationController: {
+              save: jest.fn().mockResolvedValue(undefined),
+              loadActive: jest.fn().mockResolvedValue(undefined),
+              initializeWelcome: jest.fn(),
+            },
+          },
+        }),
+      });
+
+      const tab1 = await manager.createTab('conv-1');
+      jest.runAllTimers();
+      await flushMicrotasks();
+      // tab1 is suspended inside initializeTabService; the setup-time runtime exists.
+      expect(mockInitializeTabService).toHaveBeenCalledWith(tab1, expect.anything());
+
+      const tab2 = await manager.createTab('conv-2', undefined, { activate: false });
+      await manager.switchToTab(tab2!.id);
+      jest.runAllTimers();
+      await flushMicrotasks();
+
+      resolveInit();
+      await flushMicrotasks();
+      jest.useRealTimers();
+
+      expect(tab2?.hydrationState).toBe('READY');
+      expect(tab1?.hydrationState).toBe('SHELL');
+      expect(mockCleanupTabRuntime).toHaveBeenCalledWith(tab1);
+    });
+
+    it('cleans up instead of rendering the error placeholder when a stale hydration fails', async () => {
+      jest.useFakeTimers();
+      let rejectFirst!: (reason?: unknown) => void;
+      const firstLoad = new Promise<void>((_, reject) => { rejectFirst = reject; });
+      const manager = createManager({
+        callbacks,
+        tabFactory: (n) => createMockTabData({
+          id: `tab-${n}`,
+          conversationId: `conv-${n}`,
+          hydrationState: 'SHELL',
+          controllers: {
+            conversationController: {
+              save: jest.fn().mockResolvedValue(undefined),
+              loadActive: n === 1 ? jest.fn(() => firstLoad) : jest.fn().mockResolvedValue(undefined),
+              initializeWelcome: jest.fn(),
+            },
+          },
+        }),
+      });
+
+      const tab1 = await manager.createTab('conv-1');
+      jest.runAllTimers();
+      await flushMicrotasks();
+      // tab1 is now suspended inside `await loadActive` (LOADING).
+      const tab2 = await manager.createTab('conv-2', undefined, { activate: false });
+      await manager.switchToTab(tab2!.id);
+      jest.runAllTimers();
+      await flushMicrotasks();
+
+      rejectFirst(new Error('disk unavailable'));
+      await flushMicrotasks();
+      jest.useRealTimers();
+
+      expect(tab1?.hydrationState).toBe('SHELL');
+      expect(tab2?.hydrationState).toBe('READY');
+      expect(mockCleanupTabRuntime).toHaveBeenCalledWith(tab1);
+      // The stale catch must not render a retry placeholder for tab1.
+      const tab1RetryRenders = mockRenderTabHydrationPlaceholder.mock.calls.filter(
+        ([t, retry]: [any, unknown]) => t === tab1 && typeof retry === 'function',
+      );
+      expect(tab1RetryRenders).toHaveLength(0);
     });
 
     it('re-hydrates a LOADING tab after switching away and back once its in-flight load settles', async () => {

@@ -377,12 +377,23 @@ export class TabManager implements TabManagerInterface {
       // never reach this point and therefore cannot start an observer.
       await initializeTabService(tab, this.plugin);
       setupServiceCallbacks(tab, this.plugin);
-      if (this.isStaleHydration(tab, generation)) return;
+      if (this.isStaleHydration(tab, generation)) {
+        // setupServiceCallbacks may have parked a runtime/observer before the
+        // stale check; drop it so it cannot serve a foreign session to
+        // non-save paths (same reasoning as switchTabConversationToShell).
+        cleanupTabRuntime(tab);
+        return;
+      }
 
       this.setHydrationState(tab, 'READY');
       tab.hydrationDiagnostic = null;
     } catch (error) {
-      if (this.isStaleHydration(tab, generation)) return;
+      if (this.isStaleHydration(tab, generation)) {
+        // initializeTabService may have created a runtime before throwing;
+        // a stale catch must not leave it parked on the tab.
+        cleanupTabRuntime(tab);
+        return;
+      }
       if (error instanceof ConversationHistoryHydrationError && error.result.status === 'oversize') {
         this.setHydrationState(tab, 'OVERSIZE_BLOCKED');
         tab.hydrationDiagnostic = { segments: error.result.segments };
