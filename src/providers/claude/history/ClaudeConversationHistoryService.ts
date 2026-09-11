@@ -1,4 +1,7 @@
-import type { ProviderConversationHistoryService } from '../../../core/providers/types';
+import type {
+  ConversationHistoryHydrationResult,
+  ProviderConversationHistoryService,
+} from '../../../core/providers/types';
 import { isSubagentToolName, TOOL_TASK } from '../../../core/tools/toolNames';
 import type {
   AsyncSubagentStatus,
@@ -357,9 +360,9 @@ export class ClaudeConversationHistoryService implements ProviderConversationHis
   async hydrateConversationHistory(
     conversation: Conversation,
     vaultPath: string | null,
-  ): Promise<void> {
+  ): Promise<ConversationHistoryHydrationResult> {
     if (!vaultPath || this.hydratedConversationIds.has(conversation.id)) {
-      return;
+      return { status: 'ready' };
     }
 
     const state = getClaudeState(conversation.providerState);
@@ -372,13 +375,13 @@ export class ClaudeConversationHistoryService implements ProviderConversationHis
         ].filter((id): id is string => !!id);
 
     if (allSessionIds.length === 0) {
-      return;
+      return { status: 'ready' };
     }
 
     const allSdkMessages: ChatMessage[] = [];
     let missingSessionCount = 0;
-    let errorCount = 0;
-    let successCount = 0;
+    const errors: Array<{ sessionId: string; message: string }> = [];
+    const oversizeSegments: Array<{ sessionId: string; sizeBytes: number }> = [];
 
     const currentSessionId = isPendingFork
       ? state.forkSource!.sessionId
@@ -396,19 +399,29 @@ export class ClaudeConversationHistoryService implements ProviderConversationHis
         : undefined;
       const result = await loadSDKSessionMessages(vaultPath, sessionId, truncateAt);
 
-      if (result.error) {
-        errorCount++;
+      if (result.status === 'oversize') {
+        oversizeSegments.push({ sessionId, sizeBytes: result.sizeBytes ?? 0 });
+        continue;
+      }
+      if (result.status === 'failed') {
+        errors.push({ sessionId, message: result.error ?? 'Unknown history read error' });
         continue;
       }
 
-      successCount++;
       allSdkMessages.push(...result.messages);
     }
 
+    if (oversizeSegments.length > 0) {
+      return { status: 'oversize', segments: oversizeSegments };
+    }
+    if (errors.length > 0) {
+      return { status: 'error', errors };
+    }
+
     const allSessionsMissing = missingSessionCount === allSessionIds.length;
-    const hasLoadErrors = errorCount > 0 && successCount === 0 && !allSessionsMissing;
-    if (hasLoadErrors) {
-      return;
+    if (allSessionsMissing) {
+      this.hydratedConversationIds.add(conversation.id);
+      return { status: 'ready' };
     }
 
     const filteredSdkMessages = allSdkMessages.filter(msg => !msg.isRebuiltContext);
@@ -429,6 +442,7 @@ export class ClaudeConversationHistoryService implements ProviderConversationHis
 
     conversation.messages = merged;
     this.hydratedConversationIds.add(conversation.id);
+    return { status: 'ready' };
   }
 
   async deleteConversationSession(

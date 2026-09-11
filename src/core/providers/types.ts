@@ -369,11 +369,23 @@ export interface ProviderWorkspaceRegistration<
   initialize(context: ProviderWorkspaceInitContext): Promise<TServices>;
 }
 
+export type ConversationHistoryHydrationResult =
+  | { status: 'ready' }
+  | { status: 'oversize'; segments: Array<{ sessionId: string; sizeBytes: number }> }
+  | { status: 'error'; errors: Array<{ sessionId: string; message: string }> };
+
+export class ConversationHistoryHydrationError extends Error {
+  constructor(readonly result: Exclude<ConversationHistoryHydrationResult, { status: 'ready' }>) {
+    super(result.status === 'oversize' ? 'Conversation history is too large' : 'Conversation history failed to load');
+    this.name = 'ConversationHistoryHydrationError';
+  }
+}
+
 export interface ProviderConversationHistoryService {
   hydrateConversationHistory(
     conversation: Conversation,
     vaultPath: string | null,
-  ): Promise<void>;
+  ): Promise<void | ConversationHistoryHydrationResult>;
   deleteConversationSession(
     conversation: Conversation,
     vaultPath: string | null,

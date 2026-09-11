@@ -1,6 +1,7 @@
 import { createMockEl } from '@test/helpers/mockElement';
 
 import { ProviderWorkspaceRegistry } from '@/core/providers/ProviderWorkspaceRegistry';
+import { ConversationHistoryHydrationError } from '@/core/providers/types';
 import { TabManager } from '@/features/chat/tabs/TabManager';
 import {
   DEFAULT_MAX_TABS,
@@ -18,6 +19,7 @@ const mockInitializeTabUI = jest.fn();
 const mockInitializeTabControllers = jest.fn();
 const mockInitializeTabService = jest.fn().mockResolvedValue(undefined);
 const mockSetupServiceCallbacks = jest.fn();
+const mockRenderTabHydrationPlaceholder = jest.fn();
 const mockWireTabInputEvents = jest.fn();
 const mockGetTabTitle = jest.fn().mockReturnValue('Test Tab');
 const mockCreateChatRuntime = jest.fn();
@@ -33,8 +35,16 @@ jest.mock('@/features/chat/tabs/Tab', () => ({
   initializeTabControllers: (...args: any[]) => mockInitializeTabControllers(...args),
   initializeTabService: (...args: any[]) => mockInitializeTabService(...args),
   setupServiceCallbacks: (...args: any[]) => mockSetupServiceCallbacks(...args),
+  renderTabHydrationPlaceholder: (...args: any[]) => mockRenderTabHydrationPlaceholder(...args),
   wireTabInputEvents: (...args: any[]) => mockWireTabInputEvents(...args),
   getTabTitle: (...args: any[]) => mockGetTabTitle(...args),
+  cleanupTabRuntime: (tab: { service: any; serviceInitialized: boolean }) => {
+    if (tab.service && typeof tab.service.cleanup === 'function') {
+      tab.service.cleanup();
+    }
+    tab.service = null;
+    tab.serviceInitialized = false;
+  },
 }));
 
 const mockChooseForkTarget = jest.fn();
@@ -171,6 +181,9 @@ function createMockTabData(overrides: Record<string, any> = {}): any {
     id: `tab-${Date.now()}-${Math.random().toString(36).substring(2, 9)}`,
     providerId: 'claude',
     conversationId: null,
+    hydrationState: 'READY',
+    hydrationGeneration: 0,
+    hydrationDiagnostic: null,
     service: null,
     serviceInitialized: false,
     state: {
@@ -183,6 +196,7 @@ function createMockTabData(overrides: Record<string, any> = {}): any {
     },
     dom: {
       contentEl: createMockEl(),
+      inputEl: { disabled: false } as unknown as HTMLTextAreaElement,
     },
     ui: {
       externalContextSelector: null,
@@ -327,13 +341,424 @@ describe('TabManager - Tab Lifecycle', () => {
       expect(mockActivateTab).not.toHaveBeenCalled();
     });
 
-    it('should NOT initialize service on switch (lazy until first query)', async () => {
-      const manager = createManager({ callbacks });
+    it('hydrates a bound shell only after switching to it', async () => {
+      const hydrate = jest.fn().mockResolvedValue(undefined);
+      const manager = createManager({
+        callbacks,
+        tabFactory: (n) => createMockTabData({
+          id: `tab-${n}`,
+          conversationId: `conv-${n}`,
+          hydrationState: 'SHELL',
+          controllers: {
+            conversationController: {
+              save: jest.fn().mockResolvedValue(undefined),
+              loadActive: hydrate,
+              initializeWelcome: jest.fn(),
+            },
+          },
+        }),
+      });
 
-      await manager.createTab();
+      jest.useFakeTimers();
+      const tab = await manager.createTab('conv-1');
+      jest.runAllTimers();
+      await flushMicrotasks();
+      jest.useRealTimers();
 
-      // Service initialization is now lazy (on first query), not on switch
+      expect(hydrate).toHaveBeenCalledTimes(1);
+      expect(tab?.hydrationState).toBe('READY');
       expect(mockInitializeTabService).not.toHaveBeenCalled();
+    });
+
+    it('shows an oversize placeholder without marking the shell ready', async () => {
+      jest.useFakeTimers();
+      const loadActive = jest.fn().mockRejectedValue(new ConversationHistoryHydrationError({
+        status: 'oversize',
+        segments: [{ sessionId: 'large-session', sizeBytes: 65 * 1024 * 1024 }],
+      }));
+      const manager = createManager({
+        callbacks,
+        tabFactory: () => createMockTabData({
+          id: 'large-tab',
+          conversationId: 'large-conv',
+          hydrationState: 'SHELL',
+          controllers: { conversationController: { loadActive, initializeWelcome: jest.fn() } },
+        }),
+      });
+
+      const tab = await manager.createTab('large-conv');
+      jest.runAllTimers();
+      await flushMicrotasks();
+      jest.useRealTimers();
+
+      expect(tab?.hydrationState).toBe('OVERSIZE_BLOCKED');
+      expect(tab?.hydrationDiagnostic?.segments).toEqual([
+        { sessionId: 'large-session', sizeBytes: 65 * 1024 * 1024 },
+      ]);
+      // Oversize placeholder blocks the input so sends cannot hit the
+      // hydration error path.
+      expect(tab?.dom.inputEl.disabled).toBe(true);
+    });
+
+    it('shows a retryable error placeholder after hydration failure', async () => {
+      jest.useFakeTimers();
+      const loadActive = jest.fn()
+        .mockRejectedValueOnce(new Error('disk unavailable'))
+        .mockResolvedValueOnce(undefined);
+      const manager = createManager({
+        callbacks,
+        tabFactory: () => createMockTabData({
+          id: 'error-tab',
+          conversationId: 'error-conv',
+          hydrationState: 'SHELL',
+          controllers: { conversationController: { loadActive, initializeWelcome: jest.fn() } },
+        }),
+      });
+
+      const tab = await manager.createTab('error-conv');
+      jest.runAllTimers();
+      await flushMicrotasks();
+      expect(tab?.hydrationState).toBe('ERROR');
+
+      const retry = mockRenderTabHydrationPlaceholder.mock.calls.at(-1)?.[1];
+      expect(retry).toEqual(expect.any(Function));
+      retry();
+      jest.runAllTimers();
+      await flushMicrotasks();
+      jest.useRealTimers();
+
+      expect(loadActive).toHaveBeenCalledTimes(2);
+      expect(tab?.hydrationState).toBe('READY');
+    });
+
+    it('ignores a stale hydration result after rapid tab switching', async () => {
+      let resolveFirst!: () => void;
+      const firstLoad = new Promise<void>((resolve) => { resolveFirst = resolve; });
+      const manager = createManager({
+        callbacks,
+        tabFactory: (n) => createMockTabData({
+          id: `tab-${n}`,
+          conversationId: `conv-${n}`,
+          hydrationState: 'SHELL',
+          controllers: {
+            conversationController: {
+              save: jest.fn().mockResolvedValue(undefined),
+              loadActive: n === 1 ? jest.fn(() => firstLoad) : jest.fn().mockResolvedValue(undefined),
+              initializeWelcome: jest.fn(),
+            },
+          },
+        }),
+      });
+
+      jest.useFakeTimers();
+      const tab1 = await manager.createTab('conv-1');
+      jest.runOnlyPendingTimers();
+      await flushMicrotasks();
+      const tab2 = await manager.createTab('conv-2', undefined, { activate: false });
+      await manager.switchToTab(tab2!.id);
+      jest.runAllTimers();
+      await flushMicrotasks();
+      resolveFirst();
+      await flushMicrotasks();
+      jest.useRealTimers();
+
+      expect(tab1?.hydrationState).not.toBe('READY');
+      expect(tab2?.hydrationState).toBe('READY');
+    });
+
+    it('re-hydrates a LOADING tab after switching away and back once its in-flight load settles', async () => {
+      let resolveFirst!: () => void;
+      const firstLoad = new Promise<void>((resolve) => { resolveFirst = resolve; });
+      const loadActive = jest.fn()
+        .mockImplementationOnce(() => firstLoad)
+        .mockResolvedValueOnce(undefined);
+      const manager = createManager({
+        callbacks,
+        tabFactory: (n) => createMockTabData({
+          id: n === 1 ? 'tab-1' : 'tab-2',
+          conversationId: n === 1 ? 'conv-1' : 'conv-2',
+          hydrationState: 'SHELL',
+          controllers: {
+            conversationController: {
+              save: jest.fn().mockResolvedValue(undefined),
+              loadActive: n === 1 ? loadActive : jest.fn().mockResolvedValue(undefined),
+              initializeWelcome: jest.fn(),
+            },
+          },
+        }),
+      });
+
+      jest.useFakeTimers();
+      const tab1 = await manager.createTab('conv-1');
+      jest.runAllTimers();
+      await flushMicrotasks();
+      expect(tab1?.hydrationState).toBe('LOADING');
+
+      const tab2 = await manager.createTab('conv-2', undefined, { activate: false });
+      await manager.switchToTab(tab2!.id);
+
+      resolveFirst();
+      await flushMicrotasks();
+      // Stale completion while backgrounded falls back to SHELL (no reschedule pending).
+      expect(tab1?.hydrationState).toBe('SHELL');
+
+      await manager.switchToTab(tab1!.id);
+      jest.runAllTimers();
+      await flushMicrotasks();
+      jest.useRealTimers();
+
+      expect(tab1?.hydrationState).toBe('READY');
+      expect(loadActive).toHaveBeenCalledTimes(2);
+    });
+
+    it('re-hydrates a SCHEDULED tab switched away before its hydration callback fires', async () => {
+      const loadActive = jest.fn().mockResolvedValue(undefined);
+      const manager = createManager({
+        callbacks,
+        tabFactory: (n) => createMockTabData({
+          id: n === 1 ? 'tab-1' : 'tab-2',
+          conversationId: n === 1 ? 'conv-1' : 'conv-2',
+          hydrationState: 'SHELL',
+          controllers: {
+            conversationController: {
+              save: jest.fn().mockResolvedValue(undefined),
+              loadActive: n === 1 ? loadActive : jest.fn().mockResolvedValue(undefined),
+              initializeWelcome: jest.fn(),
+            },
+          },
+        }),
+      });
+
+      jest.useFakeTimers();
+      const tab1 = await manager.createTab('conv-1');
+      expect(tab1?.hydrationState).toBe('SCHEDULED');
+
+      const tab2 = await manager.createTab('conv-2', undefined, { activate: false });
+      await manager.switchToTab(tab2!.id);
+
+      jest.runAllTimers();
+      await flushMicrotasks();
+      expect(loadActive).not.toHaveBeenCalled();
+      // Stale scheduled callback while backgrounded falls back to SHELL.
+      expect(tab1?.hydrationState).toBe('SHELL');
+
+      await manager.switchToTab(tab1!.id);
+      jest.runAllTimers();
+      await flushMicrotasks();
+      jest.useRealTimers();
+
+      expect(loadActive).toHaveBeenCalledTimes(1);
+      expect(tab1?.hydrationState).toBe('READY');
+    });
+
+    it('resets a switched-away tab to SHELL after its stale load settles', async () => {
+      let resolveFirst!: () => void;
+      const firstLoad = new Promise<void>((resolve) => { resolveFirst = resolve; });
+      const manager = createManager({
+        callbacks,
+        tabFactory: (n) => createMockTabData({
+          id: n === 1 ? 'tab-1' : 'tab-2',
+          conversationId: n === 1 ? 'conv-1' : 'conv-2',
+          hydrationState: 'SHELL',
+          controllers: {
+            conversationController: {
+              save: jest.fn().mockResolvedValue(undefined),
+              loadActive: n === 1 ? jest.fn(() => firstLoad) : jest.fn().mockResolvedValue(undefined),
+              initializeWelcome: jest.fn(),
+            },
+          },
+        }),
+      });
+
+      jest.useFakeTimers();
+      const tab1 = await manager.createTab('conv-1');
+      jest.runAllTimers();
+      await flushMicrotasks();
+      const tab2 = await manager.createTab('conv-2', undefined, { activate: false });
+      await manager.switchToTab(tab2!.id);
+
+      resolveFirst();
+      await flushMicrotasks();
+      jest.useRealTimers();
+
+      expect(tab1?.hydrationState).toBe('SHELL');
+    });
+
+    it('survives rapid multi-round switching without hanging or duplicate loads', async () => {
+      const loads: Record<number, jest.Mock> = {
+        1: jest.fn().mockResolvedValue(undefined),
+        2: jest.fn().mockResolvedValue(undefined),
+      };
+      const manager = createManager({
+        callbacks,
+        tabFactory: (n) => createMockTabData({
+          id: `tab-${n}`,
+          conversationId: `conv-${n}`,
+          hydrationState: 'SHELL',
+          controllers: {
+            conversationController: {
+              save: jest.fn().mockResolvedValue(undefined),
+              loadActive: loads[n],
+              initializeWelcome: jest.fn(),
+            },
+          },
+        }),
+      });
+
+      jest.useFakeTimers();
+      const tab1 = await manager.createTab('conv-1');
+      const tab2 = await manager.createTab('conv-2', undefined, { activate: false });
+
+      // Rapid flips without letting timers run: every in-flight schedule is
+      // invalidated, neither tab may hang or load concurrently.
+      for (let round = 0; round < 3; round++) {
+        await manager.switchToTab(tab2!.id);
+        await manager.switchToTab(tab1!.id);
+      }
+
+      // Settle on each tab and let hydration complete.
+      await manager.switchToTab(tab2!.id);
+      jest.runAllTimers();
+      await flushMicrotasks();
+      expect(tab2?.hydrationState).toBe('READY');
+
+      await manager.switchToTab(tab1!.id);
+      jest.runAllTimers();
+      await flushMicrotasks();
+      jest.useRealTimers();
+
+      expect(tab1?.hydrationState).toBe('READY');
+      expect(loads[1]).toHaveBeenCalledTimes(1);
+      expect(loads[2]).toHaveBeenCalledTimes(1);
+    });
+
+    it('routes blocked active opens through the hydration shell hooks wired into tab controllers', async () => {
+      const loadActive = jest.fn()
+        .mockRejectedValueOnce(new ConversationHistoryHydrationError({
+          status: 'oversize',
+          segments: [{ sessionId: 'large-session', sizeBytes: 65 * 1024 * 1024 }],
+        }))
+        .mockResolvedValueOnce(undefined);
+      const manager = createManager({
+        callbacks,
+        tabFactory: () => createMockTabData({
+          id: 'shell-tab',
+          conversationId: 'conv-old',
+          hydrationState: 'READY',
+          state: {
+            currentConversationId: 'conv-old',
+            clearMessages: jest.fn(),
+          },
+          controllers: { conversationController: { loadActive, initializeWelcome: jest.fn() } },
+        }),
+      });
+
+      const tab = (await manager.createTab('conv-old'))!;
+      const hydrationHooks = mockInitializeTabControllers.mock.calls.at(-1)?.[6] as {
+        switchToHydrationShell: (conversationId: string) => void;
+        markHydrationReady: () => void;
+      };
+      expect(hydrationHooks).toBeDefined();
+
+      jest.useFakeTimers();
+
+      // Blocked active open: bind the shell and schedule hydration.
+      hydrationHooks.switchToHydrationShell('conv-blocked');
+      expect(tab.state.currentConversationId).toBe('conv-blocked');
+      expect(tab.state.clearMessages).toHaveBeenCalled();
+      expect(tab.hydrationState).toBe('SCHEDULED');
+
+      jest.runAllTimers();
+      await flushMicrotasks();
+      expect(tab.hydrationState).toBe('OVERSIZE_BLOCKED');
+      expect(tab.dom.inputEl.disabled).toBe(true);
+
+      // Direct switch away from the blocked conversation resets to READY.
+      hydrationHooks.markHydrationReady();
+      expect(tab.hydrationState).toBe('READY');
+      expect(tab.dom.inputEl.disabled).toBe(false);
+
+      jest.useRealTimers();
+    });
+
+    it('disables the input in every non-READY shell state so sends cannot race the hydration restore', async () => {
+      let resolveLoad!: () => void;
+      const loadActive = jest.fn().mockImplementation(
+        () => new Promise<void>((resolve) => { resolveLoad = resolve; }),
+      );
+      const manager = createManager({
+        callbacks,
+        tabFactory: () => createMockTabData({
+          id: 'race-tab',
+          conversationId: 'conv-race',
+          hydrationState: 'SHELL',
+          controllers: { conversationController: { loadActive, initializeWelcome: jest.fn() } },
+        }),
+      });
+
+      jest.useFakeTimers();
+      const tab = await manager.createTab('conv-race');
+      jest.runAllTimers();
+      await flushMicrotasks();
+
+      // SCHEDULED and LOADING both block the input (only OVERSIZE_BLOCKED
+      // used to); a message sent mid-LOADING could be overwritten by the
+      // restored history.
+      expect(tab?.hydrationState).toBe('LOADING');
+      expect(tab?.dom.inputEl.disabled).toBe(true);
+
+      // Hydration completes: input is re-enabled without clearing drafts.
+      const draft = 'draft survives the loading window';
+      (tab!.dom.inputEl as unknown as { value: string }).value = draft;
+      resolveLoad();
+      await flushMicrotasks();
+      expect(tab?.hydrationState).toBe('READY');
+      expect(tab?.dom.inputEl.disabled).toBe(false);
+      expect((tab!.dom.inputEl as unknown as { value: string }).value).toBe(draft);
+
+      jest.useRealTimers();
+    });
+
+    it('drops the parked runtime when a blocked switch routes to the shell', async () => {
+      const parkedRuntime = {
+        providerId: 'claude',
+        isReady: jest.fn().mockReturnValue(true),
+        cleanup: jest.fn(),
+      };
+      const manager = createManager({
+        callbacks,
+        tabFactory: () => createMockTabData({
+          id: 'shell-tab',
+          conversationId: 'conv-old',
+          hydrationState: 'READY',
+          state: { currentConversationId: 'conv-old', clearMessages: jest.fn() },
+          service: parkedRuntime,
+          serviceInitialized: true,
+          controllers: {
+            conversationController: {
+              loadActive: jest.fn().mockResolvedValue(undefined),
+              initializeWelcome: jest.fn(),
+            },
+          },
+        }),
+      });
+
+      const tab = (await manager.createTab('conv-old'))!;
+      const hydrationHooks = mockInitializeTabControllers.mock.calls.at(-1)?.[6] as {
+        switchToHydrationShell: (conversationId: string) => void;
+        isHydrationReady: () => boolean;
+      };
+
+      hydrationHooks.switchToHydrationShell('conv-blocked');
+
+      // The parked runtime from the previous conversation must be detached:
+      // it no longer matches the shell binding and would otherwise serve a
+      // foreign session to non-save paths (provider resolution, fork, warmup).
+      expect(parkedRuntime.cleanup).toHaveBeenCalled();
+      expect(tab.service).toBeNull();
+      expect(tab.serviceInitialized).toBe(false);
+      // The shell guard reflects the non-READY binding.
+      expect(hydrationHooks.isHydrationReady()).toBe(false);
     });
   });
 
@@ -687,7 +1112,7 @@ describe('TabManager - Conversation Management', () => {
 
       expect(mockCreateTab).toHaveBeenCalledWith(
         expect.objectContaining({
-          conversation: { id: 'conv-new' },
+          conversation: undefined,
         })
       );
     });
@@ -703,7 +1128,7 @@ describe('TabManager - Conversation Management', () => {
 
       expect(mockCreateTab).toHaveBeenCalledWith(
         expect.objectContaining({
-          conversation: { id: 'conv-background' },
+          conversation: undefined,
         })
       );
       expect(manager.getActiveTabId()).toBe(initialActiveTabId);
@@ -784,7 +1209,23 @@ describe('TabManager - Persistence', () => {
   });
 
   describe('restoreState', () => {
-    it('should restore tabs from persisted state', async () => {
+    it('restores bound tab shells without hydrating background conversations', async () => {
+      const plugin = createMockPlugin({
+        getConversationSync: jest.fn((id: string) => ({
+          id,
+          providerId: 'claude',
+          title: `Title ${id}`,
+          messages: [],
+        })),
+      });
+      manager = createManager({
+        plugin,
+        tabFactory: (n) => createMockTabData({
+          id: `restored-${n}`,
+          conversationId: `conv-${n}`,
+          hydrationState: 'SHELL',
+        }),
+      });
       const persistedState: PersistedTabManagerState = {
         openTabs: [
           { tabId: 'restored-1', conversationId: 'conv-1' },
@@ -795,6 +1236,9 @@ describe('TabManager - Persistence', () => {
 
       await manager.restoreState(persistedState);
 
+      expect(plugin.getConversationById).not.toHaveBeenCalled();
+      expect(plugin.getConversationSync).toHaveBeenCalledTimes(3);
+      expect(manager.getTab('restored-1')?.hydrationState).toBe('SHELL');
       expect(mockCreateTab).toHaveBeenCalledTimes(2);
     });
 
@@ -1253,7 +1697,7 @@ describe('TabManager - SDK Commands', () => {
           id: 'conv-opencode',
           messages: [{ id: 'm1' }],
           providerState: { databasePath: '/persisted/opencode.db' },
-          sessionId: 'session-1',
+          sessionId: 'session-2',
         })
         .mockResolvedValueOnce({
           id: 'conv-opencode',
@@ -2078,46 +2522,17 @@ describe('TabManager - Service Initialization Errors', () => {
 });
 
 describe('TabManager - Concurrent Switch Guard', () => {
-  it('should prevent concurrent tab switches', async () => {
-    const callbacks: TabManagerCallbacks = {
-      onTabSwitched: jest.fn(),
-    };
+  it('keeps rapid shell switches non-blocking', async () => {
+    const callbacks: TabManagerCallbacks = { onTabSwitched: jest.fn() };
     const manager = createManager({ callbacks });
-
     const tab1 = await manager.createTab();
     const tab2 = await manager.createTab();
 
-    // Set up tab-1 to trigger the async conversationController.switchTo path
-    // so that switchToTab hangs mid-execution with isSwitchingTab = true
-    let resolveSwitchTo!: () => void;
-    const hangingPromise = new Promise<void>(resolve => {
-      resolveSwitchTo = resolve;
-    });
-    tab1!.conversationId = 'conv-1';
-    tab1!.state.messages = [];
-    tab1!.controllers.conversationController!.switchTo = jest.fn().mockReturnValue(hangingPromise);
-
     jest.clearAllMocks();
-
-    // Start first switch to tab-1 (will hang on conversationController.switchTo)
-    const firstSwitch = manager.switchToTab(tab1!.id);
-
-    // While first switch is in progress, try a second switch.
-    // isSwitchingTab is true, so this should return immediately (lines 143-144)
+    await manager.switchToTab(tab1!.id);
     await manager.switchToTab(tab2!.id);
 
-    expect(mockDeactivateTab).toHaveBeenCalledTimes(1);
-    expect(mockActivateTab).toHaveBeenCalledTimes(1);
-
-    // Resolve the hanging first switch
-    resolveSwitchTo();
-    await firstSwitch;
-
-    expect(callbacks.onTabSwitched).toHaveBeenCalledTimes(1);
-
-    // After first switch completes, isSwitchingTab is false
-    // and subsequent switches should work normally
-    await manager.switchToTab(tab2!.id);
+    expect(manager.getActiveTabId()).toBe(tab2!.id);
     expect(callbacks.onTabSwitched).toHaveBeenCalledTimes(2);
   });
 });

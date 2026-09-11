@@ -1,9 +1,13 @@
 import type { AsyncSubagentStatus, ChatMessage } from '../../../core/types';
 
+export type SDKSessionReadStatus = 'complete' | 'missing' | 'oversize' | 'failed';
+
 export interface SDKSessionReadResult {
   messages: SDKNativeMessage[];
   skippedLines: number;
+  status: SDKSessionReadStatus;
   error?: string;
+  sizeBytes?: number;
 }
 
 /** Stored in session JSONL files. Based on Claude Agent SDK internal format. */
@@ -50,7 +54,9 @@ export interface SDKNativeContentBlock {
 export interface SDKSessionLoadResult {
   messages: ChatMessage[];
   skippedLines: number;
+  status?: SDKSessionReadStatus;
   error?: string;
+  sizeBytes?: number;
 }
 
 export interface AsyncSubagentResult {

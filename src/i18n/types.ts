@@ -48,6 +48,15 @@ export type TranslationKey =
   | 'chat.notifications.needsAttention'
   | 'chat.notifications.streamComplete'
 
+  // Chat - History hydration
+  | 'chat.history.loading'
+  | 'chat.history.oversizeTitle'
+  | 'chat.history.oversizeDescription'
+  | 'chat.history.errorTitle'
+  | 'chat.history.errorDescription'
+  | 'chat.history.retry'
+  | 'chat.history.switchFailed'
+
   // Chat - Fork
   | 'chat.fork.ariaLabel'
   | 'chat.fork.chooseTarget'

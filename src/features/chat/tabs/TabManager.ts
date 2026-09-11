@@ -3,10 +3,11 @@ import { Notice } from 'obsidian';
 import { ProviderRegistry } from '../../../core/providers/ProviderRegistry';
 import { ProviderSettingsCoordinator } from '../../../core/providers/ProviderSettingsCoordinator';
 import { ProviderWorkspaceRegistry } from '../../../core/providers/ProviderWorkspaceRegistry';
-import type {
-  ProviderId,
-  ProviderTabWarmupContext,
-  ProviderTabWarmupMode,
+import {
+  ConversationHistoryHydrationError,
+  type ProviderId,
+  type ProviderTabWarmupContext,
+  type ProviderTabWarmupMode,
 } from '../../../core/providers/types';
 import type { ChatRuntime } from '../../../core/runtime/ChatRuntime';
 import type { Conversation, SlashCommand } from '../../../core/types';
@@ -17,6 +18,7 @@ import { type DesktopNotificationKind,notifyBackgroundTabStateChange } from './d
 import { getTabProviderId } from './providerResolution';
 import {
   activateTab,
+  cleanupTabRuntime,
   createTab,
   deactivateTab,
   destroyTab,
@@ -25,6 +27,7 @@ import {
   initializeTabControllers,
   initializeTabService,
   initializeTabUI,
+  renderTabHydrationPlaceholder,
   setupServiceCallbacks,
   wireTabInputEvents,
 } from './Tab';
@@ -36,6 +39,7 @@ import {
   type PersistedTabState,
   type TabBarItem,
   type TabData,
+  type TabHydrationState,
   type TabId,
   type TabManagerCallbacks,
   type TabManagerInterface,
@@ -183,7 +187,7 @@ export class TabManager implements TabManagerInterface {
     const { activate = true, draftModel } = options;
 
     const conversation = conversationId
-      ? await this.plugin.getConversationById(conversationId)
+      ? this.plugin.getConversationSync(conversationId) ?? undefined
       : undefined;
 
     // Inherit the active tab's provider so the new blank tab picks up its model
@@ -240,10 +244,20 @@ export class TabManager implements TabManagerInterface {
       (forkContext) => this.handleForkRequest(forkContext),
       (conversationId) => this.openConversation(conversationId),
       () => this.getProviderCatalogConfig(tab),
+      {
+        switchToHydrationShell: (conversationId) => this.switchTabConversationToShell(tab, conversationId),
+        markHydrationReady: () => this.setHydrationState(tab, 'READY'),
+        isHydrationReady: () => tab.hydrationState === 'READY',
+      },
     );
 
     // Wire input event handlers
     wireTabInputEvents(tab, this.plugin);
+
+    if (conversation) {
+      tab.state.currentConversationId = conversation.id;
+      this.setHydrationState(tab, 'SHELL');
+    }
 
     this.tabs.set(tab.id, tab);
     this.callbacks.onTabCreated?.(tab);
@@ -276,10 +290,11 @@ export class TabManager implements TabManagerInterface {
     const previousTabId = this.activeTabId;
 
     try {
-      // Deactivate current tab
+      // Deactivate current tab and invalidate any in-flight history writeback.
       if (previousTabId && previousTabId !== tabId) {
         const currentTab = this.tabs.get(previousTabId);
         if (currentTab) {
+          currentTab.hydrationGeneration++;
           deactivateTab(currentTab);
         }
       }
@@ -289,11 +304,21 @@ export class TabManager implements TabManagerInterface {
       activateTab(tab);
       tab.state.needsReview = false;
 
-      // Load conversation if not already loaded
-      if (tab.conversationId && tab.state.messages.length === 0) {
-        await tab.controllers.conversationController?.switchTo(tab.conversationId);
+      // Bound shells hydrate only from this activation path, after one frame.
+      // SCHEDULED/LOADING tabs were invalidated by a previous switch-away
+      // (generation++), so re-schedule here: without it they would hang in
+      // the loading placeholder forever after switching back.
+      if (
+        tab.conversationId
+        && (tab.hydrationState === 'SHELL'
+          || tab.hydrationState === 'SCHEDULED'
+          || tab.hydrationState === 'LOADING'
+          || tab.hydrationState === 'ERROR')
+      ) {
+        this.scheduleTabHydration(tab);
       } else if (
         tab.conversationId
+        && tab.hydrationState === 'READY'
         && tab.state.messages.length > 0
         && tab.service
         && !tab.state.isStreaming
@@ -318,6 +343,100 @@ export class TabManager implements TabManagerInterface {
       this.maybePrimeProviderRuntime(tab);
     } finally {
       this.isSwitchingTab = false;
+    }
+  }
+
+  private scheduleTabHydration(tab: TabData): void {
+    const generation = ++tab.hydrationGeneration;
+    this.setHydrationState(tab, 'SCHEDULED');
+    renderTabHydrationPlaceholder(tab);
+
+    const scheduleFrame = typeof requestAnimationFrame === 'function'
+      ? requestAnimationFrame
+      : (callback: FrameRequestCallback) => setTimeout(() => callback(Date.now()), 0) as unknown as number;
+    scheduleFrame(() => {
+      setTimeout(() => {
+        void this.hydrateTab(tab, generation);
+      }, 0);
+    });
+  }
+
+  private async hydrateTab(tab: TabData, generation: number): Promise<void> {
+    if (this.isStaleHydration(tab, generation)) return;
+    this.setHydrationState(tab, 'LOADING');
+    renderTabHydrationPlaceholder(tab);
+
+    try {
+      await tab.controllers.conversationController?.loadActive(
+        () => tab.hydrationGeneration === generation && this.activeTabId === tab.id,
+      );
+      if (this.isStaleHydration(tab, generation)) return;
+      this.setHydrationState(tab, 'READY');
+      tab.hydrationDiagnostic = null;
+    } catch (error) {
+      if (this.isStaleHydration(tab, generation)) return;
+      if (error instanceof ConversationHistoryHydrationError && error.result.status === 'oversize') {
+        this.setHydrationState(tab, 'OVERSIZE_BLOCKED');
+        tab.hydrationDiagnostic = { segments: error.result.segments };
+      } else {
+        this.setHydrationState(tab, 'ERROR');
+        tab.hydrationDiagnostic = {
+          message: error instanceof Error ? error.message : String(error),
+        };
+      }
+      renderTabHydrationPlaceholder(tab, () => {
+        if (this.activeTabId === tab.id) this.scheduleTabHydration(tab);
+      });
+    }
+  }
+
+  /**
+   * Stale check for in-flight hydration. A newer schedule superseding this
+   * one (same tab, reactivated) leaves state untouched; a tab switched away
+   * with no pending reschedule falls back to SHELL so a background tab never
+   * parks in an intermediate state (SCHEDULED/LOADING).
+   */
+  private isStaleHydration(tab: TabData, generation: number): boolean {
+    if (tab.hydrationGeneration === generation && this.activeTabId === tab.id) {
+      return false;
+    }
+    if (this.activeTabId !== tab.id) {
+      this.setHydrationState(tab, 'SHELL');
+    }
+    return true;
+  }
+
+  private setHydrationState(tab: TabData, state: TabHydrationState): void {
+    tab.hydrationState = state;
+    // Block input in every non-READY shell state so sends cannot race the
+    // hydration restore (a message sent mid-LOADING could be overwritten by
+    // the restored history) nor hit the hydration error path. READY
+    // re-enables it; `disabled` does not clear the textarea value, so user
+    // drafts survive the loading window.
+    tab.dom.inputEl.disabled = state !== 'READY';
+  }
+
+  /**
+   * Routes a blocked active open (e.g. an oversize conversation picked from
+   * the history dropdown) onto the shell state machine: bind the target
+   * conversation without loading messages, then re-enter the regular
+   * hydration schedule so the oversize/error placeholder renders exactly
+   * like a restored tab (M1 shell semantics for active opens). The ChatState
+   * setter fires onConversationChanged, which syncs tab.conversationId.
+   */
+  private switchTabConversationToShell(tab: TabData, conversationId: string): void {
+    tab.state.currentConversationId = conversationId;
+    tab.state.clearMessages();
+    tab.hydrationDiagnostic = null;
+    // Drop the runtime parked from the previous conversation: the blocked
+    // switch threw before ensureServiceForConversation rebinds it, so it
+    // would serve a foreign session to non-save paths (provider resolution,
+    // fork, command warmup). A later hydration or first send re-creates a
+    // runtime bound to the shell conversation.
+    cleanupTabRuntime(tab);
+    this.setHydrationState(tab, 'SHELL');
+    if (this.activeTabId === tab.id) {
+      this.scheduleTabHydration(tab);
     }
   }
 
@@ -863,7 +982,9 @@ export class TabManager implements TabManagerInterface {
     providerId: ProviderId,
   ): Promise<ProviderWarmupContext> {
     const conversation = tab.conversationId
-      ? await this.plugin.getConversationById(tab.conversationId)
+      ? (tab.hydrationState === 'READY'
+          ? await this.plugin.getConversationById(tab.conversationId)
+          : this.plugin.getConversationSync(tab.conversationId))
       : null;
     const hasConversationContext = (conversation?.messages.length ?? 0) > 0;
     const externalContextPaths = tab.ui.externalContextSelector?.getExternalContexts()

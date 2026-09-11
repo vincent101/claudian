@@ -66,6 +66,15 @@
     "notifications": {
       "needsAttention": "Tab {index} \"{title}\" needs your response",
       "streamComplete": "Tab {index} \"{title}\" finished. Ready for review."
+    },
+    "history": {
+      "loading": "Loading conversation…",
+      "oversizeTitle": "Large conversation",
+      "oversizeDescription": "On-demand loading will be available in the pagination milestone.",
+      "errorTitle": "Conversation failed to load",
+      "errorDescription": "The conversation history could not be loaded.",
+      "retry": "Retry",
+      "switchFailed": "Failed to switch conversation: {error}"
     }
   },
   "settings": {

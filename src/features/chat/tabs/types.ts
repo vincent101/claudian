@@ -92,6 +92,33 @@ export interface TabManagerInterface {
 /** Tab identifier type. */
 export type TabId = string;
 
+export type TabHydrationState =
+  | 'SHELL'
+  | 'SCHEDULED'
+  | 'LOADING'
+  | 'READY'
+  | 'OVERSIZE_BLOCKED'
+  | 'ERROR';
+
+export interface TabHydrationDiagnostic {
+  segments?: Array<{ sessionId: string; sizeBytes: number }>;
+  message?: string;
+}
+
+/**
+ * Tab-level hydration hooks injected into the per-tab ConversationController.
+ * Keeps the controller free of TabData references while letting the M1 shell
+ * state machine own every hydration transition.
+ */
+export interface TabHydrationHooks {
+  /** Route a hydration-blocked active open onto the shell state machine. */
+  switchToHydrationShell: (conversationId: string) => void;
+  /** Report a direct (non-shell) load/switch completion (reset to READY). */
+  markHydrationReady: () => void;
+  /** Whether the tab has fully hydrated (READY) and may persist session state. */
+  isHydrationReady: () => boolean;
+}
+
 /** Generates a unique tab ID. */
 export function generateTabId(): TabId {
   return `tab-${Date.now()}-${Math.random().toString(36).substring(2, 9)}`;
@@ -204,6 +231,11 @@ export interface TabData {
 
   /** Conversation ID bound to this tab (null for new/empty tabs). */
   conversationId: string | null;
+
+  /** UI-only history hydration lifecycle for restored/bound tabs. */
+  hydrationState: TabHydrationState;
+  hydrationGeneration: number;
+  hydrationDiagnostic: TabHydrationDiagnostic | null;
 
   /** Per-tab chat runtime instance for independent streaming. */
   service: ChatRuntime | null;

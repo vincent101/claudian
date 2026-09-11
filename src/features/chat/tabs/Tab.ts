@@ -48,7 +48,7 @@ import { NavigationSidebar } from '../ui/NavigationSidebar';
 import { StatusPanel } from '../ui/StatusPanel';
 import { recalculateUsageForModel } from '../utils/usageInfo';
 import { getTabProviderId } from './providerResolution';
-import type { TabData, TabDOMElements, TabId, TabProviderContext } from './types';
+import type { TabData, TabDOMElements, TabHydrationHooks, TabId, TabProviderContext } from './types';
 import { generateTabId, TEXTAREA_MAX_HEIGHT_PERCENT, TEXTAREA_MIN_MAX_HEIGHT } from './types';
 
 type TabProviderSettings = Record<string, unknown> & {
@@ -287,7 +287,7 @@ function syncTabProviderServices(
   );
 }
 
-function cleanupTabRuntime(tab: TabData): void {
+export function cleanupTabRuntime(tab: TabData): void {
   if (tab.service && typeof tab.service.cleanup === 'function') {
     tab.service.cleanup();
   }
@@ -394,6 +394,9 @@ export function createTab(options: TabCreateOptions): TabData {
     draftModel,
     providerId: initialProviderId,
     conversationId: conversation?.id ?? null,
+    hydrationState: isBound ? 'SHELL' : 'READY',
+    hydrationGeneration: 0,
+    hydrationDiagnostic: null,
     service: null,
     serviceInitialized: false,
     state,
@@ -1157,6 +1160,7 @@ export function initializeTabControllers(
   forkRequestCallback?: (forkContext: ForkContext) => Promise<void>,
   openConversation?: (conversationId: string) => Promise<void>,
   getProviderCatalogConfig?: () => ProviderCatalogInfo,
+  hydrationHooks?: TabHydrationHooks,
 ): void;
 /** @deprecated Legacy 7-arg overload — 4th arg was previously an MCP manager. */
 export function initializeTabControllers(
@@ -1167,6 +1171,7 @@ export function initializeTabControllers(
   forkRequestCallback?: (forkContext: ForkContext) => Promise<void>,
   openConversation?: (conversationId: string) => Promise<void>,
   getProviderCatalogConfig?: () => ProviderCatalogInfo,
+  hydrationHooks?: TabHydrationHooks,
 ): void;
 export function initializeTabControllers(
   tab: TabData,
@@ -1176,6 +1181,7 @@ export function initializeTabControllers(
   arg5?: unknown,
   arg6?: unknown,
   arg7?: unknown,
+  arg8?: unknown,
 ): void {
   // Support legacy 7-arg call sites (4th arg was previously an MCP manager)
   const isLegacy = arg4 !== undefined && typeof arg4 !== 'function';
@@ -1185,6 +1191,7 @@ export function initializeTabControllers(
     ((conversationId: string) => Promise<void>) | undefined;
   const getProviderCatalogConfig = (isLegacy ? arg7 : arg6) as
     (() => ProviderCatalogInfo) | undefined;
+  const hydrationHooks = (isLegacy ? arg8 : arg7) as TabHydrationHooks | undefined;
 
   const { dom, state, services, ui } = tab;
 
@@ -1282,6 +1289,9 @@ export function initializeTabControllers(
       getStatusPanel: () => ui.statusPanel,
       getAgentService: () => tab.service, // Use tab's service instead of plugin's
       dismissPendingInlinePrompts: () => tab.controllers.inputController?.dismissPendingApproval(),
+      switchToHydrationShell: hydrationHooks?.switchToHydrationShell,
+      markHydrationReady: hydrationHooks?.markHydrationReady,
+      isHydrationReady: hydrationHooks?.isHydrationReady,
       ensureServiceForConversation: async (conversation) => {
         const nextProviderId = getTabProviderId(tab, plugin, conversation);
         const providerChanged = tab.providerId !== nextProviderId;
@@ -1561,6 +1571,38 @@ export function wireTabInputEvents(tab: TabData, plugin: ClaudianPlugin): void {
     dom.messagesEl.removeEventListener('scroll', scrollHandler);
     if (reEnableTimeout) clearTimeout(reEnableTimeout);
   });
+}
+
+export function renderTabHydrationPlaceholder(
+  tab: TabData,
+  onRetry?: () => void,
+): void {
+  const { messagesEl } = tab.dom;
+  messagesEl.empty();
+  const placeholder = messagesEl.createDiv({ cls: 'claudian-history-placeholder' });
+
+  if (tab.hydrationState === 'OVERSIZE_BLOCKED') {
+    placeholder.createDiv({ cls: 'claudian-history-placeholder-title', text: t('chat.history.oversizeTitle') });
+    placeholder.createDiv({ text: t('chat.history.oversizeDescription') });
+    for (const segment of tab.hydrationDiagnostic?.segments ?? []) {
+      placeholder.createDiv({
+        cls: 'claudian-history-placeholder-detail',
+        text: `${segment.sessionId} (${(segment.sizeBytes / 1024 / 1024).toFixed(1)} MiB)`,
+      });
+    }
+    return;
+  }
+
+  const isError = tab.hydrationState === 'ERROR';
+  placeholder.createDiv({
+    cls: 'claudian-history-placeholder-title',
+    text: isError ? t('chat.history.errorTitle') : t('chat.history.loading'),
+  });
+  if (isError) {
+    placeholder.createDiv({ text: tab.hydrationDiagnostic?.message ?? t('chat.history.errorDescription') });
+    const retry = placeholder.createEl('button', { text: t('chat.history.retry') });
+    retry.addEventListener('click', () => onRetry?.());
+  }
 }
 
 /**

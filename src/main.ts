@@ -20,7 +20,10 @@ import { ProviderSettingsCoordinator } from './core/providers/ProviderSettingsCo
 import { ProviderWorkspaceRegistry } from './core/providers/ProviderWorkspaceRegistry';
 import type { ProviderId } from './core/providers/types';
 import type { AppTabManagerState } from './core/providers/types';
-import { DEFAULT_CHAT_PROVIDER_ID } from './core/providers/types';
+import {
+  ConversationHistoryHydrationError,
+  DEFAULT_CHAT_PROVIDER_ID,
+} from './core/providers/types';
 import type {
   ClaudianSettings,
   Conversation,
@@ -586,9 +589,12 @@ export default class ClaudianPlugin extends Plugin {
   }
 
   private async loadSdkMessagesForConversation(conversation: Conversation): Promise<void> {
-    await ProviderRegistry
+    const result = await ProviderRegistry
       .getConversationHistoryService(conversation.providerId)
       .hydrateConversationHistory(conversation, getVaultPath(this.app));
+    if (result && result.status !== 'ready') {
+      throw new ConversationHistoryHydrationError(result);
+    }
   }
 
   async createConversation(options?: {

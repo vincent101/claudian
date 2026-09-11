@@ -64,8 +64,14 @@ export async function loadSDKSessionMessages(
 ): Promise<SDKSessionLoadResult> {
   const result = await readSDKSession(vaultPath, sessionId);
 
-  if (result.error) {
-    return { messages: [], skippedLines: result.skippedLines, error: result.error };
+  if (result.status !== 'complete') {
+    return {
+      messages: [],
+      skippedLines: result.skippedLines,
+      status: result.status,
+      error: result.error,
+      sizeBytes: result.sizeBytes,
+    };
   }
 
   const filteredEntries = filterActiveBranch(result.messages, resumeAtMessageId);
@@ -166,5 +172,5 @@ export async function loadSDKSessionMessages(
 
   chatMessages.sort((a, b) => a.timestamp - b.timestamp);
 
-  return { messages: chatMessages, skippedLines: result.skippedLines };
+  return { messages: chatMessages, skippedLines: result.skippedLines, status: 'complete' };
 }

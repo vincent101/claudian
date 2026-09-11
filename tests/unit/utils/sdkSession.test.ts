@@ -36,6 +36,7 @@ describe('sdkSession', () => {
   beforeEach(() => {
     jest.clearAllMocks();
     mockOs.homedir.mockReturnValue('/Users/test');
+    mockFsPromises.stat.mockResolvedValue({ size: 0 } as any);
   });
 
   describe('encodeVaultPathForSDK', () => {
@@ -266,13 +267,27 @@ describe('sdkSession', () => {
       expect(result.messages).toHaveLength(2);
     });
 
-    it('returns error on read failure', async () => {
+    it('blocks files over 64 MiB after stat without reading them', async () => {
       mockExistsSync.mockReturnValue(true);
+      mockFsPromises.stat.mockResolvedValue({ size: 64 * 1024 * 1024 + 1 } as any);
+
+      const result = await readSDKSession('/Users/test/vault', 'session-large');
+
+      expect(result.status).toBe('oversize');
+      expect(result.sizeBytes).toBe(64 * 1024 * 1024 + 1);
+      expect(mockFsPromises.readFile).not.toHaveBeenCalled();
+      expect(mockFsPromises.open).not.toHaveBeenCalled();
+    });
+
+    it('returns a structured failure on stat or read failure', async () => {
+      mockExistsSync.mockReturnValue(true);
+      mockFsPromises.stat.mockResolvedValue({ size: 10 } as any);
       mockFsPromises.readFile.mockRejectedValue(new Error('Read error'));
 
       const result = await readSDKSession('/Users/test/vault', 'session-err');
 
       expect(result.messages).toEqual([]);
+      expect(result.status).toBe('failed');
       expect(result.error).toBe('Read error');
     });
   });

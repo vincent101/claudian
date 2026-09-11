@@ -1,6 +1,6 @@
 import { Menu, Notice, setIcon } from 'obsidian';
 
-import type { TitleGenerationService } from '../../../core/providers/types';
+import { ConversationHistoryHydrationError, type TitleGenerationService } from '../../../core/providers/types';
 import type { ChatRuntime } from '../../../core/runtime/ChatRuntime';
 import type { Conversation } from '../../../core/types';
 import { t } from '../../../i18n/i18n';
@@ -44,6 +44,23 @@ export interface ConversationControllerDeps {
   getAgentService?: () => ChatRuntime | null;
   ensureServiceForConversation?: (conversation: Conversation | null) => Promise<void>;
   dismissPendingInlinePrompts?: () => void;
+  /**
+   * M1 shell semantics for active opens: route a hydration-blocked switch
+   * (oversize/failed segments) onto the tab-level shell state machine so the
+   * blocked placeholder renders instead of the switch failing silently.
+   */
+  switchToHydrationShell?: (conversationId: string) => void;
+  /**
+   * Reports a direct (non-shell) load/switch completion so the tab-level
+   * hydration state resets and a blocked input is re-enabled.
+   */
+  markHydrationReady?: () => void;
+  /**
+   * Whether the tab-level hydration reached READY. While false, the tab is
+   * bound to a conversation whose runtime/contexts may not be restored yet,
+   * so save() must not persist (see the guard in save()).
+   */
+  isHydrationReady?: () => boolean;
 }
 
 type SaveOptions = {
@@ -167,6 +184,8 @@ export class ConversationController {
       );
       this.deps.clearQueuedMessage();
 
+      this.deps.markHydrationReady?.();
+
       this.callbacks.onNewConversation?.();
     } finally {
       state.isCreatingConversation = false;
@@ -179,11 +198,12 @@ export class ConversationController {
    * Entry point (no conversation) shows welcome screen without
    * creating a conversation. Conversation is created lazily on first message.
    */
-  async loadActive(): Promise<void> {
+  async loadActive(shouldApply: () => boolean = () => true): Promise<void> {
     const { plugin, state, renderer } = this.deps;
 
     const conversationId = state.currentConversationId;
     const conversation = conversationId ? await plugin.getConversationById(conversationId) : null;
+    if (!shouldApply()) return;
 
     // No active conversation - start at entry point
     if (!conversation) {
@@ -272,7 +292,23 @@ export class ConversationController {
       this.deps.getHistoryDropdown()?.removeClass('visible');
       this.updateWelcomeVisibility();
 
+      this.deps.markHydrationReady?.();
+
       this.callbacks.onConversationSwitched?.();
+    } catch (error) {
+      // Hydration-blocked opens follow the M1 shell semantics: keep the
+      // switch but bind only the shell, then let the tab hydration state
+      // machine render the oversize/error placeholder. Other errors
+      // propagate to the caller (history dropdown surfaces a notice).
+      if (
+        error instanceof ConversationHistoryHydrationError
+        && this.deps.switchToHydrationShell
+      ) {
+        this.deps.getHistoryDropdown()?.removeClass('visible');
+        this.deps.switchToHydrationShell(id);
+        return;
+      }
+      throw error;
     } finally {
       state.isSwitchingConversation = false;
     }
@@ -381,6 +417,18 @@ export class ConversationController {
 
     // Entry point with no messages - nothing to save
     if (!state.currentConversationId && state.messages.length === 0) {
+      return;
+    }
+
+    // Shell-state guard: a non-READY tab is bound to a conversation whose
+    // runtime may still be a parked foreign session (a hydration-blocked
+    // switch throws before ensureServiceForConversation rebinds it) and
+    // whose UI contexts have not been restored. Persisting here would
+    // overwrite the conversation's sessionId/providerState with the parked
+    // runtime's session and clear its persisted context fields, so skip the
+    // write entirely — provider-native message storage is unaffected. A
+    // missing hook (legacy wiring) keeps the previous behavior.
+    if (this.deps.isHydrationReady && !this.deps.isHydrationReady()) {
       return;
     }
 
@@ -534,7 +582,12 @@ export class ConversationController {
     if (!dropdown) return;
 
     this.renderHistoryItems(dropdown, {
-      onSelectConversation: (id) => this.switchTo(id),
+      onSelectConversation: (id) => this.switchTo(id).catch((error: unknown) => {
+        // Non-hydration failures have no shell route; surface them instead
+        // of leaving an unhandled rejection with no user feedback.
+        const message = error instanceof Error ? error.message : String(error);
+        new Notice(t('chat.history.switchFailed', { error: message }));
+      }),
       onRerender: () => this.updateHistoryDropdown(),
     });
   }

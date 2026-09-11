@@ -1,6 +1,7 @@
 import { createMockEl } from '@test/helpers/mockElement';
 import { Menu, Notice } from 'obsidian';
 
+import { ConversationHistoryHydrationError } from '@/core/providers/types';
 import { ConversationController, type ConversationControllerDeps } from '@/features/chat/controllers/ConversationController';
 import { ChatState } from '@/features/chat/state/ChatState';
 import { confirm } from '@/shared/modals/ConfirmModal';
@@ -262,6 +263,52 @@ describe('ConversationController', () => {
 
         expect(invalidateTurnLifecycle).toHaveBeenCalledTimes(1);
       });
+
+      it('routes a hydration-blocked switch through the hydration shell instead of rejecting', async () => {
+        deps.state.currentConversationId = 'old-conv';
+        (deps.plugin.switchConversation as jest.Mock).mockRejectedValue(
+          new ConversationHistoryHydrationError({
+            status: 'oversize',
+            segments: [{ sessionId: 'large-session', sizeBytes: 65 * 1024 * 1024 }],
+          }),
+        );
+        const switchToHydrationShell = jest.fn();
+        deps.switchToHydrationShell = switchToHydrationShell;
+        const dropdown = deps.getHistoryDropdown()!;
+        dropdown.addClass('visible');
+
+        await expect(controller.switchTo('oversize-conv')).resolves.toBeUndefined();
+
+        expect(switchToHydrationShell).toHaveBeenCalledWith('oversize-conv');
+        expect(dropdown.hasClass('visible')).toBe(false);
+      });
+
+      it('still rejects non-hydration switch errors when no shell hook is configured', async () => {
+        deps.state.currentConversationId = 'old-conv';
+        (deps.plugin.switchConversation as jest.Mock).mockRejectedValue(new Error('storage failed'));
+
+        await expect(controller.switchTo('broken-conv')).rejects.toThrow('storage failed');
+      });
+
+      it('marks hydration ready after a successful switch', async () => {
+        deps.state.currentConversationId = 'old-conv';
+        const markHydrationReady = jest.fn();
+        deps.markHydrationReady = markHydrationReady;
+
+        await controller.switchTo('new-conv');
+
+        expect(markHydrationReady).toHaveBeenCalledTimes(1);
+      });
+
+      it('marks hydration ready after createNew resets to the entry point', async () => {
+        deps.state.currentConversationId = 'old-conv';
+        const markHydrationReady = jest.fn();
+        deps.markHydrationReady = markHydrationReady;
+
+        await controller.createNew();
+
+        expect(markHydrationReady).toHaveBeenCalledTimes(1);
+      });
     });
 
     describe('Welcome visibility', () => {
@@ -519,6 +566,110 @@ describe('ConversationController', () => {
     });
   });
 
+  describe('save hydration shell guard (M1 review fix)', () => {
+    /**
+     * Rebuilds the oversize-switch pollution scenario: the dropdown switch to
+     * conv-X threw before ensureServiceForConversation ran, so the tab is
+     * bound to X (via switchToHydrationShell) while tab.service still parks
+     * the runtime of the previous conversation Y. save() at that point must
+     * not persist anything, or buildSessionUpdates overwrites X's meta with
+     * Y's session and a loading-window close clears X's persisted fields.
+     */
+    function setupParkedRuntimeScenario(): Record<string, any> {
+      // Mock storage layer: conv-X meta as persisted on disk.
+      const metaStore: Record<string, any> = {
+        'conv-X': {
+          id: 'conv-X',
+          providerId: 'claude',
+          title: 'Oversize X',
+          messages: [{ id: 'm1', role: 'user', content: 'x', timestamp: 1 }],
+          sessionId: 'session-X',
+          providerState: { providerSessionId: 'session-X' },
+          currentNote: 'notes/X.md',
+          usage: { inputTokens: 10 },
+          externalContextPaths: ['/ext/x'],
+          enabledMcpServers: ['mcp-x'],
+          createdAt: 1,
+          updatedAt: 1,
+        },
+      };
+      (deps.plugin.getConversationSync as jest.Mock).mockImplementation(
+        (id: string) => metaStore[id],
+      );
+      (deps.plugin.updateConversation as jest.Mock).mockImplementation(
+        async (id: string, updates: Record<string, unknown>) => {
+          Object.assign(metaStore[id], updates);
+        },
+      );
+
+      // Parked runtime from conversation Y. buildSessionUpdates mirrors
+      // ClaudeChatRuntime semantics: the live runtime session wins over the
+      // conversation's persisted session.
+      const parkedRuntime = {
+        providerId: 'claude',
+        getSessionId: jest.fn().mockReturnValue('session-Y'),
+        consumeSessionInvalidation: jest.fn().mockReturnValue(false),
+        buildSessionUpdates: jest.fn().mockImplementation(({ conversation }: { conversation: { providerState?: Record<string, unknown> } | null }) => ({
+          updates: {
+            sessionId: 'session-Y',
+            providerState: {
+              ...(conversation?.providerState || {}),
+              providerSessionId: 'session-Y',
+            },
+          },
+        })),
+        syncConversationState: jest.fn(),
+      };
+      deps.getAgentService = () => parkedRuntime as any;
+
+      // State left behind by switchToHydrationShell: bound to X, not hydrated.
+      deps.state.currentConversationId = 'conv-X';
+      deps.state.messages = [];
+      deps.isHydrationReady = () => false;
+      return metaStore;
+    }
+
+    it('skips the write while the tab is in a shell state, keeping X meta free of Y session pollution', async () => {
+      const metaStore = setupParkedRuntimeScenario();
+
+      await controller.save();
+
+      expect(deps.plugin.updateConversation).not.toHaveBeenCalled();
+      expect(metaStore['conv-X'].sessionId).toBe('session-X');
+      expect(metaStore['conv-X'].providerState.providerSessionId).toBe('session-X');
+    });
+
+    it('keeps persisted currentNote/usage/externalContextPaths/enabledMcpServers when a loading window is closed', async () => {
+      const metaStore = setupParkedRuntimeScenario();
+
+      await controller.save();
+
+      expect(metaStore['conv-X'].currentNote).toBe('notes/X.md');
+      expect(metaStore['conv-X'].usage).toEqual({ inputTokens: 10 });
+      expect(metaStore['conv-X'].externalContextPaths).toEqual(['/ext/x']);
+      expect(metaStore['conv-X'].enabledMcpServers).toEqual(['mcp-x']);
+      expect(metaStore['conv-X'].messages).toHaveLength(1);
+    });
+
+    it('saves normally once hydration reports READY', async () => {
+      setupParkedRuntimeScenario();
+      deps.isHydrationReady = () => true;
+
+      await controller.save();
+
+      expect(deps.plugin.updateConversation).toHaveBeenCalledWith('conv-X', expect.any(Object));
+    });
+
+    it('saves normally when no hydration hook is wired (legacy callers)', async () => {
+      setupParkedRuntimeScenario();
+      deps.isHydrationReady = undefined;
+
+      await controller.save();
+
+      expect(deps.plugin.updateConversation).toHaveBeenCalledWith('conv-X', expect.any(Object));
+    });
+  });
+
   describe('loadActive with existing conversation', () => {
     it('should restore currentNote when conversation has one', async () => {
       const fileContextManager = deps.getFileContextManager()!;
@@ -549,6 +700,23 @@ describe('ConversationController', () => {
 
       expect(fileContextManager.autoAttachActiveFile).toHaveBeenCalled();
       expect(fileContextManager.setCurrentNote).not.toHaveBeenCalled();
+    });
+
+    it('does not apply a stale load after its generation is invalidated', async () => {
+      let valid = true;
+      deps.state.currentConversationId = 'conv-1';
+      (deps.plugin.getConversationById as jest.Mock).mockImplementation(async () => {
+        valid = false;
+        return {
+          id: 'conv-1',
+          messages: [{ id: '1', role: 'user', content: 'stale', timestamp: Date.now() }],
+        };
+      });
+
+      await controller.loadActive(() => valid);
+
+      expect(deps.state.messages).toEqual([]);
+      expect(deps.renderer.renderMessages).not.toHaveBeenCalled();
     });
 
     it('should call renderer.renderMessages with greeting callback', async () => {
