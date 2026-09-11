@@ -1,6 +1,7 @@
 ---
 type: design-decision
-status: confirmed
+status: superseded
+superseded_by: "[[2026-09-09-Claudian空闲期宿主tab实时投影-v6-transcript感知]]"
 target: /Users/vincentwang/Documents/NoteVault/tools/claudian
 tags:
   - architect
