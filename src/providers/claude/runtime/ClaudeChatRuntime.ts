@@ -35,6 +35,9 @@ import type {
   ApprovalCallback,
   AskUserQuestionCallback,
   AutoTurnCancelledEvent,
+  AutoTurnChunkEvent,
+  AutoTurnDiagnosticEvent,
+  AutoTurnFinishedEvent,
   AutoTurnResult,
   AutoTurnStartedEvent,
   ChatRewindResult,
@@ -71,6 +74,7 @@ import {
 import { CLAUDE_PROVIDER_CAPABILITIES } from '../capabilities';
 import { loadSubagentFinalResult, loadSubagentToolCalls } from '../history/ClaudeHistoryStore';
 import { extractXmlTag } from '../history/sdkMessageParsing';
+import { getSDKSessionPath } from '../history/sdkSessionPaths';
 import {
   createStopSubagentHook,
   type StopHookCircuitBreaker,
@@ -83,6 +87,8 @@ import { getClaudeProviderSettings } from '../settings';
 import {
   transformSDKMessage,
 } from '../stream/transformClaudeMessage';
+import { ClaudeTranscriptDiagnosticLog } from '../transcript/ClaudeTranscriptDiagnosticLog';
+import { ClaudeTranscriptTurnObserver } from '../transcript/ClaudeTranscriptTurnObserver';
 import { type ClaudeProviderState, getClaudeState } from '../types/providerState';
 import { createClaudeApprovalCallback } from './ClaudeApprovalHandler';
 import { applyClaudeDynamicUpdates } from './ClaudeDynamicUpdates';
@@ -151,33 +157,12 @@ function isLeaselessSessionControlMessage(message: SDKMessage): boolean {
   return (message as { subtype?: string }).subtype !== 'task_notification';
 }
 
-/**
- * Harness task-notification shapes Fix 2 settles: queue-operation envelopes
- * carrying a <task-notification> XML payload, and the SDK's typed
- * system/subtype=task_notification spelling. Mirrors the shape check in
- * dispatchTaskNotification — keep the two in sync.
- */
-function isTaskNotificationMessage(message: SDKMessage): boolean {
-  const record = message as Record<string, unknown>;
-  if (record['type'] === 'queue-operation') {
-    return record['operation'] === 'enqueue'
-      && typeof record['content'] === 'string'
-      && (record['content'] as string).includes('<task-notification>');
-  }
-  return record['type'] === 'system' && record['subtype'] === 'task_notification';
-}
-
-/**
- * Ghost auto turn guard: the only message kinds that legitimately begin an
- * SDK-initiated turn. assistant content (and streaming deltas) are turn
- * content; everything else trailing a settled turn (queue-operation records,
- * bookkeeping kinds) is not — starting an auto turn on them would deadlock
- * the lease (no result ever follows).
- */
-function isAutoTurnStartMessage(message: SDKMessage): boolean {
-  const type = (message as { type?: string }).type;
-  return type === 'assistant' || type === 'stream_event';
-}
+type UserTurnCompletionBarrier = {
+  featureFinished: Promise<void>;
+  resolveFeatureFinished: () => void;
+  runtimeHandoffDone: Promise<void>;
+  resolveRuntimeHandoffDone: () => void;
+};
 
 export class ClaudianService implements ChatRuntime {
   readonly providerId = CLAUDE_PROVIDER_CAPABILITIES.providerId;
@@ -233,23 +218,29 @@ export class ClaudianService implements ChatRuntime {
 
   // Fix 2 (通知直接销账): live task-notification sink (set from feature layer).
   private _subagentNotificationHandler: SubagentTaskNotificationHandler | null = null;
-
   // Auto-triggered turn handling (e.g., task-notification delivery by the SDK)
   private _autoTurnCallback: ((result: AutoTurnResult) => void) | null = null;
   /** Sync signal for feature layer when an SDK-initiated turn starts (S1 API). */
-  private _onAutoTurnStarted: ((event: AutoTurnStartedEvent) => void) | null = null;
-  /** S2 lifecycle: feature lease cleared (v4 §3.1 step 3). */
-  private _onAutoTurnFinished: ((turnId: string) => void) | null = null;
+  private _onAutoTurnStarted: ((event: AutoTurnStartedEvent) => unknown) | null = null;
+  /** Ordered live projection for SDK-initiated turns. */
+  private _onAutoTurnChunk: ((event: AutoTurnChunkEvent) => Promise<void>) | null = null;
+  /** Runtime→feature→runtime completion handshake for user turns. */
+  private userTurnCompletionBarriers = new Map<string, UserTurnCompletionBarrier>();
+  /** S2 lifecycle: feature projection finalized before runtime settlement. */
+  private _onAutoTurnFinished: ((event: AutoTurnFinishedEvent) => Promise<void>) | null = null;
   /** S2 lifecycle: lease gone + channel released → UI queue may proceed (step 7). */
   private _onAutoTurnReleased: ((turnId: string) => void) | null = null;
   /** S2 lifecycle: feature clears its auto lease only (v3 §4.2). */
   private _onAutoTurnCancelled: ((event: AutoTurnCancelledEvent) => void) | null = null;
+  private _onEmbeddedExternal: ((event: AutoTurnStartedEvent) => Promise<void>) | null = null;
   /**
    * Turn-lease hotfix fix 6: a queued message dequeued for a turn the runtime
    * no longer knows — the feature layer conditionally cancels its lease for
    * the same turnId so the two layers cannot drift apart.
    */
   private _onUnregisteredTurnDequeued: ((turnId: string) => void) | null = null;
+  private transcriptObserver: ClaudeTranscriptTurnObserver | null = null;
+  private transcriptDiagnosticLog: ClaudeTranscriptDiagnosticLog | null = null;
 
   // S1 turn-lease base: live turn registry keyed by turnId. All transform,
   // usage, metadata and dedup state lives on the turn, never on the runtime.
@@ -630,6 +621,7 @@ export class ClaudianService implements ChatRuntime {
    * Closes the persistent query and cleans up resources.
    */
   closePersistentQuery(_reason?: string, options?: ClosePersistentQueryOptions): void {
+    this.abortUserTurnCompletionBarriers();
     if (!this.persistentQuery) {
       return;
     }
@@ -940,7 +932,7 @@ export class ClaudianService implements ChatRuntime {
    *
    * Turn resolution (S1 turn lease):
    * 1. The channel's activeTurnId names the owning turn (a dequeued user
-   *    message or an auto turn begun via beginExternalTurn).
+   *    message).
    * 2. No active lease + session-level control message (system/init,
    *    compact_boundary, ...) → side effects only via
    *    applyLeaselessSystemMessage: no auto turn, no lease, no callbacks.
@@ -950,10 +942,10 @@ export class ClaudianService implements ChatRuntime {
    *    transcript occurrences) never sees a result, so an auto turn opened
    *    here would hold the lease forever — tab stuck "running", queued user
    *    messages dead-waiting (ghost auto turn, fbd4de8 regression).
-   * 4. No active lease otherwise → the SDK initiated a turn on its own
-   *    (notification continuation, Stop-hook follow-up): ensureAutoTurn()
-   *    creates the auto RuntimeTurn, signs the external lease and fires
-   *    onAutoTurnStarted synchronously.
+   * 4. No active lease otherwise → dropped. External (SDK-initiated) turns
+   *    are no longer opened from the stdout stream: the transcript observer
+   *    owns their lifecycle (v6), so an unleased assistant/stream message
+   *    has no runtime turn to land on.
    * 5. A notification arriving under an existing lease is dispatched for
    *    accounting only; a second lease is never created.
    * 6. Chunks go to the owning turn's waiters; a turn without waiters buffers
@@ -963,85 +955,23 @@ export class ClaudianService implements ChatRuntime {
     // Note: Session expiration errors are handled in catch blocks (queryViaSDK, handleAbort)
     // The SDK throws errors as exceptions, not as message types
 
-    let turn = this.resolveActiveTurn();
-
-    if (!turn && isTurnCompleteMessage(message)) {
-      // Trailing result of a turn already settled by cancel()/close: its
-      // generation is invalid, so instead of spinning up a ghost auto turn
-      // (which would flash isStreaming in the feature layer), drop it and
-      // keep the consumer alive (S1 leftover #3).
-      console.warn('[Claudian] trailing result without a turn lease; dropping');
+    if (message.type === 'user' && (message as SDKUserMessage & { isReplay?: boolean }).isReplay === true) {
       return;
     }
 
-    // Lease-less session-level control messages (system/init at persistent
-    // query start, compact_boundary mid-session) never start an auto turn:
-    // they carry no result, so the auto lease would never release and the
-    // first queued user message would deadlock (S1 regression). Session-level
-    // side effects still run on a throwaway transform state.
-    if (!turn && isLeaselessSessionControlMessage(message)) {
-      this.applyLeaselessSystemMessage(message);
+    const turn = this.resolveActiveTurn();
+    const user = message.type === 'user' ? message as SDKUserMessage : null;
+    if (user?.origin) {
+      if (user.origin.kind === 'task-notification') this.dispatchTaskNotification(message);
       return;
     }
-
-    // Lease-less pure task-notification (hotfix/notify-lease): settle-only.
-    // ~49% of notification deliveries (measured 0823 over 1383 transcript
-    // occurrences) never see a result, so an auto turn opened here would
-    // hold the lease forever (ghost auto turn → tab stuck "running",
-    // queued user messages dead-waiting). Dispatch the accounting and
-    // return without a lease; a continuation turn (the other ~51%) opens
-    // its own auto turn on its first assistant/stream message below.
-    // Known trade-off (accepted; pending-auto barrier in S4+S5 refines):
-    // a user message sent in the narrow window right after the notification
-    // may sign the lease before the continuation's first message and
-    // mis-attribute the continuation chunks to the user turn — far less
-    // likely than the ~49% ghost-lease hang this branch removes.
-    if (!turn && isTaskNotificationMessage(message)) {
-      this.dispatchTaskNotification(message);
-      return;
-    }
-
-    // Ghost auto turn guard (0823 console-logging evidence): only genuine turn
-    // content may start an auto turn. Non-content traffic that arrives without
-    // a lease — queue-operation records, unknown message kinds trailing a
-    // settled user turn — would create an auto turn that never sees a result,
-    // permanently holding the channel + feature lease (tab stuck "running",
-    // next message queues, ESC dead, reload required). The race depends on
-    // millisecond ordering between result settlement and the trailing message,
-    // which is why it appeared intermittent.
-    if (!turn && !isAutoTurnStartMessage(message)) {
-      console.warn('[Claudian] non-turn message arrived with no lease; dropping', {
-        type: (message as { type?: string }).type,
-        subtype: (message as { subtype?: string }).subtype ?? null,
-      });
-      return;
-    }
-
-    // Auto turn (lease signed) must exist before the notification handler runs
-    // so its accounting happens under one exclusive turn (v4 §6 order).
-    if (!turn) {
-      turn = this.ensureAutoTurn();
-    }
-
-    // Fix 2 (通知直接销账): intercept harness task-notifications on the live
-    // stream. Two shapes exist:
-    // 1. queue-operation messages carrying a <task-notification> XML payload
-    //    (the form observed in transcripts);
-    // 2. system/subtype=task_notification structured messages (the SDK's
-    //    typed spelling; 'stopped' there is the same terminal state as 'killed').
-    // Neither shape is otherwise handled below, so settling here and returning
-    // is safe. Session-load replay (collectAsyncSubagentResults) reads these
-    // from the transcript independently — double settlement is tolerated.
-    if (this.dispatchTaskNotification(message)) {
-      return;
-    }
+    if (this.dispatchTaskNotification(message)) return;
 
     if (!turn) {
-      // No lease owner could be established — drop the message but keep the
-      // consumer loop alive.
-      console.warn('[Claudian] message arrived with no turn lease; dropping', (message as { type?: string }).type);
+      if (isLeaselessSessionControlMessage(message)) this.applyLeaselessSystemMessage(message);
       return;
     }
+    if (turn.phase === 'cancelled' && isTurnCompleteMessage(message)) return;
     const activeTurn = turn;
 
     // Transform SDK message to StreamChunks using the turn's own state
@@ -1062,7 +992,7 @@ export class ClaudianService implements ChatRuntime {
         if (!usageChunk) {
           continue;
         }
-        this.deliverChunkToTurn(activeTurn, usageChunk);
+        await this.deliverChunkToTurn(activeTurn, usageChunk);
       } else if (isStreamChunk(event)) {
         // Dedup: SDK delivers text via stream_events (incremental) AND the assistant message
         // (complete). Skip the assistant message text if stream text was already seen.
@@ -1094,7 +1024,7 @@ export class ClaudianService implements ChatRuntime {
           ? this.bufferUsageChunk(activeTurn, { ...event, sessionId: this.sessionManager.getSessionId() })
           : event;
 
-        this.deliverChunkToTurn(activeTurn, normalizedChunk);
+        await this.deliverChunkToTurn(activeTurn, normalizedChunk);
       }
     }
 
@@ -1137,6 +1067,7 @@ export class ClaudianService implements ChatRuntime {
     // Fork: suppress needsHistoryRebuild since SDK returns a different session ID by design
     const wasFork = this.pendingForkSession;
     this.sessionManager.captureSession(event.sessionId);
+    this.restartTranscriptObserver(event.sessionId);
     if (wasFork) {
       this.sessionManager.clearHistoryRebuild();
       this.pendingForkSession = false;
@@ -1165,7 +1096,6 @@ export class ClaudianService implements ChatRuntime {
     if (!turn) {
       // Lease held for a turn unknown to the runtime (cancelled/crashed
       // earlier). v4 §3.3: settle that queue item, keep the consumer alive.
-      console.warn('[Claudian] channel lease references unregistered turn; releasing', { turnId: activeTurnId });
       this.completeChannelTurn(activeTurnId);
     }
     return turn;
@@ -1177,7 +1107,7 @@ export class ClaudianService implements ChatRuntime {
    * generator exit) buffers the chunk; settlement flushes it through the
    * auto-turn callback adapter.
    */
-  private deliverChunkToTurn(turn: RuntimeTurn, chunk: StreamChunk): void {
+  private async deliverChunkToTurn(turn: RuntimeTurn, chunk: StreamChunk): Promise<void> {
     turn.receivedChunk = true;
     if (turn.waiters.size > 0) {
       for (const handler of turn.waiters) {
@@ -1185,81 +1115,46 @@ export class ClaudianService implements ChatRuntime {
       }
       return;
     }
+    if (turn.kind === 'auto' && this._onAutoTurnChunk && !turn.liveProjectionFailed) {
+      try {
+        await this._onAutoTurnChunk({
+          turnId: turn.id,
+          generation: turn.generation,
+          chunk,
+        });
+        return;
+      } catch {
+        turn.liveProjectionFailed = true;
+      }
+    }
     turn.chunks.push(chunk);
   }
 
-  /**
-   * Creates the SDK-initiated (auto) turn for a message that arrived with no
-   * channel lease: registers the turn, signs the external lease and fires
-   * onAutoTurnStarted synchronously. If another turn raced us to the lease,
-   * that turn is returned — a second lease is never created (v4 §3.3).
-   */
-  private ensureAutoTurn(): RuntimeTurn | null {
-    const channel = this.messageChannel;
-    const turn = createRuntimeTurn({
-      id: `auto-${Date.now()}-${Math.random().toString(36).slice(2)}`,
-      kind: 'auto',
-      phase: 'collecting',
-    });
-
-    if (!channel) {
-      // Defensive: no channel → track the turn without a lease.
-      this.runtimeTurns.set(turn.id, turn);
-      this.fireOnAutoTurnStarted(turn);
-      return turn;
-    }
-
-    let lease = channel.beginExternalTurn(turn.id);
-    if (!lease.ok && lease.activeTurnId && !this.runtimeTurns.has(lease.activeTurnId)) {
-      // Stale lease on an unregistered turn — release it and retry once.
-      console.warn('[Claudian] beginExternalTurn found stale lease; releasing', { activeTurnId: lease.activeTurnId });
-      this.completeChannelTurn(lease.activeTurnId);
-      lease = channel.beginExternalTurn(turn.id);
-    }
-
-    if (lease.ok) {
-      this.runtimeTurns.set(turn.id, turn);
-      this.fireOnAutoTurnStarted(turn);
-      return turn;
-    }
-
-    // An existing registered turn owns the lease — process under it.
-    if (lease.activeTurnId && this.runtimeTurns.has(lease.activeTurnId)) {
-      return this.runtimeTurns.get(lease.activeTurnId)!;
-    }
-    return null;
-  }
-
-  private fireOnAutoTurnStarted(turn: RuntimeTurn): void {
+  private async fireOnAutoTurnFinished(turn: RuntimeTurn): Promise<void> {
     try {
-      this._onAutoTurnStarted?.({ turnId: turn.id, generation: turn.generation });
-    } catch (error) {
-      // Feature callback must never break the consumer loop.
-      console.warn('[Claudian] onAutoTurnStarted callback failed', error);
-    }
-  }
-
-  private fireOnAutoTurnFinished(turnId: string): void {
-    try {
-      this._onAutoTurnFinished?.(turnId);
-    } catch (error) {
-      console.warn('[Claudian] onAutoTurnFinished callback failed', error);
+      await this._onAutoTurnFinished?.({
+        turnId: turn.id,
+        generation: turn.generation,
+        metadata: { ...turn.metadata },
+      });
+    } catch {
+      // Lifecycle callback errors are isolated.
     }
   }
 
   private fireOnAutoTurnReleased(turnId: string): void {
     try {
       this._onAutoTurnReleased?.(turnId);
-    } catch (error) {
-      console.warn('[Claudian] onAutoTurnReleased callback failed', error);
+    } catch {
+      // Lifecycle callback errors are isolated.
     }
   }
 
   private fireOnAutoTurnCancelled(turnId: string, generation: number, reason: string): void {
     try {
       this._onAutoTurnCancelled?.({ turnId, generation, reason });
-    } catch (error) {
-      console.warn('[Claudian] onAutoTurnCancelled callback failed', error);
+    } catch {
+      // Lifecycle callback errors are isolated.
     }
   }
 
@@ -1281,7 +1176,11 @@ export class ClaudianService implements ChatRuntime {
     turn.phase = 'projecting';
 
     if (turn.waiters.size > 0) {
-      // Feature layer consumes this after the generator drains.
+      const barrier = turn.kind === 'user' && this._onAutoTurnStarted
+        ? this.registerUserTurnCompletionBarrier(turn.id)
+        : null;
+      // Feature layer consumes this after the generator drains. The barrier is
+      // registered first so a fast feature acknowledgement cannot be lost.
       this.pendingFeatureTurnMetadata = { ...turn.metadata };
       for (const handler of turn.waiters) {
         handler.resetStreamText();
@@ -1289,15 +1188,18 @@ export class ClaudianService implements ChatRuntime {
         handler.onDone();
       }
       turn.waiters.clear();
+      if (barrier) await barrier.featureFinished;
       await this.executeDeferredRestartIfAny(turn.id);
       turn.phase = 'settled';
-      this.runtimeTurns.delete(turn.id);
-      this.completeChannelTurn(turn.id);
+      if (barrier) {
+        this.completeUserRuntimeHandoff(turn, barrier);
+      } else {
+        this.runtimeTurns.delete(turn.id);
+        this.completeChannelTurn(turn.id);
+      }
       return;
     }
 
-    // Auto turn (or a user turn whose generator already exited): buffered
-    // chunks flush through the legacy adapter (kept until S4 projection).
     if (turn.chunks.length > 0) {
       const chunks = [...turn.chunks];
       const metadata = { ...turn.metadata };
@@ -1314,7 +1216,7 @@ export class ClaudianService implements ChatRuntime {
     // generator exited early keeps its feature lease until sendMessage()'s
     // finally runs (S4 moves user projection onto this order as well).
     if (turn.kind === 'auto') {
-      this.fireOnAutoTurnFinished(turn.id);
+      await this.fireOnAutoTurnFinished(turn);
     }
     // Step 4: deferred config restart runs only when the channel is idle
     // (this turn's lease excepted), i.e. strictly before the next queued
@@ -1326,10 +1228,55 @@ export class ClaudianService implements ChatRuntime {
     // Step 6: release the lease so the async iterator may dequeue the next
     // queued user message.
     this.completeChannelTurn(turn.id);
-    // Step 7: no active lease remains — the UI queued message may proceed.
+    // Step 7: release remains the only feature queue pump. If a pending
+    // external turn was promoted, its newly acquired feature lease blocks it.
     if (turn.kind === 'auto') {
       this.fireOnAutoTurnReleased(turn.id);
     }
+  }
+
+
+  private registerUserTurnCompletionBarrier(turnId: string): UserTurnCompletionBarrier {
+    const existing = this.userTurnCompletionBarriers.get(turnId);
+    if (existing) return existing;
+    let resolveFeatureFinished!: () => void;
+    let resolveRuntimeHandoffDone!: () => void;
+    const barrier: UserTurnCompletionBarrier = {
+      featureFinished: new Promise(resolve => { resolveFeatureFinished = resolve; }),
+      resolveFeatureFinished,
+      runtimeHandoffDone: new Promise(resolve => { resolveRuntimeHandoffDone = resolve; }),
+      resolveRuntimeHandoffDone,
+    };
+    this.userTurnCompletionBarriers.set(turnId, barrier);
+    return barrier;
+  }
+
+  private completeUserRuntimeHandoff(turn: RuntimeTurn, barrier: UserTurnCompletionBarrier): void {
+    this.runtimeTurns.delete(turn.id);
+    this.completeChannelTurn(turn.id);
+    barrier.resolveRuntimeHandoffDone();
+    this.userTurnCompletionBarriers.delete(turn.id);
+  }
+
+  private abortUserTurnCompletionBarriers(): void {
+    for (const barrier of this.userTurnCompletionBarriers.values()) {
+      barrier.resolveFeatureFinished();
+      barrier.resolveRuntimeHandoffDone();
+    }
+    this.userTurnCompletionBarriers.clear();
+  }
+
+  beginUserTurnProjection(turnId: string): void {
+    this.transcriptObserver?.beginUserTurnProjection(turnId);
+  }
+
+  async completeUserTurnProjection(turnId: string): Promise<void> {
+    const barrier = this.userTurnCompletionBarriers.get(turnId);
+    if (barrier) {
+      barrier.resolveFeatureFinished();
+      await barrier.runtimeHandoffDone;
+    }
+    await this.transcriptObserver?.completeUserTurnProjection(turnId);
   }
 
   /** Channel dequeue hook: a user message left the queue and now owns the lease. */
@@ -1338,14 +1285,13 @@ export class ClaudianService implements ChatRuntime {
     if (!turn) {
       // v4 §3.3 dequeue mismatch: the runtime no longer knows this turn
       // (cancelled earlier). Release the item and continue with the next.
-      console.warn('[Claudian] dequeued message for unregistered turn; releasing', { turnId });
       this.completeChannelTurn(turnId);
       // Fix 6: the feature layer may still hold the lease for this turnId —
       // notify it so both layers settle for the same turn instead of drifting.
       try {
         this._onUnregisteredTurnDequeued?.(turnId);
-      } catch (error) {
-        console.warn('[Claudian] onUnregisteredTurnDequeued callback failed', error);
+      } catch {
+        // Runtime mismatch callbacks are best-effort.
       }
       return;
     }
@@ -1385,11 +1331,6 @@ export class ClaudianService implements ChatRuntime {
       return;
     }
 
-    console.warn('[Claudian] completeTurn mismatch', {
-      turnId,
-      code: result.code,
-      activeTurnId: result.activeTurnId,
-    });
 
     const actualActive = result.activeTurnId;
     if (actualActive && actualActive !== turnId) {
@@ -1427,6 +1368,10 @@ export class ClaudianService implements ChatRuntime {
   private cancelTurn(turnId: string, reason: string, error?: Error): void {
     const turn = this.runtimeTurns.get(turnId);
     if (!turn) {
+      return;
+    }
+    if (turn.kind === 'user' && reason === 'user_cancel' && this._onAutoTurnStarted) {
+      this.cancelUserTurnWithProjectionBarrier(turn, error);
       return;
     }
 
@@ -1469,7 +1414,27 @@ export class ClaudianService implements ChatRuntime {
     // Holds the lease → release so the next queued message can flow.
     if (this.messageChannel?.getActiveTurnId() === turnId) {
       this.completeChannelTurn(turnId);
+        if (turn.kind === 'auto') this.fireOnAutoTurnReleased(turnId);
     }
+  }
+
+  private cancelUserTurnWithProjectionBarrier(turn: RuntimeTurn, error?: Error): void {
+    turn.phase = 'cancelled';
+    turn.generation += 1;
+    try { turn.abortController.abort(); } catch { /* Already aborted */ }
+    const barrier = this.registerUserTurnCompletionBarrier(turn.id);
+    this.pendingFeatureTurnMetadata = { ...turn.metadata };
+    for (const handler of turn.waiters) {
+      if (error) handler.onError(error);
+      else handler.onDone();
+    }
+    turn.waiters.clear();
+    void barrier.featureFinished.then(async () => {
+      await this.executeDeferredRestartIfAny(turn.id);
+      this.completeUserRuntimeHandoff(turn, barrier);
+    }).catch(() => {
+      this.completeUserRuntimeHandoff(turn, barrier);
+    });
   }
 
   /** Cancels every live turn plus any turn still holding channel state. */
@@ -1507,8 +1472,8 @@ export class ClaudianService implements ChatRuntime {
     this.deferredRestartPaths = null;
     try {
       await this.ensureReady({ force: true, externalContextPaths: paths });
-    } catch (error) {
-      console.warn('[Claudian] deferred restart failed; next query will retry', error);
+    } catch {
+      // Deferred restart is retried by the next query.
     }
   }
 
@@ -1516,6 +1481,11 @@ export class ClaudianService implements ChatRuntime {
    * Fix 2 (通知直接销账): parses a live message as a harness task-notification
    * and forwards it to the notification handler. Returns true when the message
    * was a task-notification (and has been fully handled here).
+   */
+  /**
+   * Harness task-notification shapes Fix 2 settles: queue-operation envelopes
+   * carrying a <task-notification> XML payload, and the SDK's typed
+   * system/subtype=task_notification spelling.
    */
   private dispatchTaskNotification(message: SDKMessage): boolean {
     if (!this._subagentNotificationHandler) {
@@ -1551,15 +1521,13 @@ export class ClaudianService implements ChatRuntime {
     }
 
     if (!taskId || !status) {
-      console.warn('[Claudian] task-notification arrived without task-id/status; ignoring');
       return true;
     }
 
     try {
       this._subagentNotificationHandler(taskId, status, result);
-    } catch (error) {
+    } catch {
       // Settlement must never break the message routing loop.
-      console.warn('[Claudian] task-notification handler failed', error);
     }
     return true;
   }
@@ -2435,6 +2403,7 @@ export class ClaudianService implements ChatRuntime {
     }
 
     this.sessionManager.setSessionId(id, this.getScopedSettings().model);
+    this.restartTranscriptObserver(id);
 
     // Track external context paths for when the runtime starts on demand
     if (externalContextPaths !== undefined) {
@@ -2445,11 +2414,31 @@ export class ClaudianService implements ChatRuntime {
     // Runtime starts on demand when query() is called.
   }
 
+  private restartTranscriptObserver(sessionId: string | null): void {
+    this.transcriptObserver?.stop('session_switch');
+    this.transcriptObserver = null;
+    const vaultPath = getVaultPath(this.plugin.app);
+    if (!sessionId || !vaultPath || !this._onAutoTurnStarted || !this._onAutoTurnChunk || !this._onAutoTurnFinished) return;
+    this.transcriptDiagnosticLog ??= new ClaudeTranscriptDiagnosticLog(vaultPath, message => { new Notice(message); });
+    const observer = new ClaudeTranscriptTurnObserver({
+      started: event => this._onAutoTurnStarted?.(event) !== false,
+      chunk: event => this._onAutoTurnChunk?.(event) ?? Promise.resolve(),
+      finished: event => this._onAutoTurnFinished?.(event) ?? Promise.resolve(),
+      released: turnId => this._onAutoTurnReleased?.(turnId),
+      cancelled: event => this._onAutoTurnCancelled?.(event),
+      projectEmbeddedExternal: event => this._onEmbeddedExternal?.(event) ?? Promise.resolve(),
+    }, () => true, this.transcriptDiagnosticLog);
+    this.transcriptObserver = observer;
+    void observer.start(getSDKSessionPath(vaultPath, sessionId));
+  }
+
   /**
    * Cleanup resources (Phase 5).
    * Called on plugin unload to close persistent query and abort any cold-start query.
    */
   cleanup() {
+    this.transcriptObserver?.stop('plugin_cleanup');
+    this.transcriptObserver = null;
     // Close persistent query
     this.closePersistentQuery('plugin cleanup');
 
@@ -2505,13 +2494,19 @@ export class ClaudianService implements ChatRuntime {
   }
 
   /** S1: fired synchronously when an SDK-initiated (auto) turn starts. */
-  setOnAutoTurnStarted(callback: ((event: AutoTurnStartedEvent) => void) | null): void {
+  setOnAutoTurnStarted(callback: ((event: AutoTurnStartedEvent) => unknown) | null): void {
     this._onAutoTurnStarted = callback;
   }
 
-  /** S2 (v4 §3.1 step 3): feature clears its auto-turn lease. */
-  setOnAutoTurnFinished(callback: ((turnId: string) => void) | null): void {
+  setOnAutoTurnChunk(callback: ((event: AutoTurnChunkEvent) => Promise<void>) | null): void {
+    this._onAutoTurnChunk = callback;
+  }
+
+
+  /** Feature finalization is awaited before runtime settlement and lease release. */
+  setOnAutoTurnFinished(callback: ((event: AutoTurnFinishedEvent) => Promise<void>) | null): void {
     this._onAutoTurnFinished = callback;
+    this.restartTranscriptObserver(this.sessionManager.getSessionId());
   }
 
   /** S2 (v4 §3.1 step 7): lease gone + channel released → UI queue may proceed. */
@@ -2522,6 +2517,17 @@ export class ClaudianService implements ChatRuntime {
   /** S2 (v3 §4.2): feature clears only the cancelled turn's state. */
   setOnAutoTurnCancelled(callback: ((event: AutoTurnCancelledEvent) => void) | null): void {
     this._onAutoTurnCancelled = callback;
+  }
+
+  setOnEmbeddedExternal(callback: ((event: AutoTurnStartedEvent) => Promise<void>) | null): void {
+    this._onEmbeddedExternal = callback;
+  }
+
+  recordAutoTurnDiagnostic(event: AutoTurnDiagnosticEvent): void {
+    this.transcriptDiagnosticLog?.record({
+      ...event,
+      ...(event.turnId ? { turnIdHash: this.transcriptDiagnosticLog.hashId(event.turnId) } : {}),
+    });
   }
 
   /** Turn-lease hotfix fix 6: notify the feature layer on an unregistered dequeue. */

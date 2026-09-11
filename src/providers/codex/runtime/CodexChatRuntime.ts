@@ -14,6 +14,7 @@ import type {
   ApprovalCallback,
   AskUserQuestionCallback,
   AutoTurnCancelledEvent,
+  AutoTurnFinishedEvent,
   AutoTurnResult,
   AutoTurnStartedEvent,
   ChatRewindResult,
@@ -787,7 +788,7 @@ export class CodexChatRuntime implements ChatRuntime {
 
   // S2 auto-turn lifecycle: Codex has no SDK-initiated turns — no-ops.
   setOnAutoTurnStarted(_callback: ((event: AutoTurnStartedEvent) => void) | null): void {}
-  setOnAutoTurnFinished(_callback: ((turnId: string) => void) | null): void {}
+  setOnAutoTurnFinished(_callback: ((event: AutoTurnFinishedEvent) => Promise<void>) | null): void {}
   setOnAutoTurnReleased(_callback: ((turnId: string) => void) | null): void {}
   setOnAutoTurnCancelled(_callback: ((event: AutoTurnCancelledEvent) => void) | null): void {}
   // Turn-lease hotfix fix 6: Codex has no channel-queued turns — no-op.

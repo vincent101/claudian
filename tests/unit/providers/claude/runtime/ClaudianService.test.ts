@@ -1,7 +1,6 @@
 import '@/providers';
 
 import * as sdkModule from '@anthropic-ai/claude-agent-sdk';
-import { Notice } from 'obsidian';
 
 import type { McpServerManager } from '@/core/mcp/McpServerManager';
 import type ClaudianPlugin from '@/main';
@@ -1232,7 +1231,10 @@ describe('ClaudianService', () => {
     it('should signal turn complete on result message', async () => {
       const message = { type: 'result', subtype: 'success', result: 'completed' };
 
-      await (service as any).routeMessage(message);
+      const settlement = (service as any).routeMessage(message);
+      await Promise.resolve();
+      await service.completeUserTurnProjection('route-test-turn');
+      await settlement;
 
       expect((service as any).messageChannel.getActiveTurnId()).toBeNull();
       expect(onDone).toHaveBeenCalled();
@@ -1392,72 +1394,6 @@ describe('ClaudianService', () => {
       );
       expect(thinkingChunks).toHaveLength(1);
       expect(thinkingChunks[0][0].content).toBe('Final thinking');
-    });
-
-    it('should reset auto-turn stream-text dedup after a buffered turn completes', async () => {
-      // Clear the user turn lease so messages start SDK-initiated (auto) turns.
-      (service as any).responseHandlers = [];
-      (service as any).runtimeTurns.clear();
-      (service as any).messageChannel = new MessageChannel();
-      const autoTurnCallback = jest.fn();
-      service.setAutoTurnCallback(autoTurnCallback);
-
-      await (service as any).routeMessage({
-        type: 'stream_event',
-        event: { type: 'content_block_delta', delta: { type: 'text_delta', text: 'First chunk' } },
-      });
-      await (service as any).routeMessage({
-        type: 'assistant',
-        message: { content: [{ type: 'text', text: 'Deduped away' }] },
-      });
-      await (service as any).routeMessage({
-        type: 'result',
-        subtype: 'success',
-        result: 'first turn complete',
-      });
-
-      await (service as any).routeMessage({
-        type: 'assistant',
-        message: { content: [{ type: 'text', text: 'Fresh auto-turn text' }] },
-      });
-      await (service as any).routeMessage({
-        type: 'result',
-        subtype: 'success',
-        result: 'second turn complete',
-      });
-
-      expect(autoTurnCallback).toHaveBeenCalledTimes(2);
-      expect(autoTurnCallback).toHaveBeenNthCalledWith(2, {
-        chunks: [
-          expect.objectContaining({ type: 'text', content: 'Fresh auto-turn text' }),
-        ],
-        metadata: {},
-      });
-    });
-
-    it('should notify when auto-turn callback rendering fails', async () => {
-      // Clear the user turn lease so messages start SDK-initiated (auto) turns.
-      (service as any).responseHandlers = [];
-      (service as any).runtimeTurns.clear();
-      (service as any).messageChannel = new MessageChannel();
-      const callbackError = new Error('renderer exploded');
-      service.setAutoTurnCallback(() => {
-        throw callbackError;
-      });
-
-      await (service as any).routeMessage({
-        type: 'assistant',
-        message: { content: [{ type: 'text', text: 'Background result' }] },
-      });
-      await (service as any).routeMessage({
-        type: 'result',
-        subtype: 'success',
-        result: 'turn complete',
-      });
-
-      expect(Notice).toHaveBeenCalledWith(
-        expect.stringContaining('Background task completed')
-      );
     });
 
     it('should suppress history rebuild and clear pendingForkSession on fork session init', async () => {
@@ -3793,6 +3729,7 @@ describe('ClaudianService', () => {
         while (!next.done) {
           next = await gen.next();
         }
+        await service.completeUserTurnProjection('user-thread-1');
         expect(channel.getActiveTurnId()).toBeNull();
         expect((service as any).runtimeTurns.has('user-thread-1')).toBe(false);
       });
@@ -3817,452 +3754,6 @@ describe('ClaudianService', () => {
           type: 'error',
           content: expect.stringContaining('non-empty turnId'),
         });
-      });
-    });
-
-    describe('external auto turns (v4 acceptance 3)', () => {
-      beforeEach(() => {
-        (service as any).messageChannel = new MessageChannel(
-          undefined,
-          (turnId: string) => (service as any).handleTurnDequeued(turnId),
-        );
-        (service as any).responseHandlers = [];
-        (service as any).runtimeTurns.clear();
-      });
-
-      it('creates an auto turn, fires onAutoTurnStarted synchronously with its id, and holds the lease', async () => {
-        const started: any[] = [];
-        service.setOnAutoTurnStarted((event) => started.push({ ...event }));
-
-        await (service as any).routeMessage({
-          type: 'assistant',
-          message: { content: [{ type: 'text', text: 'Background done' }] },
-        });
-
-        expect(started).toHaveLength(1);
-        expect(typeof started[0].turnId).toBe('string');
-        expect(started[0].generation).toBe(0);
-        expect(channelOf().getActiveTurnId()).toBe(started[0].turnId);
-        expect((service as any).runtimeTurns.has(started[0].turnId)).toBe(true);
-      });
-
-      it('queues a user message while the auto turn holds the lease and delivers it after completion', async () => {
-        const autoCallback = jest.fn();
-        service.setAutoTurnCallback(autoCallback);
-
-        await (service as any).routeMessage({
-          type: 'assistant',
-          message: { content: [{ type: 'text', text: 'Background result' }] },
-        });
-        const autoTurnId = channelOf().getActiveTurnId()!;
-        expect(autoTurnId).toBeTruthy();
-
-        // User message arrives mid-auto-turn → queued behind the lease.
-        const userTurn = createRuntimeTurn({ id: 'user-waiting', kind: 'user' });
-        (service as any).runtimeTurns.set('user-waiting', userTurn);
-        const iterator = channelOf()[Symbol.asyncIterator]();
-        const pendingUser = iterator.next();
-        const enqueueResult = channelOf().enqueue('user-waiting', {
-          type: 'user',
-          message: { role: 'user', content: 'user msg' },
-          parent_tool_use_id: null,
-          session_id: '',
-        });
-        expect(enqueueResult).toEqual({ canonicalTurnId: 'user-waiting' });
-        expect(channelOf().getQueueLength()).toBe(1);
-
-        // Auto turn completes → adapter flush + lease release → user delivers.
-        await (service as any).routeMessage({
-          type: 'result',
-          subtype: 'success',
-          result: 'done',
-        });
-        expect(autoCallback).toHaveBeenCalledTimes(1);
-        expect(autoCallback.mock.calls[0][0].chunks[0]).toEqual(
-          expect.objectContaining({ type: 'text', content: 'Background result' }),
-        );
-        expect(channelOf().getActiveTurnId()).toBe('user-waiting');
-        const delivered = await pendingUser;
-        expect(delivered.value.message.content).toBe('user msg');
-      });
-    });
-
-    describe('lease-less session control messages (S1 regression: first message dropped)', () => {
-      beforeEach(() => {
-        (service as any).messageChannel = new MessageChannel(
-          undefined,
-          (turnId: string) => (service as any).handleTurnDequeued(turnId),
-        );
-        (service as any).responseHandlers = [];
-        (service as any).runtimeTurns.clear();
-      });
-
-      it('system/init arriving with no lease (persistent query prewarm) starts no auto turn and holds no lease', async () => {
-        const started: any[] = [];
-        service.setOnAutoTurnStarted((event) => started.push({ ...event }));
-
-        await (service as any).routeMessage({
-          type: 'system',
-          subtype: 'init',
-          session_id: 'fresh-session-1',
-          agents: ['general-purpose'],
-          permissionMode: 'default',
-        });
-
-        // No auto turn: no lifecycle signal, no registry entry, no lease.
-        expect(started).toHaveLength(0);
-        expect([...(service as any).runtimeTurns.keys()]).toEqual([]);
-        expect(channelOf().getActiveTurnId()).toBeNull();
-        // Side effects still ran: session captured + channel session id synced.
-        expect(service.getSessionId()).toBe('fresh-session-1');
-        expect((channelOf() as any).currentSessionId).toBe('fresh-session-1');
-      });
-
-      it('a user message enqueued after the lease-less init dequeues immediately and signs the lease', async () => {
-        // New-session timing: persistent query started, init arrived with no lease.
-        await (service as any).routeMessage({
-          type: 'system',
-          subtype: 'init',
-          session_id: 'fresh-session-2',
-        });
-        expect(channelOf().getActiveTurnId()).toBeNull();
-
-        const channel = channelOf();
-        const userTurn = createRuntimeTurn({ id: 'user-first', kind: 'user' });
-        (service as any).runtimeTurns.set('user-first', userTurn);
-        const iterator = channel[Symbol.asyncIterator]();
-        const pendingUser = iterator.next();
-
-        const enqueueResult = channel.enqueue('user-first', {
-          type: 'user',
-          message: { role: 'user', content: 'first message' },
-          parent_tool_use_id: null,
-          session_id: '',
-        });
-        expect(enqueueResult).toEqual({ canonicalTurnId: 'user-first' });
-
-        // The message dequeues right away (no ghost lease blocking delivery).
-        const delivered = await pendingUser;
-        expect(delivered.done).toBe(false);
-        expect((delivered.value as any).message.content).toBe('first message');
-        expect(channel.getActiveTurnId()).toBe('user-first');
-        expect(channel.getQueueLength()).toBe(0);
-      });
-
-      it('compact_boundary arriving with no lease starts no auto turn and holds no lease', async () => {
-        const started: any[] = [];
-        service.setOnAutoTurnStarted((event) => started.push({ ...event }));
-
-        await (service as any).routeMessage({ type: 'system', subtype: 'compact_boundary' });
-
-        expect(started).toHaveLength(0);
-        expect([...(service as any).runtimeTurns.keys()]).toEqual([]);
-        expect(channelOf().getActiveTurnId()).toBeNull();
-      });
-
-      it('system task_notification with no lease settles the accounting only: no auto turn, no lease', async () => {
-        const started: any[] = [];
-        service.setOnAutoTurnStarted((event) => started.push({ ...event }));
-        const notifications: any[] = [];
-        service.setSubagentNotificationHandler((taskId, status, result) => {
-          notifications.push({ taskId, status, result });
-        });
-
-        await (service as any).routeMessage({
-          type: 'system',
-          subtype: 'task_notification',
-          task_id: 'agent-1',
-          status: 'completed',
-          summary: 'done',
-        });
-
-        // Pure notification: no ghost auto turn, no lease (hotfix/notify-lease).
-        expect(started).toHaveLength(0);
-        expect([...(service as any).runtimeTurns.keys()]).toEqual([]);
-        expect(channelOf().getActiveTurnId()).toBeNull();
-        expect(notifications).toEqual([
-          { taskId: 'agent-1', status: 'completed', result: 'done' },
-        ]);
-      });
-
-      it('queue-operation task-notification with no lease settles the accounting only: no auto turn, no lease', async () => {
-        const started: any[] = [];
-        service.setOnAutoTurnStarted((event) => started.push({ ...event }));
-        const notifications: any[] = [];
-        service.setSubagentNotificationHandler((taskId, status, result) => {
-          notifications.push({ taskId, status, result });
-        });
-
-        await (service as any).routeMessage({
-          type: 'queue-operation',
-          operation: 'enqueue',
-          content: '<task-notification><task-id>agent-2</task-id><status>completed</status><result>Background done</result></task-notification>',
-        });
-
-        expect(started).toHaveLength(0);
-        expect([...(service as any).runtimeTurns.keys()]).toEqual([]);
-        expect(channelOf().getActiveTurnId()).toBeNull();
-        expect(notifications).toEqual([
-          { taskId: 'agent-2', status: 'completed', result: 'Background done' },
-        ]);
-      });
-
-      it('a non-notification queue-operation with no lease starts no auto turn (ghost guard)', async () => {
-        // Ghost auto turn guard (0823 evidence): trailing queue-operation
-        // records after a settled user turn must not open an auto turn whose
-        // result never arrives — the millisecond race between result
-        // settlement and the trailing record is what made the hang intermittent.
-        const started: any[] = [];
-        service.setOnAutoTurnStarted((event) => started.push({ ...event }));
-
-        await (service as any).routeMessage({
-          type: 'queue-operation',
-          operation: 'enqueue',
-          content: 'just a queue record, not a notification',
-        });
-
-        expect(started).toHaveLength(0);
-        expect([...(service as any).runtimeTurns.keys()]).toEqual([]);
-        expect(channelOf().getActiveTurnId()).toBeNull();
-      });
-
-      it('an unknown message kind with no lease is dropped without starting an auto turn', async () => {
-        const started: any[] = [];
-        service.setOnAutoTurnStarted((event) => started.push({ ...event }));
-
-        await (service as any).routeMessage({ type: 'progress', subtype: 'bookkeeping' });
-
-        expect(started).toHaveLength(0);
-        expect([...(service as any).runtimeTurns.keys()]).toEqual([]);
-        expect(channelOf().getActiveTurnId()).toBeNull();
-      });
-
-      it('an assistant message with no lease still opens the auto turn (guard whitelist regression)', async () => {
-        const started: any[] = [];
-        service.setOnAutoTurnStarted((event) => started.push({ ...event }));
-
-        await (service as any).routeMessage({
-          type: 'assistant',
-          message: { role: 'assistant', content: [{ type: 'text', text: 'hi' }] },
-          parent_tool_use_id: null,
-          session_id: '',
-        });
-
-        expect(started).toHaveLength(1);
-        expect(channelOf().getActiveTurnId()).toBe(started[0].turnId);
-      });
-
-      it('a user message enqueued after a lease-less pure notification dequeues immediately and signs the lease', async () => {
-        // Ghost-lease regression core: the pure notification must not leave a
-        // lease behind, or the next user message dead-waits on it forever.
-        service.setSubagentNotificationHandler(() => {});
-        await (service as any).routeMessage({
-          type: 'system',
-          subtype: 'task_notification',
-          task_id: 'agent-1',
-          status: 'completed',
-          summary: 'done',
-        });
-        expect(channelOf().getActiveTurnId()).toBeNull();
-
-        const channel = channelOf();
-        const userTurn = createRuntimeTurn({ id: 'user-after-notify', kind: 'user' });
-        (service as any).runtimeTurns.set('user-after-notify', userTurn);
-        const iterator = channel[Symbol.asyncIterator]();
-        const pendingUser = iterator.next();
-
-        const enqueueResult = channel.enqueue('user-after-notify', {
-          type: 'user',
-          message: { role: 'user', content: 'next message' },
-          parent_tool_use_id: null,
-          session_id: '',
-        });
-        expect(enqueueResult).toEqual({ canonicalTurnId: 'user-after-notify' });
-
-        const delivered = await pendingUser;
-        expect(delivered.done).toBe(false);
-        expect((delivered.value as any).message.content).toBe('next message');
-        expect(channel.getActiveTurnId()).toBe('user-after-notify');
-        expect(channel.getQueueLength()).toBe(0);
-      });
-
-      it('notification followed by a continuation: the assistant message opens the auto turn and the result releases the lease', async () => {
-        const started: any[] = [];
-        service.setOnAutoTurnStarted((event) => started.push({ ...event }));
-        const autoCallback = jest.fn();
-        service.setAutoTurnCallback(autoCallback);
-        const notifications: any[] = [];
-        service.setSubagentNotificationHandler((taskId, status, result) => {
-          notifications.push({ taskId, status, result });
-        });
-
-        // Notification first: settled, no lease.
-        await (service as any).routeMessage({
-          type: 'system',
-          subtype: 'task_notification',
-          task_id: 'agent-3',
-          status: 'completed',
-          summary: 'done',
-        });
-        expect(channelOf().getActiveTurnId()).toBeNull();
-
-        // Continuation arrives (the ~51% case): opens its own auto turn.
-        await (service as any).routeMessage({
-          type: 'assistant',
-          message: { content: [{ type: 'text', text: 'Continuation payload' }] },
-        });
-        expect(started).toHaveLength(1);
-        const autoTurnId = channelOf().getActiveTurnId()!;
-        expect(autoTurnId).toBe(started[0].turnId);
-
-        // Result settles the auto turn and releases the lease.
-        await (service as any).routeMessage({
-          type: 'result',
-          subtype: 'success',
-          result: 'continuation done',
-        });
-        expect(autoCallback).toHaveBeenCalledTimes(1);
-        expect(autoCallback.mock.calls[0][0].chunks[0]).toEqual(
-          expect.objectContaining({ type: 'text', content: 'Continuation payload' }),
-        );
-        expect(channelOf().getActiveTurnId()).toBeNull();
-        expect((service as any).runtimeTurns.has(autoTurnId)).toBe(false);
-        expect(notifications).toEqual([
-          { taskId: 'agent-3', status: 'completed', result: 'done' },
-        ]);
-      });
-
-      it('task-notification under an existing lease is dispatched for accounting only and keeps the lease', async () => {
-        const started: any[] = [];
-        service.setOnAutoTurnStarted((event) => started.push({ ...event }));
-        const notifications: any[] = [];
-        service.setSubagentNotificationHandler((taskId, status, result) => {
-          notifications.push({ taskId, status, result });
-        });
-
-        const channel = channelOf();
-        const turn = createRuntimeTurn({ id: 'user-lease', kind: 'user', phase: 'collecting' });
-        (service as any).runtimeTurns.set('user-lease', turn);
-        channel.beginExternalTurn('user-lease');
-
-        await (service as any).routeMessage({
-          type: 'system',
-          subtype: 'task_notification',
-          task_id: 'agent-4',
-          status: 'completed',
-          summary: 'done',
-        });
-
-        // Existing behavior: accounting ran, the owning lease is untouched.
-        expect(notifications).toEqual([
-          { taskId: 'agent-4', status: 'completed', result: 'done' },
-        ]);
-        expect(started).toHaveLength(0);
-        expect(channel.getActiveTurnId()).toBe('user-lease');
-        expect((service as any).runtimeTurns.has('user-lease')).toBe(true);
-      });
-
-      it('system/init under an existing lease still merges into the active turn', async () => {
-        const channel = channelOf();
-        const turn = createRuntimeTurn({ id: 'user-lease', kind: 'user', phase: 'collecting' });
-        (service as any).runtimeTurns.set('user-lease', turn);
-        channel.beginExternalTurn('user-lease');
-
-        await (service as any).routeMessage({
-          type: 'system',
-          subtype: 'init',
-          session_id: 'mid-session-9',
-        });
-
-        expect(service.getSessionId()).toBe('mid-session-9');
-        expect(channel.getActiveTurnId()).toBe('user-lease');
-        expect((service as any).runtimeTurns.has('user-lease')).toBe(true);
-      });
-    });
-
-    describe('protocol errors do not kill the consumer (v4 acceptance 4)', () => {
-      beforeEach(() => {
-        (service as any).messageChannel = new MessageChannel(
-          undefined,
-          (turnId: string) => (service as any).handleTurnDequeued(turnId),
-        );
-        (service as any).responseHandlers = [];
-        (service as any).runtimeTurns.clear();
-      });
-
-      it('dequeues an unregistered turn: releases the lease, keeps the consumer usable', async () => {
-        const channel = channelOf();
-        // Ghost queue item with no runtime turn behind it.
-        channel.enqueue('ghost-turn', {
-          type: 'user',
-          message: { role: 'user', content: 'ghost' },
-          parent_tool_use_id: null,
-          session_id: '',
-        });
-        const iterator = channel[Symbol.asyncIterator]();
-        const delivered = await iterator.next();
-        expect(delivered.value.message.content).toBe('ghost');
-        // handleTurnDequeued settled the unknown lease item and released it.
-        expect(channel.getActiveTurnId()).toBeNull();
-
-        // The next legal turn still flows through the same channel.
-        const turn = createRuntimeTurn({ id: 'user-after-ghost', kind: 'user' });
-        (service as any).runtimeTurns.set('user-after-ghost', turn);
-        const pending = iterator.next();
-        channel.enqueue('user-after-ghost', {
-          type: 'user',
-          message: { role: 'user', content: 'real msg' },
-          parent_tool_use_id: null,
-          session_id: '',
-        });
-        const next = await pending;
-        expect(next.value.message.content).toBe('real msg');
-        expect(channel.getActiveTurnId()).toBe('user-after-ghost');
-      });
-
-      it('completeTurn mismatch cancels the actual active turn and settles its waiters', async () => {
-        const channel = channelOf();
-        const onDone = jest.fn();
-        const handler = createResponseHandler({
-          id: 'mismatch-handler',
-          onChunk: jest.fn(),
-          onDone,
-          onError: jest.fn(),
-        });
-        const turn = createRuntimeTurn({ id: 'real-active', kind: 'user' });
-        turn.waiters.add(handler);
-        (service as any).runtimeTurns.set('real-active', turn);
-        channel.beginExternalTurn('real-active');
-
-        // Report completion for the WRONG turn id.
-        (service as any).completeChannelTurn('stale-turn');
-
-        // The actual lease holder got settled (onDone), and the lease is free.
-        expect(onDone).toHaveBeenCalled();
-        expect((service as any).runtimeTurns.has('real-active')).toBe(false);
-        expect(channel.getActiveTurnId()).toBeNull();
-      });
-
-      it('routeMessage survives a stale lease and still processes the message', async () => {
-        const channel = channelOf();
-        // Lease points at a turn the runtime no longer knows.
-        channel.beginExternalTurn('stale-active');
-
-        const started: any[] = [];
-        service.setOnAutoTurnStarted((event) => started.push({ ...event }));
-
-        await (service as any).routeMessage({
-          type: 'assistant',
-          message: { content: [{ type: 'text', text: 'Fresh content' }] },
-        });
-
-        // Stale lease released, a fresh auto turn took over, chunks buffered.
-        expect(started).toHaveLength(1);
-        const autoTurn = (service as any).runtimeTurns.get(started[0].turnId);
-        expect(autoTurn.chunks[0]).toEqual(
-          expect.objectContaining({ type: 'text', content: 'Fresh content' }),
-        );
-        expect(channel.getActiveTurnId()).toBe(started[0].turnId);
       });
     });
 
@@ -4365,13 +3856,273 @@ describe('ClaudianService', () => {
         turnB.waiters.add(handlerC);
 
         // Canonical result settles every merged waiter, not just its creator.
-        await (service as any).settleTurnAtResult(turnB);
+        const settlement = (service as any).settleTurnAtResult(turnB);
+        await Promise.resolve();
+        await service.completeUserTurnProjection('user-canonical');
+        await settlement;
 
         expect(onDoneB).toHaveBeenCalled();
         expect(onDoneC).toHaveBeenCalled();
         // turnC's own registry entry is retracted with its generator cleanup.
         (service as any).finishTurnFromGenerator(turnC, handlerC);
         expect((service as any).runtimeTurns.has('user-merged')).toBe(false);
+      });
+    });
+
+    describe('lease-less session control messages (S1 regression: first message dropped)', () => {
+      beforeEach(() => {
+        (service as any).messageChannel = new MessageChannel(
+          undefined,
+          (turnId: string) => (service as any).handleTurnDequeued(turnId),
+        );
+        (service as any).responseHandlers = [];
+        (service as any).runtimeTurns.clear();
+      });
+
+      it('system/init arriving with no lease (persistent query prewarm) starts no auto turn and holds no lease', async () => {
+        const started: any[] = [];
+        service.setOnAutoTurnStarted((event) => started.push({ ...event }));
+
+        await (service as any).routeMessage({
+          type: 'system',
+          subtype: 'init',
+          session_id: 'fresh-session-1',
+          agents: ['general-purpose'],
+          permissionMode: 'default',
+        });
+
+        // No auto turn: no lifecycle signal, no registry entry, no lease.
+        expect(started).toHaveLength(0);
+        expect([...(service as any).runtimeTurns.keys()]).toEqual([]);
+        expect(channelOf().getActiveTurnId()).toBeNull();
+        // Side effects still ran: session captured + channel session id synced.
+        expect(service.getSessionId()).toBe('fresh-session-1');
+        expect((channelOf() as any).currentSessionId).toBe('fresh-session-1');
+      });
+
+      it('compact_boundary arriving with no lease starts no auto turn and holds no lease', async () => {
+        const started: any[] = [];
+        service.setOnAutoTurnStarted((event) => started.push({ ...event }));
+
+        await (service as any).routeMessage({ type: 'system', subtype: 'compact_boundary' });
+
+        expect(started).toHaveLength(0);
+        expect([...(service as any).runtimeTurns.keys()]).toEqual([]);
+        expect(channelOf().getActiveTurnId()).toBeNull();
+      });
+
+      it('system task_notification with no lease settles the accounting only: no auto turn, no lease', async () => {
+        const started: any[] = [];
+        service.setOnAutoTurnStarted((event) => started.push({ ...event }));
+        const notifications: any[] = [];
+        service.setSubagentNotificationHandler((taskId, status, result) => {
+          notifications.push({ taskId, status, result });
+        });
+
+        await (service as any).routeMessage({
+          type: 'system',
+          subtype: 'task_notification',
+          task_id: 'agent-1',
+          status: 'completed',
+          summary: 'done',
+        });
+
+        // Pure notification: no ghost auto turn, no lease (hotfix/notify-lease).
+        expect(started).toHaveLength(0);
+        expect([...(service as any).runtimeTurns.keys()]).toEqual([]);
+        expect(channelOf().getActiveTurnId()).toBeNull();
+        expect(notifications).toEqual([
+          { taskId: 'agent-1', status: 'completed', result: 'done' },
+        ]);
+      });
+
+      it('queue-operation task-notification with no lease settles the accounting only: no auto turn, no lease', async () => {
+        const started: any[] = [];
+        service.setOnAutoTurnStarted((event) => started.push({ ...event }));
+        const notifications: any[] = [];
+        service.setSubagentNotificationHandler((taskId, status, result) => {
+          notifications.push({ taskId, status, result });
+        });
+
+        await (service as any).routeMessage({
+          type: 'queue-operation',
+          operation: 'enqueue',
+          content: '<task-notification><task-id>agent-2</task-id><status>completed</status><result>Background done</result></task-notification>',
+        });
+
+        expect(started).toHaveLength(0);
+        expect([...(service as any).runtimeTurns.keys()]).toEqual([]);
+        expect(channelOf().getActiveTurnId()).toBeNull();
+        expect(notifications).toEqual([
+          { taskId: 'agent-2', status: 'completed', result: 'Background done' },
+        ]);
+      });
+
+      it('a non-notification queue-operation with no lease starts no auto turn (ghost guard)', async () => {
+        // Ghost auto turn guard (0823 evidence): trailing queue-operation
+        // records after a settled user turn must not open an auto turn whose
+        // result never arrives — the millisecond race between result
+        // settlement and the trailing record is what made the hang intermittent.
+        const started: any[] = [];
+        service.setOnAutoTurnStarted((event) => started.push({ ...event }));
+
+        await (service as any).routeMessage({
+          type: 'queue-operation',
+          operation: 'enqueue',
+          content: 'just a queue record, not a notification',
+        });
+
+        expect(started).toHaveLength(0);
+        expect([...(service as any).runtimeTurns.keys()]).toEqual([]);
+        expect(channelOf().getActiveTurnId()).toBeNull();
+      });
+
+      it('an unknown message kind with no lease is dropped without starting an auto turn', async () => {
+        const started: any[] = [];
+        service.setOnAutoTurnStarted((event) => started.push({ ...event }));
+
+        await (service as any).routeMessage({ type: 'progress', subtype: 'bookkeeping' });
+
+        expect(started).toHaveLength(0);
+        expect([...(service as any).runtimeTurns.keys()]).toEqual([]);
+        expect(channelOf().getActiveTurnId()).toBeNull();
+      });
+
+      it('task-notification under an existing lease is dispatched for accounting only and keeps the lease', async () => {
+        const started: any[] = [];
+        service.setOnAutoTurnStarted((event) => started.push({ ...event }));
+        const notifications: any[] = [];
+        service.setSubagentNotificationHandler((taskId, status, result) => {
+          notifications.push({ taskId, status, result });
+        });
+
+        const channel = channelOf();
+        const turn = createRuntimeTurn({ id: 'user-lease', kind: 'user', phase: 'collecting' });
+        (service as any).runtimeTurns.set('user-lease', turn);
+        channel.beginExternalTurn('user-lease');
+
+        await (service as any).routeMessage({
+          type: 'system',
+          subtype: 'task_notification',
+          task_id: 'agent-4',
+          status: 'completed',
+          summary: 'done',
+        });
+
+        // Existing behavior: accounting ran, the owning lease is untouched.
+        expect(notifications).toEqual([
+          { taskId: 'agent-4', status: 'completed', result: 'done' },
+        ]);
+        expect(started).toHaveLength(0);
+        expect(channel.getActiveTurnId()).toBe('user-lease');
+        expect((service as any).runtimeTurns.has('user-lease')).toBe(true);
+      });
+    });
+
+    describe('protocol errors do not kill the consumer (v4 acceptance 4)', () => {
+      beforeEach(() => {
+        (service as any).messageChannel = new MessageChannel(
+          undefined,
+          (turnId: string) => (service as any).handleTurnDequeued(turnId),
+        );
+        (service as any).responseHandlers = [];
+        (service as any).runtimeTurns.clear();
+      });
+
+      it('dequeues an unregistered turn: releases the lease, keeps the consumer usable', async () => {
+        const channel = channelOf();
+        // Ghost queue item with no runtime turn behind it.
+        channel.enqueue('ghost-turn', {
+          type: 'user',
+          message: { role: 'user', content: 'ghost' },
+          parent_tool_use_id: null,
+          session_id: '',
+        });
+        const iterator = channel[Symbol.asyncIterator]();
+        const delivered = await iterator.next();
+        expect(delivered.value.message.content).toBe('ghost');
+        // handleTurnDequeued settled the unknown lease item and released it.
+        expect(channel.getActiveTurnId()).toBeNull();
+
+        // The next legal turn still flows through the same channel.
+        const turn = createRuntimeTurn({ id: 'user-after-ghost', kind: 'user' });
+        (service as any).runtimeTurns.set('user-after-ghost', turn);
+        const pending = iterator.next();
+        channel.enqueue('user-after-ghost', {
+          type: 'user',
+          message: { role: 'user', content: 'real msg' },
+          parent_tool_use_id: null,
+          session_id: '',
+        });
+        const next = await pending;
+        expect(next.value.message.content).toBe('real msg');
+        expect(channel.getActiveTurnId()).toBe('user-after-ghost');
+      });
+
+      it('completeTurn mismatch cancels the actual active turn and settles its waiters', async () => {
+        const channel = channelOf();
+        const onDone = jest.fn();
+        const handler = createResponseHandler({
+          id: 'mismatch-handler',
+          onChunk: jest.fn(),
+          onDone,
+          onError: jest.fn(),
+        });
+        const turn = createRuntimeTurn({ id: 'real-active', kind: 'user' });
+        turn.waiters.add(handler);
+        (service as any).runtimeTurns.set('real-active', turn);
+        channel.beginExternalTurn('real-active');
+
+        // Report completion for the WRONG turn id.
+        (service as any).completeChannelTurn('stale-turn');
+
+        // The actual lease holder got settled (onDone), and the lease is free.
+        expect(onDone).toHaveBeenCalled();
+        expect((service as any).runtimeTurns.has('real-active')).toBe(false);
+        expect(channel.getActiveTurnId()).toBeNull();
+      });
+
+      it('routeMessage survives a stale lease and still processes later messages', async () => {
+        const channel = channelOf();
+        // Lease points at a turn the runtime no longer knows.
+        channel.beginExternalTurn('stale-active');
+
+        const started: any[] = [];
+        service.setOnAutoTurnStarted((event) => started.push({ ...event }));
+
+        // Unleased assistant content is dropped in v6 (the transcript observer
+        // owns external turns), but the stale lease itself must be released
+        // without killing the consumer.
+        await (service as any).routeMessage({
+          type: 'assistant',
+          message: { content: [{ type: 'text', text: 'Fresh content' }] },
+        });
+
+        expect(started).toHaveLength(0);
+        expect(channel.getActiveTurnId()).toBeNull();
+        expect((service as any).runtimeTurns.size).toBe(0);
+
+        // The consumer is still usable: a legal turn receives its chunks.
+        const onChunk = jest.fn();
+        const handler = createResponseHandler({
+          id: 'stale-recovery-handler',
+          onChunk,
+          onDone: jest.fn(),
+          onError: jest.fn(),
+        });
+        const turn = createRuntimeTurn({ id: 'user-after-stale', kind: 'user', phase: 'collecting' });
+        turn.waiters.add(handler);
+        (service as any).runtimeTurns.set('user-after-stale', turn);
+        channel.beginExternalTurn('user-after-stale');
+
+        await (service as any).routeMessage({
+          type: 'assistant',
+          message: { content: [{ type: 'text', text: 'still alive' }] },
+        });
+        expect(onChunk).toHaveBeenCalledWith(
+          expect.objectContaining({ type: 'text', content: 'still alive' }),
+        );
+        expect(channel.getActiveTurnId()).toBe('user-after-stale');
       });
     });
   });
@@ -4396,15 +4147,18 @@ describe('ClaudianService', () => {
       return (service as any).messageChannel as MessageChannel;
     }
 
+    /** Registers an auto turn the way v6 creates them: lease first, no stdout path. */
+    function registerAutoTurn(turnId: string) {
+      const turn = createRuntimeTurn({ id: turnId, kind: 'auto', phase: 'collecting' });
+      (service as any).runtimeTurns.set(turnId, turn);
+      channelOf2().beginExternalTurn(turnId);
+      return turn;
+    }
+
     it('auto turn settles in strict finish → deferredRestart → settle → completeTurn → released order', async () => {
       const order: string[] = [];
-      const autoTurnId = (() => {
-        let id = '';
-        service.setOnAutoTurnStarted((event) => { id = event.turnId; });
-        return () => id;
-      })();
-      service.setOnAutoTurnFinished(() => order.push('finishFeatureTurn'));
-      service.setOnAutoTurnReleased(() => order.push('processQueuedMessage'));
+      service.setOnAutoTurnFinished(async () => { order.push('finishFeatureTurn'); });
+      service.setOnAutoTurnReleased(() => { order.push('processQueuedMessage'); });
 
       const originalRestart = (service as any).executeDeferredRestartIfAny.bind(service);
       jest.spyOn(service as any, 'executeDeferredRestartIfAny')
@@ -4421,22 +4175,11 @@ describe('ClaudianService', () => {
           return originalComplete(...(args as [string]));
         });
 
-      // Start an auto turn via an unleased assistant message, then complete.
-      await (service as any).routeMessage({
-        type: 'assistant',
-        message: { content: [{ type: 'text', text: 'Background' }] },
-      });
-      const turnId = autoTurnId();
-      expect(turnId).toBeTruthy();
-
-      await (service as any).routeMessage({
-        type: 'result',
-        subtype: 'success',
-        result: 'done',
-      });
+      const turn = registerAutoTurn('auto-order');
+      await (service as any).settleTurnAtResult(turn);
 
       expect(order).toEqual(['finishFeatureTurn', 'deferredRestart', 'completeTurn', 'processQueuedMessage']);
-      expect((service as any).runtimeTurns.has(turnId)).toBe(false);
+      expect((service as any).runtimeTurns.has('auto-order')).toBe(false);
       expect(channelOf2().getActiveTurnId()).toBeNull();
     });
 
@@ -4473,22 +4216,16 @@ describe('ClaudianService', () => {
       const cancelled: any[] = [];
       service.setOnAutoTurnCancelled((event) => cancelled.push({ ...event }));
 
-      let autoTurnId = '';
-      service.setOnAutoTurnStarted((event) => { autoTurnId = event.turnId; });
-      await (service as any).routeMessage({
-        type: 'assistant',
-        message: { content: [{ type: 'text', text: 'Background' }] },
-      });
-
-      (service as any).cancelTurn(autoTurnId, 'lifecycle_cancel');
+      registerAutoTurn('auto-cancel');
+      (service as any).cancelTurn('auto-cancel', 'lifecycle_cancel');
 
       expect(cancelled).toHaveLength(1);
-      expect(cancelled[0].turnId).toBe(autoTurnId);
+      expect(cancelled[0].turnId).toBe('auto-cancel');
       // cancelTurn bumped the generation from 0 to 1 before firing.
       expect(cancelled[0].generation).toBe(1);
       expect(cancelled[0].reason).toBe('lifecycle_cancel');
       expect(channelOf2().getActiveTurnId()).toBeNull();
-      expect((service as any).runtimeTurns.has(autoTurnId)).toBe(false);
+      expect((service as any).runtimeTurns.has('auto-cancel')).toBe(false);
     });
   });
 
@@ -4502,7 +4239,8 @@ describe('ClaudianService', () => {
       (service as any).runtimeTurns.clear();
     });
 
-    it('cancel() settles the leased turn immediately', () => {
+    it('cancel() wakes the feature but holds the lease until projection acknowledgement', async () => {
+      service.setOnAutoTurnStarted(() => {});
       const channel = (service as any).messageChannel as MessageChannel;
       const turn = createRuntimeTurn({ id: 'user-active-cancel', kind: 'user', phase: 'collecting' });
       const onDone = jest.fn();
@@ -4519,6 +4257,9 @@ describe('ClaudianService', () => {
       service.cancel();
 
       expect(onDone).toHaveBeenCalledTimes(1);
+      expect((service as any).runtimeTurns.has('user-active-cancel')).toBe(true);
+      expect(channel.getActiveTurnId()).toBe('user-active-cancel');
+      await service.completeUserTurnProjection('user-active-cancel');
       expect((service as any).runtimeTurns.has('user-active-cancel')).toBe(false);
       expect(channel.getActiveTurnId()).toBeNull();
     });
@@ -4557,10 +4298,12 @@ describe('ClaudianService', () => {
       (service as any).runtimeTurns.set('user-trailing', turn);
       channel.beginExternalTurn('user-trailing');
       service.cancel();
-      expect(channel.getActiveTurnId()).toBeNull();
+      expect(channel.getActiveTurnId()).toBe('user-trailing');
 
-      // SDK still emits the aborted turn's result — lease-less by now.
+      // SDK may emit the aborted turn's result while the cancelled tombstone
+      // remains behind the feature completion barrier.
       await (service as any).routeMessage({ type: 'result', subtype: 'success', result: '' });
+      await service.completeUserTurnProjection('user-trailing');
 
       expect(started).toHaveLength(0);
       expect((service as any).runtimeTurns.size).toBe(0);

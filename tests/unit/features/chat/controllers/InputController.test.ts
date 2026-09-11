@@ -3343,6 +3343,24 @@ describe('InputController - Message Queue', () => {
       controller = new InputController(deps);
     });
 
+    it('registers the host turn before cold-start title I/O settles', async () => {
+      let releaseTitle!: () => void;
+      (deps.plugin.renameConversation as jest.Mock).mockImplementation(() => new Promise<void>(resolve => {
+        releaseTitle = resolve;
+      }));
+      const runtime = (deps as any).mockAgentService;
+      runtime.beginUserTurnProjection = jest.fn();
+
+      inputEl.value = 'first message';
+      const sending = controller.sendMessage();
+      await Promise.resolve();
+
+      expect(runtime.beginUserTurnProjection).toHaveBeenCalledTimes(1);
+      expect(runtime.query).not.toHaveBeenCalled();
+      releaseTitle();
+      await sending;
+    });
+
     it('releases the feature lease when title generation rejects (fix 1)', async () => {
       (deps.plugin.renameConversation as jest.Mock).mockRejectedValue(new Error('disk full'));
 
@@ -3414,6 +3432,165 @@ describe('InputController - Message Queue', () => {
       controller.cancelStreaming();
 
       expect(invalidateRenderFlush).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  describe('User turn projection acknowledgement barrier (v5)', () => {
+    let controller: InputController;
+    let deps: ReturnType<typeof createSendableDeps>;
+    let inputEl: ReturnType<typeof createMockInputEl>;
+    let coordinator: TurnCoordinator;
+    let pump: jest.Mock;
+    let releaseSpy: jest.SpyInstance;
+    let mockAgentService: ReturnType<typeof createMockAgentService> & {
+      completeUserTurnProjection?: jest.Mock;
+    };
+
+    beforeEach(() => {
+      jest.clearAllMocks();
+      deps = createSendableDeps();
+      inputEl = deps.getInputEl() as ReturnType<typeof createMockInputEl>;
+      mockAgentService = (deps as any).mockAgentService;
+      pump = jest.fn();
+      coordinator = new TurnCoordinator({
+        state: deps.state,
+        getConversationId: () => deps.state.currentConversationId,
+        processQueuedMessage: pump,
+      });
+      (deps as any).getTurnCoordinator = () => coordinator;
+      releaseSpy = jest.spyOn(coordinator, 'release');
+      mockAgentService.query = jest.fn().mockImplementation(() =>
+        createMockStream([{ type: 'done' }]),
+      );
+      controller = new InputController(deps);
+    });
+
+    const firstTurnId = () =>
+      ((mockAgentService.prepareTurn as jest.Mock).mock.calls[0][0] as any).turnId;
+
+    it('holds release and the queued-message pump while the acknowledgement is pending', async () => {
+      let resolveAck!: () => void;
+      const ackPromise = new Promise<void>((resolve) => {
+        resolveAck = resolve;
+      });
+      mockAgentService.completeUserTurnProjection = jest.fn(() => ackPromise);
+
+      inputEl.value = 'first message';
+      const sendPromise = controller.sendMessage();
+      // Flush through the stream end, save, and finish(turnId) — the send is
+      // now parked on the runtime acknowledgement.
+      await new Promise((resolve) => setTimeout(resolve, 0));
+
+      // finish(turnId) already ran (lease cleared, settled record armed)...
+      expect(coordinator.isBusy()).toBe(false);
+      // ...and the ack was requested with the feature turnId...
+      expect(mockAgentService.completeUserTurnProjection).toHaveBeenCalledTimes(1);
+      expect(mockAgentService.completeUserTurnProjection).toHaveBeenCalledWith(firstTurnId());
+      // ...but the release and its queued-message pump are still blocked.
+      expect(releaseSpy).not.toHaveBeenCalled();
+      expect(pump).not.toHaveBeenCalled();
+
+      resolveAck();
+      await sendPromise;
+    });
+
+    it('runs release and the queued-message pump in order once the acknowledgement resolves', async () => {
+      let resolveAck!: () => void;
+      const ackPromise = new Promise<void>((resolve) => {
+        resolveAck = resolve;
+      });
+      mockAgentService.completeUserTurnProjection = jest.fn(() => ackPromise);
+
+      const order: string[] = [];
+      const originalRelease = TurnCoordinator.prototype.release.bind(coordinator);
+      releaseSpy.mockImplementation((turnId: string) => {
+        order.push('release');
+        originalRelease(turnId);
+      });
+      pump.mockImplementation(() => {
+        order.push('pump');
+      });
+
+      inputEl.value = 'first message';
+      const sendPromise = controller.sendMessage();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(order).toEqual([]);
+
+      resolveAck();
+      await sendPromise;
+
+      expect(releaseSpy).toHaveBeenCalledWith(firstTurnId());
+      expect(order).toEqual(['release', 'pump']);
+    });
+
+    it('runs the deferred plan auto-send only after the acknowledgement resolves', async () => {
+      let resolveAck!: () => void;
+      const ackPromise = new Promise<void>((resolve) => {
+        resolveAck = resolve;
+      });
+      mockAgentService.completeUserTurnProjection = jest.fn(() => ackPromise);
+      mockAgentService.providerId = 'codex';
+      mockAgentService.consumeTurnMetadata = jest.fn()
+        .mockReturnValueOnce({ planCompleted: true, wasSent: true })
+        .mockReturnValueOnce({ wasSent: true });
+      let queryCount = 0;
+      mockAgentService.query = jest.fn().mockImplementation(() => {
+        queryCount += 1;
+        return createMockStream(
+          queryCount === 1
+            ? [{ type: 'text', content: 'Plan content' }, { type: 'done' }]
+            : [{ type: 'done' }],
+        );
+      });
+      (controller as any).showPlanApproval = jest.fn().mockResolvedValue({
+        decision: { type: 'implement' },
+        invalidated: false,
+      });
+
+      inputEl.value = 'Plan this feature';
+      const sendPromise = controller.sendMessage();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+
+      // The plan turn finished and asked for its ack, but the deferred
+      // auto-send never started while the ack is pending.
+      expect(mockAgentService.completeUserTurnProjection).toHaveBeenCalledTimes(1);
+      expect(mockAgentService.query).toHaveBeenCalledTimes(1);
+      expect(inputEl.value).toBe('');
+
+      resolveAck();
+      await sendPromise;
+      // The auto-send is fire-and-forget; give the deferred turn a tick.
+      await new Promise((resolve) => setTimeout(resolve, 0));
+
+      expect(mockAgentService.query).toHaveBeenCalledTimes(2);
+      expect(inputEl.value).toBe('');
+    });
+
+    it('still releases the lease when the acknowledgement rejects', async () => {
+      mockAgentService.completeUserTurnProjection = jest
+        .fn()
+        .mockRejectedValue(new Error('projection ack failed'));
+
+      inputEl.value = 'first message';
+      // The ack rejection is swallowed silently (no console.* in production
+      // code): the send must settle, not reject, and the lease still releases.
+      await controller.sendMessage();
+
+      expect(releaseSpy).toHaveBeenCalledWith(firstTurnId());
+      expect(pump).toHaveBeenCalledTimes(1);
+      expect(coordinator.isBusy()).toBe(false);
+    });
+
+    it('tolerates runtimes without completeUserTurnProjection (optional chaining)', async () => {
+      // The default mock runtime has no completeUserTurnProjection at all.
+      expect(mockAgentService.completeUserTurnProjection).toBeUndefined();
+
+      inputEl.value = 'first message';
+      await controller.sendMessage();
+
+      expect(coordinator.isBusy()).toBe(false);
+      expect(releaseSpy).toHaveBeenCalledWith(firstTurnId());
+      expect(pump).toHaveBeenCalledTimes(1);
     });
   });
 });

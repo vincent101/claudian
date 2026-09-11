@@ -426,6 +426,24 @@ describe('sdkSession', () => {
       expect(chatMsg!.timestamp).toBe(new Date('2024-01-15T10:30:00Z').getTime());
     });
 
+    it.each(['peer', 'channel', 'coordinator'])('hydrates sanitized isMeta %s messages', kind => {
+      const sdkMsg: SDKNativeMessage = {
+        type: 'user',
+        uuid: `external-${kind}`,
+        isMeta: true,
+        origin: { kind, body: '[to] host\n[msg] visible only', msg_id: 'secret-msg-id', from: 'uds:/secret.sock' },
+        message: { content: 'transport envelope' },
+      };
+      const chatMsg = parseSDKMessageToChat(sdkMsg);
+      const expectedLabel = kind === 'peer' ? 'Peer' : kind === 'channel' ? 'Channel' : 'Coordinator';
+      expect(chatMsg).toEqual(expect.objectContaining({
+        content: 'visible only',
+        displayContent: `${expectedLabel}\n\nvisible only`,
+      }));
+      expect(JSON.stringify(chatMsg)).not.toContain('secret-msg-id');
+      expect(JSON.stringify(chatMsg)).not.toContain('uds:');
+    });
+
     it('sets userMessageId on user messages with uuid', () => {
       const sdkMsg: SDKNativeMessage = {
         type: 'user',
@@ -1594,6 +1612,23 @@ describe('sdkSession', () => {
 
       // Should include: u1, a1, u3, a3 (new branch), not u2, a2
       expect(result.map(e => e.uuid)).toEqual(['u1', 'a1', 'u3', 'a3']);
+    });
+
+    it('keeps displayable external meta users on the active rewind branch', () => {
+      const external: SDKNativeMessage = {
+        type: 'user', uuid: 'peer-meta', parentUuid: 'a1', isMeta: true,
+        origin: { kind: 'peer', msg_id: 'm1', body: 'peer note' },
+        message: { content: 'envelope' },
+      };
+      const entries: SDKNativeMessage[] = [
+        { type: 'user', uuid: 'u1', parentUuid: null },
+        { type: 'assistant', uuid: 'a1', parentUuid: 'u1' },
+        { type: 'user', uuid: 'u-old', parentUuid: 'a1' },
+        { type: 'assistant', uuid: 'a-old', parentUuid: 'u-old' },
+        external,
+        { type: 'assistant', uuid: 'a-peer', parentUuid: 'peer-meta' },
+      ];
+      expect(filterActiveBranch(entries).map(entry => entry.uuid)).toEqual(['u1', 'a1', 'peer-meta', 'a-peer']);
     });
 
     it('returns latest branch after multiple rewinds', () => {

@@ -371,6 +371,14 @@ export class TabManager implements TabManagerInterface {
         () => tab.hydrationGeneration === generation && this.activeTabId === tab.id,
       );
       if (this.isStaleHydration(tab, generation)) return;
+
+      // A hydrated Claude tab must own its runtime before becoming READY so
+      // transcript observation covers the idle period. Shell/blocked tabs
+      // never reach this point and therefore cannot start an observer.
+      await initializeTabService(tab, this.plugin);
+      setupServiceCallbacks(tab, this.plugin);
+      if (this.isStaleHydration(tab, generation)) return;
+
       this.setHydrationState(tab, 'READY');
       tab.hydrationDiagnostic = null;
     } catch (error) {

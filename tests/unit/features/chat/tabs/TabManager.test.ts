@@ -366,8 +366,28 @@ describe('TabManager - Tab Lifecycle', () => {
       jest.useRealTimers();
 
       expect(hydrate).toHaveBeenCalledTimes(1);
+      expect(mockInitializeTabService).toHaveBeenCalledWith(tab, expect.anything());
+      expect(mockSetupServiceCallbacks).toHaveBeenCalledWith(tab, expect.anything());
       expect(tab?.hydrationState).toBe('READY');
+    });
+
+    it('keeps an inactive shell runtime-free so peer transcript events wait for hydration', async () => {
+      const manager = createManager({
+        callbacks,
+        tabFactory: (n) => createMockTabData({
+          id: `tab-${n}`,
+          conversationId: `conv-${n}`,
+          hydrationState: 'SHELL',
+        }),
+      });
+
+      await manager.createTab('conv-1');
+      jest.clearAllMocks();
+      const shell = await manager.createTab('conv-2', undefined, { activate: false });
+
+      expect(shell?.hydrationState).not.toBe('READY');
       expect(mockInitializeTabService).not.toHaveBeenCalled();
+      expect(mockSetupServiceCallbacks).not.toHaveBeenCalled();
     });
 
     it('shows an oversize placeholder without marking the shell ready', async () => {
@@ -398,6 +418,8 @@ describe('TabManager - Tab Lifecycle', () => {
       // Oversize placeholder blocks the input so sends cannot hit the
       // hydration error path.
       expect(tab?.dom.inputEl.disabled).toBe(true);
+      expect(mockInitializeTabService).not.toHaveBeenCalled();
+      expect(mockSetupServiceCallbacks).not.toHaveBeenCalled();
     });
 
     it('shows a retryable error placeholder after hydration failure', async () => {

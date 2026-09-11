@@ -1,4 +1,5 @@
 import type { SDKNativeMessage } from './sdkHistoryTypes';
+import { isDisplayableExternalUser } from './sdkMessageParsing';
 
 export function filterActiveBranch(
   entries: SDKNativeMessage[],
@@ -12,7 +13,7 @@ export function filterActiveBranch(
     return !!entry
       && entry.type === 'user'
       && !('toolUseResult' in entry)
-      && !entry.isMeta
+      && (!entry.isMeta || isDisplayableExternalUser(entry))
       && !('sourceToolUseID' in entry);
   }
 
@@ -113,7 +114,7 @@ export function filterActiveBranch(
     let result = false;
     if (entry?.type === 'assistant') {
       result = true;
-    } else if (entry?.type === 'user' && !entry.isMeta && !('sourceToolUseID' in entry)) {
+    } else if (entry?.type === 'user' && isRealUserBranchChild(entry)) {
       result = true;
     } else {
       const children = childrenOf.get(uuid);
