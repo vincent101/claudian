@@ -167,21 +167,43 @@ describe('ConversationController', () => {
       expect(deps.renderer.highlightSearchMatch).toHaveBeenCalledWith(messageEl, 'needle');
     });
 
-    it('loads an unloaded search result page before highlighting it', async () => {
+    it('relocates pagination to an unloaded search page and continues older without gaps or duplicates', async () => {
       deps.state.currentConversationId = 'large';
+      deps.state.messages = [{ id: 'latest', role: 'user', content: 'latest', timestamp: 100 }];
+      deps.state.historyCursor = 'latest-cursor';
+      deps.state.historyHasMore = true;
       (deps.plugin.getConversationSync as jest.Mock).mockReturnValue({ id: 'large', providerId: 'claude' });
       const messageEl = {} as HTMLElement;
       (deps.renderer.findMessageElement as jest.Mock).mockReturnValueOnce(null).mockReturnValueOnce(messageEl);
-      const service = { loadHistoryAt: jest.fn().mockResolvedValue({
-        messages: [{ id: 'target', role: 'user', content: 'needle', timestamp: 1 }], cursor: null, hasMore: false,
-      }) };
+      const service = {
+        loadHistoryAt: jest.fn().mockResolvedValue({
+          messages: [
+            { id: 'target', role: 'user', content: 'needle', timestamp: 50 },
+            { id: 'overlap', role: 'assistant', content: 'overlap', timestamp: 51 },
+          ],
+          cursor: 'jump-cursor', hasMore: true,
+        }),
+        loadOlderHistory: jest.fn().mockResolvedValue({
+          messages: [
+            { id: 'older', role: 'user', content: 'older', timestamp: 1 },
+            { id: 'target', role: 'user', content: 'needle', timestamp: 50 },
+          ],
+          cursor: null, hasMore: false,
+        }),
+      };
       jest.spyOn(ProviderRegistry, 'getConversationHistoryService').mockReturnValue(service as any);
       const result = { messageKey: 'target', cursor: 'search', timestamp: 1, snippet: 'needle', matchStart: 0, matchLength: 6, matchedText: 'needle' };
 
       await controller.locateHistorySearchResult(result);
+      await controller.loadOlderHistory();
 
       expect(service.loadHistoryAt).toHaveBeenCalledWith('search', 50);
-      expect(deps.renderer.prependMessages).toHaveBeenCalled();
+      expect(service.loadOlderHistory).toHaveBeenCalledWith('jump-cursor', 50);
+      expect(deps.state.messages.map(message => message.id)).toEqual(['older', 'target', 'overlap', 'latest']);
+      expect((deps.renderer.prependMessages as jest.Mock).mock.calls[0][0].map((message: { id: string }) => message.id)).toEqual(['target', 'overlap']);
+      expect((deps.renderer.prependMessages as jest.Mock).mock.calls[1][0].map((message: { id: string }) => message.id)).toEqual(['older']);
+      expect(deps.state.historyCursor).toBeNull();
+      expect(deps.state.historyHasMore).toBe(false);
       expect(deps.renderer.highlightSearchMatch).toHaveBeenCalledWith(messageEl, 'needle');
     });
 

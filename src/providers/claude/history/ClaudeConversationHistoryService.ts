@@ -347,6 +347,7 @@ export class ClaudeConversationHistoryService implements ProviderConversationHis
   private searchCursors = new Map<string, PageCursorState>();
   private conversationIndexes = new Map<string, PageCursorState>();
   private protectedConversations = new Map<string, string>();
+  private indexBuildControllers = new Map<string, AbortController>();
   private cursorSequence = 0;
   private indexDiagnostics: ClaudeTranscriptDiagnosticLog | null = null;
 
@@ -391,12 +392,11 @@ export class ClaudeConversationHistoryService implements ProviderConversationHis
       ...getClaudeState(conversation.providerState),
     };
 
-    const subagentData = buildPersistedSubagentData(conversation.messages);
-    if (Object.keys(subagentData).length > 0) {
-      providerState.subagentData = subagentData;
-    } else {
-      delete providerState.subagentData;
-    }
+    const subagentData = {
+      ...(providerState.subagentData ?? {}),
+      ...buildPersistedSubagentData(conversation.messages),
+    };
+    if (Object.keys(subagentData).length > 0) providerState.subagentData = subagentData;
 
     return sanitizeProviderState(providerState);
   }
@@ -508,18 +508,30 @@ export class ClaudeConversationHistoryService implements ProviderConversationHis
     const currentSessionId = state.providerSessionId ?? conversation.sessionId ?? state.forkSource?.sessionId;
     if (!currentSessionId) throw new Error('Conversation has no Claude session');
     const sessionIds = [...(state.previousProviderSessionIds ?? []), currentSessionId];
+    this.indexBuildControllers.get(conversation.id)?.abort();
+    const buildController = new AbortController();
+    this.indexBuildControllers.set(conversation.id, buildController);
     const segments: IndexedSegment[] = [];
-    for (const sessionId of sessionIds) {
-      if (!sdkSessionExists(vaultPath, sessionId)) continue;
-      const result = await buildTranscriptIndex(getSDKSessionPath(vaultPath, sessionId), {
-        resumeAtMessageId: sessionId === currentSessionId
-          ? (state.forkSource?.resumeAt ?? conversation.resumeAtMessageId)
-          : undefined,
-      });
-      if (result.status === 'failed' || result.status === 'partial') throw new Error(result.error);
-      segments.push({ sessionId, index: result.index });
+    try {
+      for (const sessionId of sessionIds) {
+        if (!sdkSessionExists(vaultPath, sessionId)) continue;
+        const result = await buildTranscriptIndex(getSDKSessionPath(vaultPath, sessionId), {
+          resumeAtMessageId: sessionId === currentSessionId
+            ? (state.forkSource?.resumeAt ?? conversation.resumeAtMessageId)
+            : undefined,
+          signal: buildController.signal,
+        });
+        if (result.status === 'failed' || result.status === 'partial') throw new Error(result.error);
+        segments.push({ sessionId, index: result.index });
+      }
+      if (segments.length === 0) throw new Error('Conversation transcript is unavailable');
+    } finally {
+      // A failed build must not leave its controller registered: a superseding
+      // loadInitialHistory owns the slot, so only remove it if still ours.
+      if (this.indexBuildControllers.get(conversation.id) === buildController) {
+        this.indexBuildControllers.delete(conversation.id);
+      }
     }
-    if (segments.length === 0) throw new Error('Conversation transcript is unavailable');
     this.releaseHistory(conversation.id);
     for (const segment of segments) protectTranscriptIndex(segment.index.filePath);
     this.protectedConversations.set(conversation.id, segments.map(segment => segment.index.filePath).join('\n'));
@@ -548,21 +560,22 @@ export class ClaudeConversationHistoryService implements ProviderConversationHis
     let globalTurnOffset = 0;
     for (const segment of state.segments) {
       for (const item of segment.index.searchCorpus) {
-        const matchStart = item.text.toLocaleLowerCase().indexOf(needle);
+        const text = segment.index.searchText.slice(item.textOffset, item.textOffset + item.textLength);
+        const matchStart = text.toLocaleLowerCase().indexOf(needle);
         if (matchStart < 0) continue;
         const turnIndex = globalTurnOffset + item.turnIndex;
         const cursor = `claude-search:${++this.cursorSequence}`;
         this.searchCursors.set(cursor, { ...state, endTurn: turnIndex });
         const contextStart = Math.max(0, matchStart - 48);
-        const contextEnd = Math.min(item.text.length, matchStart + query.length + 48);
+        const contextEnd = Math.min(text.length, matchStart + query.length + 48);
         results.push({
           messageKey: item.messageKey,
           cursor,
           timestamp: item.timestamp ? new Date(item.timestamp).getTime() : 0,
-          snippet: `${contextStart > 0 ? '…' : ''}${item.text.slice(contextStart, contextEnd)}${contextEnd < item.text.length ? '…' : ''}`,
+          snippet: `${contextStart > 0 ? '…' : ''}${text.slice(contextStart, contextEnd)}${contextEnd < text.length ? '…' : ''}`,
           matchStart: matchStart - contextStart + (contextStart > 0 ? 1 : 0),
           matchLength: query.length,
-          matchedText: item.text.slice(matchStart, matchStart + query.length),
+          matchedText: text.slice(matchStart, matchStart + query.length),
         });
       }
       globalTurnOffset += segment.index.turns.length;
@@ -614,6 +627,8 @@ export class ClaudeConversationHistoryService implements ProviderConversationHis
   }
 
   releaseHistory(conversationId: string): void {
+    this.indexBuildControllers.get(conversationId)?.abort();
+    this.indexBuildControllers.delete(conversationId);
     const filePaths = this.protectedConversations.get(conversationId);
     for (const filePath of filePaths?.split('\n') ?? []) releaseTranscriptIndex(filePath);
     this.protectedConversations.delete(conversationId);

@@ -7,6 +7,8 @@ import {
   clearTranscriptIndexCache,
   getTranscriptIndexCacheSize,
   materializeTranscriptPage,
+  protectTranscriptIndex,
+  releaseTranscriptIndex,
   resetTranscriptIndexWorkerProbe,
   setTranscriptIndexDiagnosticSink,
   type TranscriptIndexDiagnosticEvent,
@@ -14,7 +16,7 @@ import {
 import { filterActiveBranch } from '@/providers/claude/history/sdkBranchFilter';
 import type { SDKNativeMessage } from '@/providers/claude/history/sdkHistoryTypes';
 
-let mockWorkerConstructorMode: 'real' | 'throw' | 'record' = 'real';
+let mockWorkerConstructorMode: 'real' | 'throw' | 'record' | 'probe-error' | 'build-error' = 'real';
 const mockWorkerSources: string[] = [];
 
 jest.mock('worker_threads', () => {
@@ -28,7 +30,14 @@ jest.mock('worker_threads', () => {
           throw new TypeError("Failed to construct 'Worker': The V8 platform used by this instance of Node does not support creating Workers");
         }
         super(...args);
-        if (mockWorkerConstructorMode === 'record') mockWorkerSources.push(String(args[0]));
+        const source = String(args[0]);
+        if (mockWorkerConstructorMode === 'record') mockWorkerSources.push(source);
+        if (mockWorkerConstructorMode === 'probe-error' && source.includes('postMessage("ready")')) {
+          queueMicrotask(() => this.emit('error', new Error('probe failed')));
+        }
+        if (mockWorkerConstructorMode === 'build-error' && !source.includes('postMessage("ready")')) {
+          queueMicrotask(() => this.emit('error', new Error('build failed')));
+        }
       }
     },
   };
@@ -70,13 +79,16 @@ describe('ClaudeTranscriptHistoryIndex', () => {
     const result = await buildTranscriptIndex(path, { useWorker: false, chunkSize: 41 });
     expect(result.status).toBe('complete');
     if (result.status !== 'complete') return;
-    expect(result.index.searchCorpus.map(item => item.text)).toEqual([
+    const texts = result.index.searchCorpus.map(item =>
+      result.index.searchText.slice(item.textOffset, item.textOffset + item.textLength)
+    );
+    expect(texts).toEqual([
       'fixture A',
       'answer A\nnotification answer A',
       'fixture B',
       'answer B\nnotification answer B',
     ]);
-    const corpus = result.index.searchCorpus.map(item => item.text).join('\n');
+    const corpus = texts.join('\n');
     expect(corpus).not.toContain('thinking A');
     expect(corpus).not.toContain('queue item');
     expect(corpus).not.toContain('fixture notification');
@@ -121,6 +133,23 @@ describe('ClaudeTranscriptHistoryIndex', () => {
     expect(getTranscriptIndexCacheSize()).toBeLessThanOrEqual(2);
   });
 
+  it('keeps the cache bound when more than two paths are protected', async () => {
+    clearTranscriptIndexCache();
+    const paths: string[] = [];
+    try {
+      for (let index = 0; index < 3; index += 1) {
+        const path = join(process.env.TMPDIR ?? '/tmp', `claudian-protected-lru-${process.pid}-${index}.jsonl`);
+        paths.push(path);
+        protectTranscriptIndex(path);
+        await writeFile(path, `${JSON.stringify({ type: 'user', uuid: `p${index}`, message: { content: 'x' } })}\n`);
+        await buildTranscriptIndex(path, { useWorker: false });
+      }
+      expect(getTranscriptIndexCacheSize()).toBeLessThanOrEqual(2);
+    } finally {
+      for (const path of paths) releaseTranscriptIndex(path);
+    }
+  });
+
   it('deduplicates concurrent worker builds for the same snapshot', async () => {
     const { path } = await fixture('production-auto-turn-sequence.jsonl');
     const first = buildTranscriptIndex(path, { useWorker: false });
@@ -130,6 +159,45 @@ describe('ClaudeTranscriptHistoryIndex', () => {
     if (result.status === 'failed') throw new Error(result.error);
     expect(result.status).toBe('complete');
     expect(result.index.turns.map(turn => turn.turnId)).toEqual(['peer-a', 'peer-b']);
+  });
+
+  it('lets a superseding build succeed when the previous build is aborted mid-scan', async () => {
+    const path = join(process.env.TMPDIR ?? '/tmp', `claudian-supersede-${process.pid}.jsonl`);
+    const lines = [
+      JSON.stringify({ type: 'user', uuid: 'u1', message: { content: 'one' } }),
+      JSON.stringify({ type: 'assistant', uuid: 'a1', parentUuid: 'u1', message: { content: 'two' } }),
+      JSON.stringify({ type: 'user', uuid: 'u2', parentUuid: 'a1', message: { content: 'three' } }),
+      JSON.stringify({ type: 'assistant', uuid: 'a2', parentUuid: 'u2', message: { content: 'four' } }),
+      JSON.stringify({ type: 'user', uuid: 'u3', parentUuid: 'a2', message: { content: 'five' } }),
+      JSON.stringify({ type: 'assistant', uuid: 'a3', parentUuid: 'u3', message: { content: 'six' } }),
+    ];
+    await writeFile(path, `${lines.join('\n')}\n`);
+    const superseded = new AbortController();
+    const superseding = new AbortController();
+    let releaseProgress!: () => void;
+    const progressGate = new Promise<void>(resolve => { releaseProgress = resolve; });
+    const first = buildTranscriptIndex(path, {
+      useWorker: false,
+      chunkSize: 16,
+      signal: superseded.signal,
+      onProgress: () => releaseProgress(),
+    });
+    // loadInitialHistory aborts the old controller and starts a new build for
+    // the same path in the same synchronous section; pause mid-scan to pin
+    // that window open.
+    await progressGate;
+    superseded.abort();
+    const second = buildTranscriptIndex(path, {
+      useWorker: false,
+      chunkSize: 16,
+      signal: superseding.signal,
+    });
+    const [firstResult, secondResult] = await Promise.all([first, second]);
+    expect(firstResult).toEqual({ status: 'failed', error: 'History index build aborted' });
+    expect(secondResult.status).toBe('complete');
+    if (secondResult.status !== 'complete') return;
+    expect(secondResult.index.turns.map(turn => turn.turnId)).toEqual(['u1', 'u2', 'u3']);
+    expect(secondResult.index.entries.map(entry => entry.messageKey)).toEqual(['u1', 'a1', 'u2', 'a2', 'u3', 'a3']);
   });
 });
 
@@ -161,6 +229,34 @@ describe('ClaudeTranscriptHistoryIndex worker fallback', () => {
     expect(mockWorkerSources).toHaveLength(0);
   });
 
+  it('treats a probe error as unavailable and falls back to the main thread', async () => {
+    const events: TranscriptIndexDiagnosticEvent[] = [];
+    setTranscriptIndexDiagnosticSink(event => events.push(event));
+    mockWorkerConstructorMode = 'probe-error';
+    const path = join(process.env.TMPDIR ?? '/tmp', `claudian-probe-error-${process.pid}.jsonl`);
+    await writeFile(path, `${JSON.stringify({ type: 'user', uuid: 'u1', message: { content: 'x' } })}\n`);
+
+    const result = await buildTranscriptIndex(path, {});
+
+    expect(result.status).toBe('complete');
+    expect(events).toEqual([{ phase: 'index_worker_fallback', errorName: 'Error' }]);
+  });
+
+  it('falls back once when the build worker errors after a successful probe', async () => {
+    const events: TranscriptIndexDiagnosticEvent[] = [];
+    setTranscriptIndexDiagnosticSink(event => events.push(event));
+    mockWorkerConstructorMode = 'build-error';
+    const path = join(process.env.TMPDIR ?? '/tmp', `claudian-build-error-${process.pid}.jsonl`);
+    await writeFile(path, `${JSON.stringify({ type: 'user', uuid: 'u1', message: { content: 'x' } })}\n`);
+
+    const result = await buildTranscriptIndex(path, {});
+
+    expect(result.status).toBe('complete');
+    if (result.status !== 'complete') return;
+    expect(result.index.entries.map(entry => entry.messageKey)).toEqual(['u1']);
+    expect(events).toEqual([{ phase: 'index_worker_fallback', errorName: 'Error' }]);
+  });
+
   it('builds in a worker when the constructor probe succeeds', async () => {
     mockWorkerConstructorMode = 'record';
     const path = join(process.env.TMPDIR ?? '/tmp', `claudian-worker-probe-${process.pid}.jsonl`);
@@ -173,6 +269,9 @@ describe('ClaudeTranscriptHistoryIndex worker fallback', () => {
     if (result.status !== 'complete') return;
     expect(result.index.turns.map(turn => turn.turnId)).toEqual(['u1']);
     expect(result.index.entries.map(entry => entry.messageKey)).toEqual(['u1', 'a1']);
-    expect(mockWorkerSources).toEqual(['null', expect.any(String)]);
+    expect(mockWorkerSources).toEqual([
+      'require("worker_threads").parentPort.postMessage("ready")',
+      expect.any(String),
+    ]);
   });
 });

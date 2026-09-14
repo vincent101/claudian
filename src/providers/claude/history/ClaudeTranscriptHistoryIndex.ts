@@ -41,7 +41,8 @@ export interface TranscriptSearchCorpusItem {
   messageKey: string;
   turnIndex: number;
   timestamp?: string;
-  text: string;
+  textOffset: number;
+  textLength: number;
 }
 
 export interface TranscriptHistoryIndex {
@@ -53,6 +54,7 @@ export interface TranscriptHistoryIndex {
   entries: TranscriptIndexEntry[];
   turns: TranscriptTurnIndex[];
   searchCorpus: TranscriptSearchCorpusItem[];
+  searchText: string;
   skippedLines: number;
   buildDurationMs: number;
   peakWorkerHeapBytes: number;
@@ -68,7 +70,20 @@ interface BuildOptions {
   maxLineBytes?: number;
   useWorker?: boolean;
   resumeAtMessageId?: string;
+  signal?: AbortSignal;
   onProgress?: (bytesRead: number, snapshotSize: number) => void;
+}
+
+const FINALIZE_BATCH_SIZE = 2_000;
+
+function throwIfAborted(signal?: AbortSignal): void {
+  if (signal?.aborted) throw new Error('History index build aborted');
+}
+
+async function yieldToMainThread(signal?: AbortSignal): Promise<void> {
+  throwIfAborted(signal);
+  await new Promise<void>(resolve => setImmediate(resolve));
+  throwIfAborted(signal);
 }
 
 interface RawIndexEntry extends TranscriptIndexEntry {
@@ -128,20 +143,26 @@ function toRawEntry(message: SDKNativeMessage, offset: number, length: number, l
   };
 }
 
-function finalizeIndex(
+async function finalizeIndex(
   filePath: string,
   snapshot: { dev: number; ino: number; size: number; mtimeMs: number },
   rawEntries: RawIndexEntry[],
   skippedLines: number,
   resumeAtMessageId?: string,
-): TranscriptHistoryIndex {
+  signal?: AbortSignal,
+): Promise<TranscriptHistoryIndex> {
+  throwIfAborted(signal);
   const canonical = filterActiveBranchEntries(rawEntries, resumeAtMessageId, entry => entry.realUser);
+  await yieldToMainThread(signal);
   let currentTurn: TranscriptTurnIndex | undefined;
   let currentTurnIndex = -1;
   let currentAssistantKey: string | undefined;
   const turns: TranscriptTurnIndex[] = [];
   const searchCorpus: TranscriptSearchCorpusItem[] = [];
-  canonical.forEach((entry, index) => {
+  const searchTextParts: string[] = [];
+  let searchTextLength = 0;
+  for (let index = 0; index < canonical.length; index += 1) {
+    const entry = canonical[index];
     if (entry.realUser) {
       currentAssistantKey = undefined;
       if (currentTurn) currentTurn.endEntry = index - 1;
@@ -161,21 +182,26 @@ function finalizeIndex(
         ? (currentAssistantKey ??= entry.messageKey)
         : entry.messageKey;
       const existing = searchCorpus[searchCorpus.length - 1];
-      if (entry.type === 'assistant' && existing?.messageKey === messageKey) {
-        existing.text += `\n${entry.searchText}`;
+      const separator = entry.type === 'assistant' && existing?.messageKey === messageKey ? '\n' : '';
+      searchTextParts.push(separator, entry.searchText);
+      if (separator) {
+        existing.textLength += separator.length + entry.searchText.length;
         existing.timestamp ??= entry.timestamp;
       } else {
         searchCorpus.push({
           messageKey,
           turnIndex: currentTurnIndex,
           timestamp: entry.timestamp,
-          text: entry.searchText,
+          textOffset: searchTextLength,
+          textLength: entry.searchText.length,
         });
       }
+      searchTextLength += separator.length + entry.searchText.length;
     }
     delete entry.originMessageId;
     delete entry.searchText;
-  });
+    if ((index + 1) % FINALIZE_BATCH_SIZE === 0) await yieldToMainThread(signal);
+  }
   return {
     filePath,
     dev: snapshot.dev,
@@ -185,6 +211,7 @@ function finalizeIndex(
     entries: canonical,
     turns,
     searchCorpus,
+    searchText: searchTextParts.join(''),
     skippedLines,
     buildDurationMs: 0,
     peakWorkerHeapBytes: 0,
@@ -196,6 +223,7 @@ async function scanSnapshot(
   chunkSize: number,
   maxLineBytes: number,
   onProgress?: (bytesRead: number, snapshotSize: number) => void,
+  signal?: AbortSignal,
 ): Promise<{
   entries: RawIndexEntry[];
   skippedLines: number;
@@ -215,6 +243,7 @@ async function scanSnapshot(
   let peakHeapBytes = process.memoryUsage().heapUsed;
   try {
     while (position < snapshot.size) {
+      throwIfAborted(signal);
       const length = Math.min(chunkSize, snapshot.size - position);
       const chunk = Buffer.allocUnsafe(length);
       const { bytesRead } = await handle.read(chunk, 0, length, position);
@@ -245,7 +274,7 @@ async function scanSnapshot(
       position += bytesRead;
       peakHeapBytes = Math.max(peakHeapBytes, process.memoryUsage().heapUsed);
       onProgress?.(position, snapshot.size);
-      await new Promise<void>(resolve => setImmediate(resolve));
+      await yieldToMainThread(signal);
     }
   } finally {
     await handle.close();
@@ -261,13 +290,15 @@ async function buildDirect(filePath: string, options: BuildOptions): Promise<Tra
       options.chunkSize ?? DEFAULT_CHUNK_SIZE,
       options.maxLineBytes ?? DEFAULT_MAX_LINE_BYTES,
       options.onProgress,
+      options.signal,
     );
-    const index = finalizeIndex(
+    const index = await finalizeIndex(
       filePath,
       scanned.snapshot,
       scanned.entries,
       scanned.skippedLines,
       options.resumeAtMessageId,
+      options.signal,
     );
     index.buildDurationMs = performance.now() - startedAt;
     index.peakWorkerHeapBytes = scanned.peakHeapBytes;
@@ -288,13 +319,20 @@ function touchCompleted(key: string, result: TranscriptIndexResult): void {
   completed.set(key, result);
 }
 
+function isProtectedCompletedKey(key: string, result: TranscriptIndexResult): boolean {
+  if (result.status === 'failed' || !protectedPaths.has(result.index.filePath)) return false;
+  const keys = [...completed.entries()]
+    .filter(([, candidate]) => candidate.status !== 'failed' && candidate.index.filePath === result.index.filePath)
+    .map(([candidateKey]) => candidateKey);
+  return keys[keys.length - 1] === key;
+}
+
 function evictCompleted(): void {
   while (completed.size > MAX_COMPLETED_INDEXES) {
     const candidate = [...completed.keys()].find(key => {
       const result = completed.get(key);
-      return !result || result.status === 'failed'
-        || !protectedPaths.has(result.index.filePath);
-    });
+      return !result || !isProtectedCompletedKey(key, result);
+    }) ?? completed.keys().next().value;
     if (!candidate) return;
     completed.delete(candidate);
   }
@@ -322,6 +360,9 @@ function buildInWorker(filePath: string, options: BuildOptions): Promise<Transcr
     const { open, stat } = import_promises;
     const DEFAULT_CHUNK_SIZE = ${DEFAULT_CHUNK_SIZE};
     const DEFAULT_MAX_LINE_BYTES = ${DEFAULT_MAX_LINE_BYTES};
+    const FINALIZE_BATCH_SIZE = ${FINALIZE_BATCH_SIZE};
+    const throwIfAborted = (${serializeWorkerFunction(throwIfAborted)});
+    const yieldToMainThread = (${serializeWorkerFunction(yieldToMainThread)});
     const DISPLAYABLE_EXTERNAL_KINDS = new Set(['peer', 'channel', 'coordinator']);
     const extractUserText = (${serializeWorkerFunction(extractUserText)});
     const unwrapExternalEnvelope = (${serializeWorkerFunction(unwrapExternalEnvelope)});
@@ -346,21 +387,39 @@ function buildInWorker(filePath: string, options: BuildOptions): Promise<Transcr
     };
     buildDirect(workerData.filePath, options).then(result => parentPort.postMessage({ kind: 'result', result }), error => parentPort.postMessage({ kind: 'result', result: { status: 'failed', error: String(error) } }));
   `;
-  return new Promise(resolve => {
-    const { onProgress: _, ...workerOptions } = options;
+  return new Promise((resolve, reject) => {
+    const { onProgress: _, signal: __, ...workerOptions } = options;
     const worker = new Worker(source, { eval: true, workerData: { filePath, options: { ...workerOptions, useWorker: false } } });
+    let settled = false;
+    const finish = (result: TranscriptIndexResult): void => {
+      if (settled) return;
+      settled = true;
+      options.signal?.removeEventListener('abort', abort);
+      resolve(result);
+    };
+    const abort = (): void => {
+      void worker.terminate();
+      finish({ status: 'failed', error: 'History index build aborted' });
+    };
+    options.signal?.addEventListener('abort', abort, { once: true });
+    if (options.signal?.aborted) abort();
     worker.on('message', message => {
       const payload = message as { kind: 'progress'; bytesRead: number; snapshotSize: number }
         | { kind: 'result'; result: TranscriptIndexResult };
       if (payload.kind === 'progress') options.onProgress?.(payload.bytesRead, payload.snapshotSize);
-      else resolve(payload.result);
+      else finish(payload.result);
     });
-    worker.once('error', error => resolve({
-      status: 'failed',
-      error: error instanceof Error ? error.message : String(error),
-    }));
+    worker.once('error', error => {
+      if (settled) return;
+      settled = true;
+      options.signal?.removeEventListener('abort', abort);
+      reject(error);
+    });
     worker.once('exit', code => {
-      if (code !== 0) resolve({ status: 'failed', error: `History index worker exited with code ${code}` });
+      if (code === 0 || settled) return;
+      settled = true;
+      options.signal?.removeEventListener('abort', abort);
+      reject(new Error(`History index worker exited with code ${code}`));
     });
   });
 }
@@ -384,24 +443,65 @@ export function setTranscriptIndexDiagnosticSink(sink: TranscriptIndexDiagnostic
 // streaming main-thread path builds the index instead. Re-probing only happens after
 // a module reload, so future Electron support recovers without code changes.
 let workerAvailability: boolean | null = null;
+let workerProbe: Promise<boolean> | null = null;
+let directBuildTail = Promise.resolve();
 
-function probeWorkerAvailability(): boolean {
+function recordWorkerFallback(error: unknown): void {
+  diagnosticSink?.({
+    phase: 'index_worker_fallback',
+    errorName: error instanceof Error ? error.name : 'UnknownError',
+  });
+}
+
+async function probeWorkerAvailability(): Promise<boolean> {
   if (workerAvailability !== null) return workerAvailability;
-  try {
-    void new Worker('null', { eval: true }).terminate();
-    workerAvailability = true;
-  } catch (error) {
-    workerAvailability = false;
-    diagnosticSink?.({
-      phase: 'index_worker_fallback',
-      errorName: error instanceof Error ? error.name : 'UnknownError',
+  if (workerProbe) return workerProbe;
+  const probe = new Promise<boolean>(resolve => {
+    let worker: Worker;
+    try {
+      worker = new Worker('require("worker_threads").parentPort.postMessage("ready")', { eval: true });
+    } catch (error) {
+      workerAvailability = false;
+      recordWorkerFallback(error);
+      resolve(false);
+      return;
+    }
+    let settled = false;
+    const finish = (available: boolean, error?: unknown): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      workerAvailability = available;
+      if (!available) recordWorkerFallback(error);
+      void worker.terminate();
+      resolve(available);
+    };
+    const timeout = setTimeout(() => finish(false, new Error('History index worker probe timed out')), 1_000);
+    worker.once('message', () => finish(true));
+    worker.once('error', error => finish(false, error));
+    worker.once('exit', code => {
+      if (code !== 0) finish(false, new Error(`History index worker probe exited with code ${code}`));
     });
-  }
-  return workerAvailability;
+  });
+  workerProbe = probe.finally(() => { workerProbe = null; });
+  return workerProbe;
+}
+
+function scheduleDirectBuild(filePath: string, options: BuildOptions): Promise<TranscriptIndexResult> {
+  const build = directBuildTail.then(async () => {
+    throwIfAborted(options.signal);
+    return buildDirect(filePath, options);
+  }, async () => {
+    throwIfAborted(options.signal);
+    return buildDirect(filePath, options);
+  });
+  directBuildTail = build.then(() => undefined, () => undefined);
+  return build.catch(error => ({ status: 'failed', error: error instanceof Error ? error.message : String(error) }));
 }
 
 export function resetTranscriptIndexWorkerProbe(): void {
   workerAvailability = null;
+  workerProbe = null;
 }
 
 export function buildTranscriptIndex(filePath: string, options: BuildOptions = {}): Promise<TranscriptIndexResult> {
@@ -416,11 +516,28 @@ export function buildTranscriptIndex(filePath: string, options: BuildOptions = {
     }
     const existing = inFlight.get(key);
     if (existing) return existing;
-    const build = options.useWorker === false || !probeWorkerAvailability()
-      ? buildDirect(filePath, options)
-      : buildInWorker(filePath, options);
+    const build = (async (): Promise<TranscriptIndexResult> => {
+      if (options.useWorker === false || !await probeWorkerAvailability()) {
+        return scheduleDirectBuild(filePath, options);
+      }
+      try {
+        return await buildInWorker(filePath, options);
+      } catch (error) {
+        workerAvailability = false;
+        recordWorkerFallback(error);
+        return scheduleDirectBuild(filePath, options);
+      }
+    })();
     inFlight.set(key, build);
+    // Same supersede race as the request cache below, one layer deeper: an
+    // aborted build only settles after its scanSnapshot close() IO completes,
+    // so a same-tick rebuild would otherwise join the doomed in-flight build.
+    const removeInFlight = (): void => {
+      if (inFlight.get(key) === build) inFlight.delete(key);
+    };
+    options.signal?.addEventListener('abort', removeInFlight, { once: true });
     void build.then(result => {
+      options.signal?.removeEventListener('abort', removeInFlight);
       inFlight.delete(key);
       if (result.status !== 'failed') {
         touchCompleted(key, result);
@@ -430,7 +547,18 @@ export function buildTranscriptIndex(filePath: string, options: BuildOptions = {
     return build;
   });
   requests.set(requestKey, request);
-  void request.finally(() => requests.delete(requestKey));
+  // A supersede caller aborts the old controller and synchronously starts a
+  // new build for the same request key; the .finally cleanup below only runs
+  // on a later microtask, so the doomed entry must leave the shared cache
+  // inside the abort listener itself.
+  const removeRequest = (): void => {
+    if (requests.get(requestKey) === request) requests.delete(requestKey);
+  };
+  options.signal?.addEventListener('abort', removeRequest, { once: true });
+  void request.finally(() => {
+    options.signal?.removeEventListener('abort', removeRequest);
+    removeRequest();
+  });
   return request;
 }
 
@@ -504,7 +632,7 @@ export function releaseTranscriptIndex(filePath: string): void {
 /** Evicts only unprotected completed indexes; active and in-flight indexes survive. */
 export function clearTranscriptIndexCache(): void {
   for (const [key, result] of completed) {
-    if (result.status === 'failed' || !protectedPaths.has(result.index.filePath)) completed.delete(key);
+    if (result.status === 'failed' || !isProtectedCompletedKey(key, result)) completed.delete(key);
   }
   evictCompleted();
 }

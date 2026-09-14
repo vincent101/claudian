@@ -53,6 +53,31 @@ describe('ClaudeConversationHistoryService M1 fuse', () => {
     mockSdkSessionExists.mockReturnValue(true);
   });
 
+  it('preserves subagent metadata outside the currently materialized page when saving', () => {
+    const conversation = createConversation();
+    const oldSubagent = { id: 'old-agent', mode: 'async', status: 'completed', taskId: 'old-task' } as any;
+    const visibleSubagent = { id: 'visible-agent', mode: 'sync', status: 'completed', taskId: 'visible-task' } as any;
+    conversation.providerState = {
+      ...conversation.providerState,
+      subagentData: { 'old-agent': oldSubagent },
+    };
+    conversation.messages = [{
+      id: 'assistant',
+      role: 'assistant',
+      content: '',
+      timestamp: 1,
+      toolCalls: [{ id: 'tool', name: 'Task', input: {}, status: 'completed', subagent: visibleSubagent }],
+    }];
+    const service = new ClaudeConversationHistoryService();
+
+    expect(service.buildPersistedProviderState(conversation)).toMatchObject({
+      subagentData: {
+        'old-agent': oldSubagent,
+        'visible-agent': visibleSubagent,
+      },
+    });
+  });
+
   it('returns oversize without merging a successful previous segment', async () => {
     mockLoadSDKSessionMessages
       .mockResolvedValueOnce({
@@ -84,7 +109,7 @@ describe('ClaudeConversationHistoryService M1 fuse', () => {
     const turns = Array.from({ length: 120 }, (_, index) => ({ turnId: `u${index}`, startEntry: index, endEntry: index }));
     mockBuildTranscriptIndex.mockResolvedValue({
       status: 'complete',
-      index: { filePath: '/current', dev: 1, ino: 1, snapshotSize: 999, mtimeMs: 1, entries: [], turns, searchCorpus: [], skippedLines: 0, buildDurationMs: 1, peakWorkerHeapBytes: 1 },
+      index: { filePath: '/current', dev: 1, ino: 1, snapshotSize: 999, mtimeMs: 1, entries: [], turns, searchCorpus: [], searchText: '', skippedLines: 0, buildDurationMs: 1, peakWorkerHeapBytes: 1 },
     });
     mockSdkSessionExists.mockImplementation((_vault, session) => session === 'current-session');
     mockMaterializeTranscriptPage.mockResolvedValue([]);
@@ -102,13 +127,14 @@ describe('ClaudeConversationHistoryService M1 fuse', () => {
   });
 
   it('searches case-insensitive substrings and returns snippets with page cursors', async () => {
+    const searchText = 'Alpha NEEDLE omegaanother needle result';
     const searchCorpus = [
-      { messageKey: 'u1', turnIndex: 0, timestamp: '2026-01-01T00:00:00Z', text: 'Alpha NEEDLE omega' },
-      { messageKey: 'a1', turnIndex: 1, timestamp: '2026-01-02T00:00:00Z', text: 'another needle result' },
+      { messageKey: 'u1', turnIndex: 0, timestamp: '2026-01-01T00:00:00Z', textOffset: 0, textLength: 18 },
+      { messageKey: 'a1', turnIndex: 1, timestamp: '2026-01-02T00:00:00Z', textOffset: 18, textLength: 21 },
     ];
     mockBuildTranscriptIndex.mockResolvedValue({
       status: 'complete',
-      index: { filePath: '/current', dev: 1, ino: 1, snapshotSize: 999, mtimeMs: 1, entries: [], turns: [{ turnId: 'u1', startEntry: 0, endEntry: 0 }, { turnId: 'u2', startEntry: 1, endEntry: 1 }], searchCorpus, skippedLines: 0, buildDurationMs: 1, peakWorkerHeapBytes: 1 },
+      index: { filePath: '/current', dev: 1, ino: 1, snapshotSize: 999, mtimeMs: 1, entries: [], turns: [{ turnId: 'u1', startEntry: 0, endEntry: 0 }, { turnId: 'u2', startEntry: 1, endEntry: 1 }], searchCorpus, searchText, skippedLines: 0, buildDurationMs: 1, peakWorkerHeapBytes: 1 },
     });
     mockSdkSessionExists.mockImplementation((_vault, session) => session === 'current-session');
     mockMaterializeTranscriptPage.mockResolvedValue([]);
@@ -128,7 +154,7 @@ describe('ClaudeConversationHistoryService M1 fuse', () => {
     const turns = Array.from({ length: 120 }, (_, index) => ({ turnId: `u${index}`, startEntry: index, endEntry: index }));
     mockBuildTranscriptIndex.mockResolvedValue({
       status: 'complete',
-      index: { filePath: '/current', dev: 1, ino: 1, snapshotSize: 999, mtimeMs: 1, entries: [], turns, searchCorpus: [], skippedLines: 0, buildDurationMs: 1, peakWorkerHeapBytes: 1 },
+      index: { filePath: '/current', dev: 1, ino: 1, snapshotSize: 999, mtimeMs: 1, entries: [], turns, searchCorpus: [], searchText: '', skippedLines: 0, buildDurationMs: 1, peakWorkerHeapBytes: 1 },
     });
     mockSdkSessionExists.mockImplementation((_vault, session) => session === 'current-session');
     mockMaterializeTranscriptPage.mockResolvedValue([]);
@@ -157,5 +183,15 @@ describe('ClaudeConversationHistoryService M1 fuse', () => {
     await service.hydrateConversationHistory(conversation, '/vault');
 
     expect(mockLoadSDKSessionMessages).toHaveBeenCalledTimes(2);
+  });
+
+  it('clears the index build controller when the initial history build fails', async () => {
+    mockBuildTranscriptIndex.mockResolvedValue({ status: 'failed', error: 'History index build aborted' });
+    mockSdkSessionExists.mockImplementation((_vault, session) => session === 'current-session');
+    const service = new ClaudeConversationHistoryService();
+
+    await expect(service.loadInitialHistory(createConversation(), '/vault', 50))
+      .rejects.toThrow('History index build aborted');
+    expect((service as unknown as { indexBuildControllers: Map<string, unknown> }).indexBuildControllers.size).toBe(0);
   });
 });

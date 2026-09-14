@@ -319,9 +319,11 @@ export class ConversationController {
     this.renderHistoryPager();
     try {
       const page = await service.loadOlderHistory(state.historyCursor, 50);
-      const combined = [...page.messages, ...state.messages];
-      state.prependMessages(page.messages);
-      renderer.prependMessages(page.messages, combined);
+      const existing = new Set(state.messages.map(message => message.id));
+      const added = page.messages.filter(message => !existing.has(message.id));
+      const combined = [...added, ...state.messages];
+      state.prependMessages(added);
+      renderer.prependMessages(added, combined);
       state.historyCursor = page.cursor;
       state.historyHasMore = page.hasMore;
     } catch (error) {
@@ -365,6 +367,9 @@ export class ConversationController {
       const combined = [...added, ...state.messages];
       state.prependMessages(added);
       renderer.prependMessages(added, combined);
+      state.historyCursor = page.cursor;
+      state.historyHasMore = page.hasMore;
+      this.renderHistoryPager();
       target = renderer.findMessageElement(result.messageKey);
     }
     if (target) renderer.highlightSearchMatch(target, result.matchedText);
