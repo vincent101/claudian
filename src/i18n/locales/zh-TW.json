@@ -75,6 +75,12 @@
       "errorDescription": "無法載入對話歷史。",
       "retry": "重試",
       "switchFailed": "切換會話失敗：{error}"
+    },
+    "search": {
+      "placeholder": "搜尋對話歷史",
+      "noResults": "沒有結果",
+      "error": "搜尋失敗",
+      "resultCount": "第 {current} 項，共 {total} 項"
     }
   },
   "settings": {

@@ -7,6 +7,11 @@ describe('ChatState', () => {
       const state = createInitialState();
 
       expect(state.messages).toEqual([]);
+      expect(state.historyCursor).toBeNull();
+      expect(state.historyHasMore).toBe(false);
+      expect(state.historyLoading).toBe(false);
+      expect(state.historyError).toBeNull();
+      expect(state.historySnapshotOffset).toBeNull();
       expect(state.isStreaming).toBe(false);
       expect(state.cancelRequested).toBe(false);
       expect(state.streamGeneration).toBe(0);

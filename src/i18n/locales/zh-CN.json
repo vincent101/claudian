@@ -75,6 +75,12 @@
       "errorDescription": "无法加载会话历史。",
       "retry": "重试",
       "switchFailed": "切换会话失败：{error}"
+    },
+    "search": {
+      "placeholder": "搜索会话历史",
+      "noResults": "无结果",
+      "error": "搜索失败",
+      "resultCount": "第 {current} 项，共 {total} 项"
     }
   },
   "settings": {

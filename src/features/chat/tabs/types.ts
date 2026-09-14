@@ -7,6 +7,7 @@ import type { AutoTurnProjectionController } from '../controllers/AutoTurnProjec
 import type { BrowserSelectionController } from '../controllers/BrowserSelectionController';
 import type { CanvasSelectionController } from '../controllers/CanvasSelectionController';
 import type { ConversationController } from '../controllers/ConversationController';
+import type { HistorySearchController } from '../controllers/HistorySearchController';
 import type { InputController } from '../controllers/InputController';
 import type { NavigationController } from '../controllers/NavigationController';
 import type { SelectionController } from '../controllers/SelectionController';
@@ -135,6 +136,7 @@ export interface TabControllers {
   browserSelectionController: BrowserSelectionController | null;
   canvasSelectionController: CanvasSelectionController | null;
   conversationController: ConversationController | null;
+  historySearchController: HistorySearchController | null;
   streamController: StreamController | null;
   inputController: InputController | null;
   navigationController: NavigationController | null;

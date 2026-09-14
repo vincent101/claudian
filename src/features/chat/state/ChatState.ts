@@ -13,6 +13,11 @@ import type {
 function createInitialState(): ChatStateData {
   return {
     messages: [],
+    historyCursor: null,
+    historyHasMore: false,
+    historyLoading: false,
+    historyError: null,
+    historySnapshotOffset: null,
     isStreaming: false,
     cancelRequested: false,
     streamGeneration: 0,
@@ -84,6 +89,34 @@ export class ChatState {
   clearMessages(): void {
     this.state.messages = [];
     this._callbacks.onMessagesChanged?.();
+  }
+
+  prependMessages(messages: ChatMessage[]): void {
+    const existing = new Set(this.state.messages.map(message => message.id));
+    this.state.messages = [
+      ...messages.filter(message => !existing.has(message.id)),
+      ...this.state.messages,
+    ];
+    this._callbacks.onMessagesChanged?.();
+  }
+
+  get historyCursor(): string | null { return this.state.historyCursor; }
+  set historyCursor(value: string | null) { this.state.historyCursor = value; }
+  get historyHasMore(): boolean { return this.state.historyHasMore; }
+  set historyHasMore(value: boolean) { this.state.historyHasMore = value; }
+  get historyLoading(): boolean { return this.state.historyLoading; }
+  set historyLoading(value: boolean) { this.state.historyLoading = value; }
+  get historyError(): string | null { return this.state.historyError; }
+  set historyError(value: string | null) { this.state.historyError = value; }
+  get historySnapshotOffset(): number | null { return this.state.historySnapshotOffset; }
+  set historySnapshotOffset(value: number | null) { this.state.historySnapshotOffset = value; }
+
+  resetHistoryPagination(): void {
+    this.state.historyCursor = null;
+    this.state.historyHasMore = false;
+    this.state.historyLoading = false;
+    this.state.historyError = null;
+    this.state.historySnapshotOffset = null;
   }
 
   truncateAt(messageId: string): number {
@@ -421,6 +454,7 @@ export class ChatState {
 
   resetForNewConversation(): void {
     this.clearMessages();
+    this.resetHistoryPagination();
     this.resetStreamingState();
     this.clearMaps();
     this.state.queuedMessage = null;

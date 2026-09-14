@@ -1,6 +1,7 @@
 import { createMockEl } from '@test/helpers/mockElement';
 import { Menu, Notice } from 'obsidian';
 
+import { ProviderRegistry } from '@/core/providers/ProviderRegistry';
 import { ConversationHistoryHydrationError } from '@/core/providers/types';
 import { ConversationController, type ConversationControllerDeps } from '@/features/chat/controllers/ConversationController';
 import { ChatState } from '@/features/chat/state/ChatState';
@@ -9,6 +10,7 @@ import { confirm } from '@/shared/modals/ConfirmModal';
 jest.mock('@/shared/modals/ConfirmModal', () => ({
   confirm: jest.fn().mockResolvedValue(true),
 }));
+jest.mock('@/utils/path', () => ({ getVaultPath: jest.fn().mockReturnValue('/vault') }));
 
 const mockNotice = Notice as jest.Mock;
 
@@ -65,6 +67,10 @@ function createMockDeps(overrides: Partial<ConversationControllerDeps> = {}): Co
     state,
     renderer: {
       renderMessages: jest.fn().mockReturnValue(createMockEl()),
+      renderHistoryPager: jest.fn(),
+      prependMessages: jest.fn(),
+      findMessageElement: jest.fn(),
+      highlightSearchMatch: jest.fn(),
     } as any,
     subagentManager: {
       orphanAllActive: jest.fn(),
@@ -107,6 +113,96 @@ describe('ConversationController', () => {
     (Menu as typeof Menu & { instances: unknown[] }).instances.length = 0;
     deps = createMockDeps();
     controller = new ConversationController(deps);
+  });
+
+  describe('paged history', () => {
+    it('materializes an oversize initial page and enables paged rendering', async () => {
+      const conversation = {
+        id: 'large', providerId: 'claude', title: 'Large', messages: [], sessionId: 'session', createdAt: 1, updatedAt: 1,
+      } as any;
+      deps.state.currentConversationId = 'large';
+      (deps.plugin.getConversationById as jest.Mock).mockRejectedValue(new ConversationHistoryHydrationError({
+        status: 'oversize', segments: [{ sessionId: 'session', sizeBytes: 99 }],
+      }));
+      (deps.plugin.getConversationSync as jest.Mock).mockReturnValue(conversation);
+      const service = { loadInitialHistory: jest.fn().mockResolvedValue({
+        messages: [{ id: 'latest', role: 'user', content: 'latest', timestamp: 1 }],
+        cursor: 'opaque', hasMore: true, snapshotOffset: 123,
+      }) };
+      jest.spyOn(ProviderRegistry, 'getConversationHistoryService').mockReturnValue(service as any);
+      const loadInitialHistory = service.loadInitialHistory;
+
+      await controller.loadActive();
+
+      expect(loadInitialHistory).toHaveBeenCalledWith(conversation, expect.anything(), 50);
+      expect(deps.state.messages.map(message => message.id)).toEqual(['latest']);
+      expect(deps.state.historyCursor).toBe('opaque');
+      expect(deps.state.historySnapshotOffset).toBe(123);
+    });
+
+    it('surfaces the real materialization error when the paged initial load fails', async () => {
+      const conversation = {
+        id: 'large', providerId: 'claude', title: 'Large', messages: [], sessionId: 'session', createdAt: 1, updatedAt: 1,
+      } as any;
+      deps.state.currentConversationId = 'large';
+      (deps.plugin.getConversationById as jest.Mock).mockRejectedValue(new ConversationHistoryHydrationError({
+        status: 'oversize', segments: [{ sessionId: 'session', sizeBytes: 99 }],
+      }));
+      (deps.plugin.getConversationSync as jest.Mock).mockReturnValue(conversation);
+      const service = { loadInitialHistory: jest.fn().mockRejectedValue(new Error('index build failed: worker crashed')) };
+      jest.spyOn(ProviderRegistry, 'getConversationHistoryService').mockReturnValue(service as any);
+
+      await expect(controller.loadActive()).rejects.toThrow('index build failed: worker crashed');
+      expect(deps.state.historyLoading).toBe(false);
+    });
+
+    it('locates an already loaded search result without paging and highlights it', async () => {
+      deps.state.currentConversationId = 'large';
+      const messageEl = {} as HTMLElement;
+      (deps.renderer.findMessageElement as jest.Mock).mockReturnValue(messageEl);
+      const result = { messageKey: 'loaded', cursor: 'search', timestamp: 1, snippet: 'needle', matchStart: 0, matchLength: 6, matchedText: 'needle' };
+
+      await controller.locateHistorySearchResult(result);
+
+      expect(deps.renderer.highlightSearchMatch).toHaveBeenCalledWith(messageEl, 'needle');
+    });
+
+    it('loads an unloaded search result page before highlighting it', async () => {
+      deps.state.currentConversationId = 'large';
+      (deps.plugin.getConversationSync as jest.Mock).mockReturnValue({ id: 'large', providerId: 'claude' });
+      const messageEl = {} as HTMLElement;
+      (deps.renderer.findMessageElement as jest.Mock).mockReturnValueOnce(null).mockReturnValueOnce(messageEl);
+      const service = { loadHistoryAt: jest.fn().mockResolvedValue({
+        messages: [{ id: 'target', role: 'user', content: 'needle', timestamp: 1 }], cursor: null, hasMore: false,
+      }) };
+      jest.spyOn(ProviderRegistry, 'getConversationHistoryService').mockReturnValue(service as any);
+      const result = { messageKey: 'target', cursor: 'search', timestamp: 1, snippet: 'needle', matchStart: 0, matchLength: 6, matchedText: 'needle' };
+
+      await controller.locateHistorySearchResult(result);
+
+      expect(service.loadHistoryAt).toHaveBeenCalledWith('search', 50);
+      expect(deps.renderer.prependMessages).toHaveBeenCalled();
+      expect(deps.renderer.highlightSearchMatch).toHaveBeenCalledWith(messageEl, 'needle');
+    });
+
+    it('prepends an older page through the opaque cursor', async () => {
+      deps.state.currentConversationId = 'large';
+      deps.state.messages = [{ id: 'new', role: 'user', content: 'new', timestamp: 2 }];
+      deps.state.historyCursor = 'opaque';
+      deps.state.historyHasMore = true;
+      (deps.plugin.getConversationSync as jest.Mock).mockReturnValue({ id: 'large', providerId: 'claude' });
+      const service = { loadOlderHistory: jest.fn().mockResolvedValue({
+        messages: [{ id: 'old', role: 'user', content: 'old', timestamp: 1 }],
+        cursor: null, hasMore: false,
+      }) };
+      jest.spyOn(ProviderRegistry, 'getConversationHistoryService').mockReturnValue(service as any);
+
+      await controller.loadOlderHistory();
+
+      expect(deps.state.messages.map(message => message.id)).toEqual(['old', 'new']);
+      expect(deps.renderer.prependMessages).toHaveBeenCalled();
+      expect(deps.state.historyHasMore).toBe(false);
+    });
   });
 
   describe('Queue Management', () => {
@@ -298,6 +394,70 @@ describe('ConversationController', () => {
         await controller.switchTo('new-conv');
 
         expect(markHydrationReady).toHaveBeenCalledTimes(1);
+      });
+
+      it('releases the switched-away conversation history protection after a successful switch', async () => {
+        deps.state.currentConversationId = 'old-conv';
+        (deps.plugin.getConversationSync as jest.Mock).mockImplementation((id: string) => (
+          id === 'old-conv'
+            ? { id: 'old-conv', providerId: 'claude', title: 'Old', messages: [], createdAt: 1, updatedAt: 1 }
+            : null
+        ));
+        const releaseHistory = jest.fn();
+        jest.spyOn(ProviderRegistry, 'getConversationHistoryService').mockReturnValue({ releaseHistory } as any);
+
+        await controller.switchTo('new-conv');
+
+        expect(releaseHistory).toHaveBeenCalledTimes(1);
+        expect(releaseHistory).toHaveBeenCalledWith('old-conv');
+      });
+
+      it('releases the switched-away conversation history protection when a switch lands on the hydration shell', async () => {
+        deps.state.currentConversationId = 'old-conv';
+        (deps.plugin.getConversationSync as jest.Mock).mockImplementation((id: string) => (
+          id === 'old-conv'
+            ? { id: 'old-conv', providerId: 'claude', title: 'Old', messages: [], createdAt: 1, updatedAt: 1 }
+            : null
+        ));
+        (deps.plugin.switchConversation as jest.Mock).mockRejectedValue(new ConversationHistoryHydrationError({
+          status: 'oversize',
+          segments: [{ sessionId: 'large-session', sizeBytes: 65 * 1024 * 1024 }],
+        }));
+        deps.switchToHydrationShell = jest.fn();
+        const releaseHistory = jest.fn();
+        jest.spyOn(ProviderRegistry, 'getConversationHistoryService').mockReturnValue({ releaseHistory } as any);
+
+        await controller.switchTo('oversize-conv');
+
+        expect(releaseHistory).toHaveBeenCalledTimes(1);
+        expect(releaseHistory).toHaveBeenCalledWith('old-conv');
+      });
+
+      it('does not release the current conversation history when the switch does not complete', async () => {
+        deps.state.currentConversationId = 'old-conv';
+        (deps.plugin.getConversationSync as jest.Mock).mockImplementation((id: string) => (
+          id === 'old-conv'
+            ? { id: 'old-conv', providerId: 'claude', title: 'Old', messages: [], createdAt: 1, updatedAt: 1 }
+            : null
+        ));
+        (deps.plugin.switchConversation as jest.Mock).mockResolvedValue(null);
+        const releaseHistory = jest.fn();
+        jest.spyOn(ProviderRegistry, 'getConversationHistoryService').mockReturnValue({ releaseHistory } as any);
+
+        await controller.switchTo('missing-conv');
+
+        expect(releaseHistory).not.toHaveBeenCalled();
+      });
+
+      it('releases the switched-away conversation history protection when createNew resets to blank', async () => {
+        deps.state.currentConversationId = 'old-conv';
+        (deps.plugin.getConversationSync as jest.Mock).mockReturnValue({ id: 'old-conv', providerId: 'claude' });
+        const releaseHistory = jest.fn();
+        jest.spyOn(ProviderRegistry, 'getConversationHistoryService').mockReturnValue({ releaseHistory } as any);
+
+        await controller.createNew();
+
+        expect(releaseHistory).toHaveBeenCalledWith('old-conv');
       });
 
       it('marks hydration ready after createNew resets to the entry point', async () => {

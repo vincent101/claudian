@@ -46,6 +46,11 @@ export interface StoredSelection {
 export interface ChatStateData {
   // Message state
   messages: ChatMessage[];
+  historyCursor: string | null;
+  historyHasMore: boolean;
+  historyLoading: boolean;
+  historyError: string | null;
+  historySnapshotOffset: number | null;
 
   // Streaming control
   isStreaming: boolean;

@@ -28,6 +28,7 @@ import { AutoTurnProjectionController } from '../controllers/AutoTurnProjectionC
 import { BrowserSelectionController } from '../controllers/BrowserSelectionController';
 import { CanvasSelectionController } from '../controllers/CanvasSelectionController';
 import { ConversationController } from '../controllers/ConversationController';
+import { HistorySearchController } from '../controllers/HistorySearchController';
 import { InputController } from '../controllers/InputController';
 import { NavigationController } from '../controllers/NavigationController';
 import { SelectionController } from '../controllers/SelectionController';
@@ -406,6 +407,7 @@ export function createTab(options: TabCreateOptions): TabData {
       browserSelectionController: null,
       canvasSelectionController: null,
       conversationController: null,
+      historySearchController: null,
       streamController: null,
       inputController: null,
       navigationController: null,
@@ -572,6 +574,7 @@ export async function initializeTabService(
 
     const runtime = ProviderRegistry.createChatRuntime({ plugin, providerId });
     service = runtime;
+    runtime.setTranscriptObserverStartOffset?.(tab.state.historySnapshotOffset);
     unsubscribeReadyState = runtime.onReadyStateChange(() => {});
     tab.dom.eventCleanups.push(() => unsubscribeReadyState?.());
 
@@ -1335,14 +1338,31 @@ export function initializeTabControllers(
         if (tab.providerId !== previousProviderId) {
           syncTabProviderServices(tab, plugin);
         }
+        // The panel's results belong to the outgoing conversation; close() also
+        // invalidates any in-flight debounced search via the generation bump.
+        tab.controllers.historySearchController?.close();
         refreshTabProviderUI(tab, plugin);
         applyProviderUIGating(tab, plugin);
         syncSlashCommandDropdownForProvider(tab, plugin, getProviderCatalogConfig);
       },
       onConversationLoaded: () => ui.slashCommandDropdown?.resetSdkSkillsCache(),
-      onConversationSwitched: () => ui.slashCommandDropdown?.resetSdkSkillsCache(),
+      onConversationSwitched: () => {
+        // Stale results from the previous conversation must not leak into the
+        // newly switched one (same reset point as other per-conversation UI).
+        tab.controllers.historySearchController?.close();
+        ui.slashCommandDropdown?.resetSdkSkillsCache();
+      },
     }
   );
+
+  tab.controllers.historySearchController = new HistorySearchController({
+    rootEl: dom.contentEl,
+    messagesEl: dom.messagesEl,
+    getConversationId: () => state.currentConversationId,
+    searchHistory: (_conversationId, query) => tab.controllers.conversationController!.searchHistory(query),
+    locateResult: result => tab.controllers.conversationController!.locateHistorySearchResult(result),
+  });
+  dom.eventCleanups.push(() => tab.controllers.historySearchController?.destroy());
 
   // Feature-layer turn lease (S2): created before the InputController so its
   // deps getter can resolve it lazily. Both user sends and runtime auto

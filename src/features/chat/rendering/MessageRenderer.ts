@@ -215,6 +215,77 @@ export class MessageRenderer {
     return newWelcomeEl;
   }
 
+  prependMessages(messages: ChatMessage[], allMessages: ChatMessage[]): void {
+    const anchor = this.messagesEl.querySelector('.claudian-message') as HTMLElement | null;
+    const before = anchor?.getBoundingClientRect().top ?? 0;
+    const fragment = document.createDocumentFragment();
+    const original = this.messagesEl;
+    this.messagesEl = fragment as unknown as HTMLElement;
+    for (let index = 0; index < messages.length; index += 1) {
+      this.renderStoredMessage(messages[index], allMessages, index);
+    }
+    this.messagesEl = original;
+    const first = original.querySelector('.claudian-message');
+    original.insertBefore(fragment, first);
+    if (anchor) original.scrollTop += anchor.getBoundingClientRect().top - before;
+  }
+
+  renderHistoryPager(
+    hasMore: boolean,
+    loading: boolean,
+    error: string | null,
+    onLoad: () => void,
+  ): void {
+    this.messagesEl.querySelector('.claudian-history-pager')?.remove();
+    if (!hasMore && !error) return;
+    const pager = document.createElement('div');
+    pager.className = 'claudian-history-pager';
+    const button = document.createElement('button');
+    button.textContent = loading ? 'Loading earlier messages…' : (error ? 'Retry loading earlier messages' : 'Load earlier messages');
+    button.disabled = loading;
+    button.addEventListener('click', onLoad);
+    pager.appendChild(button);
+    if (error) {
+      const detail = document.createElement('div');
+      detail.className = 'claudian-history-pager-error';
+      detail.textContent = error;
+      pager.appendChild(detail);
+    }
+    this.messagesEl.insertBefore(pager, this.messagesEl.firstChild);
+  }
+
+  findMessageElement(messageKey: string): HTMLElement | null {
+    return this.messagesEl.querySelector(`[data-message-id="${CSS.escape(messageKey)}"]`) as HTMLElement | null;
+  }
+
+  highlightSearchMatch(messageEl: HTMLElement, matchedText: string): void {
+    messageEl.querySelectorAll('mark.claudian-search-match').forEach(mark => mark.replaceWith(mark.textContent ?? ''));
+    const needle = matchedText.toLocaleLowerCase();
+    if (needle) {
+      const walker = document.createTreeWalker(messageEl, NodeFilter.SHOW_TEXT);
+      let node = walker.nextNode();
+      while (node) {
+        const text = node.textContent ?? '';
+        const matchStart = text.toLocaleLowerCase().indexOf(needle);
+        if (matchStart >= 0) {
+          const mark = document.createElement('mark');
+          mark.className = 'claudian-search-match';
+          mark.textContent = text.slice(matchStart, matchStart + matchedText.length);
+          const after = (node as Text).splitText(matchStart);
+          after.deleteData(0, matchedText.length);
+          after.parentNode?.insertBefore(mark, after);
+          break;
+        }
+        node = walker.nextNode();
+      }
+    }
+    messageEl.scrollIntoView({ block: 'center', behavior: 'smooth' });
+    messageEl.classList.remove('claudian-search-highlight');
+    void messageEl.offsetWidth;
+    messageEl.classList.add('claudian-search-highlight');
+    setTimeout(() => messageEl.classList.remove('claudian-search-highlight'), 1600);
+  }
+
   renderStoredMessage(msg: ChatMessage, allMessages?: ChatMessage[], index?: number): void {
     // Bare interrupt marker: user-role interrupts (Claude bracket markers) always render
     // as a standalone indicator. Assistant-role interrupts (Codex partial responses)

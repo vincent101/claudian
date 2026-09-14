@@ -56,6 +56,10 @@ export type TranslationKey =
   | 'chat.history.errorDescription'
   | 'chat.history.retry'
   | 'chat.history.switchFailed'
+  | 'chat.search.placeholder'
+  | 'chat.search.noResults'
+  | 'chat.search.error'
+  | 'chat.search.resultCount'
 
   // Chat - Fork
   | 'chat.fork.ariaLabel'

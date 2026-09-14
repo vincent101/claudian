@@ -48,7 +48,7 @@ export class ClaudeTranscriptTurnObserver {
     private readonly diagnostics?: ClaudeTranscriptDiagnosticLog,
   ) {}
 
-  async start(filePath: string): Promise<void> {
+  async start(filePath: string, fromOffset?: number): Promise<void> {
     this.stop('session_switch');
     this.stopped = false;
     const generation = ++this.generation;
@@ -60,10 +60,12 @@ export class ClaudeTranscriptTurnObserver {
         errorName: error instanceof Error ? error.name : 'UnknownError',
       });
     });
-    const recoverEof = await this.recover(filePath, generation);
+    const recoverEof = fromOffset === undefined
+      ? await this.recover(filePath, generation)
+      : fromOffset;
     if (this.stopped || generation !== this.generation || !this.reader) return;
-    // Prime from the EOF the recovery scan already observed: re-statting here
-    // could land past it and silently skip the lines appended in between.
+    // A supplied boundary is the index snapshot EOF; otherwise retain the
+    // recovery scan's observed EOF so neither path races a second stat.
     await this.reader.prime(recoverEof ?? undefined);
     this.reader.start(batch => this.enqueueConsume(() => this.consumeBatch(batch, generation)));
   }

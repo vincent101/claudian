@@ -1,28 +1,31 @@
+import { isRealUserMessage } from './externalUserMessage';
 import type { SDKNativeMessage } from './sdkHistoryTypes';
-import { isDisplayableExternalUser } from './sdkMessageParsing';
 
-export function filterActiveBranch(
-  entries: SDKNativeMessage[],
-  resumeAtMessageId?: string,
-): SDKNativeMessage[] {
+export interface BranchFilterEntry {
+  type: string;
+  uuid?: string;
+  parentUuid?: string | null;
+}
+
+export function filterActiveBranchEntries<T extends BranchFilterEntry>(
+  entries: T[],
+  resumeAtMessageId: string | undefined,
+  isRealUser: (entry: T) => boolean,
+): T[] {
   if (entries.length === 0) {
     return [];
   }
 
-  function isRealUserBranchChild(entry: SDKNativeMessage | undefined): boolean {
-    return !!entry
-      && entry.type === 'user'
-      && !('toolUseResult' in entry)
-      && (!entry.isMeta || isDisplayableExternalUser(entry))
-      && !('sourceToolUseID' in entry);
+  function isRealUserBranchChild(entry: T | undefined): boolean {
+    return !!entry && isRealUser(entry);
   }
 
-  function isDirectRealUserBranchChild(parentUuid: string, entry: SDKNativeMessage | undefined): boolean {
+  function isDirectRealUserBranchChild(parentUuid: string, entry: T | undefined): boolean {
     return !!entry && entry.parentUuid === parentUuid && isRealUserBranchChild(entry);
   }
 
   const seen = new Set<string>();
-  const deduped: SDKNativeMessage[] = [];
+  const deduped: T[] = [];
   for (const entry of entries) {
     if (entry.uuid) {
       if (seen.has(entry.uuid)) {
@@ -60,7 +63,7 @@ export function filterActiveBranch(
   }
 
   const conversationEntries = deduped.filter(entry => (entry.type as string) !== 'progress');
-  const byUuid = new Map<string, SDKNativeMessage>();
+  const byUuid = new Map<string, T>();
   const childrenOf = new Map<string, Set<string>>();
 
   for (const entry of conversationEntries) {
@@ -79,7 +82,7 @@ export function filterActiveBranch(
     }
   }
 
-  function findLatestLeaf(): SDKNativeMessage | undefined {
+  function findLatestLeaf(): T | undefined {
     for (let i = conversationEntries.length - 1; i >= 0; i--) {
       const uuid = conversationEntries[i].uuid;
       if (uuid && !childrenOf.has(uuid)) {
@@ -158,11 +161,11 @@ export function filterActiveBranch(
     return false;
   });
 
-  let leaf: SDKNativeMessage | undefined;
+  let leaf: T | undefined;
   if (hasBranching) {
     leaf = latestLeaf;
     if (resumeAtMessageId && leaf?.uuid && byUuid.has(resumeAtMessageId)) {
-      let current: SDKNativeMessage | undefined = leaf;
+      let current: T | undefined = leaf;
       while (current?.uuid) {
         if (current.uuid === resumeAtMessageId) {
           leaf = current;
@@ -183,7 +186,7 @@ export function filterActiveBranch(
   }
 
   const activeUuids = new Set<string>();
-  let current: SDKNativeMessage | undefined = leaf;
+  let current: T | undefined = leaf;
   while (current?.uuid) {
     activeUuids.add(current.uuid);
     const parent = resolveParent(current.parentUuid);
@@ -269,4 +272,11 @@ export function filterActiveBranch(
     }
     return prevIsActive[idx] && nextIsActive[idx];
   });
+}
+
+export function filterActiveBranch(
+  entries: SDKNativeMessage[],
+  resumeAtMessageId?: string,
+): SDKNativeMessage[] {
+  return filterActiveBranchEntries(entries, resumeAtMessageId, isRealUserMessage);
 }

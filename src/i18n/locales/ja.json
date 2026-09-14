@@ -75,6 +75,12 @@
       "errorDescription": "The conversation history could not be loaded.",
       "retry": "Retry",
       "switchFailed": "Failed to switch conversation: {error}"
+    },
+    "search": {
+      "placeholder": "会話履歴を検索",
+      "noResults": "結果がありません",
+      "error": "検索に失敗しました",
+      "resultCount": "{total} 件中 {current} 件目"
     }
   },
   "settings": {

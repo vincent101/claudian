@@ -54,8 +54,22 @@ describe('ClaudeTranscriptTurnObserver', () => {
     expect(callbacks.finished).not.toHaveBeenCalled();
   });
 
-  it('recovery primes completed history without reprojecting it', async () => {
-    await writeFile(file, `${peerTurn('peer-done', 'hello').join('\n')}\n`);
+  it('starts from an explicit snapshot boundary without recovery duplication', async () => {
+    const snapshot = `${peerTurn('old', 'old').join('\n')}\n`;
+    await writeFile(file, snapshot);
+    const boundary = (await stat(file)).size;
+    const { observer, callbacks } = setup();
+    await observer.start(file, boundary);
+    await appendFile(file, `${peerTurn('new', 'new').join('\n')}\n`);
+    const reader = (observer as any).reader as ClaudeTranscriptTailReader;
+    const batch = await reader.readAvailable();
+    await (observer as any).consumeBatch(batch, (observer as any).generation);
+    expect(callbacks.started).toHaveBeenCalledTimes(1);
+    expect(callbacks.started).toHaveBeenCalledWith(expect.objectContaining({ turnId: 'new' }));
+    observer.stop();
+  });
+
+  it('recovery primes completed history without reprojecting it', async () => {    await writeFile(file, `${peerTurn('peer-done', 'hello').join('\n')}\n`);
     const { observer, callbacks } = setup();
     await observer.start(file);
     observer.stop();

@@ -2,7 +2,7 @@ import { isSubagentToolName } from '../../../core/tools/toolNames';
 import type { ChatMessage, SubagentInfo, ToolCallInfo } from '../../../core/types';
 import { buildAsyncSubagentInfo } from './sdkAsyncSubagent';
 import { filterActiveBranch } from './sdkBranchFilter';
-import type { SDKSessionLoadResult } from './sdkHistoryTypes';
+import type { SDKNativeMessage, SDKSessionLoadResult } from './sdkHistoryTypes';
 import {
   collectAsyncSubagentResults,
   collectStructuredPatchResults,
@@ -57,28 +57,15 @@ export {
   resolveToolUseResultStatus,
 } from './sdkAsyncSubagent';
 
-export async function loadSDKSessionMessages(
+export async function materializeSDKMessages(
   vaultPath: string,
   sessionId: string,
-  resumeAtMessageId?: string
-): Promise<SDKSessionLoadResult> {
-  const result = await readSDKSession(vaultPath, sessionId);
-
-  if (result.status !== 'complete') {
-    return {
-      messages: [],
-      skippedLines: result.skippedLines,
-      status: result.status,
-      error: result.error,
-      sizeBytes: result.sizeBytes,
-    };
-  }
-
-  const filteredEntries = filterActiveBranch(result.messages, resumeAtMessageId);
-
-  const toolResults = collectToolResults(filteredEntries);
-  const toolUseResults = collectStructuredPatchResults(filteredEntries);
-  const asyncSubagentResults = collectAsyncSubagentResults(filteredEntries);
+  filteredEntries: SDKNativeMessage[],
+  associationEntries: SDKNativeMessage[] = filteredEntries,
+): Promise<ChatMessage[]> {
+  const toolResults = collectToolResults(associationEntries);
+  const toolUseResults = collectStructuredPatchResults(associationEntries);
+  const asyncSubagentResults = collectAsyncSubagentResults(associationEntries);
 
   const chatMessages: ChatMessage[] = [];
   let pendingAssistant: ChatMessage | null = null;
@@ -172,5 +159,27 @@ export async function loadSDKSessionMessages(
 
   chatMessages.sort((a, b) => a.timestamp - b.timestamp);
 
+  return chatMessages;
+}
+
+export async function loadSDKSessionMessages(
+  vaultPath: string,
+  sessionId: string,
+  resumeAtMessageId?: string
+): Promise<SDKSessionLoadResult> {
+  const result = await readSDKSession(vaultPath, sessionId);
+
+  if (result.status !== 'complete') {
+    return {
+      messages: [],
+      skippedLines: result.skippedLines,
+      status: result.status,
+      error: result.error,
+      sizeBytes: result.sizeBytes,
+    };
+  }
+
+  const filteredEntries = filterActiveBranch(result.messages, resumeAtMessageId);
+  const chatMessages = await materializeSDKMessages(vaultPath, sessionId, filteredEntries);
   return { messages: chatMessages, skippedLines: result.skippedLines, status: 'complete' };
 }

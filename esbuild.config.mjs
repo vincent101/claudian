@@ -11,11 +11,13 @@ import {
   rmSync,
 } from 'fs';
 import rendererSafeUnrefHelpers from './scripts/rendererSafeUnref.js';
+import workerSourceGuard from './scripts/workerSourceGuard.js';
 
 const {
   findUnsafeTimerUnrefSites,
   patchRendererUnsafeUnrefSites,
 } = rendererSafeUnrefHelpers;
+const { assertWorkerSourceSymbols } = workerSourceGuard;
 
 // Load .env.local if it exists
 if (existsSync('.env.local')) {
@@ -43,6 +45,16 @@ const patchCodexSdkImportMeta = {
         };
       },
     );
+  },
+};
+
+const guardWorkerSourceSymbols = {
+  name: 'guard-worker-source-symbols',
+  setup(build) {
+    build.onEnd(async (result) => {
+      if (result.errors.length > 0 || !existsSync('main.js')) return;
+      assertWorkerSourceSymbols(await fsPromises.readFile(path.join(process.cwd(), 'main.js'), 'utf8'));
+    });
   },
 };
 
@@ -112,7 +124,7 @@ const copyToObsidian = {
 const context = await esbuild.context({
   entryPoints: ['src/main.ts'],
   bundle: true,
-  plugins: [patchCodexSdkImportMeta, patchRendererUnsafeUnref, copyToObsidian],
+  plugins: [patchCodexSdkImportMeta, patchRendererUnsafeUnref, guardWorkerSourceSymbols, copyToObsidian],
   external: [
     'obsidian',
     'electron',
@@ -135,6 +147,7 @@ const context = await esbuild.context({
   logLevel: 'info',
   sourcemap: prod ? false : 'inline',
   treeShaking: true,
+  keepNames: true,
   outfile: 'main.js',
 });
 

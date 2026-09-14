@@ -6,6 +6,10 @@ import type {
   AutoTurnStartedEvent,
 } from '../../../core/runtime/types';
 import type { StreamChunk } from '../../../core/types';
+import {
+  extractExternalDisplayContent,
+  extractUserText,
+} from '../history/externalUserMessage';
 import type { SDKNativeMessage } from '../history/sdkHistoryTypes';
 import { createRuntimeTurn } from '../runtime/types';
 import { transformSDKMessage } from '../stream/transformClaudeMessage';
@@ -28,52 +32,13 @@ export interface TranscriptTurnStart {
   showUser: boolean;
 }
 
-function extractUserText(message: SDKNativeMessage): string | undefined {
-  const content = message.message?.content;
-  if (typeof content === 'string') return content.trim() || undefined;
-  if (!Array.isArray(content)) return undefined;
-  const text = content
-    .filter(block => block.type === 'text' && typeof block.text === 'string')
-    .map(block => block.text as string)
-    .join('\n')
-    .trim();
-  return text || undefined;
-}
-
 function isStopHookBlockFeedback(message: SDKNativeMessage): boolean {
   if (message.type !== 'user' || message.isMeta !== true || message.userType !== 'external') return false;
   const text = extractUserText(message);
   return text?.startsWith('Stop hook feedback:') === true;
 }
 
-function unwrap(candidate: string, tag: 'cross-session-message' | 'agent-message'): string | null {
-  const start = candidate.indexOf(`<${tag}`);
-  if (start < 0) return candidate;
-  const openEnd = candidate.indexOf('>', start + tag.length + 1);
-  const close = openEnd < 0 ? -1 : candidate.indexOf(`</${tag}>`, openEnd + 1);
-  return openEnd < 0 || close < 0 ? null : candidate.slice(openEnd + 1, close);
-}
-
-export function extractExternalDisplayContent(message: SDKNativeMessage): string | undefined {
-  let candidate = typeof message.origin?.body === 'string'
-    && message.origin.body.trim()
-    ? message.origin.body
-    : extractUserText(message);
-  if (!candidate) return undefined;
-  candidate = candidate.trim();
-  const prologue = 'Another Claude session sent a message:';
-  if (candidate.startsWith(prologue)) candidate = candidate.slice(prologue.length).trim();
-  for (const tag of ['cross-session-message', 'agent-message'] as const) {
-    const value = unwrap(candidate, tag);
-    if (value === null) return undefined;
-    candidate = value.trim();
-  }
-  const lines = candidate.split('\n');
-  let first = 0;
-  while (first < lines.length && (/^\[to\](?:\s|$)/.test(lines[first]) || /^\[from\](?:\s|$)/.test(lines[first]))) first += 1;
-  if (first < lines.length && /^\[msg\](?:\s|$)/.test(lines[first])) lines[first] = lines[first].replace(/^\[msg\]\s*/, '');
-  return lines.slice(first).join('\n').trim() || undefined;
-}
+export { extractExternalDisplayContent } from '../history/externalUserMessage';
 
 export function classifyLeaselessTurnStart(message: SDKNativeMessage): TranscriptTurnStart | null {
   if (message.type !== 'user' || message.isReplay === true || message.isSidechain === true || message.shouldQuery === false) return null;

@@ -2859,6 +2859,30 @@ describe('Tab - Controller Configuration', () => {
 
       expect(mockSlashCommandDropdown.resetSdkSkillsCache).toHaveBeenCalledTimes(3);
     });
+
+    it('should close the history search panel on conversation switch and new conversation', () => {
+      const { ConversationController } = jest.requireMock('@/features/chat/controllers/ConversationController');
+      const options = createMockOptions();
+      const tab = createTab(options);
+      const mockComponent = {} as any;
+
+      initializeTabUI(tab, options.plugin);
+      initializeTabControllers(tab, options.plugin, mockComponent, options.mcpManager);
+
+      const constructorCall = ConversationController.mock.calls[0];
+      const callbacks = constructorCall[1];
+
+      // close() tears down the panel and clears results; its DOM behavior is
+      // covered by the controller's own jsdom suite. Here we only assert the
+      // conversation lifecycle wires it in (this suite runs in node env).
+      const closeSpy = jest.spyOn(tab.controllers.historySearchController!, 'close');
+
+      callbacks.onConversationSwitched();
+      expect(closeSpy).toHaveBeenCalledTimes(1);
+
+      callbacks.onNewConversation();
+      expect(closeSpy).toHaveBeenCalledTimes(2);
+    });
   });
 });
 

@@ -11,7 +11,10 @@ import { extractContentBeforeXmlContext } from '../../../utils/context';
 import { extractDiffData } from '../../../utils/diff';
 import { isCompactionCanceledStderr, isInterruptSignalText } from '../../../utils/interrupt';
 import { extractToolResultContent } from '../sdk/toolResultContent';
-import { extractExternalDisplayContent } from '../transcript/ClaudeTranscriptTurnMapper';
+import {
+  extractExternalDisplayContent,
+  isDisplayableExternalUser,
+} from './externalUserMessage';
 import type {
   AsyncSubagentResult,
   SDKNativeContentBlock,
@@ -163,14 +166,7 @@ function mapContentBlocks(content: string | SDKNativeContentBlock[] | undefined)
   return blocks.length > 0 ? blocks : undefined;
 }
 
-const DISPLAYABLE_EXTERNAL_KINDS = new Set(['peer', 'channel', 'coordinator']);
-
-export function isDisplayableExternalUser(sdkMsg: SDKNativeMessage): boolean {
-  if (sdkMsg.type !== 'user' || 'toolUseResult' in sdkMsg || 'sourceToolUseID' in sdkMsg) return false;
-  if (!DISPLAYABLE_EXTERNAL_KINDS.has(sdkMsg.origin?.kind ?? '')) return false;
-  if (!sdkMsg.uuid && !sdkMsg.origin?.msg_id) return false;
-  return extractExternalDisplayContent(sdkMsg) !== undefined;
-}
+export { isDisplayableExternalUser } from './externalUserMessage';
 
 export function parseSDKMessageToChat(
   sdkMsg: SDKNativeMessage,

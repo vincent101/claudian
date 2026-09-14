@@ -14,6 +14,7 @@ import type { Conversation, SlashCommand } from '../../../core/types';
 import { t } from '../../../i18n/i18n';
 import type ClaudianPlugin from '../../../main';
 import { chooseForkTarget } from '../../../shared/modals/ForkTargetModal';
+import { getVaultPath } from '../../../utils/path';
 import { type DesktopNotificationKind,notifyBackgroundTabStateChange } from './desktopNotifier';
 import { getTabProviderId } from './providerResolution';
 import {
@@ -376,6 +377,17 @@ export class TabManager implements TabManagerInterface {
       // transcript observation covers the idle period. Shell/blocked tabs
       // never reach this point and therefore cannot start an observer.
       await initializeTabService(tab, this.plugin);
+      const historyConversation = tab.conversationId
+        ? this.plugin.getConversationSync(tab.conversationId)
+        : null;
+      const historyService = historyConversation
+        ? ProviderRegistry.getConversationHistoryService(historyConversation.providerId)
+        : null;
+      tab.service?.setFullHistoryExporter?.(
+        historyConversation && historyService?.exportFullHistory
+          ? () => historyService.exportFullHistory!(historyConversation, getVaultPath(this.plugin.app))
+          : null,
+      );
       setupServiceCallbacks(tab, this.plugin);
       if (this.isStaleHydration(tab, generation)) {
         // setupServiceCallbacks may have parked a runtime/observer before the
@@ -484,6 +496,9 @@ export class TabManager implements TabManagerInterface {
 
     // Save conversation before closing
     await tab.controllers.conversationController?.save();
+    if (tab.conversationId) {
+      ProviderRegistry.getConversationHistoryService(tab.providerId).releaseHistory?.(tab.conversationId);
+    }
 
     // Capture tab order BEFORE deletion for fallback calculation
     const tabIdsBefore = Array.from(this.tabs.keys());

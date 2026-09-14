@@ -44,6 +44,9 @@ export interface ChatRuntime {
   cancel(): void;
   beginUserTurnProjection?(turnId: string): void;
   completeUserTurnProjection?(turnId: string): Promise<void>;
+  /** Starts transcript observation at an already-materialized snapshot boundary. */
+  setTranscriptObserverStartOffset?(offset: number | null): void;
+  setFullHistoryExporter?(exporter: (() => Promise<ChatMessage[]>) | null): void;
   resetSession(): void;
   getSessionId(): string | null;
   consumeSessionInvalidation(): boolean;

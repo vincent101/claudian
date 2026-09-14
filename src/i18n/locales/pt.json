@@ -75,6 +75,12 @@
       "errorDescription": "The conversation history could not be loaded.",
       "retry": "Retry",
       "switchFailed": "Failed to switch conversation: {error}"
+    },
+    "search": {
+      "placeholder": "Pesquisar no histórico",
+      "noResults": "Nenhum resultado",
+      "error": "Falha na pesquisa",
+      "resultCount": "{current} de {total}"
     }
   },
   "settings": {

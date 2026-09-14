@@ -1,11 +1,18 @@
 import { Menu, Notice, setIcon } from 'obsidian';
 
-import { ConversationHistoryHydrationError, type TitleGenerationService } from '../../../core/providers/types';
+import { ProviderRegistry } from '../../../core/providers/ProviderRegistry';
+import {
+  ConversationHistoryHydrationError,
+  type HistorySearchResult,
+  type ProviderId,
+  type TitleGenerationService,
+} from '../../../core/providers/types';
 import type { ChatRuntime } from '../../../core/runtime/ChatRuntime';
 import type { Conversation } from '../../../core/types';
 import { t } from '../../../i18n/i18n';
 import type ClaudianPlugin from '../../../main';
 import { confirm } from '../../../shared/modals/ConfirmModal';
+import { getVaultPath } from '../../../utils/path';
 import type { MessageRenderer } from '../rendering/MessageRenderer';
 import { cleanupThinkingBlock } from '../rendering/ThinkingBlockRenderer';
 import { findRewindContext } from '../rewind';
@@ -106,6 +113,11 @@ export class ConversationController {
     if (state.isCreatingConversation) return;
     if (state.isSwitchingConversation) return;
 
+    const previousConversationId = state.currentConversationId;
+    const previousProviderId = previousConversationId
+      ? plugin.getConversationSync(previousConversationId)?.providerId
+      : undefined;
+
     // Set flag to block message sending during reset
     state.isCreatingConversation = true;
 
@@ -144,6 +156,7 @@ export class ConversationController {
       // Reset to entry point state - no conversation created yet
       state.currentConversationId = null;
       state.clearMessages();
+      state.resetHistoryPagination();
       state.usage = null;
       state.currentTodos = null;
       state.pendingNewSessionPlan = null;
@@ -185,6 +198,7 @@ export class ConversationController {
       this.deps.clearQueuedMessage();
 
       this.deps.markHydrationReady?.();
+      this.releaseSwitchedAwayHistory(previousConversationId, previousProviderId);
 
       this.callbacks.onNewConversation?.();
     } finally {
@@ -202,13 +216,47 @@ export class ConversationController {
     const { plugin, state, renderer } = this.deps;
 
     const conversationId = state.currentConversationId;
-    const conversation = conversationId ? await plugin.getConversationById(conversationId) : null;
+    let conversation: Conversation | null;
+    let paged = false;
+    try {
+      conversation = conversationId ? await plugin.getConversationById(conversationId) : null;
+    } catch (error) {
+      if (!(error instanceof ConversationHistoryHydrationError) || error.result.status !== 'oversize' || !conversationId) {
+        throw error;
+      }
+      conversation = plugin.getConversationSync(conversationId);
+      if (!conversation) throw error;
+      const historyService = ProviderRegistry.getConversationHistoryService(conversation.providerId);
+      if (!historyService.loadInitialHistory) throw error;
+      state.historyLoading = true;
+      // No catch on purpose: a failed initial page must propagate its real
+      // error so the tab-level catch renders it as a retryable ERROR
+      // placeholder; rethrowing the oversize error instead would show only
+      // the segment-size list and hide the cause (M3: any segment error
+      // must be visible).
+      try {
+        const page = await historyService.loadInitialHistory(conversation, getVaultPath(plugin.app), 50);
+        if (!shouldApply()) {
+          historyService.releaseHistory?.(conversation.id);
+          return;
+        }
+        conversation = { ...conversation, messages: page.messages };
+        paged = true;
+        state.historyCursor = page.cursor;
+        state.historyHasMore = page.hasMore;
+        state.historySnapshotOffset = page.snapshotOffset ?? null;
+        state.historyError = null;
+      } finally {
+        state.historyLoading = false;
+      }
+    }
     if (!shouldApply()) return;
 
     // No active conversation - start at entry point
     if (!conversation) {
       state.currentConversationId = null;
       state.clearMessages();
+      state.resetHistoryPagination();
       state.usage = null;
       state.currentTodos = null;
       state.pendingNewSessionPlan = null;
@@ -247,9 +295,74 @@ export class ConversationController {
 
     await this.deps.ensureServiceForConversation?.(conversation);
     this.restoreConversation(conversation, { autoAttachFile: true });
+    if (!paged) state.resetHistoryPagination();
     this.updateWelcomeVisibility();
 
+    this.renderHistoryPager();
     this.callbacks.onConversationLoaded?.();
+  }
+
+  async loadOlderHistory(): Promise<void> {
+    const { state, plugin, renderer } = this.deps;
+    if (!state.historyCursor || state.historyLoading || !state.currentConversationId) return;
+    const conversation = plugin.getConversationSync(state.currentConversationId);
+    if (!conversation) return;
+    const service = ProviderRegistry.getConversationHistoryService(conversation.providerId);
+    if (!service.loadOlderHistory) return;
+    state.historyLoading = true;
+    state.historyError = null;
+    this.renderHistoryPager();
+    try {
+      const page = await service.loadOlderHistory(state.historyCursor, 50);
+      const combined = [...page.messages, ...state.messages];
+      state.prependMessages(page.messages);
+      renderer.prependMessages(page.messages, combined);
+      state.historyCursor = page.cursor;
+      state.historyHasMore = page.hasMore;
+    } catch (error) {
+      state.historyError = error instanceof Error ? error.message : String(error);
+    } finally {
+      state.historyLoading = false;
+      this.renderHistoryPager();
+    }
+  }
+
+  private renderHistoryPager(): void {
+    this.deps.renderer.renderHistoryPager(
+      this.deps.state.historyHasMore,
+      this.deps.state.historyLoading,
+      this.deps.state.historyError,
+      () => { void this.loadOlderHistory(); },
+    );
+  }
+
+  async searchHistory(query: string): Promise<HistorySearchResult[]> {
+    const { state, plugin } = this.deps;
+    if (!state.currentConversationId) return [];
+    const conversation = plugin.getConversationSync(state.currentConversationId);
+    if (!conversation) return [];
+    const service = ProviderRegistry.getConversationHistoryService(conversation.providerId);
+    return service.searchHistory?.(conversation, getVaultPath(plugin.app), query) ?? [];
+  }
+
+  async locateHistorySearchResult(result: HistorySearchResult): Promise<void> {
+    const { state, plugin, renderer } = this.deps;
+    if (!state.currentConversationId) return;
+    let target = renderer.findMessageElement(result.messageKey);
+    if (!target) {
+      const conversation = plugin.getConversationSync(state.currentConversationId);
+      if (!conversation) return;
+      const service = ProviderRegistry.getConversationHistoryService(conversation.providerId);
+      if (!service.loadHistoryAt) return;
+      const page = await service.loadHistoryAt(result.cursor, 50);
+      const existing = new Set(state.messages.map(message => message.id));
+      const added = page.messages.filter(message => !existing.has(message.id));
+      const combined = [...added, ...state.messages];
+      state.prependMessages(added);
+      renderer.prependMessages(added, combined);
+      target = renderer.findMessageElement(result.messageKey);
+    }
+    if (target) renderer.highlightSearchMatch(target, result.matchedText);
   }
 
   /** Switches to a different conversation. */
@@ -260,6 +373,15 @@ export class ConversationController {
     if (state.isStreaming) return;
     if (state.isSwitchingConversation) return;
     if (state.isCreatingConversation) return;
+
+    // Capture the outgoing conversation before the switch: once this tab
+    // stops displaying it, its paged-history index protection must be
+    // released (same release point as closeTab) or the protected index
+    // stays pinned out of the LRU forever.
+    const previousConversationId = state.currentConversationId;
+    const previousProviderId = previousConversationId
+      ? plugin.getConversationSync(previousConversationId)?.providerId
+      : undefined;
 
     state.isSwitchingConversation = true;
 
@@ -289,6 +411,8 @@ export class ConversationController {
 
       this.restoreConversation(conversation);
 
+      this.releaseSwitchedAwayHistory(previousConversationId, previousProviderId);
+
       this.deps.getHistoryDropdown()?.removeClass('visible');
       this.updateWelcomeVisibility();
 
@@ -305,6 +429,7 @@ export class ConversationController {
         && this.deps.switchToHydrationShell
       ) {
         this.deps.getHistoryDropdown()?.removeClass('visible');
+        this.releaseSwitchedAwayHistory(previousConversationId, previousProviderId);
         this.deps.switchToHydrationShell(id);
         return;
       }
@@ -312,6 +437,19 @@ export class ConversationController {
     } finally {
       state.isSwitchingConversation = false;
     }
+  }
+
+  /**
+   * Releases the paged-history index protection of the conversation this tab
+   * switched away from; mirrors closeTab so a protected transcript index
+   * becomes LRU-evictable again instead of staying pinned.
+   */
+  private releaseSwitchedAwayHistory(
+    conversationId: string | null,
+    providerId: ProviderId | undefined,
+  ): void {
+    if (!conversationId || !providerId) return;
+    ProviderRegistry.getConversationHistoryService(providerId).releaseHistory?.(conversationId);
   }
 
   async rewind(userMessageId: string): Promise<void> {

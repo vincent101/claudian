@@ -1,5 +1,7 @@
 import type {
   ConversationHistoryHydrationResult,
+  HistoryPage,
+  HistorySearchResult,
   ProviderConversationHistoryService,
 } from '../../../core/providers/types';
 import { isSubagentToolName, TOOL_TASK } from '../../../core/tools/toolNames';
@@ -16,8 +18,19 @@ import {
   deleteSDKSession,
   loadSDKSessionMessages,
   loadSubagentToolCalls,
+  materializeSDKMessages,
   sdkSessionExists,
 } from './ClaudeHistoryStore';
+import {
+  buildTranscriptIndex,
+  clearTranscriptIndexCache,
+  materializeTranscriptPage,
+  materializeTranscriptToolAssociations,
+  protectTranscriptIndex,
+  releaseTranscriptIndex,
+  type TranscriptHistoryIndex,
+} from './ClaudeTranscriptHistoryIndex';
+import { getSDKSessionPath } from './sdkSessionPaths';
 
 function chooseRicherResult(sdkResult?: string, cachedResult?: string): string | undefined {
   const sdkText = typeof sdkResult === 'string' ? sdkResult.trim() : '';
@@ -313,8 +326,26 @@ function sanitizeProviderState(
   return Object.fromEntries(sanitizedEntries);
 }
 
+interface IndexedSegment {
+  sessionId: string;
+  index: TranscriptHistoryIndex;
+}
+
+interface PageCursorState {
+  conversationId: string;
+  vaultPath: string;
+  segments: IndexedSegment[];
+  endTurn: number;
+  flattenedTurns: Array<{ segment: IndexedSegment; turnIndex: number }>;
+}
+
 export class ClaudeConversationHistoryService implements ProviderConversationHistoryService {
   private hydratedConversationIds = new Set<string>();
+  private pageCursors = new Map<string, PageCursorState>();
+  private searchCursors = new Map<string, PageCursorState>();
+  private conversationIndexes = new Map<string, PageCursorState>();
+  private protectedConversations = new Map<string, string>();
+  private cursorSequence = 0;
 
   isPendingForkConversation(conversation: Conversation): boolean {
     const state = getClaudeState(conversation.providerState);
@@ -401,6 +432,13 @@ export class ClaudeConversationHistoryService implements ProviderConversationHis
 
       if (result.status === 'oversize') {
         oversizeSegments.push({ sessionId, sizeBytes: result.sizeBytes ?? 0 });
+        // M2 shadow only: build the paged-history index without changing M1's
+        // blocked UI or starting the runtime/observer. M3 will consume it.
+        // Shadow-mode fire-and-forget: snapshotKey stat failures on vanishing
+        // transcripts (file-race) must not surface as unhandled rejections.
+        void buildTranscriptIndex(getSDKSessionPath(vaultPath, sessionId), {
+          resumeAtMessageId: truncateAt,
+        }).catch(() => {});
         continue;
       }
       if (result.status === 'failed') {
@@ -443,6 +481,156 @@ export class ClaudeConversationHistoryService implements ProviderConversationHis
     conversation.messages = merged;
     this.hydratedConversationIds.add(conversation.id);
     return { status: 'ready' };
+  }
+
+  async loadInitialHistory(
+    conversation: Conversation,
+    vaultPath: string | null,
+    pageSize: number,
+  ): Promise<HistoryPage> {
+    if (!vaultPath) throw new Error('Vault path is unavailable');
+    const state = getClaudeState(conversation.providerState);
+    const currentSessionId = state.providerSessionId ?? conversation.sessionId ?? state.forkSource?.sessionId;
+    if (!currentSessionId) throw new Error('Conversation has no Claude session');
+    const sessionIds = [...(state.previousProviderSessionIds ?? []), currentSessionId];
+    const segments: IndexedSegment[] = [];
+    for (const sessionId of sessionIds) {
+      if (!sdkSessionExists(vaultPath, sessionId)) continue;
+      const result = await buildTranscriptIndex(getSDKSessionPath(vaultPath, sessionId), {
+        resumeAtMessageId: sessionId === currentSessionId
+          ? (state.forkSource?.resumeAt ?? conversation.resumeAtMessageId)
+          : undefined,
+      });
+      if (result.status === 'failed' || result.status === 'partial') throw new Error(result.error);
+      segments.push({ sessionId, index: result.index });
+    }
+    if (segments.length === 0) throw new Error('Conversation transcript is unavailable');
+    this.releaseHistory(conversation.id);
+    for (const segment of segments) protectTranscriptIndex(segment.index.filePath);
+    this.protectedConversations.set(conversation.id, segments.map(segment => segment.index.filePath).join('\n'));
+    const flattenedTurns = segments.flatMap(segment =>
+      segment.index.turns.map((_, turnIndex) => ({ segment, turnIndex }))
+    );
+    const startTurn = Math.max(0, flattenedTurns.length - pageSize);
+    const cursorState = { conversationId: conversation.id, vaultPath, segments, endTurn: startTurn, flattenedTurns };
+    this.conversationIndexes.set(conversation.id, cursorState);
+    return this.materializePage(cursorState, pageSize);
+  }
+
+  async searchHistory(
+    conversation: Conversation,
+    vaultPath: string | null,
+    query: string,
+  ): Promise<HistorySearchResult[]> {
+    let state = this.conversationIndexes.get(conversation.id);
+    if (!state && vaultPath) {
+      await this.loadInitialHistory(conversation, vaultPath, 50);
+      state = this.conversationIndexes.get(conversation.id);
+    }
+    const needle = query.trim().toLocaleLowerCase();
+    if (!state || !needle) return [];
+    const results: HistorySearchResult[] = [];
+    let globalTurnOffset = 0;
+    for (const segment of state.segments) {
+      for (const item of segment.index.searchCorpus) {
+        const matchStart = item.text.toLocaleLowerCase().indexOf(needle);
+        if (matchStart < 0) continue;
+        const turnIndex = globalTurnOffset + item.turnIndex;
+        const cursor = `claude-search:${++this.cursorSequence}`;
+        this.searchCursors.set(cursor, { ...state, endTurn: turnIndex });
+        const contextStart = Math.max(0, matchStart - 48);
+        const contextEnd = Math.min(item.text.length, matchStart + query.length + 48);
+        results.push({
+          messageKey: item.messageKey,
+          cursor,
+          timestamp: item.timestamp ? new Date(item.timestamp).getTime() : 0,
+          snippet: `${contextStart > 0 ? '…' : ''}${item.text.slice(contextStart, contextEnd)}${contextEnd < item.text.length ? '…' : ''}`,
+          matchStart: matchStart - contextStart + (contextStart > 0 ? 1 : 0),
+          matchLength: query.length,
+          matchedText: item.text.slice(matchStart, matchStart + query.length),
+        });
+      }
+      globalTurnOffset += segment.index.turns.length;
+    }
+    return results;
+  }
+
+  async loadHistoryAt(cursor: string, pageSize: number): Promise<HistoryPage> {
+    const state = this.searchCursors.get(cursor);
+    if (!state) throw new Error('History search cursor expired');
+    return this.materializePage(state, pageSize);
+  }
+
+  async loadOlderHistory(cursor: string, pageSize: number): Promise<HistoryPage> {
+    const state = this.pageCursors.get(cursor);
+    if (!state) throw new Error('History cursor expired');
+    this.pageCursors.delete(cursor);
+    const startTurn = Math.max(0, state.endTurn - pageSize);
+    try {
+      return await this.materializePage({ ...state, endTurn: startTurn }, pageSize);
+    } catch (error) {
+      // A failed page must not burn the cursor: restore it so the pager's
+      // Retry replays this page instead of failing with "cursor expired".
+      this.pageCursors.set(cursor, state);
+      throw error;
+    }
+  }
+
+  async exportFullHistory(conversation: Conversation, vaultPath: string | null): Promise<ChatMessage[]> {
+    if (!vaultPath) return [...conversation.messages];
+    const state = getClaudeState(conversation.providerState);
+    const currentSessionId = state.providerSessionId ?? conversation.sessionId ?? state.forkSource?.sessionId;
+    if (!currentSessionId) return [...conversation.messages];
+    const sessionIds = [...(state.previousProviderSessionIds ?? []), currentSessionId];
+    const messages: ChatMessage[] = [];
+    for (const sessionId of sessionIds) {
+      if (!sdkSessionExists(vaultPath, sessionId)) continue;
+      const result = await buildTranscriptIndex(getSDKSessionPath(vaultPath, sessionId), {
+        resumeAtMessageId: sessionId === currentSessionId
+          ? (state.forkSource?.resumeAt ?? conversation.resumeAtMessageId)
+          : undefined,
+      });
+      if (result.status !== 'complete') throw new Error(result.error);
+      const native = await materializeTranscriptPage(result.index, 0, result.index.turns.length);
+      messages.push(...await materializeSDKMessages(vaultPath, sessionId, native));
+    }
+    return dedupeMessages(messages).sort((a, b) => a.timestamp - b.timestamp);
+  }
+
+  releaseHistory(conversationId: string): void {
+    const filePaths = this.protectedConversations.get(conversationId);
+    for (const filePath of filePaths?.split('\n') ?? []) releaseTranscriptIndex(filePath);
+    this.protectedConversations.delete(conversationId);
+    this.conversationIndexes.delete(conversationId);
+    clearTranscriptIndexCache();
+    for (const [cursor, state] of this.searchCursors) {
+      if (state.conversationId === conversationId) this.searchCursors.delete(cursor);
+    }
+    for (const [cursor, state] of this.pageCursors) {
+      if (state.conversationId === conversationId) this.pageCursors.delete(cursor);
+    }
+  }
+
+  private async materializePage(state: PageCursorState, pageSize: number): Promise<HistoryPage> {
+    const selected = state.flattenedTurns.slice(state.endTurn, state.endTurn + pageSize);
+    const messages: ChatMessage[] = [];
+    for (const segment of state.segments) {
+      const indexes = selected.filter(item => item.segment === segment).map(item => item.turnIndex);
+      if (indexes.length === 0) continue;
+      const native = await materializeTranscriptPage(segment.index, indexes[0], indexes.length);
+      const associations = await materializeTranscriptToolAssociations(segment.index, native);
+      messages.push(...await materializeSDKMessages(state.vaultPath, segment.sessionId, native, associations));
+    }
+    const hasMore = state.endTurn > 0;
+    const cursor = hasMore ? `claude-history:${++this.cursorSequence}` : null;
+    if (cursor) this.pageCursors.set(cursor, state);
+    const current = state.segments[state.segments.length - 1];
+    return {
+      messages: dedupeMessages(messages).sort((a, b) => a.timestamp - b.timestamp),
+      cursor,
+      hasMore,
+      snapshotOffset: current.index.snapshotSize,
+    };
   }
 
   async deleteConversationSession(

@@ -242,6 +242,8 @@ export class ClaudianService implements ChatRuntime {
   private transcriptObserver: ClaudeTranscriptTurnObserver | null = null;
   private transcriptObserverTarget: string | null = null;
   private transcriptObserverRestartChain: Promise<void> = Promise.resolve();
+  private transcriptObserverStartOffset: number | null = null;
+  private fullHistoryExporter: (() => Promise<ChatMessage[]>) | null = null;
   private transcriptDiagnosticLog: ClaudeTranscriptDiagnosticLog | null = null;
 
   // S1 turn-lease base: live turn registry keyed by turnId. All transform,
@@ -1680,8 +1682,11 @@ export class ClaudianService implements ChatRuntime {
     );
     const prompt = normalized.encodedTurn.prompt;
     const images = normalized.request.images;
-    const conversationHistory = normalized.conversationHistory;
+    let conversationHistory = normalized.conversationHistory;
     const queryOptions = normalized.queryOptions;
+    if (this.sessionManager.needsHistoryRebuild() && this.fullHistoryExporter) {
+      conversationHistory = await this.fullHistoryExporter();
+    }
 
     // v4 §2.1: the user turnId comes from the feature layer (PreparedChatTurn).
     // The runtime neither regenerates it nor accepts an empty/duplicate one.
@@ -2416,6 +2421,14 @@ export class ClaudianService implements ChatRuntime {
     // Runtime starts on demand when query() is called.
   }
 
+  setTranscriptObserverStartOffset(offset: number | null): void {
+    this.transcriptObserverStartOffset = offset;
+  }
+
+  setFullHistoryExporter(exporter: (() => Promise<ChatMessage[]>) | null): void {
+    this.fullHistoryExporter = exporter;
+  }
+
   private restartTranscriptObserver(sessionId: string | null): void {
     const vaultPath = getVaultPath(this.plugin.app);
     const ready = Boolean(sessionId && vaultPath && this._onAutoTurnStarted && this._onAutoTurnChunk && this._onAutoTurnFinished);
@@ -2438,7 +2451,9 @@ export class ClaudianService implements ChatRuntime {
       }, () => true, this.transcriptDiagnosticLog);
       this.transcriptObserver = observer;
       try {
-        await observer.start(target);
+        const fromOffset = this.transcriptObserverStartOffset ?? undefined;
+        this.transcriptObserverStartOffset = null;
+        await observer.start(target, fromOffset);
       } catch {
         observer.stop('start_failed');
         if (this.transcriptObserver === observer) this.transcriptObserver = null;

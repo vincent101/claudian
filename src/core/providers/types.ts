@@ -7,6 +7,7 @@ import type { HomeFileAdapter } from '../storage/HomeFileAdapter';
 import type { VaultFileAdapter } from '../storage/VaultFileAdapter';
 import type {
   AgentDefinition,
+  ChatMessage,
   Conversation,
   InstructionRefineResult,
   ManagedMcpServer,
@@ -381,11 +382,41 @@ export class ConversationHistoryHydrationError extends Error {
   }
 }
 
+export interface HistoryPage {
+  messages: ChatMessage[];
+  cursor: string | null;
+  hasMore: boolean;
+  snapshotOffset?: number;
+}
+
+export interface HistorySearchResult {
+  messageKey: string;
+  cursor: string;
+  timestamp: number;
+  snippet: string;
+  matchStart: number;
+  matchLength: number;
+  matchedText: string;
+}
+
 export interface ProviderConversationHistoryService {
   hydrateConversationHistory(
     conversation: Conversation,
     vaultPath: string | null,
   ): Promise<void | ConversationHistoryHydrationResult>;
+  loadInitialHistory?(
+    conversation: Conversation,
+    vaultPath: string | null,
+    pageSize: number,
+  ): Promise<HistoryPage>;
+  loadOlderHistory?(cursor: string, pageSize: number): Promise<HistoryPage>;
+  searchHistory?(conversation: Conversation, vaultPath: string | null, query: string): Promise<HistorySearchResult[]>;
+  loadHistoryAt?(cursor: string, pageSize: number): Promise<HistoryPage>;
+  exportFullHistory?(
+    conversation: Conversation,
+    vaultPath: string | null,
+  ): Promise<ChatMessage[]>;
+  releaseHistory?(conversationId: string): void;
   deleteConversationSession(
     conversation: Conversation,
     vaultPath: string | null,
