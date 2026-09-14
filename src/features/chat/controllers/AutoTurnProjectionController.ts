@@ -17,7 +17,10 @@ import {
 } from './StreamController';
 import type { TurnCoordinator } from './TurnCoordinator';
 
-const SAVE_SETTLE_TIMEOUT_MS = 5_000;
+// Initial values conservatively exceed measured 1–16 ms callback ticks; calibrate from smoke-test percentiles.
+const CALLBACK_CHUNK_TIMEOUT_MS = 1_000;
+const CALLBACK_FINALIZE_TIMEOUT_MS = 3_000;
+const CALLBACK_SAVE_TIMEOUT_MS = 5_000;
 
 interface AutoTurnProjectionControllerDeps {
   state: ChatState;
@@ -134,7 +137,16 @@ export class AutoTurnProjectionController {
     if (!active || !this.isCurrent(active, event.turnId, event.generation)) return;
     if (event.replay && this.isDuplicateReplayChunk(active, event)) return;
     active.context.renderTarget = this.deps.state.currentContentEl;
-    await this.deps.streamController.handleStreamChunk(event.chunk, active.context);
+    try {
+      await this.withTimeout(
+        this.deps.streamController.handleStreamChunk(event.chunk, active.context),
+        CALLBACK_CHUNK_TIMEOUT_MS,
+        'chunk_timeout',
+      );
+    } catch (error) {
+      this.abortActive(event.turnId, event.generation);
+      throw error;
+    }
     if (event.replay) {
       if (event.transcriptIdentity) active.replaySeenIdentities.add(event.transcriptIdentity);
       if (event.chunk.type === 'text') {
@@ -209,13 +221,22 @@ export class AutoTurnProjectionController {
     if (!active || !this.isCurrent(active, event.turnId, event.generation)) return;
 
     let completionError: unknown = null;
+    let timedOut = false;
     this.deps.recordDiagnostic?.({ phase: 'render_start', turnId: event.turnId, generation: event.generation, leaseKind: 'auto' });
     try {
       active.assistantMessage.assistantMessageId =
         event.metadata.assistantMessageId ?? active.assistantMessage.assistantMessageId;
       this.deps.streamController.hideThinkingIndicator();
-      await this.deps.streamController.finalizeCurrentThinkingBlock(active.assistantMessage, active.context);
-      await this.deps.streamController.finalizeCurrentTextBlock(active.assistantMessage, active.context);
+      await this.withTimeout(
+        this.deps.streamController.finalizeCurrentThinkingBlock(active.assistantMessage, active.context),
+        CALLBACK_FINALIZE_TIMEOUT_MS,
+        'finalize_timeout',
+      );
+      await this.withTimeout(
+        this.deps.streamController.finalizeCurrentTextBlock(active.assistantMessage, active.context),
+        CALLBACK_FINALIZE_TIMEOUT_MS,
+        'finalize_timeout',
+      );
       this.deps.recordDiagnostic?.({ phase: 'render_end', turnId: event.turnId, generation: event.generation, leaseKind: 'auto' });
       this.deps.state.hasPendingConversationSave = true;
       this.deps.recordDiagnostic?.({ phase: 'save_start', turnId: event.turnId, generation: event.generation, leaseKind: 'auto' });
@@ -226,13 +247,13 @@ export class AutoTurnProjectionController {
         await Promise.race([
           savePromise,
           new Promise<never>((_, reject) => {
-            timeout = setTimeout(() => reject(new Error('save_timeout')), SAVE_SETTLE_TIMEOUT_MS);
+            timeout = setTimeout(() => reject(new Error('save_timeout')), CALLBACK_SAVE_TIMEOUT_MS);
           }),
         ]);
         this.deps.recordDiagnostic?.({ phase: 'save_end', turnId: event.turnId, generation: event.generation, leaseKind: 'auto' });
       } catch (error) {
         completionError = error;
-        const timedOut = error instanceof Error && error.message === 'save_timeout';
+        timedOut = error instanceof Error && error.message === 'save_timeout';
         if (timedOut) {
           savePromise.finally(() => { this.deps.state.hasPendingConversationSave = true; }).catch(() => {});
         }
@@ -249,15 +270,20 @@ export class AutoTurnProjectionController {
       }
     } catch (error) {
       completionError ??= error;
+      timedOut = error instanceof Error && error.message === 'finalize_timeout';
     } finally {
-      try {
-        this.deps.streamController.resetStreamingState();
-      } catch {
-        // Lease release must survive cleanup failures.
+      if (timedOut) {
+        this.abortActive(event.turnId, event.generation);
+      } else {
+        try {
+          this.deps.streamController.resetStreamingState();
+        } catch {
+          // Lease release must survive cleanup failures.
+        }
+        this.active = null;
+        this.deps.turnCoordinator.finish(event.turnId);
+        this.deps.recordDiagnostic?.({ phase: 'lease_finish', turnId: event.turnId, generation: event.generation, leaseKind: 'auto' });
       }
-      this.active = null;
-      this.deps.turnCoordinator.finish(event.turnId);
-      this.deps.recordDiagnostic?.({ phase: 'lease_finish', turnId: event.turnId, generation: event.generation, leaseKind: 'auto' });
     }
     if (completionError) {
       try {
@@ -287,6 +313,32 @@ export class AutoTurnProjectionController {
   invalidate(): void {
     this.deps.streamController.invalidateRenderFlush();
     this.active = null;
+  }
+
+  private abortActive(turnId: string, generation: number): void {
+    this.deps.streamController.invalidateRenderFlush();
+    try {
+      this.deps.streamController.resetStreamingState();
+    } catch {
+      // Lease cancellation must survive cleanup failures.
+    }
+    this.active = null;
+    this.deps.turnCoordinator.cancelAutoTurn(turnId, generation + 1);
+  }
+
+  private async withTimeout<T>(promise: Promise<T>, timeoutMs: number, reason: string): Promise<T> {
+    void promise.catch(() => {});
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    try {
+      return await Promise.race([
+        promise,
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(() => reject(new Error(reason)), timeoutMs);
+        }),
+      ]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
   }
 
   private isCurrent(active: AutoProjection, turnId: string, generation: number): boolean {

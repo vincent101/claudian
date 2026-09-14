@@ -7,6 +7,7 @@ import type ClaudianPlugin from '@/main';
 import { ClaudianService } from '@/providers/claude/runtime/ClaudeChatRuntime';
 import { MessageChannel } from '@/providers/claude/runtime/ClaudeMessageChannel';
 import { createResponseHandler, createRuntimeTurn } from '@/providers/claude/runtime/types';
+import { ClaudeTranscriptTurnObserver } from '@/providers/claude/transcript/ClaudeTranscriptTurnObserver';
 import * as envUtils from '@/utils/env';
 import * as sessionUtils from '@/utils/session';
 
@@ -1169,6 +1170,55 @@ describe('ClaudianService', () => {
       await (service as any).routeMessage(message);
 
       expect(service.getSessionId()).toBe('new-session-42');
+    });
+
+    it('keeps the same transcript observer across repeated session_init for one path', async () => {
+      jest.spyOn(ClaudeTranscriptTurnObserver.prototype, 'start').mockResolvedValue(undefined);
+      const stop = jest.spyOn(ClaudeTranscriptTurnObserver.prototype, 'stop');
+      service.setOnAutoTurnStarted(() => true);
+      service.setOnAutoTurnChunk(async () => {});
+      service.setOnAutoTurnFinished(async () => {});
+      await (service as any).transcriptObserverRestartChain;
+      const first = (service as any).transcriptObserver;
+
+      await (service as any).routeMessage({ type: 'system', subtype: 'init', session_id: 'same-session' });
+      await (service as any).transcriptObserverRestartChain;
+      const afterFirstInit = (service as any).transcriptObserver;
+      const mapper = afterFirstInit.mapper;
+      mapper.map({ type: 'user', uuid: 'peer-real-shape', origin: { kind: 'peer', body: 'fixture' }, message: { role: 'user', content: 'fixture' } });
+      mapper.map({ type: 'assistant', uuid: 'thinking-row', message: { id: 'shared-id', role: 'assistant', content: [{ type: 'thinking', thinking: 'thinking' }], stop_reason: 'end_turn' } });
+
+      await (service as any).routeMessage({ type: 'system', subtype: 'init', session_id: 'same-session' });
+      await (service as any).transcriptObserverRestartChain;
+      const textEvents = mapper.map({ type: 'assistant', uuid: 'text-row', message: { id: 'shared-id', role: 'assistant', content: [{ type: 'text', text: 'answer' }], stop_reason: 'end_turn' } });
+      const settled = mapper.settleTerminalCandidate();
+
+      expect(afterFirstInit).not.toBe(first);
+      expect((service as any).transcriptObserver).toBe(afterFirstInit);
+      expect(textEvents.some((event: any) => event.type === 'chunk' && event.event.chunk.type === 'text')).toBe(true);
+      expect(settled.filter((event: any) => event.type === 'finished')).toHaveLength(1);
+      expect(stop).not.toHaveBeenCalled();
+    });
+
+    it('retries the same transcript observer target after start fails', async () => {
+      const start = jest.spyOn(ClaudeTranscriptTurnObserver.prototype, 'start')
+        .mockRejectedValueOnce(new Error('transient start failure'))
+        .mockResolvedValueOnce(undefined);
+      service.setOnAutoTurnStarted(() => true);
+      service.setOnAutoTurnChunk(async () => {});
+      service.setOnAutoTurnFinished(async () => {});
+      service.setSessionId('retry-session');
+      await (service as any).transcriptObserverRestartChain;
+
+      expect((service as any).transcriptObserver).toBeNull();
+      expect((service as any).transcriptObserverTarget).toBeNull();
+
+      await (service as any).routeMessage({ type: 'system', subtype: 'init', session_id: 'retry-session' });
+      await (service as any).transcriptObserverRestartChain;
+
+      expect(start).toHaveBeenCalledTimes(2);
+      expect((service as any).transcriptObserver).not.toBeNull();
+      expect((service as any).transcriptObserverTarget).toContain('retry-session.jsonl');
     });
 
     it('should route stream chunks to handler', async () => {

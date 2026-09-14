@@ -240,6 +240,8 @@ export class ClaudianService implements ChatRuntime {
    */
   private _onUnregisteredTurnDequeued: ((turnId: string) => void) | null = null;
   private transcriptObserver: ClaudeTranscriptTurnObserver | null = null;
+  private transcriptObserverTarget: string | null = null;
+  private transcriptObserverRestartChain: Promise<void> = Promise.resolve();
   private transcriptDiagnosticLog: ClaudeTranscriptDiagnosticLog | null = null;
 
   // S1 turn-lease base: live turn registry keyed by turnId. All transform,
@@ -2415,21 +2417,39 @@ export class ClaudianService implements ChatRuntime {
   }
 
   private restartTranscriptObserver(sessionId: string | null): void {
-    this.transcriptObserver?.stop('session_switch');
-    this.transcriptObserver = null;
     const vaultPath = getVaultPath(this.plugin.app);
-    if (!sessionId || !vaultPath || !this._onAutoTurnStarted || !this._onAutoTurnChunk || !this._onAutoTurnFinished) return;
-    this.transcriptDiagnosticLog ??= new ClaudeTranscriptDiagnosticLog(vaultPath, message => { new Notice(message); });
-    const observer = new ClaudeTranscriptTurnObserver({
-      started: event => this._onAutoTurnStarted?.(event) !== false,
-      chunk: event => this._onAutoTurnChunk?.(event) ?? Promise.resolve(),
-      finished: event => this._onAutoTurnFinished?.(event) ?? Promise.resolve(),
-      released: turnId => this._onAutoTurnReleased?.(turnId),
-      cancelled: event => this._onAutoTurnCancelled?.(event),
-      projectEmbeddedExternal: event => this._onEmbeddedExternal?.(event) ?? Promise.resolve(),
-    }, () => true, this.transcriptDiagnosticLog);
-    this.transcriptObserver = observer;
-    void observer.start(getSDKSessionPath(vaultPath, sessionId));
+    const ready = Boolean(sessionId && vaultPath && this._onAutoTurnStarted && this._onAutoTurnChunk && this._onAutoTurnFinished);
+    const target = ready ? getSDKSessionPath(vaultPath!, sessionId!) : null;
+    if (target === this.transcriptObserverTarget && (target === null || this.transcriptObserver)) return;
+    this.transcriptObserverTarget = target;
+    this.transcriptObserverRestartChain = this.transcriptObserverRestartChain.then(async () => {
+      if (target !== this.transcriptObserverTarget) return;
+      this.transcriptObserver?.stop('session_switch');
+      this.transcriptObserver = null;
+      if (!target || !vaultPath) return;
+      this.transcriptDiagnosticLog ??= new ClaudeTranscriptDiagnosticLog(vaultPath, message => { new Notice(message); });
+      const observer = new ClaudeTranscriptTurnObserver({
+        started: event => this._onAutoTurnStarted?.(event) !== false,
+        chunk: event => this._onAutoTurnChunk?.(event) ?? Promise.resolve(),
+        finished: event => this._onAutoTurnFinished?.(event) ?? Promise.resolve(),
+        released: turnId => this._onAutoTurnReleased?.(turnId),
+        cancelled: event => this._onAutoTurnCancelled?.(event),
+        projectEmbeddedExternal: event => this._onEmbeddedExternal?.(event) ?? Promise.resolve(),
+      }, () => true, this.transcriptDiagnosticLog);
+      this.transcriptObserver = observer;
+      try {
+        await observer.start(target);
+      } catch {
+        observer.stop('start_failed');
+        if (this.transcriptObserver === observer) this.transcriptObserver = null;
+        if (this.transcriptObserverTarget === target) this.transcriptObserverTarget = null;
+        return;
+      }
+      if (target !== this.transcriptObserverTarget && this.transcriptObserver === observer) {
+        observer.stop('session_switch');
+        this.transcriptObserver = null;
+      }
+    });
   }
 
   /**
@@ -2437,6 +2457,7 @@ export class ClaudianService implements ChatRuntime {
    * Called on plugin unload to close persistent query and abort any cold-start query.
    */
   cleanup() {
+    this.transcriptObserverTarget = null;
     this.transcriptObserver?.stop('plugin_cleanup');
     this.transcriptObserver = null;
     // Close persistent query

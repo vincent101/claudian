@@ -11,6 +11,9 @@ import { ClaudeTranscriptTailReader, type TranscriptTailBatch } from './ClaudeTr
 import { ClaudeTranscriptTurnMapper, type TranscriptTurnEvent } from './ClaudeTranscriptTurnMapper';
 
 const RECOVERY_BYTES = 4 * 1024 * 1024;
+// Initial values conservatively exceed measured 1–16 ms callback ticks; calibrate from smoke-test percentiles.
+const CALLBACK_CHUNK_TIMEOUT_MS = 1_000;
+const QUIET_SETTLE_MS = 2_000;
 
 export interface ClaudeTranscriptObserverCallbacks {
   started: (event: AutoTurnStartedEvent) => boolean;
@@ -36,6 +39,7 @@ export class ClaudeTranscriptTurnObserver {
   private embeddedQueue: AutoTurnStartedEvent[] = [];
   private hostUserTurnId: string | null = null;
   private consumeChain: Promise<void> = Promise.resolve();
+  private quietTimer: ReturnType<typeof setTimeout> | null = null;
   private stopped = true;
 
   constructor(
@@ -69,6 +73,8 @@ export class ClaudeTranscriptTurnObserver {
     this.generation += 1;
     this.reader?.stop();
     this.reader = null;
+    if (this.quietTimer) clearTimeout(this.quietTimer);
+    this.quietTimer = null;
     this.abandonActiveTurn(reason);
     this.queue = [];
     this.embeddedQueue = [];
@@ -120,11 +126,18 @@ export class ClaudeTranscriptTurnObserver {
       }
       return;
     }
+    if (this.quietTimer) clearTimeout(this.quietTimer);
+    this.quietTimer = null;
     for (const line of batch.lines) {
       for (const event of this.mapper.mapLine(line, false, { hostUserTurnActive: this.hostUserTurnId !== null })) {
         this.diagnostics?.record({ phase: 'map', generation, turnIdHash: this.diagnostics.hashId(event.event.turnId) });
         this.enqueue(event);
       }
+    }
+    if (this.mapper.hasTerminalCandidate()) {
+      this.quietTimer = setTimeout(() => {
+        void this.enqueueConsume(() => this.settleQuietCandidate(generation));
+      }, QUIET_SETTLE_MS);
     }
     if (promote) await this.promote();
     await this.drainActive();
@@ -141,6 +154,13 @@ export class ClaudeTranscriptTurnObserver {
     if (event.type === 'started') {
       const pending = { started: event.event, events: [], promoted: false };
       this.queue.push(pending);
+      return;
+    }
+    if (event.type === 'interrupted') {
+      const pending = this.active?.started.turnId === event.event.turnId
+        ? this.active
+        : this.queue.find(item => item.started.turnId === event.event.turnId);
+      if (pending) pending.events.push(event);
       return;
     }
     const turnId = event.event.turnId;
@@ -186,12 +206,20 @@ export class ClaudeTranscriptTurnObserver {
     try {
       while (pending.events.length > 0 && this.active === pending) {
         const event = pending.events.shift()!;
-        if (event.type === 'chunk') await this.callbacks.chunk(event.event);
+        if (event.type === 'chunk') {
+          await this.withTimeout(this.callbacks.chunk(event.event), CALLBACK_CHUNK_TIMEOUT_MS, 'chunk_timeout');
+        }
+        if (event.type === 'interrupted') {
+          this.callbacks.cancelled(event.event);
+          this.active = null;
+          this.callbacks.released(event.event.turnId);
+          await this.promote();
+        }
         if (event.type === 'finished') {
           await this.callbacks.finished(event.event);
           this.active = null;
-          await this.promote();
           this.callbacks.released(event.event.turnId);
+          await this.promote();
         }
       }
     } catch (error) {
@@ -200,13 +228,36 @@ export class ClaudeTranscriptTurnObserver {
         this.callbacks.cancelled({
           turnId: pending.started.turnId,
           generation: pending.started.generation + 1,
-          reason: error instanceof Error ? error.name : 'callback_error',
+          reason: error instanceof Error ? error.message : 'callback_error',
           interrupted: true,
         });
         this.active = null;
         this.callbacks.released(pending.started.turnId);
         await this.promote();
       }
+    }
+  }
+
+  private async settleQuietCandidate(generation: number): Promise<void> {
+    if (generation !== this.generation || this.stopped) return;
+    this.quietTimer = null;
+    for (const event of this.mapper.settleTerminalCandidate()) this.enqueue(event);
+    await this.promote();
+    await this.drainActive();
+  }
+
+  private async withTimeout(promise: Promise<void>, timeoutMs: number, reason: string): Promise<void> {
+    void promise.catch(() => {});
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    try {
+      await Promise.race([
+        promise,
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(() => reject(new Error(reason)), timeoutMs);
+        }),
+      ]);
+    } finally {
+      if (timer) clearTimeout(timer);
     }
   }
 
@@ -249,6 +300,7 @@ export class ClaudeTranscriptTurnObserver {
     if (boundary < 0 || generation !== this.generation) return info.size;
     const shadow = new ClaudeTranscriptTurnMapper(generation);
     const events = lines.slice(boundary).flatMap(line => shadow.mapLine(line, true));
+    events.push(...shadow.settleTerminalCandidate(true));
     if (shadow.hasOpenTurn()) {
       for (const event of events) this.enqueue(event);
       await this.promote();

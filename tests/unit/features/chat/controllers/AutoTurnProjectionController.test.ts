@@ -235,6 +235,33 @@ describe('AutoTurnProjectionController', () => {
     jest.useRealTimers();
   });
 
+  it('times out a never-settling chunk and invalidates the render flush', async () => {
+    jest.useFakeTimers();
+    const { controller, turnCoordinator, streamController, handleStreamChunk } = setup();
+    handleStreamChunk.mockImplementationOnce(() => new Promise(() => {}));
+    controller.started({ turnId: 'auto-chunk-timeout', generation: 0, source: { kind: 'assistant-continuation' } });
+    const chunk = controller.chunk({ turnId: 'auto-chunk-timeout', generation: 0, chunk: { type: 'text', content: 'stuck' } });
+    const rejected = expect(chunk).rejects.toThrow('chunk_timeout'); // eslint-disable-line jest/valid-expect
+    await jest.advanceTimersByTimeAsync(1_000);
+    await rejected;
+    expect(streamController.invalidateRenderFlush).toHaveBeenCalled();
+    expect(turnCoordinator.isBusy()).toBe(false);
+    jest.useRealTimers();
+  });
+
+  it('times out never-settling finalization after three seconds and releases', async () => {
+    jest.useFakeTimers();
+    const { controller, turnCoordinator, streamController } = setup();
+    streamController.finalizeCurrentThinkingBlock.mockImplementationOnce(() => new Promise(() => {}));
+    controller.started({ turnId: 'auto-finalize-timeout', generation: 0, source: { kind: 'assistant-continuation' } });
+    const finished = controller.finished({ turnId: 'auto-finalize-timeout', generation: 0, metadata: {} });
+    await jest.advanceTimersByTimeAsync(3_000);
+    await finished;
+    expect(streamController.invalidateRenderFlush).toHaveBeenCalled();
+    expect(turnCoordinator.isBusy()).toBe(false);
+    jest.useRealTimers();
+  });
+
   it('finishes without deadlocking when finalization rejects', async () => {
     const { controller, state, turnCoordinator, streamController, notify } = setup();
     streamController.finalizeCurrentThinkingBlock.mockRejectedValueOnce(new Error('render failed'));

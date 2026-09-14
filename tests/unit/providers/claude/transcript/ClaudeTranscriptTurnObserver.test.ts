@@ -10,7 +10,10 @@ function peerTurn(id: string, text: string, complete = true): string[] {
     JSON.stringify({ type: 'user', uuid: id, origin: { kind: 'peer', body: text }, message: { role: 'user', content: text } }),
     JSON.stringify({ type: 'assistant', uuid: `${id}-a1`, message: { id: `${id}-m1`, role: 'assistant', content: [{ type: 'text', text: 'working' }], stop_reason: 'tool_use' } }),
   ];
-  if (complete) lines.push(JSON.stringify({ type: 'assistant', uuid: `${id}-a2`, message: { id: `${id}-m2`, role: 'assistant', content: [{ type: 'text', text: 'done' }], stop_reason: 'end_turn' } }));
+  if (complete) {
+    lines.push(JSON.stringify({ type: 'assistant', uuid: `${id}-a2`, message: { id: `${id}-m2`, role: 'assistant', content: [{ type: 'text', text: 'done' }], stop_reason: 'end_turn' } }));
+    lines.push(JSON.stringify({ type: 'system', subtype: 'stop_hook_summary', uuid: `${id}-stop` }));
+  }
   return lines;
 }
 
@@ -103,14 +106,49 @@ describe('ClaudeTranscriptTurnObserver', () => {
       'chunk:peer-1:text',
       'chunk:peer-1:text',
       'finish:peer-1',
+      'release:peer-1',
       'start:peer-2',
       'chunk:peer-2:text',
       'chunk:peer-2:text',
       'finish:peer-2',
       'release:peer-2',
-      'release:peer-1',
     ]);
     observer.stop();
+  });
+
+  it('releases turn A before promoting turn B', async () => {
+    const { observer, order } = setup();
+    await writeFile(file, '');
+    await observer.start(file);
+    const generation = (observer as any).generation;
+    await (observer as any).consumeBatch({
+      lines: [...peerTurn('peer-a', 'one'), ...peerTurn('peer-b', 'two')],
+      reset: false,
+    }, generation);
+    await (observer as any).settleQuietCandidate(generation);
+    expect(order.indexOf('release:peer-a')).toBeLessThan(order.indexOf('start:peer-b'));
+    observer.stop();
+  });
+
+  it('times out a stuck chunk callback, releases, and continues the next turn', async () => {
+    jest.useFakeTimers();
+    const { observer, callbacks, order } = setup();
+    callbacks.chunk.mockImplementationOnce(() => new Promise(() => {}));
+    await writeFile(file, '');
+    await observer.start(file);
+    const generation = (observer as any).generation;
+    const consuming = (observer as any).consumeBatch({
+      lines: [...peerTurn('peer-stuck', 'stuck'), ...peerTurn('peer-next', 'next')],
+      reset: false,
+    }, generation);
+    await jest.advanceTimersByTimeAsync(1_000);
+    await consuming;
+    await (observer as any).settleQuietCandidate(generation);
+    expect(callbacks.cancelled).toHaveBeenCalledWith(expect.objectContaining({ turnId: 'peer-stuck' }));
+    expect(order).toContain('release:peer-stuck');
+    expect(order).toContain('start:peer-next');
+    observer.stop();
+    jest.useRealTimers();
   });
 
   it('projects a mid-turn peer only as an embedded bubble after catch-up', async () => {

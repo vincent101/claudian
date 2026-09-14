@@ -1,4 +1,5 @@
 import type {
+  AutoTurnCancelledEvent,
   AutoTurnChunkEvent,
   AutoTurnFinishedEvent,
   AutoTurnSource,
@@ -13,7 +14,8 @@ export type TranscriptTurnEvent =
   | { type: 'started'; event: AutoTurnStartedEvent }
   | { type: 'embedded'; event: AutoTurnStartedEvent }
   | { type: 'chunk'; event: AutoTurnChunkEvent; identity: string }
-  | { type: 'finished'; event: AutoTurnFinishedEvent };
+  | { type: 'finished'; event: AutoTurnFinishedEvent }
+  | { type: 'interrupted'; event: AutoTurnCancelledEvent };
 
 export interface TranscriptMapContext {
   hostUserTurnActive: boolean;
@@ -36,6 +38,12 @@ function extractUserText(message: SDKNativeMessage): string | undefined {
     .join('\n')
     .trim();
   return text || undefined;
+}
+
+function isStopHookBlockFeedback(message: SDKNativeMessage): boolean {
+  if (message.type !== 'user' || message.isMeta !== true || message.userType !== 'external') return false;
+  const text = extractUserText(message);
+  return text?.startsWith('Stop hook feedback:') === true;
 }
 
 function unwrap(candidate: string, tag: 'cross-session-message' | 'agent-message'): string | null {
@@ -88,6 +96,9 @@ interface ActiveTurn {
   seen: Set<string>;
   runtimeTurn: ReturnType<typeof createRuntimeTurn>;
   assistantMessageId?: string;
+  currentAssistantMessageId?: string;
+  assistantInstanceInterrupted: boolean;
+  terminalCandidate: boolean;
 }
 
 export class ClaudeTranscriptTurnMapper {
@@ -112,8 +123,10 @@ export class ClaudeTranscriptTurnMapper {
 
   map(message: SDKNativeMessage, replay = false, context: TranscriptMapContext = { hostUserTurnActive: false }): TranscriptTurnEvent[] {
     if (message.isSidechain === true) return [];
+    const events: TranscriptTurnEvent[] = [];
     const start = classifyLeaselessTurnStart(message);
     if (start) {
+      if (this.active) events.push(...this.closeBeforeNextUser(replay));
       const startedEvent: AutoTurnStartedEvent = {
         turnId: start.turnId,
         generation: this.generation,
@@ -123,7 +136,7 @@ export class ClaudeTranscriptTurnMapper {
         replay,
       };
       if (context.hostUserTurnActive && start.showUser) {
-        return [{ type: 'embedded', event: startedEvent }];
+        return [...events, { type: 'embedded', event: startedEvent }];
       }
       this.active = {
         id: start.turnId,
@@ -132,15 +145,32 @@ export class ClaudeTranscriptTurnMapper {
         displayContent: start.displayContent,
         seen: new Set(),
         runtimeTurn: createRuntimeTurn({ id: start.turnId, kind: 'auto', phase: 'collecting' }),
+        assistantInstanceInterrupted: false,
+        terminalCandidate: false,
       };
-      return [{ type: 'started', event: startedEvent }];
+      return [...events, { type: 'started', event: startedEvent }];
     }
     const active = this.active;
-    if (!active) return [];
+    if (!active) return events;
 
-    const events: TranscriptTurnEvent[] = [];
+    const stopHookBlockFeedback = isStopHookBlockFeedback(message);
+    const assistantId = message.type === 'assistant' ? message.message?.id ?? message.uuid : undefined;
+    if (active.terminalCandidate && !stopHookBlockFeedback && (
+      (assistantId !== undefined && (
+        assistantId !== active.currentAssistantMessageId || active.assistantInstanceInterrupted
+      ))
+      || (message.type === 'system' && message.subtype === 'stop_hook_summary')
+    )) {
+      events.push(...this.finishActive(replay));
+      return events;
+    }
+
     const lineId = message.uuid ?? `${message.message?.id ?? message.type}:${message.parentUuid ?? ''}`;
-    if (message.type === 'assistant') active.assistantMessageId = message.message?.id ?? message.uuid ?? active.assistantMessageId;
+    if (message.type === 'assistant') {
+      active.currentAssistantMessageId = assistantId;
+      active.assistantInstanceInterrupted = false;
+      active.assistantMessageId = assistantId ?? active.assistantMessageId;
+    }
     const sdkMessage = message as unknown as Parameters<typeof transformSDKMessage>[0];
     let blockIndex = 0;
     for (const chunk of transformSDKMessage(sdkMessage, {
@@ -160,22 +190,54 @@ export class ClaudeTranscriptTurnMapper {
       } });
     }
 
-    const complete = (message.type === 'assistant' && message.message?.stop_reason === 'end_turn')
-      || message.type === 'result';
-    if (complete) {
-      events.push({ type: 'finished', event: {
-        turnId: active.id,
-        generation: active.generation,
-        metadata: { assistantMessageId: active.assistantMessageId },
-        replay,
-      } });
-      this.active = null;
+    if (message.type === 'assistant' && message.message?.stop_reason === 'end_turn') {
+      active.terminalCandidate = true;
+    } else if (message.type === 'result') {
+      events.push(...this.finishActive(replay));
+    } else if (stopHookBlockFeedback) {
+      active.terminalCandidate = false;
+      active.assistantInstanceInterrupted = false;
+    } else if (message.type !== 'assistant') {
+      active.assistantInstanceInterrupted = true;
     }
     return events;
   }
 
+  settleTerminalCandidate(replay = false): TranscriptTurnEvent[] {
+    return this.active?.terminalCandidate ? this.finishActive(replay) : [];
+  }
+
   hasOpenTurn(): boolean {
     return this.active !== null;
+  }
+
+  hasTerminalCandidate(): boolean {
+    return this.active?.terminalCandidate === true;
+  }
+
+  private closeBeforeNextUser(replay: boolean): TranscriptTurnEvent[] {
+    if (!this.active) return [];
+    if (this.active.terminalCandidate) return this.finishActive(replay);
+    const active = this.active;
+    this.active = null;
+    return [{ type: 'interrupted', event: {
+      turnId: active.id,
+      generation: active.generation + 1,
+      reason: 'protocol_gap',
+      interrupted: true,
+    } }];
+  }
+
+  private finishActive(replay: boolean): TranscriptTurnEvent[] {
+    const active = this.active;
+    if (!active) return [];
+    this.active = null;
+    return [{ type: 'finished', event: {
+      turnId: active.id,
+      generation: active.generation,
+      metadata: { assistantMessageId: active.assistantMessageId },
+      replay,
+    } }];
   }
 }
 
