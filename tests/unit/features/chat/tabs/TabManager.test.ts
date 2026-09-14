@@ -1,7 +1,10 @@
 import { createMockEl } from '@test/helpers/mockElement';
 
+import { ProviderRegistry } from '@/core/providers/ProviderRegistry';
 import { ProviderWorkspaceRegistry } from '@/core/providers/ProviderWorkspaceRegistry';
 import { ConversationHistoryHydrationError } from '@/core/providers/types';
+import { ConversationController } from '@/features/chat/controllers/ConversationController';
+import { ChatState } from '@/features/chat/state/ChatState';
 import { TabManager } from '@/features/chat/tabs/TabManager';
 import {
   DEFAULT_MAX_TABS,
@@ -17,7 +20,17 @@ const mockActivateTab = jest.fn();
 const mockDeactivateTab = jest.fn();
 const mockInitializeTabUI = jest.fn();
 const mockInitializeTabControllers = jest.fn();
-const mockInitializeTabService = jest.fn().mockResolvedValue(undefined);
+// Faithful to the real initializeTabService: without a conversation override
+// it re-fetches via plugin.getConversationById, which re-throws the oversize
+// hydration error for a paged (M3) conversation. Resolving unconditionally
+// here hid the restore-path regression this suite now guards against.
+const mockInitializeTabService = jest.fn().mockImplementation(
+  async (tab: any, plugin: any, conversationOverride?: any) => {
+    return conversationOverride ?? (
+      tab.conversationId ? await plugin.getConversationById(tab.conversationId) : null
+    );
+  },
+);
 const mockSetupServiceCallbacks = jest.fn();
 const mockRenderTabHydrationPlaceholder = jest.fn();
 const mockCleanupTabRuntime = jest.fn(
@@ -155,6 +168,67 @@ async function flushMicrotasks(count = 4): Promise<void> {
   for (let i = 0; i < count; i++) {
     await Promise.resolve();
   }
+}
+
+/**
+ * Wires a real ConversationController (real ChatState) so hydration tests can
+ * exercise the actual loadActive chain — including the oversize paged branch —
+ * instead of a mock that only resembles it.
+ */
+function createRealConversationControllerHarness(plugin: any): {
+  controller: ConversationController;
+  state: ChatState;
+} {
+  const state = new ChatState();
+  const inputEl = { value: '', focus: jest.fn() } as unknown as HTMLTextAreaElement;
+  let welcomeEl: any = createMockEl();
+
+  const controller = new ConversationController({
+    plugin,
+    state,
+    renderer: {
+      renderMessages: jest.fn().mockReturnValue(createMockEl()),
+      renderHistoryPager: jest.fn(),
+      prependMessages: jest.fn(),
+      findMessageElement: jest.fn(),
+      highlightSearchMatch: jest.fn(),
+    } as any,
+    subagentManager: {
+      orphanAllActive: jest.fn(),
+      clear: jest.fn(),
+    } as any,
+    getHistoryDropdown: () => null,
+    getWelcomeEl: () => welcomeEl,
+    setWelcomeEl: (el) => { welcomeEl = el; },
+    getMessagesEl: () => createMockEl(),
+    getInputEl: () => inputEl,
+    getFileContextManager: () => ({
+      resetForNewConversation: jest.fn(),
+      resetForLoadedConversation: jest.fn(),
+      autoAttachActiveFile: jest.fn(),
+      setCurrentNote: jest.fn(),
+      getCurrentNotePath: jest.fn().mockReturnValue(null),
+    }) as any,
+    getImageContextManager: () => ({ clearImages: jest.fn() }) as any,
+    getMcpServerSelector: () => ({
+      clearEnabled: jest.fn(),
+      getEnabledServers: jest.fn().mockResolvedValue(new Set()),
+      setEnabledServers: jest.fn(),
+    }) as any,
+    getExternalContextSelector: () => ({
+      getExternalContexts: jest.fn().mockReturnValue([]),
+      setExternalContexts: jest.fn(),
+      clearExternalContexts: jest.fn(),
+    }) as any,
+    clearQueuedMessage: jest.fn(),
+    invalidateTurnLifecycle: jest.fn(),
+    getTitleGenerationService: () => null,
+    getStatusPanel: () => ({ remount: jest.fn() }) as any,
+    ensureServiceForConversation: jest.fn().mockResolvedValue(undefined),
+    dismissPendingInlinePrompts: jest.fn(),
+  });
+
+  return { controller, state };
 }
 
 function createMockTabData(overrides: Record<string, any> = {}): any {
@@ -369,7 +443,7 @@ describe('TabManager - Tab Lifecycle', () => {
       jest.useRealTimers();
 
       expect(hydrate).toHaveBeenCalledTimes(1);
-      expect(mockInitializeTabService).toHaveBeenCalledWith(tab, expect.anything());
+      expect(mockInitializeTabService).toHaveBeenCalledWith(tab, expect.anything(), null);
       expect(mockSetupServiceCallbacks).toHaveBeenCalledWith(tab, expect.anything());
       expect(tab?.hydrationState).toBe('READY');
     });
@@ -518,7 +592,7 @@ describe('TabManager - Tab Lifecycle', () => {
       jest.runAllTimers();
       await flushMicrotasks();
       // tab1 is suspended inside initializeTabService; the setup-time runtime exists.
-      expect(mockInitializeTabService).toHaveBeenCalledWith(tab1, expect.anything());
+      expect(mockInitializeTabService).toHaveBeenCalledWith(tab1, expect.anything(), null);
 
       const tab2 = await manager.createTab('conv-2', undefined, { activate: false });
       await manager.switchToTab(tab2!.id);
@@ -870,6 +944,153 @@ describe('TabManager - Tab Lifecycle', () => {
       expect(tab.serviceInitialized).toBe(false);
       // The shell guard reflects the non-READY binding.
       expect(hydrationHooks.isHydrationReady()).toBe(false);
+    });
+
+    it('materializes an oversize restored tab to READY through the shared loadActive chain', async () => {
+      // Restore path (restart → switchToTab → hydrateTab) must run the same
+      // M3 materialization entry the dropdown path uses: loadActive's oversize
+      // catch → loadInitialHistory(50) → READY with input enabled. The plugin
+      // re-throws oversize on every fetch, exactly like the real history
+      // service for an oversized transcript.
+      const oversizeError = new ConversationHistoryHydrationError({
+        status: 'oversize',
+        segments: [{ sessionId: 'large-session', sizeBytes: 96 * 1024 * 1024 }],
+      });
+      const storedConversation = {
+        id: 'large-conv',
+        providerId: 'claude',
+        title: 'Large',
+        sessionId: 'large-session',
+        messages: [],
+        createdAt: 1,
+        updatedAt: 1,
+      };
+      const loadInitialHistory = jest.fn().mockResolvedValue({
+        messages: [{ id: 'turn-50', role: 'user', content: 'latest', timestamp: 2 }],
+        cursor: 'opaque',
+        hasMore: true,
+        snapshotOffset: 4096,
+      });
+      const historyService = {
+        loadInitialHistory,
+        releaseHistory: jest.fn(),
+        exportFullHistory: jest.fn(),
+        buildForkProviderState: mockBuildForkProviderState,
+      };
+      const serviceSpy = jest.spyOn(ProviderRegistry, 'getConversationHistoryService')
+        .mockReturnValue(historyService as any);
+      const plugin = createMockPlugin({
+        app: {
+          workspace: { revealLeaf: jest.fn() },
+          vault: { adapter: { basePath: '/vault' } },
+        },
+        getConversationById: jest.fn().mockRejectedValue(oversizeError),
+        getConversationSync: jest.fn().mockReturnValue(storedConversation),
+        settings: { userName: '' },
+      });
+      const harness = createRealConversationControllerHarness(plugin);
+
+      try {
+        jest.useFakeTimers();
+        const manager = createManager({
+          callbacks,
+          plugin,
+          tabFactory: () => {
+            const tab = createMockTabData({
+              id: 'large-tab',
+              conversationId: 'large-conv',
+              hydrationState: 'SHELL',
+            });
+            tab.state = harness.state;
+            tab.controllers.conversationController = harness.controller;
+            return tab;
+          },
+        });
+
+        const tab = await manager.createTab('large-conv');
+        jest.runAllTimers();
+        await flushMicrotasks(10);
+        jest.useRealTimers();
+
+        expect(loadInitialHistory).toHaveBeenCalledWith(storedConversation, '/vault', 50);
+        expect(tab?.hydrationState).toBe('READY');
+        expect(tab?.dom.inputEl.disabled).toBe(false);
+        expect(tab?.state.messages.map((message: any) => message.id)).toEqual(['turn-50']);
+        expect(tab?.state.historyCursor).toBe('opaque');
+        // The stored conversation carries the materialized page so the tab
+        // service handoff and passive tab sync see the same view the tab
+        // renders (mirrors full hydration mutating the stored conversation).
+        expect(storedConversation.messages.map((message: any) => message.id)).toEqual(['turn-50']);
+      } finally {
+        serviceSpy.mockRestore();
+      }
+    });
+
+    it('keeps a retryable error placeholder when the restored oversize tab fails to index', async () => {
+      const oversizeError = new ConversationHistoryHydrationError({
+        status: 'oversize',
+        segments: [{ sessionId: 'large-session', sizeBytes: 96 * 1024 * 1024 }],
+      });
+      const storedConversation = {
+        id: 'large-conv',
+        providerId: 'claude',
+        title: 'Large',
+        sessionId: 'large-session',
+        messages: [],
+        createdAt: 1,
+        updatedAt: 1,
+      };
+      const loadInitialHistory = jest.fn()
+        .mockRejectedValue(new Error('index build failed: worker crashed'));
+      const serviceSpy = jest.spyOn(ProviderRegistry, 'getConversationHistoryService')
+        .mockReturnValue({
+          loadInitialHistory,
+          releaseHistory: jest.fn(),
+          buildForkProviderState: mockBuildForkProviderState,
+        } as any);
+      const plugin = createMockPlugin({
+        app: {
+          workspace: { revealLeaf: jest.fn() },
+          vault: { adapter: { basePath: '/vault' } },
+        },
+        getConversationById: jest.fn().mockRejectedValue(oversizeError),
+        getConversationSync: jest.fn().mockReturnValue(storedConversation),
+        settings: { userName: '' },
+      });
+      const harness = createRealConversationControllerHarness(plugin);
+
+      try {
+        jest.useFakeTimers();
+        const manager = createManager({
+          callbacks,
+          plugin,
+          tabFactory: () => {
+            const tab = createMockTabData({
+              id: 'large-tab',
+              conversationId: 'large-conv',
+              hydrationState: 'SHELL',
+            });
+            tab.state = harness.state;
+            tab.controllers.conversationController = harness.controller;
+            return tab;
+          },
+        });
+
+        const tab = await manager.createTab('large-conv');
+        jest.runAllTimers();
+        await flushMicrotasks(10);
+        jest.useRealTimers();
+
+        expect(loadInitialHistory).toHaveBeenCalledWith(storedConversation, '/vault', 50);
+        expect(tab?.hydrationState).toBe('ERROR');
+        expect(tab?.hydrationDiagnostic?.message).toBe('index build failed: worker crashed');
+        expect(tab?.dom.inputEl.disabled).toBe(true);
+        // The error placeholder stays retryable: re-entering the same chain.
+        const retry = mockRenderTabHydrationPlaceholder.mock.calls.at(-1)?.[1];
+        expect(retry).toEqual(expect.any(Function));
+      } finally {
+        serviceSpy.mockRestore();
+      }
     });
   });
 

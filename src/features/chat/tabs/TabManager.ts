@@ -373,13 +373,19 @@ export class TabManager implements TabManagerInterface {
       );
       if (this.isStaleHydration(tab, generation)) return;
 
-      // A hydrated Claude tab must own its runtime before becoming READY so
-      // transcript observation covers the idle period. Shell/blocked tabs
-      // never reach this point and therefore cannot start an observer.
-      await initializeTabService(tab, this.plugin);
+      // The conversation loadActive restored — fully hydrated for small
+      // transcripts or the materialized first page for oversize ones — is
+      // already this tab's view. Pass it as the initializeTabService override:
+      // letting that call re-fetch via getConversationById would re-run history
+      // hydration and re-throw the oversize error the paged path just handled,
+      // clobbering the materialized tab back to the blocked placeholder.
       const historyConversation = tab.conversationId
         ? this.plugin.getConversationSync(tab.conversationId)
         : null;
+      // A hydrated Claude tab must own its runtime before becoming READY so
+      // transcript observation covers the idle period. Shell/blocked tabs
+      // never reach this point and therefore cannot start an observer.
+      await initializeTabService(tab, this.plugin, historyConversation);
       const historyService = historyConversation
         ? ProviderRegistry.getConversationHistoryService(historyConversation.providerId)
         : null;

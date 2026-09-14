@@ -240,7 +240,12 @@ export class ConversationController {
           historyService.releaseHistory?.(conversation.id);
           return;
         }
-        conversation = { ...conversation, messages: page.messages };
+        // Write the page back into the stored conversation so every later
+        // reader (tab service init, passive tab sync) sees the materialized
+        // view the tab renders. Mirrors full hydration mutating the stored
+        // conversation in place; session metadata never persists messages,
+        // so this stays an in-memory view only.
+        conversation.messages = page.messages;
         paged = true;
         state.historyCursor = page.cursor;
         state.historyHasMore = page.hasMore;
