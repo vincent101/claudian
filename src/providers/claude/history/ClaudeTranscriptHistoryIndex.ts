@@ -310,6 +310,7 @@ function serializeWorkerFunction(fn: (...args: never[]) => unknown): string {
   // the worker source defines those helpers as locals, so normalize qualifiers.
   return fn.toString()
     .replace(/\bimport_[A-Za-z0-9_$]+\.([A-Za-z_$][\w$]*)/g, '$1')
+    .replace(/\bexports\.([A-Za-z_$][\w$]*)/g, '$1')
     .replace(/__name\([^;]+;?/g, '');
 }
 
@@ -317,6 +318,7 @@ function buildInWorker(filePath: string, options: BuildOptions): Promise<Transcr
   const source = `
     const { parentPort, workerData } = require('worker_threads');
     const import_promises = require('fs/promises');
+    const promises_1 = import_promises;
     const { open, stat } = import_promises;
     const DEFAULT_CHUNK_SIZE = ${DEFAULT_CHUNK_SIZE};
     const DEFAULT_MAX_LINE_BYTES = ${DEFAULT_MAX_LINE_BYTES};
@@ -333,6 +335,11 @@ function buildInWorker(filePath: string, options: BuildOptions): Promise<Transcr
     const finalizeIndex = (${serializeWorkerFunction(finalizeIndex)});
     const scanSnapshot = (${serializeWorkerFunction(scanSnapshot)});
     const buildDirect = (${serializeWorkerFunction(buildDirect)});
+    // ts-jest CJS output references imported symbols through module namespaces
+    // (name_1.symbol); alias them so the serialized sources resolve in both
+    // bundled and ts-jest shapes.
+    const externalUserMessage_1 = { extractUserText, unwrapExternalEnvelope, extractExternalDisplayContent, isDisplayableExternalUser, isRealUserMessage };
+    const sdkBranchFilter_1 = { filterActiveBranchEntries };
     const options = {
       ...workerData.options,
       onProgress: (bytesRead, snapshotSize) => parentPort.postMessage({ kind: 'progress', bytesRead, snapshotSize }),
@@ -360,6 +367,43 @@ function buildInWorker(filePath: string, options: BuildOptions): Promise<Transcr
 
 const requests = new Map<string, Promise<TranscriptIndexResult>>();
 
+export interface TranscriptIndexDiagnosticEvent {
+  phase: 'index_worker_fallback';
+  errorName: string;
+}
+
+type TranscriptIndexDiagnosticSink = (event: TranscriptIndexDiagnosticEvent) => void;
+let diagnosticSink: TranscriptIndexDiagnosticSink | null = null;
+
+export function setTranscriptIndexDiagnosticSink(sink: TranscriptIndexDiagnosticSink | null): void {
+  diagnosticSink = sink;
+}
+
+// Electron renderer processes run on a V8 platform without worker_threads support:
+// `new Worker` throws synchronously. Probe once per process; while unavailable, the
+// streaming main-thread path builds the index instead. Re-probing only happens after
+// a module reload, so future Electron support recovers without code changes.
+let workerAvailability: boolean | null = null;
+
+function probeWorkerAvailability(): boolean {
+  if (workerAvailability !== null) return workerAvailability;
+  try {
+    void new Worker('null', { eval: true }).terminate();
+    workerAvailability = true;
+  } catch (error) {
+    workerAvailability = false;
+    diagnosticSink?.({
+      phase: 'index_worker_fallback',
+      errorName: error instanceof Error ? error.name : 'UnknownError',
+    });
+  }
+  return workerAvailability;
+}
+
+export function resetTranscriptIndexWorkerProbe(): void {
+  workerAvailability = null;
+}
+
 export function buildTranscriptIndex(filePath: string, options: BuildOptions = {}): Promise<TranscriptIndexResult> {
   const requestKey = `${filePath}:${options.chunkSize ?? DEFAULT_CHUNK_SIZE}:${options.maxLineBytes ?? DEFAULT_MAX_LINE_BYTES}:${options.useWorker !== false}:${options.resumeAtMessageId ?? ''}`;
   const existingRequest = requests.get(requestKey);
@@ -372,7 +416,9 @@ export function buildTranscriptIndex(filePath: string, options: BuildOptions = {
     }
     const existing = inFlight.get(key);
     if (existing) return existing;
-    const build = options.useWorker === false ? buildDirect(filePath, options) : buildInWorker(filePath, options);
+    const build = options.useWorker === false || !probeWorkerAvailability()
+      ? buildDirect(filePath, options)
+      : buildInWorker(filePath, options);
     inFlight.set(key, build);
     void build.then(result => {
       inFlight.delete(key);

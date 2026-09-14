@@ -3,6 +3,7 @@
   "compilerOptions": {
     "ignoreDeprecations": "6.0",
     "module": "CommonJS",
-    "types": ["jest", "node"]
+    "types": ["jest", "node"],
+    "target": "ES2021"
   }
 }

@@ -6,7 +6,8 @@ export type TranscriptDiagnosticPhase =
   | 'tick_start' | 'tick_end' | 'map'
   | 'lease_begin' | 'lease_finish' | 'lease_release'
   | 'render_start' | 'render_end'
-  | 'save_start' | 'save_end' | 'save_timeout' | 'callback_error';
+  | 'save_start' | 'save_end' | 'save_timeout' | 'callback_error'
+  | 'index_worker_fallback';
 
 export interface TranscriptDiagnosticEvent {
   phase: TranscriptDiagnosticPhase;
@@ -31,10 +32,10 @@ export class ClaudeTranscriptDiagnosticLog {
   private disabled = false;
   private notified = false;
 
-  constructor(vaultPath: string, private readonly notify: (message: string) => void = () => {}) {
+  constructor(vaultPath: string, private readonly notify: (message: string) => void = () => {}, fileBase = 'transcript-tail') {
     const directory = join(vaultPath, '.claudian', 'diagnostics');
-    this.currentPath = join(directory, 'transcript-tail.current.jsonl');
-    this.previousPath = join(directory, 'transcript-tail.previous.jsonl');
+    this.currentPath = join(directory, `${fileBase}.current.jsonl`);
+    this.previousPath = join(directory, `${fileBase}.previous.jsonl`);
   }
 
   hashId(id: string): string {

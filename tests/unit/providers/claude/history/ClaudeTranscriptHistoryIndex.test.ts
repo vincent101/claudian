@@ -1,14 +1,38 @@
 import { readFile, writeFile } from 'fs/promises';
 import { join } from 'path';
+import type * as workerThreadsModule from 'worker_threads';
 
 import {
   buildTranscriptIndex,
   clearTranscriptIndexCache,
   getTranscriptIndexCacheSize,
   materializeTranscriptPage,
+  resetTranscriptIndexWorkerProbe,
+  setTranscriptIndexDiagnosticSink,
+  type TranscriptIndexDiagnosticEvent,
 } from '@/providers/claude/history/ClaudeTranscriptHistoryIndex';
 import { filterActiveBranch } from '@/providers/claude/history/sdkBranchFilter';
 import type { SDKNativeMessage } from '@/providers/claude/history/sdkHistoryTypes';
+
+let mockWorkerConstructorMode: 'real' | 'throw' | 'record' = 'real';
+const mockWorkerSources: string[] = [];
+
+jest.mock('worker_threads', () => {
+  const actual = jest.requireActual<typeof workerThreadsModule>('worker_threads');
+  const ActualWorker = actual.Worker;
+  return {
+    ...actual,
+    Worker: class extends ActualWorker {
+      constructor(...args: ConstructorParameters<typeof ActualWorker>) {
+        if (mockWorkerConstructorMode === 'throw') {
+          throw new TypeError("Failed to construct 'Worker': The V8 platform used by this instance of Node does not support creating Workers");
+        }
+        super(...args);
+        if (mockWorkerConstructorMode === 'record') mockWorkerSources.push(String(args[0]));
+      }
+    },
+  };
+});
 
 const fixtures = join(__dirname, '..', 'transcript', 'fixtures');
 
@@ -106,5 +130,49 @@ describe('ClaudeTranscriptHistoryIndex', () => {
     if (result.status === 'failed') throw new Error(result.error);
     expect(result.status).toBe('complete');
     expect(result.index.turns.map(turn => turn.turnId)).toEqual(['peer-a', 'peer-b']);
+  });
+});
+
+describe('ClaudeTranscriptHistoryIndex worker fallback', () => {
+  afterEach(() => {
+    mockWorkerConstructorMode = 'real';
+    mockWorkerSources.length = 0;
+    setTranscriptIndexDiagnosticSink(null);
+    resetTranscriptIndexWorkerProbe();
+  });
+
+  it('falls back to the main-thread path and records one fallback event when the worker constructor throws', async () => {
+    const events: TranscriptIndexDiagnosticEvent[] = [];
+    setTranscriptIndexDiagnosticSink(event => events.push(event));
+    mockWorkerConstructorMode = 'throw';
+    const first = join(process.env.TMPDIR ?? '/tmp', `claudian-fallback-${process.pid}-1.jsonl`);
+    await writeFile(first, `${JSON.stringify({ type: 'user', uuid: 'u1', message: { content: 'x' } })}\n`);
+    const result = await buildTranscriptIndex(first, {});
+    expect(result.status).toBe('complete');
+    if (result.status !== 'complete') return;
+    expect(result.index.entries.map(entry => entry.messageKey)).toEqual(['u1']);
+    expect(events).toEqual([{ phase: 'index_worker_fallback', errorName: 'TypeError' }]);
+
+    const second = join(process.env.TMPDIR ?? '/tmp', `claudian-fallback-${process.pid}-2.jsonl`);
+    await writeFile(second, `${JSON.stringify({ type: 'user', uuid: 'u2', message: { content: 'y' } })}\n`);
+    const again = await buildTranscriptIndex(second, {});
+    expect(again.status).toBe('complete');
+    expect(events).toHaveLength(1);
+    expect(mockWorkerSources).toHaveLength(0);
+  });
+
+  it('builds in a worker when the constructor probe succeeds', async () => {
+    mockWorkerConstructorMode = 'record';
+    const path = join(process.env.TMPDIR ?? '/tmp', `claudian-worker-probe-${process.pid}.jsonl`);
+    await writeFile(path, [
+      JSON.stringify({ type: 'user', uuid: 'u1', message: { content: 'hello' } }),
+      JSON.stringify({ type: 'assistant', uuid: 'a1', parentUuid: 'u1', message: { content: 'world' } }),
+    ].join('\n') + '\n');
+    const result = await buildTranscriptIndex(path, {});
+    expect(result.status).toBe('complete');
+    if (result.status !== 'complete') return;
+    expect(result.index.turns.map(turn => turn.turnId)).toEqual(['u1']);
+    expect(result.index.entries.map(entry => entry.messageKey)).toEqual(['u1', 'a1']);
+    expect(mockWorkerSources).toEqual(['null', expect.any(String)]);
   });
 });

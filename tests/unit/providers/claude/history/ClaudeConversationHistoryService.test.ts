@@ -14,6 +14,7 @@ jest.mock('@/providers/claude/history/ClaudeTranscriptHistoryIndex', () => ({
   materializeTranscriptToolAssociations: jest.fn(),
   protectTranscriptIndex: jest.fn(),
   releaseTranscriptIndex: jest.fn(),
+  setTranscriptIndexDiagnosticSink: jest.fn(),
 }));
 jest.mock('@/providers/claude/history/ClaudeHistoryStore', () => ({
   loadSDKSessionMessages: jest.fn(),

@@ -13,6 +13,7 @@ import type {
   SubagentInfo,
   ToolCallInfo,
 } from '../../../core/types';
+import { ClaudeTranscriptDiagnosticLog } from '../transcript/ClaudeTranscriptDiagnosticLog';
 import { type ClaudeProviderState, getClaudeState } from '../types/providerState';
 import {
   deleteSDKSession,
@@ -28,6 +29,7 @@ import {
   materializeTranscriptToolAssociations,
   protectTranscriptIndex,
   releaseTranscriptIndex,
+  setTranscriptIndexDiagnosticSink,
   type TranscriptHistoryIndex,
 } from './ClaudeTranscriptHistoryIndex';
 import { getSDKSessionPath } from './sdkSessionPaths';
@@ -346,6 +348,17 @@ export class ClaudeConversationHistoryService implements ProviderConversationHis
   private conversationIndexes = new Map<string, PageCursorState>();
   private protectedConversations = new Map<string, string>();
   private cursorSequence = 0;
+  private indexDiagnostics: ClaudeTranscriptDiagnosticLog | null = null;
+
+  // The index module probes worker_threads once per process; route its fallback
+  // event into a dedicated diagnostics file so worker degradation stays visible
+  // without surfacing anything in the UI.
+  private ensureIndexDiagnostics(vaultPath: string): void {
+    if (this.indexDiagnostics) return;
+    const diagnostics = new ClaudeTranscriptDiagnosticLog(vaultPath, () => {}, 'history-index');
+    this.indexDiagnostics = diagnostics;
+    setTranscriptIndexDiagnosticSink(event => diagnostics.record(event));
+  }
 
   isPendingForkConversation(conversation: Conversation): boolean {
     const state = getClaudeState(conversation.providerState);
@@ -395,6 +408,7 @@ export class ClaudeConversationHistoryService implements ProviderConversationHis
     if (!vaultPath || this.hydratedConversationIds.has(conversation.id)) {
       return { status: 'ready' };
     }
+    this.ensureIndexDiagnostics(vaultPath);
 
     const state = getClaudeState(conversation.providerState);
     const isPendingFork = this.isPendingForkConversation(conversation);
@@ -489,6 +503,7 @@ export class ClaudeConversationHistoryService implements ProviderConversationHis
     pageSize: number,
   ): Promise<HistoryPage> {
     if (!vaultPath) throw new Error('Vault path is unavailable');
+    this.ensureIndexDiagnostics(vaultPath);
     const state = getClaudeState(conversation.providerState);
     const currentSessionId = state.providerSessionId ?? conversation.sessionId ?? state.forkSource?.sessionId;
     if (!currentSessionId) throw new Error('Conversation has no Claude session');
@@ -578,6 +593,7 @@ export class ClaudeConversationHistoryService implements ProviderConversationHis
 
   async exportFullHistory(conversation: Conversation, vaultPath: string | null): Promise<ChatMessage[]> {
     if (!vaultPath) return [...conversation.messages];
+    this.ensureIndexDiagnostics(vaultPath);
     const state = getClaudeState(conversation.providerState);
     const currentSessionId = state.providerSessionId ?? conversation.sessionId ?? state.forkSource?.sessionId;
     if (!currentSessionId) return [...conversation.messages];
