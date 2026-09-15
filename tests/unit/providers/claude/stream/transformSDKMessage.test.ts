@@ -1409,6 +1409,162 @@ describe('transformSDKMessage', () => {
 
       expect(results).toEqual([]);
     });
+
+    describe('fable alias resolution via session init', () => {
+      const multiEntryUsage = {
+        'claude-haiku-4-5-20251001': {
+          inputTokens: 1000,
+          outputTokens: 300,
+          cacheReadInputTokens: 0,
+          cacheCreationInputTokens: 0,
+          webSearchRequests: 0,
+          costUSD: 0.01,
+          contextWindow: 200000,
+          maxOutputTokens: 32000,
+        },
+        'claude-opus[1m]': {
+          inputTokens: 1000,
+          outputTokens: 300,
+          cacheReadInputTokens: 0,
+          cacheCreationInputTokens: 0,
+          webSearchRequests: 0,
+          costUSD: 0.01,
+          contextWindow: 1000000,
+          maxOutputTokens: 32000,
+        },
+      };
+
+      it('matches the SDK-resolved model from system/init over the intended alias', () => {
+        const usageState = createTransformUsageState();
+        const initMessage = msg({
+          type: 'system',
+          subtype: 'init',
+          session_id: 'test-session',
+          model: 'claude-opus[1m]',
+        });
+        const initEvents = [...transformSDKMessage(initMessage, { intendedModel: 'fable', usageState })];
+        expect(initEvents).toHaveLength(1);
+
+        const resultMessage = msg({
+          type: 'result',
+          modelUsage: multiEntryUsage,
+        });
+        const results = [...transformSDKMessage(resultMessage, { intendedModel: 'fable', usageState })];
+
+        expect(results).toEqual([{ type: 'context_window', contextWindow: 1000000 }]);
+      });
+
+      it('matches the resolved model through normalization when only casing differs', () => {
+        const usageState = createTransformUsageState();
+        const initMessage = msg({
+          type: 'system',
+          subtype: 'init',
+          session_id: 'test-session',
+          model: 'claude-opus[1M]',
+        });
+        const initEvents = [...transformSDKMessage(initMessage, { intendedModel: 'fable', usageState })];
+        expect(initEvents).toHaveLength(1);
+
+        const resultMessage = msg({
+          type: 'result',
+          modelUsage: multiEntryUsage,
+        });
+        const results = [...transformSDKMessage(resultMessage, { intendedModel: 'fable', usageState })];
+
+        expect(results).toEqual([{ type: 'context_window', contextWindow: 1000000 }]);
+      });
+
+      it('falls back to fable family matching without init', () => {
+        const resultMessage = msg({
+          type: 'result',
+          modelUsage: {
+            'claude-haiku-4-5-20251001': {
+              inputTokens: 1000,
+              outputTokens: 300,
+              cacheReadInputTokens: 0,
+              cacheCreationInputTokens: 0,
+              webSearchRequests: 0,
+              costUSD: 0.01,
+              contextWindow: 200000,
+              maxOutputTokens: 32000,
+            },
+            'claude-fable-5': {
+              inputTokens: 1000,
+              outputTokens: 300,
+              cacheReadInputTokens: 0,
+              cacheCreationInputTokens: 0,
+              webSearchRequests: 0,
+              costUSD: 0.01,
+              contextWindow: 1000000,
+              maxOutputTokens: 32000,
+            },
+          },
+        });
+
+        const results = [...transformSDKMessage(resultMessage, { intendedModel: 'fable' })];
+
+        expect(results).toEqual([{ type: 'context_window', contextWindow: 1000000 }]);
+      });
+
+      it('emits no context_window when fable cannot be matched in a multi-entry result', () => {
+        const resultMessage = msg({
+          type: 'result',
+          modelUsage: multiEntryUsage,
+        });
+
+        const results = [...transformSDKMessage(resultMessage, { intendedModel: 'fable' })];
+
+        expect(results).toEqual([]);
+      });
+
+      it('keeps the 1M family default as the stream-phase denominator for fable', () => {
+        const usageState = createTransformUsageState();
+        const message = msg({
+          type: 'assistant',
+          parent_tool_use_id: null,
+          message: {
+            content: [{ type: 'text', text: 'Hello' }],
+            usage: {
+              input_tokens: 1000,
+              output_tokens: 0,
+              cache_creation_input_tokens: 0,
+              cache_read_input_tokens: 0,
+            },
+          },
+        });
+
+        const results = [...transformSDKMessage(message, { intendedModel: 'fable', usageState })];
+        const usage = (results.find(r => r.type === 'usage') as { usage: { contextWindow: number } }).usage;
+
+        expect(usage.contextWindow).toBe(1000000);
+      });
+
+      it('prefers a preset context window projected into customContextLimits', () => {
+        const usageState = createTransformUsageState();
+        const message = msg({
+          type: 'assistant',
+          parent_tool_use_id: null,
+          message: {
+            content: [{ type: 'text', text: 'Hello' }],
+            usage: {
+              input_tokens: 1000,
+              output_tokens: 0,
+              cache_creation_input_tokens: 0,
+              cache_read_input_tokens: 0,
+            },
+          },
+        });
+
+        const results = [...transformSDKMessage(message, {
+          intendedModel: 'fable',
+          customContextLimits: { 'fable': 500_000 },
+          usageState,
+        })];
+        const usage = (results.find(r => r.type === 'usage') as { usage: { contextWindow: number } }).usage;
+
+        expect(usage.contextWindow).toBe(500000);
+      });
+    });
   });
 
   describe('assistant message usage extraction', () => {

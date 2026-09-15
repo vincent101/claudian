@@ -64,6 +64,9 @@ export interface TransformUsageState {
   getPromptUsage(): PromptUsageSnapshot;
   hasEmitted(promptUsage: PromptUsageSnapshot): boolean;
   markEmitted(promptUsage: PromptUsageSnapshot): void;
+  /** Records the SDK-resolved model reported by system/init. */
+  setResolvedModel(model: string): void;
+  getResolvedModel(): string | null;
 }
 
 interface ContextWindowEntry {
@@ -73,7 +76,7 @@ interface ContextWindowEntry {
 
 interface ClaudeModelSignature {
   normalizedModel: string;
-  family: 'haiku' | 'sonnet' | 'opus';
+  family: 'haiku' | 'sonnet' | 'opus' | 'fable';
   is1M: boolean;
   major?: string;
   minor?: string;
@@ -105,9 +108,13 @@ function parseClaudeModelSignature(model: string): ClaudeModelSignature | null {
   if (normalized === 'opus' || normalized === 'opus[1m]') {
     return { normalizedModel: normalized, family: 'opus', is1M: normalized.endsWith('[1m]') };
   }
+  // Fable ships with a 1M window across its family.
+  if (normalized === 'fable' || normalized === 'fable[1m]') {
+    return { normalizedModel: normalized, family: 'fable', is1M: true };
+  }
 
   const versionedMatch = normalized.match(
-    /^(?:claude-)?(haiku|sonnet|opus)-(\d+)(?:-(\d+))?(?:-(\d{8}))?(?:-v\d+:\d+)?(\[1m\])?$/,
+    /^(?:claude-)?(haiku|sonnet|opus|fable)-(\d+)(?:-(\d+))?(?:-(\d{8}))?(?:-v\d+:\d+)?(\[1m\])?$/,
   );
   if (versionedMatch) {
     const [, familyMatch, major, minor, date, oneMillionSuffix] = versionedMatch;
@@ -115,7 +122,7 @@ function parseClaudeModelSignature(model: string): ClaudeModelSignature | null {
     return {
       normalizedModel: normalized,
       family,
-      is1M: oneMillionSuffix === '[1m]',
+      is1M: family === 'fable' || oneMillionSuffix === '[1m]',
       major,
       minor,
       date,
@@ -158,7 +165,8 @@ function matchClaudeModelSignature(
 
 function selectContextWindowEntry(
   modelUsage: Record<string, { contextWindow?: number }>,
-  intendedModel?: string
+  intendedModel?: string,
+  resolvedModel?: string
 ): ContextWindowEntry | null {
   const entries: ContextWindowEntry[] = Object.entries(modelUsage)
     .flatMap(([model, usage]) =>
@@ -173,6 +181,23 @@ function selectContextWindowEntry(
 
   if (entries.length === 1) {
     return entries[0];
+  }
+
+  // The SDK-resolved model (system/init) is authoritative for alias presets
+  // like fable: the CLI reports the concrete id it actually mapped to.
+  if (resolvedModel) {
+    const resolvedLiteralMatch = entries.find((entry) => entry.model === resolvedModel);
+    if (resolvedLiteralMatch) {
+      return resolvedLiteralMatch;
+    }
+
+    const normalizedResolvedModel = normalizeClaudeModelId(resolvedModel);
+    const resolvedNormalizedMatch = findUniqueEntry(entries, (entry) =>
+      normalizeClaudeModelId(entry.model) === normalizedResolvedModel
+    );
+    if (resolvedNormalizedMatch) {
+      return resolvedNormalizedMatch;
+    }
   }
 
   if (!intendedModel) {
@@ -292,6 +317,10 @@ function buildUsageInfo(promptUsage: PromptUsageSnapshot, options?: TransformOpt
 export function createTransformUsageState(): TransformUsageState {
   let promptUsage: PromptUsageSnapshot = { ...EMPTY_PROMPT_USAGE };
   let lastEmittedPromptUsage: PromptUsageSnapshot | null = null;
+  // Session-scoped: unlike prompt usage, the resolved model survives clear()
+  // (which fires per assistant message_start) because system/init is emitted
+  // once per query while later turns still need it for modelUsage matching.
+  let resolvedModel: string | null = null;
 
   return {
     clear(): void {
@@ -314,6 +343,14 @@ export function createTransformUsageState(): TransformUsageState {
 
     markEmitted(nextPromptUsage: PromptUsageSnapshot): void {
       lastEmittedPromptUsage = { ...nextPromptUsage };
+    },
+
+    setResolvedModel(model: string): void {
+      resolvedModel = model;
+    },
+
+    getResolvedModel(): string | null {
+      return resolvedModel;
     },
   };
 }
@@ -348,6 +385,9 @@ export function* transformSDKMessage(
   switch (message.type) {
     case 'system':
       if (message.subtype === 'init' && message.session_id) {
+        if (message.model) {
+          options?.usageState?.setResolvedModel(message.model);
+        }
         yield {
           type: 'session_init',
           sessionId: message.session_id,
@@ -540,7 +580,11 @@ export function* transformSDKMessage(
 
       if ('modelUsage' in message && message.modelUsage) {
         const modelUsage = message.modelUsage as Record<string, { contextWindow?: number }>;
-        const selectedEntry = selectContextWindowEntry(modelUsage, options?.intendedModel);
+        const selectedEntry = selectContextWindowEntry(
+          modelUsage,
+          options?.intendedModel,
+          options?.usageState?.getResolvedModel() ?? undefined,
+        );
         if (selectedEntry) {
           yield { type: 'context_window', contextWindow: selectedEntry.contextWindow };
         }
