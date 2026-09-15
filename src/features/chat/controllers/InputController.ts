@@ -362,14 +362,6 @@ export class InputController {
     let deferredAutoSendContent: string | null = null;
     let deferredNewSessionPlan: string | null = null;
     let wasInvalidated = false;
-    /**
-     * Set once the send reached the query phase. The inner finally's cleanup
-     * body reads locals that only exist by then (userMsg, assistantMsg,
-     * agentService, turnContext); a failure before that point (submission
-     * build, addMessage, title generation, service init) must skip the body —
-     * the TDZ/null accesses would throw a second error masking the original.
-     */
-    let didStartQuery = false;
 
     try {
     // Hide welcome message when sending first message
@@ -491,7 +483,6 @@ export class InputController {
       }
     }
 
-    didStartQuery = true;
     try {
       const preparedTurn = agentService.prepareTurn(turnRequest);
       userMsg.content = preparedTurn.persistedContent;
@@ -522,7 +513,12 @@ export class InputController {
       }
     } catch (error) {
       const errorMsg = error instanceof Error ? error.message : 'Unknown error';
-      await streamController.appendTurnText(`\n\n**Error:** ${errorMsg}`, turnContext!);
+      // Null guard: a turn projection that was never created has no DOM to
+      // append the error marker to — appending anyway would TypeError and
+      // mask the original error.
+      if (turnContext) {
+        await streamController.appendTurnText(`\n\n**Error:** ${errorMsg}`, turnContext);
+      }
     } finally {
       // Nested finally: the cleanup body below contains throwing awaits
       // (finalize, plan approval prompt, save, title refresh, createNew).
@@ -530,14 +526,6 @@ export class InputController {
       // them rejects — otherwise the feature lease leaks and isBusy() stays
       // true forever, deadlocking all future sends.
       try {
-      // Null guard (catch-path null deref): the body below finalizes the
-      // turn's messages and consumes runtime metadata; its locals (userMsg,
-      // assistantMsg, agentService, turnContext) only exist once the send
-      // reached the query phase. A failure before that point must skip it —
-      // the TDZ/null accesses would throw a second error masking the
-      // original — while the outer finally still releases the feature lease
-      // and resets streaming state.
-      if (didStartQuery) {
       const finalAssistantMsg = this.activeStreamingAssistantMessage ?? assistantMsg;
       const turnMetadata = agentService.consumeTurnMetadata();
       userMsg.userMessageId = turnMetadata.userMessageId ?? userMsg.userMessageId;
@@ -551,8 +539,8 @@ export class InputController {
       // Skip remaining cleanup if stream was invalidated (tab closed or conversation switched)
       if (!wasInvalidated && state.streamGeneration === streamGeneration) {
         const didCancelThisTurn = wasInterrupted || state.cancelRequested;
-        if (didCancelThisTurn && !state.pendingNewSessionPlan) {
-          await streamController.appendTurnText('\n\n<span class="claudian-interrupted">Interrupted</span> <span class="claudian-interrupted-hint">· What should Claudian do instead?</span>', turnContext!);
+        if (didCancelThisTurn && !state.pendingNewSessionPlan && turnContext) {
+          await streamController.appendTurnText('\n\n<span class="claudian-interrupted">Interrupted</span> <span class="claudian-interrupted-hint">· What should Claudian do instead?</span>', turnContext);
         }
         streamController.hideThinkingIndicator();
         state.isStreaming = false;
@@ -678,7 +666,6 @@ export class InputController {
       if (wasInvalidated) {
         this.clearPendingSteerState();
         this.updateQueueIndicator();
-      }
       }
       } finally {
         this.activeStreamingAssistantMessage = null;
