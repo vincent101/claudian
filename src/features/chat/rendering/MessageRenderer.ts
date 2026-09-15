@@ -313,19 +313,6 @@ export class MessageRenderer {
     }
   }
 
-  /**
-   * Clear-rebuild render that also waits for the frame queue to drain —
-   * thin wrapper so stored-transaction callers cannot forget the wait.
-   */
-  async renderMessagesAndWait(
-    messages: ChatMessage[],
-    getGreeting: () => string
-  ): Promise<HTMLElement> {
-    const welcomeEl = this.renderMessages(messages, getGreeting);
-    await this.waitForRenderedMessages();
-    return welcomeEl;
-  }
-
   private scheduleFrame(callback: () => void): void {
     // Node test environments may lack requestAnimationFrame; the fallback
     // still yields the event loop between slices.
