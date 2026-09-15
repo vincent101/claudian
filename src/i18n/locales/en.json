@@ -81,10 +81,14 @@
       "switchFailed": "Failed to switch conversation: {error}"
     },
     "search": {
-      "placeholder": "Search conversation history",
+      "placeholder": "Search conversation history ({shortcut})",
       "noResults": "No results",
       "error": "Search failed",
-      "resultCount": "{current} of {total}"
+      "resultCount": "{current} of {total}",
+      "close": "Close search"
+    },
+    "message": {
+      "timestamp": "Sent {time}"
     }
   },
   "settings": {

@@ -81,10 +81,14 @@
       "switchFailed": "切換會話失敗：{error}"
     },
     "search": {
-      "placeholder": "搜尋對話歷史",
+      "placeholder": "搜尋對話歷史（{shortcut}）",
       "noResults": "沒有結果",
       "error": "搜尋失敗",
-      "resultCount": "第 {current} 項，共 {total} 項"
+      "resultCount": "第 {current} 項，共 {total} 項",
+      "close": "關閉搜尋"
+    },
+    "message": {
+      "timestamp": "傳送於 {time}"
     }
   },
   "settings": {

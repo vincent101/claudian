@@ -368,6 +368,68 @@ describe('MessageRenderer', () => {
     expect(rewindCallback).toHaveBeenCalledWith('u1');
   });
 
+  describe('message-level timestamp toolbar', () => {
+    const timestamp = new Date(2026, 8, 14, 20, 35, 3).getTime();
+
+    it.each(['user', 'assistant'] as const)('renders stored %s message time in the shared toolbar', (role) => {
+      const messagesEl = createMockEl();
+      const { renderer } = createRenderer(messagesEl);
+      jest.spyOn(renderer, 'renderContent').mockResolvedValue(undefined);
+
+      renderer.renderStoredMessage({
+        id: `${role}-stored`,
+        role,
+        content: role === 'user' ? 'Question' : 'Answer',
+        contentBlocks: role === 'assistant' ? [{ type: 'text', content: 'Answer' }] : undefined,
+        timestamp,
+      });
+
+      const toolbar = messagesEl.querySelector('.claudian-message-actions');
+      const time = messagesEl.querySelector('.claudian-message-timestamp');
+      expect(toolbar).not.toBeNull();
+      expect(time?.textContent).toContain('2026');
+      expect(time?.textContent).toContain('20:35:03');
+    });
+
+    it.each(['user', 'assistant'] as const)('renders streaming %s message time', (role) => {
+      const messagesEl = createMockEl();
+      const { renderer } = createRenderer(messagesEl);
+      jest.spyOn(renderer, 'renderContent').mockResolvedValue(undefined);
+
+      renderer.addMessage({
+        id: `${role}-live`,
+        role,
+        content: role === 'user' ? 'Question' : '',
+        timestamp,
+      });
+
+      expect(messagesEl.querySelector('.claudian-message-timestamp')).not.toBeNull();
+    });
+
+    it.each(['user', 'assistant'] as const)('renders prepended %s message time through the stored helper', (role) => {
+      const messagesEl = createMockEl();
+      const { renderer } = createRenderer(messagesEl);
+      jest.spyOn(renderer, 'renderContent').mockResolvedValue(undefined);
+
+      renderer.renderStoredMessage({
+        id: `${role}-prepend`,
+        role,
+        content: role === 'user' ? 'Earlier' : 'Earlier answer',
+        contentBlocks: role === 'assistant' ? [{ type: 'text', content: 'Earlier answer' }] : undefined,
+        timestamp,
+      });
+
+      expect(messagesEl.querySelectorAll('.claudian-message-timestamp')).toHaveLength(1);
+    });
+
+    it('does not render a timestamp for invalid input', () => {
+      const messagesEl = createMockEl();
+      const { renderer } = createRenderer(messagesEl);
+      renderer.addMessage({ id: 'a-invalid', role: 'assistant', content: '', timestamp: Number.NaN });
+      expect(messagesEl.querySelector('.claudian-message-timestamp')).toBeNull();
+    });
+  });
+
   // ============================================
   // renderAssistantContent
   // ============================================

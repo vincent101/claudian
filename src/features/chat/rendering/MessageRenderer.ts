@@ -9,7 +9,7 @@ import {
 } from '../../../core/tools/toolNames';
 import { extractToolResultContent } from '../../../core/tools/toolResultContent';
 import type { ChatMessage, ImageAttachment, SubagentInfo, ToolCallInfo } from '../../../core/types';
-import { t } from '../../../i18n/i18n';
+import { getLocale, t } from '../../../i18n/i18n';
 import type ClaudianPlugin from '../../../main';
 import { formatDurationMmSs } from '../../../utils/date';
 import { processFileLinks, registerFileLinkHandler } from '../../../utils/fileLink';
@@ -136,6 +136,7 @@ export class MessageRenderer {
         this.liveMessageEls.set(msg.id, msgEl);
       }
     }
+    this.addMessageTimestamp(msgEl, msg.timestamp);
 
     this.scrollToBottom();
     return msgEl;
@@ -165,7 +166,7 @@ export class MessageRenderer {
       void this.renderContent(textEl, textToShow);
     }
 
-    const toolbar = msgEl.querySelector('.claudian-user-msg-actions') as HTMLElement | null;
+    const toolbar = msgEl.querySelector('.claudian-message-actions') as HTMLElement | null;
     if (toolbar) {
       toolbar.querySelectorAll('.claudian-user-msg-copy-btn').forEach((el) => el.remove());
     }
@@ -353,6 +354,7 @@ export class MessageRenderer {
         this.appendInterruptIndicator(contentEl);
       }
     }
+    this.addMessageTimestamp(msgEl, msg.timestamp);
   }
 
   private hasVisibleContent(msg: ChatMessage): boolean {
@@ -812,9 +814,29 @@ export class MessageRenderer {
   }
 
   private getOrCreateActionsToolbar(msgEl: HTMLElement): HTMLElement {
-    const existing = msgEl.querySelector('.claudian-user-msg-actions') as HTMLElement | null;
+    const existing = msgEl.querySelector('.claudian-message-actions') as HTMLElement | null;
     if (existing) return existing;
-    return msgEl.createDiv({ cls: 'claudian-user-msg-actions' });
+    return msgEl.createDiv({ cls: 'claudian-message-actions' });
+  }
+
+  private addMessageTimestamp(msgEl: HTMLElement, timestamp: number): void {
+    if (!Number.isFinite(timestamp)) return;
+    const toolbar = this.getOrCreateActionsToolbar(msgEl);
+    if (toolbar.querySelector('.claudian-message-timestamp')) return;
+    const formatted = new Intl.DateTimeFormat(getLocale(), {
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+      hourCycle: 'h23',
+    }).format(new Date(timestamp));
+    const timeEl = toolbar.createSpan({
+      cls: 'claudian-message-timestamp',
+      text: formatted,
+    });
+    timeEl.setAttribute('aria-label', t('chat.message.timestamp', { time: formatted }));
   }
 
   private addUserCopyButton(msgEl: HTMLElement, content: string): void {

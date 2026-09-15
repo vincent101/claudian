@@ -1228,15 +1228,18 @@ describe('Tab - Activation/Deactivation', () => {
   });
 
   describe('deactivateTab', () => {
-    it('should hide tab content', () => {
+    it('should hide tab content and lifecycle-close search without restoring focus', () => {
       const options = createMockOptions();
       const tab = createTab(options);
+      const close = jest.fn();
+      tab.controllers.historySearchController = { close } as any;
 
       // First activate, then deactivate
       activateTab(tab);
       deactivateTab(tab);
 
       expect(tab.dom.contentEl.style.display).toBe('none');
+      expect(close).toHaveBeenCalledWith({ restoreFocus: false });
     });
   });
 });
@@ -2774,8 +2777,13 @@ describe('Tab - Controller Configuration', () => {
       mockInputController.isResumeDropdownVisible.mockReturnValue(true);
       expect(config.shouldSkipEscapeHandling()).toBe(true);
 
-      // Test when nothing active
+      // Test when history search is active
       mockInputController.isResumeDropdownVisible.mockReturnValue(false);
+      jest.spyOn(tab.controllers.historySearchController!, 'isActive').mockReturnValue(true);
+      expect(config.shouldSkipEscapeHandling()).toBe(true);
+
+      // Test when nothing active
+      jest.spyOn(tab.controllers.historySearchController!, 'isActive').mockReturnValue(false);
       expect(config.shouldSkipEscapeHandling()).toBe(false);
     });
 

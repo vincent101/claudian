@@ -81,10 +81,14 @@
       "switchFailed": "Failed to switch conversation: {error}"
     },
     "search": {
-      "placeholder": "会話履歴を検索",
+      "placeholder": "会話履歴を検索（{shortcut}）",
       "noResults": "結果がありません",
       "error": "検索に失敗しました",
-      "resultCount": "{total} 件中 {current} 件目"
+      "resultCount": "{total} 件中 {current} 件目",
+      "close": "検索を閉じる"
+    },
+    "message": {
+      "timestamp": "送信日時: {time}"
     }
   },
   "settings": {

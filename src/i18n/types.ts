@@ -64,6 +64,8 @@ export type TranslationKey =
   | 'chat.search.noResults'
   | 'chat.search.error'
   | 'chat.search.resultCount'
+  | 'chat.search.close'
+  | 'chat.message.timestamp'
 
   // Chat - Fork
   | 'chat.fork.ariaLabel'

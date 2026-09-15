@@ -81,10 +81,14 @@
       "switchFailed": "Failed to switch conversation: {error}"
     },
     "search": {
-      "placeholder": "Поиск по истории беседы",
+      "placeholder": "Поиск по истории ({shortcut})",
       "noResults": "Нет результатов",
       "error": "Ошибка поиска",
-      "resultCount": "{current} из {total}"
+      "resultCount": "{current} из {total}",
+      "close": "Закрыть поиск"
+    },
+    "message": {
+      "timestamp": "Отправлено: {time}"
     }
   },
   "settings": {

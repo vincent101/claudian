@@ -81,10 +81,14 @@
       "switchFailed": "Failed to switch conversation: {error}"
     },
     "search": {
-      "placeholder": "대화 기록 검색",
+      "placeholder": "대화 기록 검색 ({shortcut})",
       "noResults": "결과 없음",
       "error": "검색 실패",
-      "resultCount": "{total}개 중 {current}"
+      "resultCount": "{total}개 중 {current}",
+      "close": "검색 닫기"
+    },
+    "message": {
+      "timestamp": "보낸 시간: {time}"
     }
   },
   "settings": {

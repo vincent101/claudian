@@ -1345,7 +1345,7 @@ export function initializeTabControllers(
         }
         // The panel's results belong to the outgoing conversation; close() also
         // invalidates any in-flight debounced search via the generation bump.
-        tab.controllers.historySearchController?.close();
+        tab.controllers.historySearchController?.close({ restoreFocus: false });
         refreshTabProviderUI(tab, plugin);
         applyProviderUIGating(tab, plugin);
         syncSlashCommandDropdownForProvider(tab, plugin, getProviderCatalogConfig);
@@ -1354,7 +1354,7 @@ export function initializeTabControllers(
       onConversationSwitched: () => {
         // Stale results from the previous conversation must not leak into the
         // newly switched one (same reset point as other per-conversation UI).
-        tab.controllers.historySearchController?.close();
+        tab.controllers.historySearchController?.close({ restoreFocus: false });
         ui.slashCommandDropdown?.resetSdkSkillsCache();
       },
     }
@@ -1363,6 +1363,11 @@ export function initializeTabControllers(
   tab.controllers.historySearchController = new HistorySearchController({
     rootEl: dom.contentEl,
     messagesEl: dom.messagesEl,
+    isActive: () => (
+      tab.lifecycleState !== 'closing'
+      && dom.contentEl.style.display !== 'none'
+      && plugin.app.workspace.activeLeaf === (component as Component & { leaf?: unknown }).leaf
+    ),
     getConversationId: () => state.currentConversationId,
     searchHistory: (_conversationId, query) => tab.controllers.conversationController!.searchHistory(query),
     locateResult: result => tab.controllers.conversationController!.locateHistorySearchResult(result),
@@ -1473,6 +1478,7 @@ export function initializeTabControllers(
       if (tab.controllers.inputController?.isResumeDropdownVisible()) return true;
       if (ui.slashCommandDropdown?.isVisible()) return true;
       if (ui.fileContextManager?.isMentionDropdownVisible()) return true;
+      if (tab.controllers.historySearchController?.isActive()) return true;
       return false;
     },
   });
@@ -1668,6 +1674,7 @@ export function activateTab(tab: TabData): void {
  * Deactivates a tab (hides it and stops services).
  */
 export function deactivateTab(tab: TabData): void {
+  tab.controllers.historySearchController?.close({ restoreFocus: false });
   tab.dom.contentEl.style.display = 'none';
   tab.controllers.selectionController?.stop();
   tab.controllers.browserSelectionController?.stop();

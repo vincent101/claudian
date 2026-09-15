@@ -4,9 +4,14 @@ import { t } from '../../../i18n/i18n';
 interface HistorySearchControllerDeps {
   rootEl: HTMLElement;
   messagesEl: HTMLElement;
+  isActive: () => boolean;
   getConversationId: () => string | null;
   searchHistory: (conversationId: string, query: string) => Promise<HistorySearchResult[]>;
   locateResult: (result: HistorySearchResult) => Promise<void>;
+}
+
+interface CloseOptions {
+  restoreFocus?: boolean;
 }
 
 export class HistorySearchController {
@@ -17,8 +22,11 @@ export class HistorySearchController {
   private selectedIndex = -1;
   private timer: ReturnType<typeof setTimeout> | null = null;
   private generation = 0;
-  private readonly onRootKeyDown = (event: KeyboardEvent): void => {
-    if ((event.metaKey || event.ctrlKey) && event.key.toLocaleLowerCase() === 'f' && !event.isComposing) {
+  private openingFocus: HTMLElement | null = null;
+  private readonly eventDocument: Document | null;
+  private readonly onDocumentKeyDown = (event: KeyboardEvent): void => {
+    if (this.isSearchShortcut(event)) {
+      if (!this.deps.isActive()) return;
       event.preventDefault();
       event.stopPropagation();
       this.open();
@@ -32,47 +40,91 @@ export class HistorySearchController {
   };
 
   constructor(private readonly deps: HistorySearchControllerDeps) {
-    deps.rootEl.addEventListener('keydown', this.onRootKeyDown);
+    this.eventDocument = deps.rootEl.ownerDocument ?? (typeof document !== 'undefined' ? document : null);
+    this.eventDocument?.addEventListener('keydown', this.onDocumentKeyDown, { capture: true });
+  }
+
+  isActive(): boolean {
+    return this.panel !== null;
   }
 
   open(): void {
     if (this.panel) {
       this.input?.focus();
+      this.input?.select();
       return;
     }
-    const panel = document.createElement('div');
+    this.openingFocus = this.eventDocument?.activeElement instanceof HTMLElement
+      ? this.eventDocument.activeElement
+      : null;
+    if (!this.eventDocument) return;
+    const panel = this.deps.rootEl.ownerDocument.createElement('div');
     panel.className = 'claudian-history-search';
-    const input = document.createElement('input');
+    const input = this.deps.rootEl.ownerDocument.createElement('input');
     input.type = 'search';
-    input.placeholder = t('chat.search.placeholder');
-    input.setAttribute('aria-label', t('chat.search.placeholder'));
-    const results = document.createElement('div');
+    const shortcut = this.getShortcutLabel();
+    input.placeholder = t('chat.search.placeholder', { shortcut });
+    input.setAttribute('aria-label', t('chat.search.placeholder', { shortcut }));
+    const closeButton = this.deps.rootEl.ownerDocument.createElement('button');
+    closeButton.className = 'claudian-history-search-close';
+    closeButton.type = 'button';
+    closeButton.textContent = '×';
+    closeButton.setAttribute('aria-label', t('chat.search.close'));
+    closeButton.title = t('chat.search.close');
+    const results = this.deps.rootEl.ownerDocument.createElement('div');
     results.className = 'claudian-history-search-results';
-    panel.append(input, results);
+    panel.append(input, closeButton, results);
     this.deps.rootEl.insertBefore(panel, this.deps.rootEl.firstChild);
     this.panel = panel;
     this.input = input;
     this.resultsEl = results;
     input.addEventListener('input', () => this.scheduleSearch());
     input.addEventListener('keydown', event => this.onInputKeyDown(event));
+    closeButton.addEventListener('click', () => this.close());
     input.focus();
   }
 
-  close(): void {
+  close(options: CloseOptions = {}): void {
+    const { restoreFocus = true } = options;
+    const focusTarget = this.openingFocus;
     this.generation += 1;
     if (this.timer) clearTimeout(this.timer);
     this.timer = null;
+    this.clearHighlights();
     this.panel?.remove();
     this.panel = null;
     this.input = null;
     this.resultsEl = null;
     this.results = [];
     this.selectedIndex = -1;
+    this.openingFocus = null;
+    if (restoreFocus && focusTarget?.isConnected) focusTarget.focus();
   }
 
   destroy(): void {
-    this.close();
-    this.deps.rootEl.removeEventListener('keydown', this.onRootKeyDown);
+    this.close({ restoreFocus: false });
+    this.eventDocument?.removeEventListener('keydown', this.onDocumentKeyDown, { capture: true });
+  }
+
+  private isSearchShortcut(event: KeyboardEvent): boolean {
+    if (event.isComposing || event.key.toLocaleLowerCase() !== 'f') return false;
+    const isMac = navigator.platform.includes('Mac');
+    return isMac
+      ? event.metaKey && !event.ctrlKey && !event.altKey
+      : event.ctrlKey && !event.metaKey && !event.altKey;
+  }
+
+  private getShortcutLabel(): string {
+    return navigator.platform.includes('Mac') ? '⌘F' : 'Ctrl+F';
+  }
+
+  private clearHighlights(): void {
+    this.deps.messagesEl.querySelectorAll('mark.claudian-search-match').forEach(mark => {
+      mark.replaceWith(mark.textContent ?? '');
+    });
+    this.deps.messagesEl.querySelectorAll('.claudian-search-highlight').forEach(element => {
+      element.classList.remove('claudian-search-highlight');
+    });
   }
 
   private scheduleSearch(): void {
@@ -87,6 +139,7 @@ export class HistorySearchController {
     if (!conversationId || !query) {
       this.results = [];
       this.selectedIndex = -1;
+      this.clearHighlights();
       this.renderResults();
       return;
     }
@@ -139,7 +192,7 @@ export class HistorySearchController {
     this.resultsEl.replaceChildren();
     if (this.results.length === 0) {
       if (this.input?.value.trim()) {
-        const empty = document.createElement('div');
+        const empty = this.deps.rootEl.ownerDocument.createElement('div');
         empty.className = 'claudian-history-search-empty';
         empty.textContent = t('chat.search.noResults');
         this.resultsEl.appendChild(empty);
@@ -147,12 +200,12 @@ export class HistorySearchController {
       return;
     }
     this.results.forEach((result, index) => {
-      const button = document.createElement('button');
+      const button = this.deps.rootEl.ownerDocument.createElement('button');
       button.className = `claudian-history-search-result${index === this.selectedIndex ? ' is-selected' : ''}`;
-      const snippet = document.createElement('div');
+      const snippet = this.deps.rootEl.ownerDocument.createElement('div');
       snippet.className = 'claudian-history-search-snippet';
       snippet.textContent = result.snippet;
-      const time = document.createElement('div');
+      const time = this.deps.rootEl.ownerDocument.createElement('div');
       time.className = 'claudian-history-search-time';
       time.textContent = result.timestamp ? new Date(result.timestamp).toLocaleString() : '';
       button.append(snippet, time);
@@ -166,7 +219,7 @@ export class HistorySearchController {
     this.results = [];
     this.selectedIndex = -1;
     this.resultsEl.replaceChildren();
-    const error = document.createElement('div');
+    const error = this.deps.rootEl.ownerDocument.createElement('div');
     error.className = 'claudian-history-search-error';
     error.textContent = t('chat.search.error');
     this.resultsEl.appendChild(error);

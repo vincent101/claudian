@@ -13,6 +13,7 @@ describe('HistorySearchController', () => {
   let searchHistory: jest.Mock;
   let locate: jest.Mock;
   let controller: HistorySearchController;
+  let isActive: jest.Mock;
 
   beforeEach(() => {
     jest.useFakeTimers();
@@ -22,9 +23,11 @@ describe('HistorySearchController', () => {
     document.body.appendChild(root);
     searchHistory = jest.fn().mockResolvedValue([result('m1'), result('m2')]);
     locate = jest.fn().mockResolvedValue(undefined);
+    isActive = jest.fn().mockReturnValue(true);
     controller = new HistorySearchController({
       rootEl: root,
       messagesEl: messages,
+      isActive,
       getConversationId: () => 'conversation',
       searchHistory,
       locateResult: locate,
@@ -37,16 +40,89 @@ describe('HistorySearchController', () => {
     jest.useRealTimers();
   });
 
-  it('opens only for Ctrl/Cmd+F inside the chat root and closes on Escape', () => {
-    const outside = new KeyboardEvent('keydown', { key: 'f', metaKey: true, bubbles: true, cancelable: true });
-    document.dispatchEvent(outside);
-    expect(root.querySelector('.claudian-history-search')).toBeNull();
-
-    root.dispatchEvent(new KeyboardEvent('keydown', { key: 'f', metaKey: true, bubbles: true, cancelable: true }));
+  it('handles the platform shortcut at document capture only for the active chat tab', () => {
+    const shortcut = new KeyboardEvent('keydown', {
+      key: 'f',
+      metaKey: navigator.platform.includes('Mac'),
+      ctrlKey: !navigator.platform.includes('Mac'),
+      bubbles: true,
+      cancelable: true,
+    });
+    document.dispatchEvent(shortcut);
     expect(root.querySelector('.claudian-history-search')).not.toBeNull();
+    expect(shortcut.defaultPrevented).toBe(true);
 
-    root.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }));
+    controller.close({ restoreFocus: false });
+    isActive.mockReturnValue(false);
+    const inactiveShortcut = new KeyboardEvent('keydown', {
+      key: 'f',
+      metaKey: navigator.platform.includes('Mac'),
+      ctrlKey: !navigator.platform.includes('Mac'),
+      bubbles: true,
+      cancelable: true,
+    });
+    document.dispatchEvent(inactiveShortcut);
     expect(root.querySelector('.claudian-history-search')).toBeNull();
+    expect(inactiveShortcut.defaultPrevented).toBe(false);
+  });
+
+  it('selects the existing query when the shortcut is repeated', () => {
+    controller.open();
+    const input = root.querySelector('input') as HTMLInputElement;
+    input.value = 'needle';
+    const select = jest.spyOn(input, 'select');
+
+    document.dispatchEvent(new KeyboardEvent('keydown', {
+      key: 'f',
+      metaKey: navigator.platform.includes('Mac'),
+      ctrlKey: !navigator.platform.includes('Mac'),
+      bubbles: true,
+      cancelable: true,
+    }));
+
+    expect(select).toHaveBeenCalled();
+  });
+
+  it('first Escape closes active search and restores the opening focus', () => {
+    const opener = document.createElement('button');
+    root.appendChild(opener);
+    opener.focus();
+    controller.open();
+
+    const firstEscape = new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true });
+    messages.dispatchEvent(firstEscape);
+    expect(root.querySelector('.claudian-history-search')).toBeNull();
+    expect(document.activeElement).toBe(opener);
+    expect(firstEscape.defaultPrevented).toBe(true);
+
+    const secondEscape = new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true });
+    messages.dispatchEvent(secondEscape);
+    expect(secondEscape.defaultPrevented).toBe(false);
+  });
+
+  it('close button restores focus while lifecycle close does not', () => {
+    const opener = document.createElement('button');
+    root.appendChild(opener);
+    opener.focus();
+    controller.open();
+    (root.querySelector('.claudian-history-search-close') as HTMLButtonElement).click();
+    expect(document.activeElement).toBe(opener);
+
+    controller.open();
+    messages.tabIndex = 0;
+    messages.focus();
+    controller.close({ restoreFocus: false });
+    expect(document.activeElement).toBe(messages);
+  });
+
+  it('exposes platform shortcut text and active state', () => {
+    controller.open();
+    const input = root.querySelector('input') as HTMLInputElement;
+    const expected = navigator.platform.includes('Mac') ? '⌘F' : 'Ctrl+F';
+    expect(input.placeholder).toContain(expected);
+    expect(controller.isActive()).toBe(true);
+    controller.close({ restoreFocus: false });
+    expect(controller.isActive()).toBe(false);
   });
 
   it('debounces case-insensitive search and renders empty state', async () => {

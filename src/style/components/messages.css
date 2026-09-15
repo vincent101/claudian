@@ -97,6 +97,23 @@
 
 .claudian-history-search input {
   width: 100%;
+  padding-inline-end: 28px;
+}
+
+.claudian-history-search-close {
+  position: absolute;
+  top: 10px;
+  inset-inline-end: 12px;
+  border: 0;
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  font-size: 18px;
+  line-height: 1;
+}
+
+.claudian-history-search-close:hover {
+  color: var(--text-normal);
 }
 
 .claudian-history-search-results {
@@ -182,6 +199,7 @@
 }
 
 .claudian-message-assistant {
+  position: relative;
   background: transparent;
   align-self: stretch;
   width: 100%;
@@ -319,7 +337,7 @@
 }
 
 /* Action buttons toolbar below user messages */
-.claudian-user-msg-actions {
+.claudian-message-actions {
   position: absolute;
   bottom: -20px;
   right: 0;
@@ -330,12 +348,12 @@
   z-index: 1;
 }
 
-.claudian-message-user:hover .claudian-user-msg-actions {
+.claudian-message:hover .claudian-message-actions,
+.claudian-message:focus-within .claudian-message-actions {
   opacity: 1;
 }
 
-.claudian-user-msg-actions span {
-  cursor: pointer;
+.claudian-message-actions span {
   display: flex;
   align-items: center;
   justify-content: center;
@@ -343,16 +361,28 @@
   transition: color 0.15s;
 }
 
-.claudian-user-msg-actions span svg {
+.claudian-message-actions span svg {
   width: 16px;
   height: 16px;
 }
 
-.claudian-user-msg-actions span:hover {
+.claudian-message-actions span:not(.claudian-message-timestamp) {
+  cursor: pointer;
+}
+
+.claudian-message-actions span:not(.claudian-message-timestamp):hover {
   color: var(--text-normal);
 }
 
-.claudian-user-msg-actions span.copied {
+.claudian-message-timestamp {
+  color: var(--text-faint);
+  cursor: default;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.claudian-message-actions span.copied {
   color: var(--text-accent);
   font-size: 11px;
   font-family: var(--font-monospace);
