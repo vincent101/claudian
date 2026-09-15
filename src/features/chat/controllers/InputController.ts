@@ -362,6 +362,14 @@ export class InputController {
     let deferredAutoSendContent: string | null = null;
     let deferredNewSessionPlan: string | null = null;
     let wasInvalidated = false;
+    /**
+     * Set once the send reached the query phase. The inner finally's cleanup
+     * body reads locals that only exist by then (userMsg, assistantMsg,
+     * agentService, turnContext); a failure before that point (submission
+     * build, addMessage, title generation, service init) must skip the body —
+     * the TDZ/null accesses would throw a second error masking the original.
+     */
+    let didStartQuery = false;
 
     try {
     // Hide welcome message when sending first message
@@ -483,6 +491,7 @@ export class InputController {
       }
     }
 
+    didStartQuery = true;
     try {
       const preparedTurn = agentService.prepareTurn(turnRequest);
       userMsg.content = preparedTurn.persistedContent;
@@ -521,6 +530,14 @@ export class InputController {
       // them rejects — otherwise the feature lease leaks and isBusy() stays
       // true forever, deadlocking all future sends.
       try {
+      // Null guard (catch-path null deref): the body below finalizes the
+      // turn's messages and consumes runtime metadata; its locals (userMsg,
+      // assistantMsg, agentService, turnContext) only exist once the send
+      // reached the query phase. A failure before that point must skip it —
+      // the TDZ/null accesses would throw a second error masking the
+      // original — while the outer finally still releases the feature lease
+      // and resets streaming state.
+      if (didStartQuery) {
       const finalAssistantMsg = this.activeStreamingAssistantMessage ?? assistantMsg;
       const turnMetadata = agentService.consumeTurnMetadata();
       userMsg.userMessageId = turnMetadata.userMessageId ?? userMsg.userMessageId;
@@ -661,6 +678,7 @@ export class InputController {
       if (wasInvalidated) {
         this.clearPendingSteerState();
         this.updateQueueIndicator();
+      }
       }
       } finally {
         this.activeStreamingAssistantMessage = null;
