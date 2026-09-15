@@ -242,12 +242,12 @@
       "desc": "加载 ~/.claude/settings.json。启用后，用户的 Claude Code 权限规则可能绕过安全模式。"
     },
     "claudeSafeMode": {
-      "name": "Safe mode",
-      "desc": "Permission mode used when the Safe toggle is active."
+      "name": "安全模式",
+      "desc": "启用 Safe 开关时使用的权限模式。"
     },
     "codexSafeMode": {
-      "name": "Safe mode",
-      "desc": "Sandbox mode used when the Safe toggle is active."
+      "name": "安全模式",
+      "desc": "启用 Safe 开关时使用的沙箱模式。"
     },
     "environment": "环境",
     "customVariables": {
