@@ -87,7 +87,11 @@ function isResultError(message: { type: 'result'; subtype: string }): message is
 function normalizeClaudeModelId(model: string): string {
   const normalized = model.trim().toLowerCase();
   const claudeIndex = normalized.indexOf('claude-');
-  return claudeIndex >= 0 ? normalized.slice(claudeIndex) : normalized;
+  // Strip everything up to AND including the "claude-" prefix: the SDK reports
+  // unversioned family keys like "claude-sonnet[1m]" while the intended model
+  // is the bare alias "sonnet[1m]" — both must normalize to the same string or
+  // multi-entry modelUsage (main + subagent) can never exact-match them.
+  return claudeIndex >= 0 ? normalized.slice(claudeIndex + 'claude-'.length) : normalized;
 }
 
 function parseClaudeModelSignature(model: string): ClaudeModelSignature | null {
@@ -103,7 +107,7 @@ function parseClaudeModelSignature(model: string): ClaudeModelSignature | null {
   }
 
   const versionedMatch = normalized.match(
-    /^claude-(haiku|sonnet|opus)-(\d+)(?:-(\d+))?(?:-(\d{8}))?(?:-v\d+:\d+)?(\[1m\])?$/,
+    /^(?:claude-)?(haiku|sonnet|opus)-(\d+)(?:-(\d+))?(?:-(\d{8}))?(?:-v\d+:\d+)?(\[1m\])?$/,
   );
   if (versionedMatch) {
     const [, familyMatch, major, minor, date, oneMillionSuffix] = versionedMatch;

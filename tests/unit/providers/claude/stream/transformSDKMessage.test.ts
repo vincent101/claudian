@@ -1208,6 +1208,42 @@ describe('transformSDKMessage', () => {
       ]);
     });
 
+    it('matches the built-in [1m] alias against the SDK unversioned family key when subagents add entries', () => {
+      // Real SDK shape: a sonnet[1m] turn with a background subagent reports
+      // "claude-sonnet[1m]" (no version digits) plus the subagent model.
+      const message = msg({
+        type: 'result',
+        modelUsage: {
+          'claude-sonnet[1m]': {
+            inputTokens: 1000,
+            outputTokens: 300,
+            cacheReadInputTokens: 0,
+            cacheCreationInputTokens: 0,
+            webSearchRequests: 0,
+            costUSD: 0.01,
+            contextWindow: 1000000,
+            maxOutputTokens: 32000,
+          },
+          'claude-haiku-4-5': {
+            inputTokens: 500,
+            outputTokens: 100,
+            cacheReadInputTokens: 0,
+            cacheCreationInputTokens: 0,
+            webSearchRequests: 0,
+            costUSD: 0.005,
+            contextWindow: 200000,
+            maxOutputTokens: 32000,
+          },
+        },
+      });
+
+      const results = [...transformSDKMessage(message, { intendedModel: 'sonnet[1m]' })];
+
+      expect(results).toEqual([
+        { type: 'context_window', contextWindow: 1000000 },
+      ]);
+    });
+
     it('matches provider-qualified custom model ids against SDK modelUsage keys', () => {
       const message = msg({
         type: 'result',

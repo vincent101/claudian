@@ -93,6 +93,12 @@ export interface RuntimeTurn {
   kind: RuntimeTurnKind;
   phase: RuntimeTurnPhase;
   generation: number;
+  /**
+   * Model snapshot taken at dispatch. Usage transforms must denominate against
+   * the model actually running this turn, never against live provider settings
+   * (they are app-global and can change mid-turn from another tab).
+   */
+  model?: string;
   /** Buffered chunks for legacy delivery or the suffix after live projection fails. */
   chunks: StreamChunk[];
   liveProjectionFailed: boolean;

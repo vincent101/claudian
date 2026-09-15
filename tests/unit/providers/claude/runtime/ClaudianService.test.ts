@@ -4411,4 +4411,95 @@ describe('ClaudianService', () => {
       expect((service as any).lastSentTurnId).toBeNull();
     });
   });
+
+  describe('turn model snapshot (context window denominator)', () => {
+    async function startPersistentQueryWithChannel(): Promise<MessageChannel> {
+      const startSpy = jest.spyOn(service as any, 'startPersistentQuery');
+      startSpy.mockImplementation(async (...args: unknown[]) => {
+        const [vaultPath, cliPath] = args as [string, string];
+        const messageChannel = new MessageChannel();
+        (service as any).messageChannel = messageChannel;
+        (service as any).persistentQuery = sdkMock.query({
+          prompt: messageChannel,
+          options: { cwd: vaultPath, pathToClaudeCodeExecutable: cliPath } as any,
+        });
+        (service as any).currentConfig = (service as any).buildPersistentQueryConfig(vaultPath, cliPath, []);
+        (service as any).startResponseConsumer();
+      });
+      await service.ensureReady();
+      return (service as any).messageChannel as MessageChannel;
+    }
+
+    afterEach(() => {
+      jest.restoreAllMocks();
+    });
+
+    it('snapshots the dispatch-time model on the user turn', async () => {
+      // enableSonnet1M must be on, or the provider-settings projection
+      // normalizes sonnet[1m] down to sonnet before the runtime sees it.
+      (mockPlugin.settings as any).enableSonnet1M = true;
+      (mockPlugin.settings as any).model = 'sonnet[1m]';
+      sdkMock.setMockMessages([
+        { type: 'system', subtype: 'init', session_id: 'sess-snapshot' },
+        { type: 'assistant', message: { content: [{ type: 'text', text: 'partial' }] } },
+      ], { appendResult: false });
+
+      const prepared = service.prepareTurn({ turnId: 'turn-snapshot', text: 'hi' });
+      const gen = service.query(prepared);
+      try {
+        const first = await gen.next();
+        expect(first.done).toBe(false);
+
+        // Mid-turn drift: another tab switches the app-global provider model.
+        (mockPlugin.settings as any).model = 'sonnet';
+
+        const turn = (service as any).runtimeTurns.get('turn-snapshot');
+        expect(turn).toBeDefined();
+        expect(turn.model).toBe('sonnet[1m]');
+      } finally {
+        await gen.return(undefined);
+      }
+    });
+
+    it('keeps the 1M context window for a sonnet[1m] turn when the global model drifts mid-turn', async () => {
+      await startPersistentQueryWithChannel();
+
+      // A turn dispatched while the provider ran sonnet[1m]; usage transforms
+      // must keep denominating against the dispatch model, not live settings.
+      const turn = createRuntimeTurn({ id: 'turn-drift', kind: 'user' });
+      turn.model = 'sonnet[1m]';
+      (service as any).runtimeTurns.set('turn-drift', turn);
+
+      const channel = (service as any).messageChannel as MessageChannel;
+      expect(channel.beginExternalTurn('turn-drift').ok).toBe(true);
+
+      (mockPlugin.settings as any).enableSonnet1M = true;
+      (mockPlugin.settings as any).model = 'sonnet';
+
+      await (service as any).routeMessage({
+        type: 'assistant',
+        message: {
+          content: [{ type: 'text', text: 'hi' }],
+          usage: { input_tokens: 1200, cache_creation_input_tokens: 0, cache_read_input_tokens: 300000 },
+        },
+      });
+      // Result with main [1m] model + a subagent entry: multi-entry modelUsage
+      // is where intended-model matching decides the authoritative window.
+      await (service as any).routeMessage({
+        type: 'result',
+        subtype: 'success',
+        result: 'done',
+        modelUsage: {
+          'claude-sonnet[1m]': { contextWindow: 1_000_000 },
+          'claude-haiku-4-5': { contextWindow: 200_000 },
+        },
+      });
+
+      const finalUsage = turn.bufferedUsage?.usage;
+      expect(finalUsage).toBeDefined();
+      expect(finalUsage!.model).toBe('sonnet[1m]');
+      expect(finalUsage!.contextWindow).toBe(1_000_000);
+      expect(finalUsage!.contextWindowIsAuthoritative).toBe(true);
+    });
+  });
 });

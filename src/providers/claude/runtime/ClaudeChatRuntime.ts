@@ -924,7 +924,7 @@ export class ClaudianService implements ChatRuntime {
   private getTransformOptions(turn: RuntimeTurn, modelOverride?: string) {
     const settings = this.getScopedSettings();
     return {
-      intendedModel: modelOverride ?? settings.model,
+      intendedModel: modelOverride ?? turn.model ?? settings.model,
       customContextLimits: settings.customContextLimits,
       streamState: turn.streamState,
       usageState: turn.usageState,
@@ -1728,6 +1728,12 @@ export class ClaudianService implements ChatRuntime {
     // cold-start paths consume it). Deletion happens at settlement, cancel or
     // generator cleanup — never by re-generating the id.
     const turn = createRuntimeTurn({ id: turnId, kind: 'user' });
+    // Snapshot the dispatch model: provider settings are app-global and can be
+    // switched mid-turn from another tab, but this turn's usage transforms and
+    // context-window selection must keep the model the query actually runs on
+    // (a sonnet[1m] turn must never re-denominate to the 200k fallback of a
+    // mid-turn "sonnet" selection).
+    turn.model = queryOptions?.model || this.getScopedSettings().model;
     this.runtimeTurns.set(turnId, turn);
     // Fresh turn must not inherit a previous turn's unconsumed metadata.
     this.pendingFeatureTurnMetadata = {};
@@ -2181,7 +2187,7 @@ export class ClaudianService implements ChatRuntime {
       return;
     }
     turn.phase = 'collecting';
-    const selectedModel = queryOptions?.model || this.getScopedSettings().model;
+    const selectedModel = turn.model ?? (queryOptions?.model || this.getScopedSettings().model);
 
     this.sessionManager.setPendingModel(selectedModel);
     this.vaultPath = cwd;
