@@ -17,7 +17,7 @@ import {
   getContextWindowSize,
   isAdaptiveThinkingModel,
   normalizeEffortLevel,
-  normalizeVisibleModelVariant,
+  normalizeVisibleModelVariantForPresets,
   supportsXHighEffort,
   THINKING_BUDGETS,
 } from '../types/models';
@@ -88,10 +88,9 @@ export const claudeChatUIConfig: ProviderChatUIConfig = {
 
   normalizeModelVariant(model: string, settings) {
     const claudeSettings = getClaudeProviderSettings(settings);
-    return normalizeVisibleModelVariant(
+    return normalizeVisibleModelVariantForPresets(
       model,
-      claudeSettings.enableOpus1M,
-      claudeSettings.enableSonnet1M,
+      claudeSettings.modelPresets.map(preset => preset.model),
     );
   },
 

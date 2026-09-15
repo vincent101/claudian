@@ -257,8 +257,8 @@ describe('ClaudianSettingsStorage', () => {
       const result = await storage.load();
       const writtenContent = JSON.parse(mockAdapter.write.mock.calls[0][1]);
 
-      expect(getClaudeProviderSettings(result).enableSonnet1M).toBe(
-        getClaudeProviderSettings(DEFAULT_SETTINGS).enableSonnet1M,
+      expect(getClaudeProviderSettings(result).modelPresets).toEqual(
+        getClaudeProviderSettings(DEFAULT_SETTINGS).modelPresets,
       );
       expect(writtenContent.model).toBe('sonnet');
       expect(writtenContent.hiddenProviderCommands).toEqual({});
@@ -349,6 +349,68 @@ describe('ClaudianSettingsStorage', () => {
       mockAdapter.read.mockResolvedValue('invalid json');
 
       await expect(storage.load()).rejects.toThrow();
+    });
+
+    describe('Claude model preset migration', () => {
+      it('migrates legacy toggles/customModels to modelPresets and drops the old fields on write-back', async () => {
+        mockAdapter.exists.mockResolvedValue(true);
+        mockAdapter.read.mockResolvedValue(JSON.stringify({
+          providerConfigs: {
+            claude: {
+              enableSonnet1M: true,
+              enableOpus1M: false,
+              customModels: 'claude-opus-4-6',
+              lastModel: 'sonnet',
+            },
+          },
+        }));
+
+        const result = await storage.load();
+        const writtenContent = JSON.parse(mockAdapter.write.mock.calls[0][1]);
+        const claudeConfig = writtenContent.providerConfigs.claude;
+
+        expect(getClaudeProviderSettings(result).modelPresets.map(p => p.model)).toEqual([
+          'haiku', 'sonnet[1m]', 'opus', 'fable', 'claude-opus-4-6',
+        ]);
+        expect(claudeConfig.modelPresets.map((p: { model: string }) => p.model)).toEqual([
+          'haiku', 'sonnet[1m]', 'opus', 'fable', 'claude-opus-4-6',
+        ]);
+        expect(claudeConfig).not.toHaveProperty('customModels');
+        expect(claudeConfig).not.toHaveProperty('enableSonnet1M');
+        expect(claudeConfig).not.toHaveProperty('enableOpus1M');
+      });
+
+      it('imports legacy customContextLimits into the migrated presets', async () => {
+        mockAdapter.exists.mockResolvedValue(true);
+        mockAdapter.read.mockResolvedValue(JSON.stringify({
+          customContextLimits: { 'claude-opus-4-6': 500_000 },
+          providerConfigs: {
+            claude: { customModels: 'claude-opus-4-6' },
+          },
+        }));
+
+        const result = await storage.load();
+
+        const byModel = new Map(
+          getClaudeProviderSettings(result).modelPresets.map(p => [p.model, p]),
+        );
+        expect(byModel.get('claude-opus-4-6')?.contextWindow).toBe(500_000);
+      });
+
+      it('does not rewrite the file again once presets are stored', async () => {
+        mockAdapter.exists.mockResolvedValue(true);
+        mockAdapter.read.mockResolvedValue(JSON.stringify({
+          providerConfigs: {
+            claude: {
+              modelPresets: [{ label: 'Haiku', model: 'haiku' }],
+            },
+          },
+        }));
+
+        await storage.load();
+
+        expect(mockAdapter.write).not.toHaveBeenCalled();
+      });
     });
 
     it('should throw on read error', async () => {

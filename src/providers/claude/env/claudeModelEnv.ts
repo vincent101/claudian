@@ -5,6 +5,7 @@ const CUSTOM_MODEL_ENV_KEYS = [
   'ANTHROPIC_DEFAULT_OPUS_MODEL',
   'ANTHROPIC_DEFAULT_SONNET_MODEL',
   'ANTHROPIC_DEFAULT_HAIKU_MODEL',
+  'ANTHROPIC_DEFAULT_FABLE_MODEL',
 ] as const;
 
 function getModelTypeFromEnvKey(envKey: string): string {
@@ -31,7 +32,7 @@ export function getModelsFromEnvironment(envVars: Record<string, string>): { val
   }
 
   const models: { value: string; label: string; description: string }[] = [];
-  const typePriority = { 'model': 4, 'haiku': 3, 'sonnet': 2, 'opus': 1 };
+  const typePriority = { 'model': 5, 'haiku': 4, 'sonnet': 3, 'opus': 2, 'fable': 1 };
 
   const sortedEntries = Array.from(modelMap.entries()).sort(([, aInfo], [, bInfo]) => {
     const aPriority = Math.max(...aInfo.types.map(t => typePriority[t as keyof typeof typePriority] || 0));
@@ -67,6 +68,9 @@ export function getCurrentModelFromEnvironment(envVars: Record<string, string>):
   }
   if (envVars.ANTHROPIC_DEFAULT_OPUS_MODEL) {
     return envVars.ANTHROPIC_DEFAULT_OPUS_MODEL;
+  }
+  if (envVars.ANTHROPIC_DEFAULT_FABLE_MODEL) {
+    return envVars.ANTHROPIC_DEFAULT_FABLE_MODEL;
   }
   return null;
 }

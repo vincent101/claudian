@@ -112,7 +112,10 @@ describe('ProviderSettingsCoordinator', () => {
         providerConfigs: {
           claude: {
             ...DEFAULT_CLAUDE_PROVIDER_SETTINGS,
-            customModels: 'claude-opus-4-6',
+            modelPresets: [
+              { label: 'Haiku', model: 'haiku' },
+              { label: 'Opus 4.6', model: 'claude-opus-4-6' },
+            ],
           },
         },
       };

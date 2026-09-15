@@ -14,12 +14,12 @@ import { getClaudeProviderSettings } from '@/providers/claude/settings';
 import {
   CONTEXT_WINDOW_1M,
   CONTEXT_WINDOW_STANDARD,
-  DEFAULT_CLAUDE_MODELS,
-  filterVisibleModelOptions,
   getContextWindowSize,
   isAdaptiveThinkingModel,
   normalizeEffortLevel,
-  normalizeVisibleModelVariant,
+  normalizeVisibleModelVariantForPresets,
+  resolveAdaptiveEffortLevel,
+  resolveThinkingTokens,
   supportsXHighEffort,
 } from '@/providers/claude/types/models';
 import {
@@ -53,7 +53,9 @@ describe('types.ts', () => {
     });
 
     it('should have empty custom Claude models by default', () => {
-      expect(getClaudeProviderSettings(DEFAULT_SETTINGS).customModels).toBe('');
+      expect(getClaudeProviderSettings(DEFAULT_SETTINGS).modelPresets.map(p => p.model)).toEqual([
+        'haiku', 'sonnet', 'opus', 'fable',
+      ]);
     });
 
     it('should have lastCustomModel as empty string by default', () => {
@@ -634,45 +636,40 @@ describe('types.ts', () => {
       });
     });
 
-    describe('filterVisibleModelOptions', () => {
-      it('should hide 1M variants when toggles are disabled', () => {
-        const models = filterVisibleModelOptions(DEFAULT_CLAUDE_MODELS, false, false).map((model) => model.value);
-        expect(models).toEqual(['haiku', 'sonnet', 'opus']);
+    describe('fable family defaults', () => {
+      it('should default the fable alias to a 1M context window', () => {
+        expect(getContextWindowSize('fable')).toBe(CONTEXT_WINDOW_1M);
       });
 
-      it('should swap in 1M variants when toggles are enabled', () => {
-        const models = filterVisibleModelOptions(DEFAULT_CLAUDE_MODELS, true, true).map((model) => model.value);
-        expect(models).toEqual(['haiku', 'sonnet[1m]', 'opus[1m]']);
+      it('should default concrete fable model ids to a 1M context window', () => {
+        expect(getContextWindowSize('claude-fable-5')).toBe(CONTEXT_WINDOW_1M);
       });
 
-      it('should swap only opus when enableOpus1M is true and enableSonnet1M is false', () => {
-        const models = filterVisibleModelOptions(DEFAULT_CLAUDE_MODELS, true, false).map((model) => model.value);
-        expect(models).toEqual(['haiku', 'sonnet', 'opus[1m]']);
-      });
-
-      it('should swap only sonnet when enableSonnet1M is true and enableOpus1M is false', () => {
-        const models = filterVisibleModelOptions(DEFAULT_CLAUDE_MODELS, false, true).map((model) => model.value);
-        expect(models).toEqual(['haiku', 'sonnet[1m]', 'opus']);
+      it('should still prefer custom limits for fable models', () => {
+        expect(getContextWindowSize('fable', { 'fable': 500_000 })).toBe(500_000);
       });
     });
 
-    describe('normalizeVisibleModelVariant', () => {
-      it('should normalize built-in variants to the visible option', () => {
-        expect(normalizeVisibleModelVariant('sonnet', true, true)).toBe('sonnet[1m]');
-        expect(normalizeVisibleModelVariant('sonnet[1m]', false, false)).toBe('sonnet');
-        expect(normalizeVisibleModelVariant('opus', true, false)).toBe('opus[1m]');
-        expect(normalizeVisibleModelVariant('opus[1m]', false, true)).toBe('opus');
+    describe('normalizeVisibleModelVariantForPresets', () => {
+      it('should remap a stored variant to the sibling offered by the presets', () => {
+        expect(normalizeVisibleModelVariantForPresets('sonnet', ['haiku', 'sonnet[1m]', 'opus', 'fable'])).toBe('sonnet[1m]');
+        expect(normalizeVisibleModelVariantForPresets('opus[1m]', ['haiku', 'sonnet', 'opus', 'fable'])).toBe('opus');
       });
 
-      it('should normalize built-in variants regardless of 1M suffix casing', () => {
-        expect(normalizeVisibleModelVariant('sonnet[1M]', false, false)).toBe('sonnet');
-        expect(normalizeVisibleModelVariant('opus[1M]', true, false)).toBe('opus[1m]');
+      it('should keep a model that the presets offer as-is', () => {
+        expect(normalizeVisibleModelVariantForPresets('sonnet[1m]', ['sonnet[1m]'])).toBe('sonnet[1m]');
+        expect(normalizeVisibleModelVariantForPresets('sonnet', ['sonnet', 'sonnet[1m]'])).toBe('sonnet');
       });
 
-      it('should leave unrelated model ids unchanged', () => {
-        expect(normalizeVisibleModelVariant('', true, true)).toBe('');
-        expect(normalizeVisibleModelVariant('haiku', true, true)).toBe('haiku');
-        expect(normalizeVisibleModelVariant('custom-model', true, true)).toBe('custom-model');
+      it('should leave a variant unchanged when no sibling is offered either', () => {
+        expect(normalizeVisibleModelVariantForPresets('sonnet', ['haiku'])).toBe('sonnet');
+        expect(normalizeVisibleModelVariantForPresets('opus[1m]', ['haiku'])).toBe('opus[1m]');
+      });
+
+      it('should leave unrelated model ids unchanged regardless of casing', () => {
+        expect(normalizeVisibleModelVariantForPresets('sonnet[1M]', ['sonnet[1m]'])).toBe('sonnet[1m]');
+        expect(normalizeVisibleModelVariantForPresets('', ['sonnet'])).toBe('');
+        expect(normalizeVisibleModelVariantForPresets('custom-model', ['sonnet'])).toBe('custom-model');
       });
     });
   });
@@ -685,6 +682,7 @@ describe('types.ts', () => {
       expect(isAdaptiveThinkingModel('opus')).toBe(true);
       expect(isAdaptiveThinkingModel('opus[1m]')).toBe(true);
       expect(isAdaptiveThinkingModel('opus[1M]')).toBe(true);
+      expect(isAdaptiveThinkingModel('fable')).toBe(true);
     });
 
     it('should return true for full Claude model IDs', () => {
@@ -732,9 +730,28 @@ describe('types.ts', () => {
       expect(supportsXHighEffort('sonnet[1m]')).toBe(true);
     });
 
+    it('returns true for fable models', () => {
+      expect(supportsXHighEffort('fable')).toBe(true);
+      expect(supportsXHighEffort('claude-fable-5')).toBe(true);
+    });
+
     it('returns false for versioned non-opus models and older opus ids', () => {
       expect(supportsXHighEffort('claude-sonnet-4-5')).toBe(false);
       expect(supportsXHighEffort('claude-opus-4-6')).toBe(false);
+    });
+  });
+
+  describe('fable reasoning semantics', () => {
+    it('never sends a legacy fixed thinking budget for fable', () => {
+      expect(resolveThinkingTokens('fable', 'high')).toBeNull();
+      expect(resolveThinkingTokens('fable', 'xhigh')).toBeNull();
+      expect(resolveThinkingTokens('claude-fable-5', 'medium')).toBeNull();
+    });
+
+    it('resolves fable to an adaptive effort level', () => {
+      expect(resolveAdaptiveEffortLevel('fable', 'xhigh')).toBe('xhigh');
+      expect(resolveAdaptiveEffortLevel('fable', 'max')).toBe('max');
+      expect(resolveAdaptiveEffortLevel('fable', undefined)).toBe('high');
     });
   });
 

@@ -1,0 +1,79 @@
+/* Model preset row editor (Claude settings tab) */
+
+.claudian-model-preset-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.claudian-model-preset-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 8px 10px;
+  background: var(--background-secondary);
+  border-radius: 6px;
+}
+
+.claudian-model-preset-row .claudian-model-preset-label {
+  flex: 1 1 96px;
+  min-width: 80px;
+}
+
+.claudian-model-preset-row .claudian-model-preset-model {
+  flex: 2 1 160px;
+  min-width: 120px;
+  font-family: var(--font-monospace);
+  font-size: var(--font-ui-smaller);
+}
+
+.claudian-model-preset-row .claudian-model-preset-window {
+  flex: 1 1 90px;
+  min-width: 76px;
+  font-family: var(--font-monospace);
+  font-size: var(--font-ui-smaller);
+}
+
+.claudian-model-preset-row button {
+  flex: 0 0 auto;
+  padding: 4px 8px;
+  background: transparent;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 4px;
+  color: var(--text-muted);
+  cursor: pointer;
+}
+
+.claudian-model-preset-row button:hover {
+  color: var(--text-normal);
+  border-color: var(--interactive-accent);
+}
+
+.claudian-model-preset-error {
+  flex-basis: 100%;
+  color: var(--text-error);
+  font-size: var(--font-ui-smaller);
+}
+
+.claudian-model-preset-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.claudian-model-preset-actions button {
+  padding: 4px 10px;
+  background: transparent;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 4px;
+  color: var(--text-muted);
+  cursor: pointer;
+  font-size: var(--font-ui-small);
+}
+
+.claudian-model-preset-actions button:hover {
+  color: var(--text-normal);
+  border-color: var(--interactive-accent);
+}

@@ -278,18 +278,23 @@
       "desc": "為您的自訂模型設定上下文視窗大小。留空使用預設值（200k 權杖）。",
       "invalid": "格式無效。使用：256k、1m 或精確數量（1000-10000000）。"
     },
-    "enableOpus1M": {
-      "name": "Opus 1M 上下文視窗",
-      "desc": "在模型選擇器中顯示 Opus 1M。Max、Team 和 Enterprise 方案已包含。API 和 Pro 使用者需要額外用量。"
-    },
-    "enableSonnet1M": {
-      "name": "Sonnet 1M 上下文視窗",
-      "desc": "在模型選擇器中顯示 Sonnet 1M。Max、Team 和 Enterprise 方案需要額外用量。API 和 Pro 使用者需要額外用量。"
-    },
-    "customModels": {
-      "name": "Custom models",
-      "desc": "Append additional Claude model IDs to the picker, one per line. Environment model overrides still replace the picker.",
-      "placeholder": "claude-opus-4-6\nclaude-opus-4-6[1m]\nclaude-opus-4-5-20251101"
+    "modelPresets": {
+      "name": "模型檔位",
+      "desc": "定義 Claude 模型選擇器中顯示的檔位。模型 ID 原樣發送給 Claude Code；上下文視窗可選，填寫後覆蓋內建預設值。",
+      "labelPlaceholder": "名稱",
+      "modelPlaceholder": "模型 ID（如 sonnet、fable）",
+      "windowPlaceholder": "上下文視窗（如 200k、1m）",
+      "add": "新增檔位",
+      "reset": "恢復預設四檔",
+      "remove": "刪除",
+      "moveUp": "上移",
+      "moveDown": "下移",
+      "validation": {
+        "emptyLabel": "名稱不能為空。",
+        "emptyModel": "模型 ID 不能為空。",
+        "duplicateModel": "模型 ID 重複。",
+        "invalidWindow": "上下文視窗格式無效。使用：256k、1m 或精確數量（1000-10000000）。"
+      }
     },
     "enableChrome": {
       "name": "啟用 Chrome 擴充功能",

@@ -11,6 +11,7 @@ export const DEFAULT_CLAUDE_MODELS: { value: ClaudeModel; label: string; descrip
   { value: 'sonnet[1m]', label: 'Sonnet 1M', description: 'Balanced performance (1M context window)' },
   { value: 'opus', label: 'Opus', description: 'Most capable' },
   { value: 'opus[1m]', label: 'Opus 1M', description: 'Most capable (1M context window)' },
+  { value: 'fable', label: 'Fable', description: 'Deep reasoning (1M context window)' },
 ];
 
 export type ThinkingBudget = 'off' | 'low' | 'medium' | 'high' | 'xhigh';
@@ -41,6 +42,7 @@ export const DEFAULT_EFFORT_LEVEL: Record<string, EffortLevel> = {
   'sonnet[1m]': 'high',
   'opus': 'high',
   'opus[1m]': 'high',
+  'fable': 'high',
 };
 
 /** Default thinking budget per model tier. */
@@ -50,6 +52,7 @@ export const DEFAULT_THINKING_BUDGET: Record<string, ThinkingBudget> = {
   'sonnet[1m]': 'low',
   'opus': 'medium',
   'opus[1m]': 'medium',
+  'fable': 'off',
 };
 
 const ONE_M_SUFFIX = '[1m]';
@@ -66,6 +69,11 @@ function has1MContextSuffix(model: string): boolean {
 function isBuiltInFamilyVariant(model: string, family: 'sonnet' | 'opus'): boolean {
   const normalized = normalizeModelId(model);
   return normalized === family || normalized === `${family}${ONE_M_SUFFIX}`;
+}
+
+function isFableFamilyModel(model: string): boolean {
+  const normalized = normalizeModelId(model);
+  return normalized === 'fable' || /^claude-fable-\d/.test(normalized);
 }
 
 function isValidContextLimit(limit: unknown): limit is number {
@@ -97,6 +105,7 @@ function resolveCustomContextLimit(
 export function isAdaptiveThinkingModel(model: string): boolean {
   const normalized = normalizeModelId(model);
   if (DEFAULT_MODEL_VALUES.has(normalized)) return true;
+  if (isFableFamilyModel(normalized)) return true;
   return /claude-(haiku|sonnet|opus)-/.test(normalized);
 }
 
@@ -113,6 +122,7 @@ export function supportsXHighEffort(model: string): boolean {
   const normalized = normalizeModelId(model);
   if (isBuiltInFamilyVariant(normalized, 'opus')) return true;
   if (isBuiltInFamilyVariant(normalized, 'sonnet')) return true;
+  if (normalized === 'fable' || isFableFamilyModel(normalized)) return true;
   return /claude-opus-(4-[7-9]|[5-9])/.test(normalized);
 }
 
@@ -160,35 +170,33 @@ export function resolveAdaptiveEffortLevel(
 export const CONTEXT_WINDOW_STANDARD = 200_000;
 export const CONTEXT_WINDOW_1M = 1_000_000;
 
-export function filterVisibleModelOptions<T extends { value: string }>(
-  models: T[],
-  enableOpus1M: boolean,
-  enableSonnet1M: boolean
-): T[] {
-  return models.filter((model) => {
-    if (isBuiltInFamilyVariant(model.value, 'opus')) {
-      return enableOpus1M ? has1MContextSuffix(model.value) : normalizeModelId(model.value) === 'opus';
-    }
-
-    if (isBuiltInFamilyVariant(model.value, 'sonnet')) {
-      return enableSonnet1M ? has1MContextSuffix(model.value) : normalizeModelId(model.value) === 'sonnet';
-    }
-
-    return true;
-  });
-}
-
-export function normalizeVisibleModelVariant(
+/**
+ * Maps a stored built-in family variant onto the variant actually offered by
+ * the preset list (e.g. stored `sonnet` when the presets offer `sonnet[1m]`).
+ * Keeps the model unchanged when it is not a built-in variant, when it is
+ * offered as-is, or when no sibling variant is offered either.
+ */
+export function normalizeVisibleModelVariantForPresets(
   model: string,
-  enableOpus1M: boolean,
-  enableSonnet1M: boolean
+  presetModels: readonly string[],
 ): string {
-  if (isBuiltInFamilyVariant(model, 'opus')) {
-    return enableOpus1M ? 'opus[1m]' : 'opus';
-  }
+  const offered = new Map(presetModels.map(presetModel => [normalizeModelId(presetModel), presetModel]));
+  for (const family of ['sonnet', 'opus'] as const) {
+    if (!isBuiltInFamilyVariant(model, family)) {
+      continue;
+    }
 
-  if (isBuiltInFamilyVariant(model, 'sonnet')) {
-    return enableSonnet1M ? 'sonnet[1m]' : 'sonnet';
+    const normalized = normalizeModelId(model);
+    const exact = offered.get(normalized);
+    if (exact) {
+      return exact;
+    }
+
+    const siblingKey = normalized === family ? `${family}${ONE_M_SUFFIX}` : family;
+    const sibling = offered.get(siblingKey);
+    if (sibling) {
+      return sibling;
+    }
   }
 
   return model;
@@ -204,6 +212,10 @@ export function getContextWindowSize(
   }
 
   if (has1MContextSuffix(model)) {
+    return CONTEXT_WINDOW_1M;
+  }
+
+  if (isFableFamilyModel(model)) {
     return CONTEXT_WINDOW_1M;
   }
 

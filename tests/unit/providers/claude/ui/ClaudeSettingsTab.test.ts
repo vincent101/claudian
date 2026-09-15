@@ -32,6 +32,7 @@ jest.mock('obsidian', () => {
     public textAreaComponents: MockTextAreaComponent[] = [];
     public dropdownComponents: MockDropdownComponent[] = [];
     public toggleComponents: MockToggleComponent[] = [];
+    public infoEl = createInfoElement();
 
     constructor(_container: unknown) {
       createdSettings.push(this);
@@ -272,6 +273,7 @@ function createToggleComponent(): MockToggleComponent {
 }
 
 function createElement(): any {
+  const listeners: Record<string, Array<() => void>> = {};
   const element: any = {
     value: '',
     style: {},
@@ -282,8 +284,23 @@ function createElement(): any {
     createSpan: jest.fn(() => createElement()),
     setText: jest.fn(),
     empty: jest.fn(),
+    addEventListener: jest.fn((event: string, handler: () => void) => {
+      listeners[event] = listeners[event] ?? [];
+      listeners[event].push(handler);
+    }),
   };
 
+  return element;
+}
+
+/** Minimal infoEl for the preset editor: counts created rows/inputs. */
+function createInfoElement(): any {
+  const element = createElement();
+  element.children = [];
+  element.appendChild = jest.fn((child: any) => {
+    element.children.push(child);
+    return element;
+  });
   return element;
 }
 
@@ -367,21 +384,20 @@ describe('ClaudeSettingsTab', () => {
     expect(cliPathInput.placeholder).not.toContain('cli.js');
   });
 
-  it('does not switch the active model while the custom models textarea is mid-edit', async () => {
+  it('renders the model preset editor in place of the retired toggles and textarea', () => {
     const plugin = createPlugin();
     const context = createContext(plugin);
 
     claudeSettingsTabRenderer.render(createContainer(), context);
 
-    const customModelsSetting = findSetting('settings.customModels.name');
-    const customModelsTextArea = customModelsSetting.textAreaComponents[0];
-
-    await customModelsTextArea.onChangeCallback?.('claude-opus-4-7');
-
-    expect(plugin.settings.providerConfigs.claude.customModels).toBe('claude-opus-4-6');
-    expect(plugin.settings.model).toBe('claude-opus-4-6');
-    expect(mockSaveSettings).not.toHaveBeenCalled();
-    expect(context.refreshModelSelectors).not.toHaveBeenCalled();
+    const presetsSetting = createdSettings.find(
+      candidate => candidate.name === 'settings.modelPresets.name',
+    );
+    expect(presetsSetting).toBeDefined();
+    // The legacy controls are gone.
+    expect(createdSettings.find(candidate => candidate.name === 'settings.enableOpus1M.name')).toBeUndefined();
+    expect(createdSettings.find(candidate => candidate.name === 'settings.enableSonnet1M.name')).toBeUndefined();
+    expect(createdSettings.find(candidate => candidate.name === 'settings.customModels.name')).toBeUndefined();
   });
 
   it('offers auto as a Claude safe mode and persists it', async () => {
@@ -403,26 +419,5 @@ describe('ClaudeSettingsTab', () => {
 
     expect(plugin.settings.providerConfigs.claude.safeMode).toBe('auto');
     expect(mockSaveSettings).toHaveBeenCalledTimes(1);
-  });
-
-  it('reconciles removed custom models on blur and clears stale title model selections', async () => {
-    const plugin = createPlugin({
-      titleGenerationModel: 'claude-opus-4-6',
-    });
-    const context = createContext(plugin);
-
-    claudeSettingsTabRenderer.render(createContainer(), context);
-
-    const customModelsSetting = findSetting('settings.customModels.name');
-    const customModelsTextArea = customModelsSetting.textAreaComponents[0];
-
-    await customModelsTextArea.onChangeCallback?.('claude-opus-4-7');
-    await customModelsTextArea.trigger('blur');
-
-    expect(plugin.settings.providerConfigs.claude.customModels).toBe('claude-opus-4-7');
-    expect(plugin.settings.model).toBe('sonnet');
-    expect(plugin.settings.titleGenerationModel).toBe('');
-    expect(mockSaveSettings).toHaveBeenCalledTimes(1);
-    expect(context.refreshModelSelectors).toHaveBeenCalledTimes(1);
   });
 });

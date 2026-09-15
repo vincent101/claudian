@@ -18,6 +18,7 @@ import {
 } from '../settings';
 import { AgentSettings } from './AgentSettings';
 import { claudeChatUIConfig } from './ClaudeChatUIConfig';
+import { ModelPresetSettings } from './ModelPresetSettings';
 import { PluginSettingsManager } from './PluginSettingsManager';
 import { SlashCommandSettings } from './SlashCommandSettings';
 
@@ -181,84 +182,19 @@ export const claudeSettingsTabRenderer: ProviderSettingsTabRenderer = {
 
     new Setting(container).setName(t('settings.models')).setHeading();
 
-    new Setting(container)
-      .setName(t('settings.enableOpus1M.name'))
-      .setDesc(t('settings.enableOpus1M.desc'))
-      .addToggle((toggle) =>
-        toggle
-          .setValue(claudeSettings.enableOpus1M)
-          .onChange(async (value) => {
-            updateClaudeProviderSettings(settingsBag, { enableOpus1M: value });
-            context.plugin.normalizeModelVariantSettings();
-            await context.plugin.saveSettings();
-            context.refreshModelSelectors();
-          })
-      );
+    const presetsSetting = new Setting(container)
+      .setName(t('settings.modelPresets.name'))
+      .setDesc(t('settings.modelPresets.desc'));
 
-    new Setting(container)
-      .setName(t('settings.enableSonnet1M.name'))
-      .setDesc(t('settings.enableSonnet1M.desc'))
-      .addToggle((toggle) =>
-        toggle
-          .setValue(claudeSettings.enableSonnet1M)
-          .onChange(async (value) => {
-            updateClaudeProviderSettings(settingsBag, { enableSonnet1M: value });
-            context.plugin.normalizeModelVariantSettings();
-            await context.plugin.saveSettings();
-            context.refreshModelSelectors();
-          })
-      );
-
-    new Setting(container)
-      .setName(t('settings.customModels.name'))
-      .setDesc(t('settings.customModels.desc'))
-      .addTextArea((text) => {
-        let pendingCustomModels = claudeSettings.customModels;
-        let savedCustomModels = claudeSettings.customModels;
-
-        const commitCustomModels = async (): Promise<void> => {
-          const previousCustomModels = savedCustomModels;
-          const previousModel = typeof settingsBag.model === 'string' ? settingsBag.model : '';
-          const previousTitleModel = typeof settingsBag.titleGenerationModel === 'string'
-            ? settingsBag.titleGenerationModel
-            : '';
-
-          if (pendingCustomModels !== savedCustomModels) {
-            updateClaudeProviderSettings(settingsBag, { customModels: pendingCustomModels });
-            savedCustomModels = pendingCustomModels;
-          }
-
-          reconcileActiveClaudeModelSelection();
-          const didReconcileTitleModel = ProviderSettingsCoordinator
-            .reconcileTitleGenerationModelSelection(settingsBag);
-          const nextModel = typeof settingsBag.model === 'string' ? settingsBag.model : '';
-          const nextTitleModel = typeof settingsBag.titleGenerationModel === 'string'
-            ? settingsBag.titleGenerationModel
-            : '';
-          const didModelSelectionChange = previousModel !== nextModel;
-          const didCustomModelsChange = previousCustomModels !== savedCustomModels;
-
-          if (!didCustomModelsChange && !didModelSelectionChange && !didReconcileTitleModel
-            && previousTitleModel === nextTitleModel) {
-            return;
-          }
-
-          await context.plugin.saveSettings();
-          context.refreshModelSelectors();
-        };
-
-        text
-          .setPlaceholder(t('settings.customModels.placeholder'))
-          .setValue(claudeSettings.customModels)
-          .onChange((value) => {
-            pendingCustomModels = value;
-          });
-        text.inputEl.rows = 6;
-        text.inputEl.cols = 40;
-        text.inputEl.addEventListener('blur', () => {
-          void commitCustomModels();
-        });
-      });
+    new ModelPresetSettings(presetsSetting.infoEl, {
+      getSettings: () => settingsBag,
+      saveSettings: () => context.plugin.saveSettings(),
+      refreshModelSelectors: () => context.refreshModelSelectors(),
+      onModelOptionsChanged: () => {
+        reconcileActiveClaudeModelSelection();
+        ProviderSettingsCoordinator.reconcileTitleGenerationModelSelection(settingsBag);
+      },
+    });
 
     // --- Slash Commands ---
 

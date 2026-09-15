@@ -5,7 +5,11 @@ import { DEFAULT_OPENCODE_PROVIDER_SETTINGS } from './opencode/settings';
 
 export function getBuiltInProviderDefaultConfigs(): ProviderConfigMap {
   return {
-    claude: { ...DEFAULT_CLAUDE_PROVIDER_SETTINGS },
+    claude: {
+      ...DEFAULT_CLAUDE_PROVIDER_SETTINGS,
+      // Shallow spread would share the frozen preset array across consumers.
+      modelPresets: DEFAULT_CLAUDE_PROVIDER_SETTINGS.modelPresets.map(preset => ({ ...preset })),
+    },
     codex: { ...DEFAULT_CODEX_PROVIDER_SETTINGS },
     opencode: { ...DEFAULT_OPENCODE_PROVIDER_SETTINGS },
   };

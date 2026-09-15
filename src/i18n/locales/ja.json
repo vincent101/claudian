@@ -278,18 +278,23 @@
       "desc": "カスタムモデルのコンテキストウィンドウサイズを設定します。デフォルト（200kトークン）を使用する場合は空欄のままにしてください。",
       "invalid": "無効な形式です。使用：256k、1m、または正確な数値（1000-10000000）。"
     },
-    "enableOpus1M": {
-      "name": "Opus 1Mコンテキストウィンドウ",
-      "desc": "モデルセレクターにOpus 1Mを表示します。Max、Team、Enterpriseプランに含まれます。APIおよびProユーザーは追加使用量が必要です。"
-    },
-    "enableSonnet1M": {
-      "name": "Sonnet 1Mコンテキストウィンドウ",
-      "desc": "モデルセレクターにSonnet 1Mを表示します。Max、Team、Enterpriseプランでは追加使用量が必要です。APIおよびProユーザーは追加使用量が必要です。"
-    },
-    "customModels": {
-      "name": "Custom models",
-      "desc": "Append additional Claude model IDs to the picker, one per line. Environment model overrides still replace the picker.",
-      "placeholder": "claude-opus-4-6\nclaude-opus-4-6[1m]\nclaude-opus-4-5-20251101"
+    "modelPresets": {
+      "name": "Model presets",
+      "desc": "Define the model tiers shown in the Claude model selector. The model id is sent to Claude Code as-is; the context window is optional and overrides the built-in default.",
+      "labelPlaceholder": "Label",
+      "modelPlaceholder": "Model id (e.g. sonnet, fable)",
+      "windowPlaceholder": "Context window (e.g. 200k, 1m)",
+      "add": "Add preset",
+      "reset": "Restore defaults",
+      "remove": "Remove",
+      "moveUp": "Move up",
+      "moveDown": "Move down",
+      "validation": {
+        "emptyLabel": "Label is required.",
+        "emptyModel": "Model id is required.",
+        "duplicateModel": "Duplicate model id.",
+        "invalidWindow": "Invalid context window. Use: 256k, 1m, or an exact count (1000-10000000)."
+      }
     },
     "enableChrome": {
       "name": "Chrome拡張機能を有効化",

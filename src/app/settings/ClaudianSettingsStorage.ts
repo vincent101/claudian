@@ -198,6 +198,28 @@ function hasLegacyTopLevelProviderFields(stored: Record<string, unknown>): boole
   return LEGACY_TOP_LEVEL_PROVIDER_FIELDS.some((key) => key in stored);
 }
 
+/**
+ * One-shot preset migration trigger: the stored Claude config predates
+ * modelPresets (or still carries the retired fields), so the migrated preset
+ * list produced during load must be written back in the new format.
+ */
+function needsClaudeModelPresetMigration(stored: Record<string, unknown>): boolean {
+  const providerConfigs = stored.providerConfigs;
+  if (!providerConfigs || typeof providerConfigs !== 'object' || Array.isArray(providerConfigs)) {
+    return false;
+  }
+
+  const claudeConfig = (providerConfigs as Record<string, unknown>).claude;
+  if (!claudeConfig || typeof claudeConfig !== 'object' || Array.isArray(claudeConfig)) {
+    return false;
+  }
+
+  return !Array.isArray((claudeConfig as Record<string, unknown>).modelPresets)
+    || 'customModels' in claudeConfig
+    || 'enableSonnet1M' in claudeConfig
+    || 'enableOpus1M' in claudeConfig;
+}
+
 function mergeLegacyClaudeHiddenCommands(
   hiddenProviderCommands: HiddenProviderCommands,
   legacyHiddenSlashCommands: unknown,
@@ -270,6 +292,7 @@ export class ClaudianSettingsStorage {
       settingsPath !== CLAUDIAN_SETTINGS_PATH
       || (
       hasLegacyTopLevelProviderFields(stored)
+      || needsClaudeModelPresetMigration(stored)
       || 'show1MModel' in stored
       || 'slashCommands' in stored
       || 'hiddenSlashCommands' in stored

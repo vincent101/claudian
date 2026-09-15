@@ -3,6 +3,7 @@ import { TOOL_SUBAGENT } from '@/core/tools/toolNames';
 import { VIEW_TYPE_CLAUDIAN } from '@/core/types';
 import * as sdkSession from '@/providers/claude/history/ClaudeHistoryStore';
 import { DEFAULT_SETTINGS } from '@/providers/claude/types/settings';
+import { claudeChatUIConfig } from '@/providers/claude/ui/ClaudeChatUIConfig';
 
 // Mock fs for ClaudianService
 jest.mock('fs');
@@ -324,7 +325,11 @@ describe('ClaudianPlugin', () => {
       const saveSpy = jest.spyOn(plugin, 'saveSettings');
       await plugin.loadSettings();
 
-      expect(plugin.settings.model).toBe('custom-model');
+      // Env models append to (no longer replace) the preset list; the default
+      // selection stays on the first preset.
+      expect(plugin.settings.model).toBe('haiku');
+      const options = claudeChatUIConfig.getModelOptions(plugin.settings);
+      expect(options.map(option => option.value)).toContain('custom-model');
       expect(saveSpy).toHaveBeenCalled();
     });
   });

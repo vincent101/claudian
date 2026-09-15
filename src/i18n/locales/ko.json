@@ -278,18 +278,23 @@
       "desc": "사용자 정의 모델의 컨텍스트 창 크기를 설정합니다. 기본값(200k 토큰)을 사용하려면 비워두세요.",
       "invalid": "잘못된 형식입니다. 사용: 256k, 1m 또는 정확한 숫자(1000-10000000)."
     },
-    "enableOpus1M": {
-      "name": "Opus 1M 컨텍스트 윈도우",
-      "desc": "모델 선택기에서 Opus 1M을 표시합니다. Max, Team, Enterprise 플랜에 포함됩니다. API 및 Pro 사용자는 추가 사용량이 필요합니다."
-    },
-    "enableSonnet1M": {
-      "name": "Sonnet 1M 컨텍스트 윈도우",
-      "desc": "모델 선택기에서 Sonnet 1M을 표시합니다. Max, Team, Enterprise 플랜에서 추가 사용량이 필요합니다. API 및 Pro 사용자는 추가 사용량이 필요합니다."
-    },
-    "customModels": {
-      "name": "Custom models",
-      "desc": "Append additional Claude model IDs to the picker, one per line. Environment model overrides still replace the picker.",
-      "placeholder": "claude-opus-4-6\nclaude-opus-4-6[1m]\nclaude-opus-4-5-20251101"
+    "modelPresets": {
+      "name": "Model presets",
+      "desc": "Define the model tiers shown in the Claude model selector. The model id is sent to Claude Code as-is; the context window is optional and overrides the built-in default.",
+      "labelPlaceholder": "Label",
+      "modelPlaceholder": "Model id (e.g. sonnet, fable)",
+      "windowPlaceholder": "Context window (e.g. 200k, 1m)",
+      "add": "Add preset",
+      "reset": "Restore defaults",
+      "remove": "Remove",
+      "moveUp": "Move up",
+      "moveDown": "Move down",
+      "validation": {
+        "emptyLabel": "Label is required.",
+        "emptyModel": "Model id is required.",
+        "duplicateModel": "Duplicate model id.",
+        "invalidWindow": "Invalid context window. Use: 256k, 1m, or an exact count (1000-10000000)."
+      }
     },
     "enableChrome": {
       "name": "Chrome 확장 프로그램 활성화",

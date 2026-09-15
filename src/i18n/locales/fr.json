@@ -278,18 +278,23 @@
       "desc": "Définissez les tailles de fenêtre de contexte pour vos modèles personnalisés. Laissez vide pour utiliser la valeur par défaut (200k tokens).",
       "invalid": "Format invalide. Utilisez : 256k, 1m ou nombre exact (1000-10000000)."
     },
-    "enableOpus1M": {
-      "name": "Fenêtre de contexte Opus 1M",
-      "desc": "Afficher Opus 1M dans le sélecteur de modèle. Inclus avec les plans Max, Team et Enterprise. Les utilisateurs API et Pro nécessitent une utilisation supplémentaire."
-    },
-    "enableSonnet1M": {
-      "name": "Fenêtre de contexte Sonnet 1M",
-      "desc": "Afficher Sonnet 1M dans le sélecteur de modèle. Nécessite une utilisation supplémentaire sur les plans Max, Team et Enterprise. Les utilisateurs API et Pro nécessitent une utilisation supplémentaire."
-    },
-    "customModels": {
-      "name": "Custom models",
-      "desc": "Append additional Claude model IDs to the picker, one per line. Environment model overrides still replace the picker.",
-      "placeholder": "claude-opus-4-6\nclaude-opus-4-6[1m]\nclaude-opus-4-5-20251101"
+    "modelPresets": {
+      "name": "Model presets",
+      "desc": "Define the model tiers shown in the Claude model selector. The model id is sent to Claude Code as-is; the context window is optional and overrides the built-in default.",
+      "labelPlaceholder": "Label",
+      "modelPlaceholder": "Model id (e.g. sonnet, fable)",
+      "windowPlaceholder": "Context window (e.g. 200k, 1m)",
+      "add": "Add preset",
+      "reset": "Restore defaults",
+      "remove": "Remove",
+      "moveUp": "Move up",
+      "moveDown": "Move down",
+      "validation": {
+        "emptyLabel": "Label is required.",
+        "emptyModel": "Model id is required.",
+        "duplicateModel": "Duplicate model id.",
+        "invalidWindow": "Invalid context window. Use: 256k, 1m, or an exact count (1000-10000000)."
+      }
     },
     "enableChrome": {
       "name": "Activer l'extension Chrome",

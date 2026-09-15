@@ -4,7 +4,7 @@ import type { Conversation } from '../../../core/types';
 import { parseEnvironmentVariables } from '../../../utils/env';
 import { resolveClaudeModelSelection } from '../modelOptions';
 import { getClaudeProviderSettings, updateClaudeProviderSettings } from '../settings';
-import { normalizeVisibleModelVariant } from '../types/models';
+import { normalizeVisibleModelVariantForPresets } from '../types/models';
 import { getClaudeState } from '../types/providerState';
 
 const ENV_HASH_MODEL_KEYS = [
@@ -12,6 +12,7 @@ const ENV_HASH_MODEL_KEYS = [
   'ANTHROPIC_DEFAULT_OPUS_MODEL',
   'ANTHROPIC_DEFAULT_SONNET_MODEL',
   'ANTHROPIC_DEFAULT_HAIKU_MODEL',
+  'ANTHROPIC_DEFAULT_FABLE_MODEL',
 ];
 const ENV_HASH_PROVIDER_KEYS = ['ANTHROPIC_BASE_URL'];
 
@@ -68,10 +69,9 @@ export const claudeSettingsReconciler: ProviderSettingsReconciler = {
     let changed = false;
 
     const normalize = (model: string): string =>
-      normalizeVisibleModelVariant(
+      normalizeVisibleModelVariantForPresets(
         model,
-        claudeSettings.enableOpus1M,
-        claudeSettings.enableSonnet1M,
+        claudeSettings.modelPresets.map(preset => preset.model),
       );
 
     const model = settings.model as string;

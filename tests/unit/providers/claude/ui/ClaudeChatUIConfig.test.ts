@@ -2,41 +2,31 @@ import { claudeChatUIConfig } from '@/providers/claude/ui/ClaudeChatUIConfig';
 
 describe('claudeChatUIConfig', () => {
   describe('getModelOptions', () => {
-    it('appends settings-defined custom models after the built-in options', () => {
+    it('serves configured presets as the primary option list', () => {
       const options = claudeChatUIConfig.getModelOptions({
         providerConfigs: {
           claude: {
-            customModels: 'claude-opus-4-6\nclaude-opus-4-6[1m]',
+            modelPresets: [
+              { label: 'Haiku', model: 'haiku' },
+              { label: 'Opus 4.6', model: 'claude-opus-4-6' },
+              { label: 'Opus 4.6 (1M)', model: 'claude-opus-4-6[1m]' },
+            ],
           },
         },
       });
 
-      expect(options.map(option => option.value)).toEqual([
-        'haiku',
-        'sonnet',
-        'opus',
-        'claude-opus-4-6',
-        'claude-opus-4-6[1m]',
-      ]);
-      expect(options.slice(-2)).toEqual([
-        {
-          value: 'claude-opus-4-6',
-          label: 'Opus 4.6',
-          description: 'Custom model',
-        },
-        {
-          value: 'claude-opus-4-6[1m]',
-          label: 'Opus 4.6 (1M)',
-          description: 'Custom model',
-        },
+      expect(options).toEqual([
+        { value: 'haiku', label: 'Haiku', description: 'Fast and efficient' },
+        { value: 'claude-opus-4-6', label: 'Opus 4.6', description: 'Custom model' },
+        { value: 'claude-opus-4-6[1m]', label: 'Opus 4.6 (1M)', description: 'Custom model' },
       ]);
     });
 
-    it('deduplicates settings-defined custom models against exact duplicates', () => {
+    it('migrates legacy customModels into presets when no presets are stored', () => {
       const options = claudeChatUIConfig.getModelOptions({
         providerConfigs: {
           claude: {
-            customModels: 'haiku\nclaude-opus-4-6\nclaude-opus-4-6\n',
+            customModels: 'claude-opus-4-6\nclaude-opus-4-6\n',
           },
         },
       });
@@ -45,6 +35,7 @@ describe('claudeChatUIConfig', () => {
         'haiku',
         'sonnet',
         'opus',
+        'fable',
         'claude-opus-4-6',
       ]);
     });
@@ -65,17 +56,18 @@ describe('claudeChatUIConfig', () => {
       });
     });
 
-    it('keeps environment-defined custom models as a full override', () => {
+    it('appends environment-defined custom models after the presets instead of overriding them', () => {
       const options = claudeChatUIConfig.getModelOptions({
         providerConfigs: {
           claude: {
-            customModels: 'claude-opus-4-6',
+            modelPresets: [{ label: 'Haiku', model: 'haiku' }],
             environmentVariables: 'ANTHROPIC_MODEL=claude-sonnet-4-5',
           },
         },
       });
 
       expect(options).toEqual([
+        { value: 'haiku', label: 'Haiku', description: 'Fast and efficient' },
         {
           value: 'claude-sonnet-4-5',
           label: 'Sonnet 4.5',

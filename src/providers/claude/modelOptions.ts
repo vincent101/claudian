@@ -1,53 +1,34 @@
 import { getRuntimeEnvironmentVariables } from '../../core/providers/providerEnvironment';
 import type { ProviderUIOption } from '../../core/providers/types';
 import { getModelsFromEnvironment } from './env/claudeModelEnv';
-import { formatCustomModelLabel } from './modelLabels';
 import { getClaudeProviderSettings } from './settings';
-import { DEFAULT_CLAUDE_MODELS, filterVisibleModelOptions } from './types/models';
+import { DEFAULT_CLAUDE_MODELS } from './types/models';
 
-function parseConfiguredCustomModelIds(value: string): string[] {
-  const modelIds: string[] = [];
-  const seen = new Set<string>();
-
-  for (const line of value.split(/\r?\n/)) {
-    const modelId = line.trim();
-    if (!modelId || seen.has(modelId)) {
-      continue;
-    }
-    seen.add(modelId);
-    modelIds.push(modelId);
-  }
-
-  return modelIds;
-}
+const BUILT_IN_MODEL_DESCRIPTIONS = new Map(
+  DEFAULT_CLAUDE_MODELS.map(model => [model.value, model.description]),
+);
 
 export function getClaudeModelOptions(settings: Record<string, unknown>): ProviderUIOption[] {
-  const customModels = getModelsFromEnvironment(
+  const claudeSettings = getClaudeProviderSettings(settings);
+  const models: ProviderUIOption[] = claudeSettings.modelPresets.map(preset => ({
+    value: preset.model,
+    label: preset.label,
+    description: BUILT_IN_MODEL_DESCRIPTIONS.get(preset.model) ?? 'Custom model',
+  }));
+
+  // Environment models are compatible additions, never a replacement: presets
+  // stay selectable even when the runtime env maps model env keys.
+  const envModels = getModelsFromEnvironment(
     getRuntimeEnvironmentVariables(settings, 'claude'),
   );
-  if (customModels.length > 0) {
-    return customModels;
-  }
-
-  const claudeSettings = getClaudeProviderSettings(settings);
-  const models = filterVisibleModelOptions(
-    [...DEFAULT_CLAUDE_MODELS],
-    claudeSettings.enableOpus1M,
-    claudeSettings.enableSonnet1M,
-  );
-
   const seenValues = new Set(models.map(model => model.value));
-  for (const modelId of parseConfiguredCustomModelIds(claudeSettings.customModels)) {
-    if (seenValues.has(modelId)) {
+  for (const envModel of envModels) {
+    if (seenValues.has(envModel.value)) {
       continue;
     }
 
-    seenValues.add(modelId);
-    models.push({
-      value: modelId,
-      label: formatCustomModelLabel(modelId),
-      description: 'Custom model',
-    });
+    seenValues.add(envModel.value);
+    models.push(envModel);
   }
 
   return models;
