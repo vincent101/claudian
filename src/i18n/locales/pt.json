@@ -69,6 +69,10 @@
     },
     "history": {
       "loading": "Loading conversation…",
+      "waitingForIndex": "Aguardando o índice…",
+      "buildingIndex": "Criando índice {percent}%",
+      "finalizingIndex": "Finalizando índice…",
+      "loadingRecentTurns": "Carregando os {count} turnos mais recentes…",
       "oversizeTitle": "Large conversation",
       "oversizeDescription": "On-demand loading will be available in the pagination milestone.",
       "errorTitle": "Conversation failed to load",

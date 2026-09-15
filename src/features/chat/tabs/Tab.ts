@@ -398,6 +398,7 @@ export function createTab(options: TabCreateOptions): TabData {
     hydrationState: isBound ? 'SHELL' : 'READY',
     hydrationGeneration: 0,
     hydrationDiagnostic: null,
+    historyLoadProgress: null,
     service: null,
     serviceInitialized: false,
     state,
@@ -1297,6 +1298,10 @@ export function initializeTabControllers(
       switchToHydrationShell: hydrationHooks?.switchToHydrationShell,
       markHydrationReady: hydrationHooks?.markHydrationReady,
       isHydrationReady: hydrationHooks?.isHydrationReady,
+      onHistoryLoadProgress: progress => {
+        tab.historyLoadProgress = progress;
+        renderTabHydrationPlaceholder(tab);
+      },
       ensureServiceForConversation: async (conversation) => {
         const nextProviderId = getTabProviderId(tab, plugin, conversation);
         const providerChanged = tab.providerId !== nextProviderId;
@@ -1630,9 +1635,15 @@ export function renderTabHydrationPlaceholder(
   }
 
   const isError = tab.hydrationState === 'ERROR';
+  const progress = tab.historyLoadProgress;
+  let loadingText = t('chat.history.loading');
+  if (progress?.phase === 'queued') loadingText = t('chat.history.waitingForIndex');
+  else if (progress?.phase === 'indexing') loadingText = t('chat.history.buildingIndex', { percent: String(progress.percent) });
+  else if (progress?.phase === 'finalizing') loadingText = t('chat.history.finalizingIndex');
+  else if (progress?.phase === 'loading') loadingText = t('chat.history.loadingRecentTurns', { count: String(progress.turnCount) });
   placeholder.createDiv({
     cls: 'claudian-history-placeholder-title',
-    text: isError ? t('chat.history.errorTitle') : t('chat.history.loading'),
+    text: isError ? t('chat.history.errorTitle') : loadingText,
   });
   if (isError) {
     placeholder.createDiv({ text: tab.hydrationDiagnostic?.message ?? t('chat.history.errorDescription') });

@@ -134,7 +134,7 @@ describe('ConversationController', () => {
 
       await controller.loadActive();
 
-      expect(loadInitialHistory).toHaveBeenCalledWith(conversation, expect.anything(), 50);
+      expect(loadInitialHistory).toHaveBeenCalledWith(conversation, expect.anything(), 50, expect.any(Function));
       expect(deps.state.messages.map(message => message.id)).toEqual(['latest']);
       expect(deps.state.historyCursor).toBe('opaque');
       expect(deps.state.historySnapshotOffset).toBe(123);
@@ -160,11 +160,11 @@ describe('ConversationController', () => {
       deps.state.currentConversationId = 'large';
       const messageEl = {} as HTMLElement;
       (deps.renderer.findMessageElement as jest.Mock).mockReturnValue(messageEl);
-      const result = { messageKey: 'loaded', cursor: 'search', timestamp: 1, snippet: 'needle', matchStart: 0, matchLength: 6, matchedText: 'needle' };
+      const result = { projectionKey: 'loaded', turnIndex: 0, matchOrdinal: 0, cursor: 'search', timestamp: 1, snippet: 'needle', matchStart: 0, matchLength: 6, matchedText: 'needle' };
 
       await controller.locateHistorySearchResult(result);
 
-      expect(deps.renderer.highlightSearchMatch).toHaveBeenCalledWith(messageEl, 'needle');
+      expect(deps.renderer.highlightSearchMatch).toHaveBeenCalledWith(messageEl, 'needle', 0);
     });
 
     it('relocates pagination to an unloaded search page and continues older without gaps or duplicates', async () => {
@@ -192,7 +192,7 @@ describe('ConversationController', () => {
         }),
       };
       jest.spyOn(ProviderRegistry, 'getConversationHistoryService').mockReturnValue(service as any);
-      const result = { messageKey: 'target', cursor: 'search', timestamp: 1, snippet: 'needle', matchStart: 0, matchLength: 6, matchedText: 'needle' };
+      const result = { projectionKey: 'target', turnIndex: 0, matchOrdinal: 0, cursor: 'search', timestamp: 1, snippet: 'needle', matchStart: 0, matchLength: 6, matchedText: 'needle' };
 
       await controller.locateHistorySearchResult(result);
       await controller.loadOlderHistory();
@@ -204,7 +204,21 @@ describe('ConversationController', () => {
       expect((deps.renderer.prependMessages as jest.Mock).mock.calls[1][0].map((message: { id: string }) => message.id)).toEqual(['older']);
       expect(deps.state.historyCursor).toBeNull();
       expect(deps.state.historyHasMore).toBe(false);
-      expect(deps.renderer.highlightSearchMatch).toHaveBeenCalledWith(messageEl, 'needle');
+      expect(deps.renderer.highlightSearchMatch).toHaveBeenCalledWith(messageEl, 'needle', 0);
+    });
+
+    it('throws when a materialized search projection still has no DOM target', async () => {
+      deps.state.currentConversationId = 'large';
+      (deps.plugin.getConversationSync as jest.Mock).mockReturnValue({ id: 'large', providerId: 'claude' });
+      (deps.renderer.findMessageElement as jest.Mock).mockReturnValue(null);
+      jest.spyOn(ProviderRegistry, 'getConversationHistoryService').mockReturnValue({
+        loadHistoryAt: jest.fn().mockResolvedValue({ messages: [], cursor: null, hasMore: false }),
+      } as any);
+
+      await expect(controller.locateHistorySearchResult({
+        projectionKey: 'missing', turnIndex: 3, matchOrdinal: 0, cursor: 'search',
+        timestamp: 1, snippet: 'needle', matchStart: 0, matchLength: 6, matchedText: 'needle',
+      })).rejects.toThrow('History search target not found: missing');
     });
 
     it('prepends an older page through the opaque cursor', async () => {

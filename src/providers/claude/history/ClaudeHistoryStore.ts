@@ -15,6 +15,11 @@ import {
   parseSDKMessageToChat,
 } from './sdkMessageParsing';
 import {
+  advanceSDKProjection,
+  createSDKProjectionState,
+  getSDKProjectionKind,
+} from './sdkMessageProjection';
+import {
   deleteSDKSession,
   encodeVaultPathForSDK,
   getSDKProjectsPath,
@@ -69,13 +74,13 @@ export async function materializeSDKMessages(
 
   const chatMessages: ChatMessage[] = [];
   let pendingAssistant: ChatMessage | null = null;
+  const projection = createSDKProjectionState();
 
   // Merge consecutive assistant messages until an actual user message appears
   for (const sdkMsg of filteredEntries) {
-    if (isSystemInjectedMessage(sdkMsg)) continue;
-
-    // Skip synthetic assistant messages (e.g., "No response requested." after /compact)
-    if (sdkMsg.type === 'assistant' && sdkMsg.message?.model === '<synthetic>') continue;
+    const projectionKind = getSDKProjectionKind(sdkMsg);
+    const projectionKey = advanceSDKProjection(projection, projectionKind, sdkMsg.uuid ?? 'skipped');
+    if (projectionKind === 'skip' || isSystemInjectedMessage(sdkMsg)) continue;
 
     const chatMsg = parseSDKMessageToChat(sdkMsg, toolResults);
     if (!chatMsg) continue;
@@ -83,6 +88,7 @@ export async function materializeSDKMessages(
     if (chatMsg.role === 'assistant') {
       // context_compacted must not merge with previous assistant (it's a standalone separator)
       const isCompactBoundary = chatMsg.contentBlocks?.some(b => b.type === 'context_compacted');
+      chatMsg.id = projectionKey ?? chatMsg.id;
       if (isCompactBoundary) {
         if (pendingAssistant) {
           chatMessages.push(pendingAssistant);
@@ -95,6 +101,7 @@ export async function materializeSDKMessages(
         pendingAssistant = chatMsg;
       }
     } else {
+      chatMsg.id = projectionKey ?? chatMsg.id;
       if (pendingAssistant) {
         chatMessages.push(pendingAssistant);
         pendingAssistant = null;

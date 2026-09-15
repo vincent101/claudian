@@ -50,6 +50,10 @@ export type TranslationKey =
 
   // Chat - History hydration
   | 'chat.history.loading'
+  | 'chat.history.waitingForIndex'
+  | 'chat.history.buildingIndex'
+  | 'chat.history.finalizingIndex'
+  | 'chat.history.loadingRecentTurns'
   | 'chat.history.oversizeTitle'
   | 'chat.history.oversizeDescription'
   | 'chat.history.errorTitle'

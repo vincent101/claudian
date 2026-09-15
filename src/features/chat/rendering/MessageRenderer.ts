@@ -258,25 +258,33 @@ export class MessageRenderer {
     return this.messagesEl.querySelector(`[data-message-id="${CSS.escape(messageKey)}"]`) as HTMLElement | null;
   }
 
-  highlightSearchMatch(messageEl: HTMLElement, matchedText: string): void {
+  highlightSearchMatch(messageEl: HTMLElement, matchedText: string, matchOrdinal = 0): void {
     messageEl.querySelectorAll('mark.claudian-search-match').forEach(mark => mark.replaceWith(mark.textContent ?? ''));
     const needle = matchedText.toLocaleLowerCase();
     if (needle) {
       const walker = document.createTreeWalker(messageEl, NodeFilter.SHOW_TEXT);
       let node = walker.nextNode();
+      let remaining = matchOrdinal;
       while (node) {
         const text = node.textContent ?? '';
-        const matchStart = text.toLocaleLowerCase().indexOf(needle);
-        if (matchStart >= 0) {
-          const mark = document.createElement('mark');
-          mark.className = 'claudian-search-match';
-          mark.textContent = text.slice(matchStart, matchStart + matchedText.length);
-          const after = (node as Text).splitText(matchStart);
-          after.deleteData(0, matchedText.length);
-          after.parentNode?.insertBefore(mark, after);
-          break;
+        let from = 0;
+        let matchStart = text.toLocaleLowerCase().indexOf(needle, from);
+        while (matchStart >= 0) {
+          if (remaining === 0) {
+            const mark = document.createElement('mark');
+            mark.className = 'claudian-search-match';
+            mark.textContent = text.slice(matchStart, matchStart + matchedText.length);
+            const after = (node as Text).splitText(matchStart);
+            after.deleteData(0, matchedText.length);
+            after.parentNode?.insertBefore(mark, after);
+            node = null;
+            break;
+          }
+          remaining -= 1;
+          from = matchStart + needle.length;
+          matchStart = text.toLocaleLowerCase().indexOf(needle, from);
         }
-        node = walker.nextNode();
+        node = node ? walker.nextNode() : null;
       }
     }
     messageEl.scrollIntoView({ block: 'center', behavior: 'smooth' });

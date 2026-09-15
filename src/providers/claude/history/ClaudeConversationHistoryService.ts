@@ -1,5 +1,6 @@
 import type {
   ConversationHistoryHydrationResult,
+  HistoryLoadProgress,
   HistoryPage,
   HistorySearchResult,
   ProviderConversationHistoryService,
@@ -501,6 +502,7 @@ export class ClaudeConversationHistoryService implements ProviderConversationHis
     conversation: Conversation,
     vaultPath: string | null,
     pageSize: number,
+    onProgress?: (progress: HistoryLoadProgress) => void,
   ): Promise<HistoryPage> {
     if (!vaultPath) throw new Error('Vault path is unavailable');
     this.ensureIndexDiagnostics(vaultPath);
@@ -513,6 +515,7 @@ export class ClaudeConversationHistoryService implements ProviderConversationHis
     this.indexBuildControllers.set(conversation.id, buildController);
     const segments: IndexedSegment[] = [];
     try {
+      onProgress?.({ phase: 'queued' });
       for (const sessionId of sessionIds) {
         if (!sdkSessionExists(vaultPath, sessionId)) continue;
         const result = await buildTranscriptIndex(getSDKSessionPath(vaultPath, sessionId), {
@@ -520,6 +523,11 @@ export class ClaudeConversationHistoryService implements ProviderConversationHis
             ? (state.forkSource?.resumeAt ?? conversation.resumeAtMessageId)
             : undefined,
           signal: buildController.signal,
+          onProgress: (bytes, totalBytes) => onProgress?.({
+            phase: 'indexing',
+            percent: totalBytes > 0 ? Math.min(100, Math.round(bytes / totalBytes * 100)) : 100,
+          }),
+          onFinalize: () => onProgress?.({ phase: 'finalizing' }),
         });
         if (result.status === 'failed' || result.status === 'partial') throw new Error(result.error);
         segments.push({ sessionId, index: result.index });
@@ -541,6 +549,7 @@ export class ClaudeConversationHistoryService implements ProviderConversationHis
     const startTurn = Math.max(0, flattenedTurns.length - pageSize);
     const cursorState = { conversationId: conversation.id, vaultPath, segments, endTurn: startTurn, flattenedTurns };
     this.conversationIndexes.set(conversation.id, cursorState);
+    onProgress?.({ phase: 'loading', turnCount: Math.min(pageSize, flattenedTurns.length) });
     return this.materializePage(cursorState, pageSize);
   }
 
@@ -561,22 +570,29 @@ export class ClaudeConversationHistoryService implements ProviderConversationHis
     for (const segment of state.segments) {
       for (const item of segment.index.searchCorpus) {
         const text = segment.index.searchText.slice(item.textOffset, item.textOffset + item.textLength);
-        const matchStart = text.toLocaleLowerCase().indexOf(needle);
-        if (matchStart < 0) continue;
-        const turnIndex = globalTurnOffset + item.turnIndex;
-        const cursor = `claude-search:${++this.cursorSequence}`;
-        this.searchCursors.set(cursor, { ...state, endTurn: turnIndex });
-        const contextStart = Math.max(0, matchStart - 48);
-        const contextEnd = Math.min(text.length, matchStart + query.length + 48);
-        results.push({
-          messageKey: item.messageKey,
-          cursor,
-          timestamp: item.timestamp ? new Date(item.timestamp).getTime() : 0,
-          snippet: `${contextStart > 0 ? '…' : ''}${text.slice(contextStart, contextEnd)}${contextEnd < text.length ? '…' : ''}`,
-          matchStart: matchStart - contextStart + (contextStart > 0 ? 1 : 0),
-          matchLength: query.length,
-          matchedText: text.slice(matchStart, matchStart + query.length),
-        });
+        const lowerText = text.toLocaleLowerCase();
+        let matchStart = lowerText.indexOf(needle);
+        let matchOrdinal = 0;
+        while (matchStart >= 0) {
+          const turnIndex = globalTurnOffset + item.turnIndex;
+          const cursor = `claude-search:${++this.cursorSequence}`;
+          this.searchCursors.set(cursor, { ...state, endTurn: turnIndex });
+          const contextStart = Math.max(0, matchStart - 48);
+          const contextEnd = Math.min(text.length, matchStart + query.length + 48);
+          results.push({
+            projectionKey: item.projectionKey,
+            turnIndex,
+            matchOrdinal,
+            cursor,
+            timestamp: item.timestamp ? new Date(item.timestamp).getTime() : 0,
+            snippet: `${contextStart > 0 ? '…' : ''}${text.slice(contextStart, contextEnd)}${contextEnd < text.length ? '…' : ''}`,
+            matchStart: matchStart - contextStart + (contextStart > 0 ? 1 : 0),
+            matchLength: query.length,
+            matchedText: text.slice(matchStart, matchStart + query.length),
+          });
+          matchOrdinal += 1;
+          matchStart = lowerText.indexOf(needle, matchStart + needle.length);
+        }
       }
       globalTurnOffset += segment.index.turns.length;
     }

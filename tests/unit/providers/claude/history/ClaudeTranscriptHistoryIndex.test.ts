@@ -84,14 +84,34 @@ describe('ClaudeTranscriptHistoryIndex', () => {
     );
     expect(texts).toEqual([
       'fixture A',
-      'answer A\nnotification answer A',
+      'answer A\n\nnotification answer A',
       'fixture B',
-      'answer B\nnotification answer B',
+      'answer B\n\nnotification answer B',
     ]);
     const corpus = texts.join('\n');
     expect(corpus).not.toContain('thinking A');
     expect(corpus).not.toContain('queue item');
     expect(corpus).not.toContain('fixture notification');
+  });
+
+  it('uses materialization projection keys across merged assistants and compact boundaries', async () => {
+    const path = join(process.env.TMPDIR ?? '/tmp', `claudian-projection-${process.pid}.jsonl`);
+    const lines = [
+      JSON.stringify({ type: 'user', uuid: 'u1', message: { content: 'question' } }),
+      JSON.stringify({ type: 'assistant', uuid: 'a1', parentUuid: 'u1', message: { content: 'first' } }),
+      JSON.stringify({ type: 'assistant', uuid: 'synthetic', parentUuid: 'a1', message: { model: '<synthetic>', content: 'skip' } }),
+      JSON.stringify({ type: 'assistant', uuid: 'a2', parentUuid: 'synthetic', message: { content: 'needle' } }),
+      JSON.stringify({ type: 'system', subtype: 'compact_boundary', uuid: 'compact', parentUuid: 'a2', timestamp: '2026-01-01T00:00:00Z' }),
+      JSON.stringify({ type: 'assistant', uuid: 'a3', parentUuid: 'compact', message: { content: 'after compact' } }),
+    ];
+    await writeFile(path, `${lines.join('\n')}\n`);
+
+    const result = await buildTranscriptIndex(path, { useWorker: false });
+
+    expect(result.status).toBe('complete');
+    if (result.status !== 'complete') return;
+    expect(result.index.searchCorpus.map(item => item.projectionKey)).toEqual(['u1', 'a1', 'a3']);
+    expect(result.index.searchText).toContain('first\n\nneedle');
   });
 
   it('indexes an external meta row and materializes byte-exact pages across chunks', async () => {
@@ -209,6 +229,52 @@ describe('ClaudeTranscriptHistoryIndex worker fallback', () => {
     resetTranscriptIndexWorkerProbe();
   });
 
+  it('records throttled direct-build lifecycle events including stalled without terminating', async () => {
+    jest.useFakeTimers({ doNotFake: ['setImmediate'] });
+    const events: TranscriptIndexDiagnosticEvent[] = [];
+    setTranscriptIndexDiagnosticSink(event => events.push(event));
+    const path = join(process.env.TMPDIR ?? '/tmp', `claudian-stalled-${process.pid}.jsonl`);
+    await writeFile(path, `${JSON.stringify({ type: 'user', uuid: 'u1', message: { content: 'x' } })}\n`);
+    let advanced = false;
+
+    const resultPromise = buildTranscriptIndex(path, {
+      useWorker: false,
+      onProgress: () => {
+        if (advanced) return;
+        advanced = true;
+        jest.advanceTimersByTime(31_000);
+      },
+    });
+    await jest.runAllTimersAsync();
+    const result = await resultPromise;
+
+    expect(result.status).toBe('complete');
+    expect(events.map(event => event.phase)).toEqual(expect.arrayContaining([
+      'queued', 'start', 'progress', 'stalled', 'finalize', 'complete',
+    ]));
+    expect(events.filter(event => event.phase === 'progress')).toHaveLength(1);
+    jest.useRealTimers();
+  });
+
+  it('records failed and aborted terminal events', async () => {
+    const events: TranscriptIndexDiagnosticEvent[] = [];
+    setTranscriptIndexDiagnosticSink(event => events.push(event));
+    const failedPath = join(process.env.TMPDIR ?? '/tmp', `claudian-failed-${process.pid}.jsonl`);
+    await writeFile(failedPath, `${JSON.stringify({ type: 'user', uuid: 'u1', message: { content: 'x'.repeat(100) } })}\n`);
+    await buildTranscriptIndex(failedPath, { useWorker: false, maxLineBytes: 10 });
+
+    const abortedPath = join(process.env.TMPDIR ?? '/tmp', `claudian-aborted-${process.pid}.jsonl`);
+    await writeFile(abortedPath, `${JSON.stringify({ type: 'user', uuid: 'u2', message: { content: 'x' } })}\n`);
+    const controller = new AbortController();
+    controller.abort();
+    await buildTranscriptIndex(abortedPath, { useWorker: false, signal: controller.signal });
+
+    expect(events).toEqual(expect.arrayContaining([
+      expect.objectContaining({ phase: 'failed', mode: 'direct' }),
+      expect.objectContaining({ phase: 'aborted', mode: 'direct' }),
+    ]));
+  });
+
   it('falls back to the main-thread path and records one fallback event when the worker constructor throws', async () => {
     const events: TranscriptIndexDiagnosticEvent[] = [];
     setTranscriptIndexDiagnosticSink(event => events.push(event));
@@ -219,13 +285,18 @@ describe('ClaudeTranscriptHistoryIndex worker fallback', () => {
     expect(result.status).toBe('complete');
     if (result.status !== 'complete') return;
     expect(result.index.entries.map(entry => entry.messageKey)).toEqual(['u1']);
-    expect(events).toEqual([{ phase: 'index_worker_fallback', errorName: 'TypeError' }]);
+    expect(events).toEqual(expect.arrayContaining([
+      { phase: 'index_worker_fallback', errorName: 'TypeError' },
+      expect.objectContaining({ phase: 'queued', mode: 'direct', buildId: expect.any(String) }),
+      expect.objectContaining({ phase: 'start', mode: 'direct', buildId: expect.any(String) }),
+      expect.objectContaining({ phase: 'complete', mode: 'direct', entries: 1, turns: 1 }),
+    ]));
 
     const second = join(process.env.TMPDIR ?? '/tmp', `claudian-fallback-${process.pid}-2.jsonl`);
     await writeFile(second, `${JSON.stringify({ type: 'user', uuid: 'u2', message: { content: 'y' } })}\n`);
     const again = await buildTranscriptIndex(second, {});
     expect(again.status).toBe('complete');
-    expect(events).toHaveLength(1);
+    expect(events.filter(event => event.phase === 'index_worker_fallback')).toHaveLength(1);
     expect(mockWorkerSources).toHaveLength(0);
   });
 
@@ -239,7 +310,11 @@ describe('ClaudeTranscriptHistoryIndex worker fallback', () => {
     const result = await buildTranscriptIndex(path, {});
 
     expect(result.status).toBe('complete');
-    expect(events).toEqual([{ phase: 'index_worker_fallback', errorName: 'Error' }]);
+    expect(events).toEqual(expect.arrayContaining([
+      { phase: 'index_worker_fallback', errorName: 'Error' },
+      expect.objectContaining({ phase: 'queued', mode: 'direct' }),
+      expect.objectContaining({ phase: 'complete', mode: 'direct' }),
+    ]));
   });
 
   it('falls back once when the build worker errors after a successful probe', async () => {
@@ -254,7 +329,10 @@ describe('ClaudeTranscriptHistoryIndex worker fallback', () => {
     expect(result.status).toBe('complete');
     if (result.status !== 'complete') return;
     expect(result.index.entries.map(entry => entry.messageKey)).toEqual(['u1']);
-    expect(events).toEqual([{ phase: 'index_worker_fallback', errorName: 'Error' }]);
+    expect(events).toEqual(expect.arrayContaining([
+      expect.objectContaining({ phase: 'index_worker_fallback' }),
+      expect.objectContaining({ phase: 'complete', mode: 'direct' }),
+    ]));
   });
 
   it('builds in a worker when the constructor probe succeeds', async () => {
@@ -265,7 +343,7 @@ describe('ClaudeTranscriptHistoryIndex worker fallback', () => {
       JSON.stringify({ type: 'assistant', uuid: 'a1', parentUuid: 'u1', message: { content: 'world' } }),
     ].join('\n') + '\n');
     const result = await buildTranscriptIndex(path, {});
-    expect(result.status).toBe('complete');
+    expect(result).toEqual(expect.objectContaining({ status: 'complete' }));
     if (result.status !== 'complete') return;
     expect(result.index.turns.map(turn => turn.turnId)).toEqual(['u1']);
     expect(result.index.entries.map(entry => entry.messageKey)).toEqual(['u1', 'a1']);

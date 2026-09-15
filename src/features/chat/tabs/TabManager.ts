@@ -350,6 +350,7 @@ export class TabManager implements TabManagerInterface {
   private scheduleTabHydration(tab: TabData): void {
     const generation = ++tab.hydrationGeneration;
     this.setHydrationState(tab, 'SCHEDULED');
+    tab.historyLoadProgress = { phase: 'queued' };
     renderTabHydrationPlaceholder(tab);
 
     const scheduleFrame = typeof requestAnimationFrame === 'function'
@@ -405,6 +406,7 @@ export class TabManager implements TabManagerInterface {
 
       this.setHydrationState(tab, 'READY');
       tab.hydrationDiagnostic = null;
+      tab.historyLoadProgress = null;
     } catch (error) {
       if (this.isStaleHydration(tab, generation)) {
         // initializeTabService may have created a runtime before throwing;
@@ -465,6 +467,7 @@ export class TabManager implements TabManagerInterface {
     tab.state.currentConversationId = conversationId;
     tab.state.clearMessages();
     tab.hydrationDiagnostic = null;
+    tab.historyLoadProgress = null;
     // Drop the runtime parked from the previous conversation: the blocked
     // switch threw before ensureServiceForConversation rebinds it, so it
     // would serve a foreign session to non-save paths (provider resolution,

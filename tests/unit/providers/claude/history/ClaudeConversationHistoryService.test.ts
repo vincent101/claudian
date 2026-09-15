@@ -129,8 +129,8 @@ describe('ClaudeConversationHistoryService M1 fuse', () => {
   it('searches case-insensitive substrings and returns snippets with page cursors', async () => {
     const searchText = 'Alpha NEEDLE omegaanother needle result';
     const searchCorpus = [
-      { messageKey: 'u1', turnIndex: 0, timestamp: '2026-01-01T00:00:00Z', textOffset: 0, textLength: 18 },
-      { messageKey: 'a1', turnIndex: 1, timestamp: '2026-01-02T00:00:00Z', textOffset: 18, textLength: 21 },
+      { projectionKey: 'u1', turnIndex: 0, timestamp: '2026-01-01T00:00:00Z', textOffset: 0, textLength: 18 },
+      { projectionKey: 'a1', turnIndex: 1, timestamp: '2026-01-02T00:00:00Z', textOffset: 18, textLength: 21 },
     ];
     mockBuildTranscriptIndex.mockResolvedValue({
       status: 'complete',
@@ -144,8 +144,8 @@ describe('ClaudeConversationHistoryService M1 fuse', () => {
     await service.loadInitialHistory(createConversation(), '/vault', 50);
 
     await expect(service.searchHistory!(createConversation(), '/vault', 'needle')).resolves.toEqual([
-      expect.objectContaining({ messageKey: 'u1', cursor: expect.stringMatching(/^claude-search:/), matchLength: 6 }),
-      expect.objectContaining({ messageKey: 'a1', cursor: expect.stringMatching(/^claude-search:/), matchLength: 6 }),
+      expect.objectContaining({ projectionKey: 'u1', turnIndex: 0, matchOrdinal: 0, cursor: expect.stringMatching(/^claude-search:/), matchLength: 6 }),
+      expect.objectContaining({ projectionKey: 'a1', turnIndex: 1, matchOrdinal: 0, cursor: expect.stringMatching(/^claude-search:/), matchLength: 6 }),
     ]);
     await expect(service.searchHistory!(createConversation(), '/vault', 'missing')).resolves.toEqual([]);
   });

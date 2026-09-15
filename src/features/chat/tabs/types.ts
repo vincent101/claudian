@@ -1,6 +1,6 @@
 import type { Component, WorkspaceLeaf } from 'obsidian';
 
-import type { InstructionRefineService, ProviderId, TitleGenerationService } from '../../../core/providers/types';
+import type { HistoryLoadProgress, InstructionRefineService, ProviderId, TitleGenerationService } from '../../../core/providers/types';
 import type { ChatRuntime } from '../../../core/runtime/ChatRuntime';
 import type { SlashCommandDropdown } from '../../../shared/components/SlashCommandDropdown';
 import type { AutoTurnProjectionController } from '../controllers/AutoTurnProjectionController';
@@ -240,6 +240,7 @@ export interface TabData {
   hydrationState: TabHydrationState;
   hydrationGeneration: number;
   hydrationDiagnostic: TabHydrationDiagnostic | null;
+  historyLoadProgress: HistoryLoadProgress | null;
 
   /** Per-tab chat runtime instance for independent streaming. */
   service: ChatRuntime | null;

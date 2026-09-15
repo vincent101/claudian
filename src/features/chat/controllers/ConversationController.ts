@@ -3,6 +3,7 @@ import { Menu, Notice, setIcon } from 'obsidian';
 import { ProviderRegistry } from '../../../core/providers/ProviderRegistry';
 import {
   ConversationHistoryHydrationError,
+  type HistoryLoadProgress,
   type HistorySearchResult,
   type ProviderId,
   type TitleGenerationService,
@@ -68,6 +69,7 @@ export interface ConversationControllerDeps {
    * so save() must not persist (see the guard in save()).
    */
   isHydrationReady?: () => boolean;
+  onHistoryLoadProgress?: (progress: HistoryLoadProgress) => void;
 }
 
 type SaveOptions = {
@@ -235,7 +237,12 @@ export class ConversationController {
       // the segment-size list and hide the cause (M3: any segment error
       // must be visible).
       try {
-        const page = await historyService.loadInitialHistory(conversation, getVaultPath(plugin.app), 50);
+        const page = await historyService.loadInitialHistory(
+          conversation,
+          getVaultPath(plugin.app),
+          50,
+          progress => this.deps.onHistoryLoadProgress?.(progress),
+        );
         if (!shouldApply()) {
           historyService.releaseHistory?.(conversation.id);
           return;
@@ -355,7 +362,7 @@ export class ConversationController {
   async locateHistorySearchResult(result: HistorySearchResult): Promise<void> {
     const { state, plugin, renderer } = this.deps;
     if (!state.currentConversationId) return;
-    let target = renderer.findMessageElement(result.messageKey);
+    let target = renderer.findMessageElement(result.projectionKey);
     if (!target) {
       const conversation = plugin.getConversationSync(state.currentConversationId);
       if (!conversation) return;
@@ -370,9 +377,10 @@ export class ConversationController {
       state.historyCursor = page.cursor;
       state.historyHasMore = page.hasMore;
       this.renderHistoryPager();
-      target = renderer.findMessageElement(result.messageKey);
+      target = renderer.findMessageElement(result.projectionKey);
     }
-    if (target) renderer.highlightSearchMatch(target, result.matchedText);
+    if (!target) throw new Error(`History search target not found: ${result.projectionKey}`);
+    renderer.highlightSearchMatch(target, result.matchedText, result.matchOrdinal);
   }
 
   /** Switches to a different conversation. */

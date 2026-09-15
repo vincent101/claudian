@@ -7,7 +7,8 @@ export type TranscriptDiagnosticPhase =
   | 'lease_begin' | 'lease_finish' | 'lease_release'
   | 'render_start' | 'render_end'
   | 'save_start' | 'save_end' | 'save_timeout' | 'callback_error'
-  | 'index_worker_fallback';
+  | 'index_worker_fallback'
+  | 'queued' | 'start' | 'progress' | 'finalize' | 'complete' | 'failed' | 'aborted' | 'stalled';
 
 export interface TranscriptDiagnosticEvent {
   phase: TranscriptDiagnosticPhase;
@@ -19,6 +20,13 @@ export interface TranscriptDiagnosticEvent {
   batchLines?: number;
   elapsedMs?: number;
   errorName?: string;
+  buildId?: string;
+  mode?: 'worker' | 'direct';
+  queueMs?: number;
+  bytes?: number;
+  totalBytes?: number;
+  entries?: number;
+  turns?: number;
 }
 
 const SEGMENT_BYTES = 128 * 1024;
@@ -66,7 +74,7 @@ export class ClaudeTranscriptDiagnosticLog {
 
   private serialize(event: TranscriptDiagnosticEvent): string {
     const clean: Record<string, unknown> = { ts: Date.now(), seq: ++this.seq, phase: event.phase };
-    for (const key of ['tabIdHash', 'turnIdHash', 'generation', 'leaseKind', 'batchBytes', 'batchLines', 'elapsedMs', 'errorName'] as const) {
+    for (const key of ['tabIdHash', 'turnIdHash', 'generation', 'leaseKind', 'batchBytes', 'batchLines', 'elapsedMs', 'errorName', 'buildId', 'mode', 'queueMs', 'bytes', 'totalBytes', 'entries', 'turns'] as const) {
       const value = event[key];
       if (value !== undefined) clean[key] = typeof value === 'string' ? value.slice(0, 128) : value;
     }

@@ -18,6 +18,7 @@ import {
   initializeTabService,
   initializeTabUI,
   onProviderAvailabilityChanged,
+  renderTabHydrationPlaceholder,
   setupServiceCallbacks,
   type TabCreateOptions,
   wireTabInputEvents,
@@ -470,6 +471,28 @@ function createMockOptions(overrides: Partial<TestTabCreateOptions> = {}): TestT
 
   return options;
 }
+
+describe('Tab - History hydration progress', () => {
+  it.each([
+    [{ phase: 'queued' }, 'Waiting for index'],
+    [{ phase: 'indexing', percent: 37 }, 'Building index 37%'],
+    [{ phase: 'finalizing' }, 'Finalizing index'],
+    [{ phase: 'loading', turnCount: 50 }, 'Loading the most recent 50 turns'],
+  ] as const)('renders %o as phased copy', (progress, expected) => {
+    const tab = createTab(createMockOptions({
+      conversation: {
+        id: 'large', providerId: 'claude', title: 'Large', messages: [],
+        createdAt: 1, updatedAt: 1,
+      } as any,
+    }));
+    tab.hydrationState = 'LOADING';
+    tab.historyLoadProgress = progress;
+
+    renderTabHydrationPlaceholder(tab);
+
+    expect(tab.dom.messagesEl.children[0]?.children[0]?.textContent).toContain(expected);
+  });
+});
 
 describe('Tab - Creation', () => {
   describe('createTab', () => {

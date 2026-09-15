@@ -4,7 +4,7 @@ import type { HistorySearchResult } from '@/core/providers/types';
 import { HistorySearchController } from '@/features/chat/controllers/HistorySearchController';
 
 function result(messageKey: string, snippet = 'before Needle after'): HistorySearchResult {
-  return { messageKey, cursor: `cursor:${messageKey}`, timestamp: 1, snippet, matchStart: 7, matchLength: 6, matchedText: 'Needle' };
+  return { projectionKey: messageKey, turnIndex: 0, matchOrdinal: 0, cursor: `cursor:${messageKey}`, timestamp: 1, snippet, matchStart: 7, matchLength: 6, matchedText: 'Needle' };
 }
 
 describe('HistorySearchController', () => {
@@ -80,7 +80,7 @@ describe('HistorySearchController', () => {
     input.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true }));
     input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
     await Promise.resolve();
-    expect(locate).toHaveBeenCalledWith(expect.objectContaining({ messageKey: 'm2' }));
+    expect(locate).toHaveBeenCalledWith(expect.objectContaining({ projectionKey: 'm2' }));
   });
 
   it('shows an in-panel error instead of failing silently when locating a result rejects', async () => {

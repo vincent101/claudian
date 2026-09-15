@@ -69,6 +69,10 @@
     },
     "history": {
       "loading": "正在加载会话…",
+      "waitingForIndex": "等待索引（排队）…",
+      "buildingIndex": "建立索引 {percent}%",
+      "finalizingIndex": "整理索引…",
+      "loadingRecentTurns": "加载最近 {count} 轮…",
       "oversizeTitle": "超大会话",
       "oversizeDescription": "按需加载将在分页里程碑提供。",
       "errorTitle": "会话加载失败",

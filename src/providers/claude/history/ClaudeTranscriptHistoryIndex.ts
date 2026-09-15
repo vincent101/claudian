@@ -1,6 +1,7 @@
 import { open, stat } from 'fs/promises';
 import { Worker } from 'worker_threads';
 
+import { isCompactionCanceledStderr } from '../../../utils/interrupt';
 import {
   extractExternalDisplayContent,
   extractUserText,
@@ -10,6 +11,12 @@ import {
 } from './externalUserMessage';
 import { filterActiveBranchEntries } from './sdkBranchFilter';
 import type { SDKNativeMessage } from './sdkHistoryTypes';
+import {
+  advanceSDKProjection,
+  createSDKProjectionState,
+  getSDKProjectionKind,
+  isSDKMessageProjectionSkipped,
+} from './sdkMessageProjection';
 
 const DEFAULT_CHUNK_SIZE = 1024 * 1024;
 const DEFAULT_MAX_LINE_BYTES = 16 * 1024 * 1024;
@@ -38,7 +45,7 @@ export interface TranscriptTurnIndex {
 }
 
 export interface TranscriptSearchCorpusItem {
-  messageKey: string;
+  projectionKey: string;
   turnIndex: number;
   timestamp?: string;
   textOffset: number;
@@ -72,6 +79,7 @@ interface BuildOptions {
   resumeAtMessageId?: string;
   signal?: AbortSignal;
   onProgress?: (bytesRead: number, snapshotSize: number) => void;
+  onFinalize?: () => void;
 }
 
 const FINALIZE_BATCH_SIZE = 2_000;
@@ -89,6 +97,7 @@ async function yieldToMainThread(signal?: AbortSignal): Promise<void> {
 interface RawIndexEntry extends TranscriptIndexEntry {
   originMessageId?: string;
   searchText?: string;
+  projectionKind: 'skip' | 'user' | 'assistant' | 'compact-boundary';
 }
 
 function extractVisibleUserSearchText(message: SDKNativeMessage): string | undefined {
@@ -132,6 +141,7 @@ function toRawEntry(message: SDKNativeMessage, offset: number, length: number, l
     uuid: message.uuid,
     originMessageId: message.origin?.msg_id,
     searchText: extractSearchText(message),
+    projectionKind: getSDKProjectionKind(message),
     parentUuid: message.parentUuid,
     timestamp: message.timestamp,
     realUser: isRealUserMessage(message),
@@ -156,15 +166,15 @@ async function finalizeIndex(
   await yieldToMainThread(signal);
   let currentTurn: TranscriptTurnIndex | undefined;
   let currentTurnIndex = -1;
-  let currentAssistantKey: string | undefined;
+  const projection = createSDKProjectionState();
   const turns: TranscriptTurnIndex[] = [];
   const searchCorpus: TranscriptSearchCorpusItem[] = [];
   const searchTextParts: string[] = [];
   let searchTextLength = 0;
   for (let index = 0; index < canonical.length; index += 1) {
     const entry = canonical[index];
+    const projectionKey = advanceSDKProjection(projection, entry.projectionKind, entry.messageKey);
     if (entry.realUser) {
-      currentAssistantKey = undefined;
       if (currentTurn) currentTurn.endEntry = index - 1;
       currentTurn = {
         turnId: entry.uuid ?? entry.originMessageId!,
@@ -177,19 +187,16 @@ async function finalizeIndex(
       currentTurn.endEntry = index;
     }
     entry.turnId = currentTurn?.turnId;
-    if (entry.searchText && currentTurnIndex >= 0) {
-      const messageKey = entry.type === 'assistant'
-        ? (currentAssistantKey ??= entry.messageKey)
-        : entry.messageKey;
+    if (entry.searchText && currentTurnIndex >= 0 && projectionKey) {
       const existing = searchCorpus[searchCorpus.length - 1];
-      const separator = entry.type === 'assistant' && existing?.messageKey === messageKey ? '\n' : '';
+      const separator = entry.type === 'assistant' && existing?.projectionKey === projectionKey ? '\n\n' : '';
       searchTextParts.push(separator, entry.searchText);
       if (separator) {
         existing.textLength += separator.length + entry.searchText.length;
         existing.timestamp ??= entry.timestamp;
       } else {
         searchCorpus.push({
-          messageKey,
+          projectionKey,
           turnIndex: currentTurnIndex,
           timestamp: entry.timestamp,
           textOffset: searchTextLength,
@@ -200,6 +207,7 @@ async function finalizeIndex(
     }
     delete entry.originMessageId;
     delete entry.searchText;
+    delete (entry as Partial<RawIndexEntry>).projectionKind;
     if ((index + 1) % FINALIZE_BATCH_SIZE === 0) await yieldToMainThread(signal);
   }
   return {
@@ -292,6 +300,7 @@ async function buildDirect(filePath: string, options: BuildOptions): Promise<Tra
       options.onProgress,
       options.signal,
     );
+    options.onFinalize?.();
     const index = await finalizeIndex(
       filePath,
       scanned.snapshot,
@@ -347,6 +356,7 @@ function serializeWorkerFunction(fn: (...args: never[]) => unknown): string {
   // ts-jest/esbuild may namespace imported helpers before Function#toString;
   // the worker source defines those helpers as locals, so normalize qualifiers.
   return fn.toString()
+    .replace(/\(0,\s*(?:import_[A-Za-z0-9_$]+|[A-Za-z_$][\w$]*_\d+)\.([A-Za-z_$][\w$]*)\)/g, '$1')
     .replace(/\bimport_[A-Za-z0-9_$]+\.([A-Za-z_$][\w$]*)/g, '$1')
     .replace(/\bexports\.([A-Za-z_$][\w$]*)/g, '$1')
     .replace(/__name\([^;]+;?/g, '');
@@ -369,6 +379,19 @@ function buildInWorker(filePath: string, options: BuildOptions): Promise<Transcr
     const extractExternalDisplayContent = (${serializeWorkerFunction(extractExternalDisplayContent)});
     const isDisplayableExternalUser = (${serializeWorkerFunction(isDisplayableExternalUser)});
     const isRealUserMessage = (${serializeWorkerFunction(isRealUserMessage)});
+    const normalize = text => text.trim();
+    const COMPACTION_CANCELED_STDERR_PATTERN = /^<local-command-stderr>\\s*Error:\\s*Compaction canceled\\.?\\s*<\\/local-command-stderr>$/i;
+    const isCompactionCanceledStderr = (${serializeWorkerFunction(isCompactionCanceledStderr)});
+    const projectionText = (message) => {
+      const content = message.message?.content;
+      if (typeof content === 'string') return content;
+      if (!Array.isArray(content)) return '';
+      return content.filter(block => block.type === 'text' && typeof block.text === 'string').map(block => block.text).join('\\n');
+    };
+    const isSDKMessageProjectionSkipped = (${serializeWorkerFunction(isSDKMessageProjectionSkipped)});
+    const getSDKProjectionKind = (${serializeWorkerFunction(getSDKProjectionKind)});
+    const createSDKProjectionState = (${serializeWorkerFunction(createSDKProjectionState)});
+    const advanceSDKProjection = (${serializeWorkerFunction(advanceSDKProjection)});
     const extractVisibleUserSearchText = (${serializeWorkerFunction(extractVisibleUserSearchText)});
     const extractSearchText = (${serializeWorkerFunction(extractSearchText)});
     const toRawEntry = (${serializeWorkerFunction(toRawEntry)});
@@ -381,14 +404,16 @@ function buildInWorker(filePath: string, options: BuildOptions): Promise<Transcr
     // bundled and ts-jest shapes.
     const externalUserMessage_1 = { extractUserText, unwrapExternalEnvelope, extractExternalDisplayContent, isDisplayableExternalUser, isRealUserMessage };
     const sdkBranchFilter_1 = { filterActiveBranchEntries };
+    const sdkMessageProjection_1 = { createSDKProjectionState, advanceSDKProjection, getSDKProjectionKind, isSDKMessageProjectionSkipped };
     const options = {
       ...workerData.options,
       onProgress: (bytesRead, snapshotSize) => parentPort.postMessage({ kind: 'progress', bytesRead, snapshotSize }),
+      onFinalize: () => parentPort.postMessage({ kind: 'finalize' }),
     };
     buildDirect(workerData.filePath, options).then(result => parentPort.postMessage({ kind: 'result', result }), error => parentPort.postMessage({ kind: 'result', result: { status: 'failed', error: String(error) } }));
   `;
   return new Promise((resolve, reject) => {
-    const { onProgress: _, signal: __, ...workerOptions } = options;
+    const { onProgress: _, onFinalize: __, signal: ___, ...workerOptions } = options;
     const worker = new Worker(source, { eval: true, workerData: { filePath, options: { ...workerOptions, useWorker: false } } });
     let settled = false;
     const finish = (result: TranscriptIndexResult): void => {
@@ -405,8 +430,10 @@ function buildInWorker(filePath: string, options: BuildOptions): Promise<Transcr
     if (options.signal?.aborted) abort();
     worker.on('message', message => {
       const payload = message as { kind: 'progress'; bytesRead: number; snapshotSize: number }
+        | { kind: 'finalize' }
         | { kind: 'result'; result: TranscriptIndexResult };
       if (payload.kind === 'progress') options.onProgress?.(payload.bytesRead, payload.snapshotSize);
+      else if (payload.kind === 'finalize') options.onFinalize?.();
       else finish(payload.result);
     });
     worker.once('error', error => {
@@ -427,8 +454,16 @@ function buildInWorker(filePath: string, options: BuildOptions): Promise<Transcr
 const requests = new Map<string, Promise<TranscriptIndexResult>>();
 
 export interface TranscriptIndexDiagnosticEvent {
-  phase: 'index_worker_fallback';
-  errorName: string;
+  phase: 'index_worker_fallback' | 'queued' | 'start' | 'progress' | 'finalize' | 'complete' | 'failed' | 'aborted' | 'stalled';
+  errorName?: string;
+  buildId?: string;
+  mode?: 'worker' | 'direct';
+  queueMs?: number;
+  elapsedMs?: number;
+  bytes?: number;
+  totalBytes?: number;
+  entries?: number;
+  turns?: number;
 }
 
 type TranscriptIndexDiagnosticSink = (event: TranscriptIndexDiagnosticEvent) => void;
@@ -445,6 +480,75 @@ export function setTranscriptIndexDiagnosticSink(sink: TranscriptIndexDiagnostic
 let workerAvailability: boolean | null = null;
 let workerProbe: Promise<boolean> | null = null;
 let directBuildTail = Promise.resolve();
+let buildSequence = 0;
+
+function observeBuild(
+  buildId: string,
+  mode: 'worker' | 'direct',
+  queuedAt: number,
+  options: BuildOptions,
+  run: (observedOptions: BuildOptions) => Promise<TranscriptIndexResult>,
+  recordRejection = true,
+): Promise<TranscriptIndexResult> {
+  const startedAt = performance.now();
+  let lastBytes = 0;
+  let totalBytes = 0;
+  let lastAdvanceAt = startedAt;
+  let lastProgressAt = -Infinity;
+  let lastProgressPercent = -Infinity;
+  let stalledReported = false;
+  diagnosticSink?.({ phase: 'start', buildId, mode, queueMs: startedAt - queuedAt });
+  const stalledTimer = setInterval(() => {
+    const now = performance.now();
+    if (!stalledReported && now - lastAdvanceAt >= 30_000) {
+      stalledReported = true;
+      diagnosticSink?.({ phase: 'stalled', buildId, mode, elapsedMs: now - startedAt, bytes: lastBytes, totalBytes });
+    }
+  }, 1_000);
+  const observedOptions: BuildOptions = {
+    ...options,
+    onProgress: (bytes, total) => {
+      options.onProgress?.(bytes, total);
+      const now = performance.now();
+      if (bytes > lastBytes) {
+        lastAdvanceAt = now;
+        stalledReported = false;
+      }
+      lastBytes = bytes;
+      totalBytes = total;
+      const percent = total > 0 ? bytes / total * 100 : 100;
+      if (now - lastProgressAt >= 2_000 || percent - lastProgressPercent >= 5 || bytes === total) {
+        lastProgressAt = now;
+        lastProgressPercent = percent;
+        diagnosticSink?.({ phase: 'progress', buildId, mode, elapsedMs: now - startedAt, bytes, totalBytes: total });
+      }
+    },
+    onFinalize: () => {
+      options.onFinalize?.();
+      diagnosticSink?.({ phase: 'finalize', buildId, mode, elapsedMs: performance.now() - startedAt, bytes: lastBytes, totalBytes });
+    },
+  };
+  return run(observedOptions).then(result => {
+    const elapsedMs = performance.now() - startedAt;
+    if (result.status === 'failed') {
+      const aborted = options.signal?.aborted || /aborted/i.test(result.error);
+      diagnosticSink?.({ phase: aborted ? 'aborted' : 'failed', buildId, mode, elapsedMs, errorName: aborted ? 'AbortError' : 'Error' });
+    } else {
+      diagnosticSink?.({
+        phase: 'complete', buildId, mode, elapsedMs,
+        bytes: result.index.snapshotSize, totalBytes: result.index.snapshotSize,
+        entries: result.index.entries.length, turns: result.index.turns.length,
+      });
+    }
+    return result;
+  }, error => {
+    if (recordRejection || options.signal?.aborted) {
+      const aborted = options.signal?.aborted;
+      diagnosticSink?.({ phase: aborted ? 'aborted' : 'failed', buildId, mode, elapsedMs: performance.now() - startedAt, errorName: error instanceof Error ? error.name : 'UnknownError' });
+    }
+    throw error;
+  }).finally(() => clearInterval(stalledTimer));
+}
 
 function recordWorkerFallback(error: unknown): void {
   diagnosticSink?.({
@@ -487,16 +591,27 @@ async function probeWorkerAvailability(): Promise<boolean> {
   return workerProbe;
 }
 
-function scheduleDirectBuild(filePath: string, options: BuildOptions): Promise<TranscriptIndexResult> {
+function scheduleDirectBuild(filePath: string, options: BuildOptions, buildId = `index-${Date.now().toString(36)}-${(++buildSequence).toString(36)}`): Promise<TranscriptIndexResult> {
+  const queuedAt = performance.now();
+  diagnosticSink?.({ phase: 'queued', buildId, mode: 'direct' });
   const build = directBuildTail.then(async () => {
     throwIfAborted(options.signal);
-    return buildDirect(filePath, options);
+    return observeBuild(buildId, 'direct', queuedAt, options, observed => buildDirect(filePath, observed));
   }, async () => {
     throwIfAborted(options.signal);
-    return buildDirect(filePath, options);
+    return observeBuild(buildId, 'direct', queuedAt, options, observed => buildDirect(filePath, observed));
   });
   directBuildTail = build.then(() => undefined, () => undefined);
-  return build.catch(error => ({ status: 'failed', error: error instanceof Error ? error.message : String(error) }));
+  return build.catch(error => {
+    diagnosticSink?.({
+      phase: options.signal?.aborted ? 'aborted' : 'failed',
+      buildId,
+      mode: 'direct',
+      elapsedMs: performance.now() - queuedAt,
+      errorName: options.signal?.aborted ? 'AbortError' : (error instanceof Error ? error.name : 'UnknownError'),
+    });
+    return { status: 'failed', error: error instanceof Error ? error.message : String(error) };
+  });
 }
 
 export function resetTranscriptIndexWorkerProbe(): void {
@@ -521,11 +636,18 @@ export function buildTranscriptIndex(filePath: string, options: BuildOptions = {
         return scheduleDirectBuild(filePath, options);
       }
       try {
-        return await buildInWorker(filePath, options);
+        const queuedAt = performance.now();
+        const buildId = `index-${Date.now().toString(36)}-${(++buildSequence).toString(36)}`;
+        diagnosticSink?.({ phase: 'queued', buildId, mode: 'worker' });
+        try {
+          return await observeBuild(buildId, 'worker', queuedAt, options, observed => buildInWorker(filePath, observed), false);
+        } catch (error) {
+          workerAvailability = false;
+          recordWorkerFallback(error);
+          return scheduleDirectBuild(filePath, options, buildId);
+        }
       } catch (error) {
-        workerAvailability = false;
-        recordWorkerFallback(error);
-        return scheduleDirectBuild(filePath, options);
+        return { status: 'failed', error: error instanceof Error ? error.message : String(error) };
       }
     })();
     inFlight.set(key, build);

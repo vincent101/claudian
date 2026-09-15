@@ -69,6 +69,10 @@
     },
     "history": {
       "loading": "正在載入對話…",
+      "waitingForIndex": "等待索引（排隊）…",
+      "buildingIndex": "建立索引 {percent}%",
+      "finalizingIndex": "整理索引…",
+      "loadingRecentTurns": "載入最近 {count} 輪…",
       "oversizeTitle": "超大對話",
       "oversizeDescription": "隨選載入將在分頁里程碑提供。",
       "errorTitle": "對話載入失敗",

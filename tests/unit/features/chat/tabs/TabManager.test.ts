@@ -1012,7 +1012,7 @@ describe('TabManager - Tab Lifecycle', () => {
         await flushMicrotasks(10);
         jest.useRealTimers();
 
-        expect(loadInitialHistory).toHaveBeenCalledWith(storedConversation, '/vault', 50);
+        expect(loadInitialHistory).toHaveBeenCalledWith(storedConversation, '/vault', 50, expect.any(Function));
         expect(tab?.hydrationState).toBe('READY');
         expect(tab?.dom.inputEl.disabled).toBe(false);
         expect(tab?.state.messages.map((message: any) => message.id)).toEqual(['turn-50']);
@@ -1081,7 +1081,7 @@ describe('TabManager - Tab Lifecycle', () => {
         await flushMicrotasks(10);
         jest.useRealTimers();
 
-        expect(loadInitialHistory).toHaveBeenCalledWith(storedConversation, '/vault', 50);
+        expect(loadInitialHistory).toHaveBeenCalledWith(storedConversation, '/vault', 50, expect.any(Function));
         expect(tab?.hydrationState).toBe('ERROR');
         expect(tab?.hydrationDiagnostic?.message).toBe('index build failed: worker crashed');
         expect(tab?.dom.inputEl.disabled).toBe(true);

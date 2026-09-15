@@ -389,8 +389,19 @@ export interface HistoryPage {
   snapshotOffset?: number;
 }
 
+export type HistoryLoadProgress =
+  | { phase: 'queued' }
+  | { phase: 'indexing'; percent: number }
+  | { phase: 'finalizing' }
+  | { phase: 'loading'; turnCount: number };
+
 export interface HistorySearchResult {
-  messageKey: string;
+  /** Stable DOM identity produced by the shared transcript projection rules. */
+  projectionKey: string;
+  /** Global turn containing this match. */
+  turnIndex: number;
+  /** Zero-based occurrence of the query within the projected message text. */
+  matchOrdinal: number;
   cursor: string;
   timestamp: number;
   snippet: string;
@@ -408,6 +419,7 @@ export interface ProviderConversationHistoryService {
     conversation: Conversation,
     vaultPath: string | null,
     pageSize: number,
+    onProgress?: (progress: HistoryLoadProgress) => void,
   ): Promise<HistoryPage>;
   loadOlderHistory?(cursor: string, pageSize: number): Promise<HistoryPage>;
   searchHistory?(conversation: Conversation, vaultPath: string | null, query: string): Promise<HistorySearchResult[]>;
