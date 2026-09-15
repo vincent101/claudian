@@ -325,6 +325,15 @@
   opacity: 1;
 }
 
+/* Assistant messages carry only the non-interactive timestamp. The -20px hang
+   below the box (user-button toolbar design) drops it onto the next message,
+   and a collapsed subagent block ends ~18px (subagent-list margin + box
+   padding) above the box edge, pushing the stamp well into the following user
+   bubble. Anchor it inside the box's bottom strip instead. */
+.claudian-message-assistant .claudian-message-actions {
+  bottom: 0;
+}
+
 .claudian-message-actions span {
   display: flex;
   align-items: center;

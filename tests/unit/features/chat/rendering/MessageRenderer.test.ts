@@ -473,6 +473,44 @@ describe('MessageRenderer', () => {
       renderer.addMessage({ id: 'a-invalid', role: 'assistant', content: '', timestamp: Number.NaN });
       expect(messagesEl.querySelector('.claudian-message-timestamp')).toBeNull();
     });
+
+    it('keeps the subagent message timestamp toolbar a direct child of the assistant message element', () => {
+      const messagesEl = createMockEl();
+      const { renderer } = createRenderer(messagesEl);
+      jest.spyOn(renderer, 'renderContent').mockResolvedValue(undefined);
+
+      renderer.renderStoredMessage({
+        id: 'sub-stored',
+        role: 'assistant',
+        content: '',
+        timestamp,
+        toolCalls: [
+          {
+            id: 'sub-1',
+            name: TOOL_TASK,
+            input: { description: 'Subagent task', prompt: 'Do things' },
+            status: 'completed',
+            result: 'done',
+          } as any,
+        ],
+        contentBlocks: [{ type: 'subagent', subagentId: 'sub-1' } as any],
+      });
+
+      expect(renderStoredSubagent).toHaveBeenCalled();
+      const msgEl = messagesEl.querySelector('.claudian-message-assistant');
+      expect(msgEl).not.toBeNull();
+      // The assistant-scoped positioning override
+      // (.claudian-message-assistant .claudian-message-actions { bottom: 0 })
+      // requires the toolbar to sit directly on the message element — never
+      // inside the content/subagent block.
+      const children = (msgEl as any).children as any[];
+      const toolbar = children.find(child => child.hasClass?.('claudian-message-actions'));
+      expect(toolbar).toBeDefined();
+      const content = children.find(child => child.hasClass?.('claudian-message-content'));
+      expect(content.querySelector('.claudian-message-actions')).toBeNull();
+      const time = toolbar.querySelector('.claudian-message-timestamp');
+      expect(time?.textContent).toContain('20:35:03');
+    });
   });
 
   // ============================================
