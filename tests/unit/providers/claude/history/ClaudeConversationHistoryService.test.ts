@@ -9,6 +9,7 @@ import {
   materializeTranscriptPage,
   materializeTranscriptToolAssociations,
 } from '@/providers/claude/history/ClaudeTranscriptHistoryIndex';
+import { measureChatProjectionChars } from '@/providers/claude/history/HistorySummaryProjection';
 
 jest.mock('@/providers/claude/history/ClaudeTranscriptHistoryIndex', () => ({
   buildTranscriptIndex: jest.fn().mockResolvedValue({ status: 'complete', index: { entries: [], turns: [] } }),
@@ -274,7 +275,13 @@ describe('ClaudeConversationHistoryService M1 fuse', () => {
       const turns = Array.from({ length: 30 }, (_, index) => ({ turnId: `u${index}`, startEntry: index, endEntry: index, sourceBytes: 1024 }));
       mockBuildTranscriptIndex.mockResolvedValue(mockIndex(turns));
       mockSdkSessionExists.mockImplementation((_vault, session) => session === 'current-session');
-      mockMaterializeTranscriptPage.mockResolvedValue([{ type: 'user', uuid: 'native' }]);
+      // Unique uuids per turn: real turns never share message ids, and the
+      // measured == reported invariant below depends on dedupe not firing.
+      let nativeCounter = 0;
+      mockMaterializeTranscriptPage.mockImplementation(() => {
+        nativeCounter += 1;
+        return Promise.resolve([{ type: 'user', uuid: `native-${nativeCounter}` }]);
+      });
       mockMaterializeSDKMessages.mockImplementation(async (_vault: string, _sessionId: string, native: any[]) =>
         native.map((message, index) => ({ id: message.uuid ?? `n${index}`, role: 'user' as const, content: 'c'.repeat(1_000_000), timestamp: 1 })));
       const service = new ClaudeConversationHistoryService();
@@ -286,9 +293,12 @@ describe('ClaudeConversationHistoryService M1 fuse', () => {
       // Two 1M-char turns fit the 2M budget; the third would exceed it.
       expect(page.range).toEqual({ start: 28, end: 30 });
       expect(page.projectedChars).toBe(2_000_000);
+      // Old-turn cumulative overflow keeps the measured == reported invariant.
+      expect(page.projectedChars).toBe(measureChatProjectionChars(page.messages));
+      expect(page.projectedChars).toBeLessThanOrEqual(budget().maxProjectedChars);
     });
 
-    it('shrinks a single turn whose projection alone exceeds the char budget', async () => {
+    it('hard-caps a plain turn whose projection alone exceeds the char budget (anchor)', async () => {
       const turns = Array.from({ length: 3 }, (_, index) => ({ turnId: `u${index}`, startEntry: index, endEntry: index, sourceBytes: 1024 }));
       mockBuildTranscriptIndex.mockResolvedValue(mockIndex(turns));
       mockSdkSessionExists.mockImplementation((_vault, session) => session === 'current-session');
@@ -304,8 +314,64 @@ describe('ClaudeConversationHistoryService M1 fuse', () => {
       // The oversized anchor turn is included as a summary projection, not an empty page.
       expect(page.range).toEqual({ start: 2, end: 3 });
       expect(page.oversizedTurnCount).toBe(1);
-      expect(page.messages[0].content).toContain('characters omitted');
-      expect(page.messages[0].content.length).toBeLessThanOrEqual(2100);
+      // Hard cap: the real measured projection never exceeds the budget.
+      expect(page.projectedChars).toBeLessThanOrEqual(1000);
+      expect(page.projectedChars).toBe(measureChatProjectionChars(page.messages));
+      expect(page.messages[0].content.length).toBeLessThanOrEqual(1000);
+      // Explicit omission marker when there is room for one.
+      expect(page.messages[0].content).toContain('…');
+    });
+
+    it('hard-caps an oversized source turn whose summary projection still exceeds the budget', async () => {
+      const giantBytes = 20 * 1024 * 1024;
+      const entries = [
+        { offset: 0, length: 90, type: 'user', messageKey: 'u0', uuid: 'u0', realUser: true, displayable: false, isMeta: false, toolUseIds: [], toolResultIds: [] },
+        { offset: 90, length: 90, type: 'assistant', messageKey: 'a0', uuid: 'a0', realUser: false, displayable: false, isMeta: false, toolUseIds: [], toolResultIds: [] },
+        { offset: 180, length: giantBytes, type: 'user', messageKey: 'tr0', uuid: 'tr0', realUser: false, displayable: false, isMeta: false, toolUseIds: [], toolResultIds: [] },
+      ];
+      const turns = [{ turnId: 'u0', startEntry: 0, endEntry: 2, sourceBytes: 180 + giantBytes }];
+      mockBuildTranscriptIndex.mockResolvedValue(mockIndex(turns, entries));
+      mockSdkSessionExists.mockImplementation((_vault, session) => session === 'current-session');
+      mockMaterializeTranscriptEntries.mockResolvedValue([]);
+      // The materialized summary projection itself dwarfs the tiny budget.
+      mockMaterializeSDKMessages.mockImplementation(async (_vault: string, _sessionId: string, native: any[]) =>
+        native.map((message, index) => ({ id: message.uuid ?? `n${index}`, role: 'user' as const, content: 's'.repeat(40_000), timestamp: 1 })));
+      const service = new ClaudeConversationHistoryService();
+      const lease = service.acquireHistoryIndex(createConversation(), '/vault');
+      await lease.ready;
+
+      const page = await lease.loadWindow!({ anchorTurn: 1, direction: 'older', budget: budget({ maxProjectedChars: 1000 }), projectionLevel: 'summary' });
+
+      // Oversized source turn: hard-capped to the budget, shells kept.
+      expect(page.range).toEqual({ start: 0, end: 1 });
+      expect(page.projectedChars).toBeLessThanOrEqual(1000);
+      expect(page.projectedChars).toBe(measureChatProjectionChars(page.messages));
+      expect(page.messages.length).toBeGreaterThan(0);
+      for (const message of page.messages) {
+        expect(message.content.length).toBeLessThanOrEqual(1000);
+      }
+    });
+
+    it('hard-caps the anchor when it is the only turn in the plan', async () => {
+      const turns = [{ turnId: 'u0', startEntry: 0, endEntry: 0, sourceBytes: 1024 }];
+      mockBuildTranscriptIndex.mockResolvedValue(mockIndex(turns));
+      mockSdkSessionExists.mockImplementation((_vault, session) => session === 'current-session');
+      mockMaterializeTranscriptPage.mockResolvedValue([{ type: 'user', uuid: 'native' }]);
+      mockMaterializeSDKMessages.mockImplementation(async (_vault: string, _sessionId: string, native: any[]) =>
+        native.map((message, index) => ({ id: message.uuid ?? `n${index}`, role: 'user' as const, content: 'only '.repeat(2000), timestamp: 1 })));
+      const service = new ClaudeConversationHistoryService();
+      const lease = service.acquireHistoryIndex(createConversation(), '/vault');
+      await lease.ready;
+
+      const page = await lease.loadWindow!({ anchorTurn: 1, direction: 'older', budget: budget({ maxProjectedChars: 1000 }), projectionLevel: 'summary' });
+
+      expect(page.range).toEqual({ start: 0, end: 1 });
+      expect(page.projectedChars).toBeLessThanOrEqual(1000);
+      expect(page.projectedChars).toBe(measureChatProjectionChars(page.messages));
+      // The anchor's message identity survives the hard cap.
+      expect(page.messages).toHaveLength(1);
+      expect(page.messages[0].id).toBe('native');
+      expect(page.messages[0].content).toContain('…');
     });
 
     it('plans windows across segments', async () => {

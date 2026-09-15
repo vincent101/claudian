@@ -38,14 +38,6 @@ export class ProjectionWriteCoordinator {
         resolve(null);
         return;
       }
-      let released = false;
-      const lease: ProjectionWriteLease = {
-        release: () => {
-          if (released) return;
-          released = true;
-          this.releaseActive();
-        },
-      };
       this.queue.push({
         isCancelled: isCancelled ?? (() => false),
         start: granted => resolve(granted),

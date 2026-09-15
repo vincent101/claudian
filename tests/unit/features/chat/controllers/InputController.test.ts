@@ -3603,7 +3603,7 @@ describe('InputController - Message Queue', () => {
   // ============================================
 
   describe('Projection write lease', () => {
-    const prepareDeps = (coordinator: import('@/features/chat/rendering/ProjectionWriteCoordinator').ProjectionWriteCoordinator) => {
+    const prepareDeps = (coordinator: ProjectionWriteCoordinatorForTest) => {
       deps = createSendableDeps({
         getProjectionCoordinator: () => coordinator,
       });

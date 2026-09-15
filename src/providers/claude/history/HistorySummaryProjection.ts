@@ -86,6 +86,118 @@ export function summarizeChatMessages(messages: ChatMessage[]): void {
   for (const message of messages) summarizeChatMessage(message);
 }
 
+export interface HardCapResult {
+  messages: ChatMessage[];
+  /** Real post-compression measurement — never a Math.min of two numbers. */
+  projectedChars: number;
+  truncated: boolean;
+}
+
+const HARD_CAP_OMISSION_MARKER = '[… truncated …]';
+
+/**
+ * Budget-aware single-string truncation: keeps head+tail excerpts around an
+ * explicit omission marker. When the budget cannot hold the full marker, the
+ * marker itself is cut to the remaining length; a zero budget yields ''.
+ */
+function capTextToBudget(text: string, budget: number): string {
+  if (budget <= 0) return '';
+  if (text.length <= budget) return text;
+  if (budget <= HARD_CAP_OMISSION_MARKER.length) {
+    return HARD_CAP_OMISSION_MARKER.slice(0, budget);
+  }
+  const body = budget - HARD_CAP_OMISSION_MARKER.length;
+  const head = Math.ceil(body / 2);
+  const tail = body - head;
+  return `${text.slice(0, head)}${HARD_CAP_OMISSION_MARKER}${tail > 0 ? text.slice(text.length - tail) : ''}`;
+}
+
+/** Strips every surface measureChatProjectionChars counts, keeping the shell. */
+function emptyMeasurableSurfaces(message: ChatMessage): void {
+  message.content = '';
+  message.displayContent = undefined;
+  for (const block of message.contentBlocks ?? []) {
+    if (block.type === 'text' || block.type === 'thinking') block.content = '';
+  }
+  for (const toolCall of message.toolCalls ?? []) {
+    toolCall.input = {};
+    toolCall.result = undefined;
+    if (toolCall.subagent) {
+      toolCall.subagent.toolCalls = [];
+      toolCall.subagent.result = undefined;
+    }
+  }
+}
+
+/**
+ * Shrinks one message in place to at most `budget` projected chars.
+ * Deterministic surface order: tool payloads (input/result/nested subagent
+ * detail — the summary layer's non-essential fields) go first, then text
+ * blocks and displayContent, and message.content is kept last as the single
+ * carrier with a head/tail excerpt plus an omission marker.
+ */
+function hardCapMessage(message: ChatMessage, budget: number): void {
+  if (measureChatProjectionChars([message]) <= budget) return;
+
+  for (const toolCall of message.toolCalls ?? []) {
+    toolCall.input = {};
+    toolCall.result = undefined;
+    toolCall.diffData = undefined;
+    if (toolCall.subagent) {
+      toolCall.subagent.toolCalls = [];
+      toolCall.subagent.result = undefined;
+    }
+  }
+  if (measureChatProjectionChars([message]) <= budget) return;
+
+  if (message.contentBlocks) {
+    for (const block of message.contentBlocks) {
+      if (block.type === 'text' || block.type === 'thinking') block.content = '';
+    }
+  }
+  message.displayContent = undefined;
+  message.content = capTextToBudget(message.content, budget);
+}
+
+/**
+ * Second-pass hard cap for a single produced turn whose summary projection
+ * still exceeds `maxProjectedChars` (anchor turns are exempt from cumulative
+ * window admission, never from this per-turn ceiling). Message identity —
+ * id, role, timestamp, provider-native message ids — and array order always
+ * survive; only projection payloads shrink. Postcondition:
+ * measureChatProjectionChars(result.messages) <= maxProjectedChars.
+ */
+export function hardCapChatProjection(
+  messages: ChatMessage[],
+  maxProjectedChars: number,
+): HardCapResult {
+  if (!Number.isFinite(maxProjectedChars) || maxProjectedChars < 0) {
+    throw new RangeError(`maxProjectedChars must be a non-negative finite number, got ${maxProjectedChars}`);
+  }
+  summarizeChatMessages(messages);
+  let total = measureChatProjectionChars(messages);
+  if (total <= maxProjectedChars) {
+    return { messages, projectedChars: total, truncated: false };
+  }
+
+  // Equal-share budget across message shells: Σ min(m_i, share_i) ≤ Σ share_i
+  // = budget, so no message can push the turn over the ceiling.
+  const share = Math.floor(maxProjectedChars / messages.length);
+  const leftover = maxProjectedChars - share * messages.length;
+  messages.forEach((message, index) => {
+    hardCapMessage(message, share + (index < leftover ? 1 : 0));
+  });
+
+  total = measureChatProjectionChars(messages);
+  if (total > maxProjectedChars) {
+    // Defensive postcondition guarantee: a surface the estimator counts but
+    // the capper missed must not leak over the hard ceiling.
+    for (const message of messages) emptyMeasurableSurfaces(message);
+    total = measureChatProjectionChars(messages);
+  }
+  return { messages, projectedChars: total, truncated: true };
+}
+
 /**
  * Deterministic projection-size estimate used for budget enforcement. String
  * payloads count exactly; non-string input values are estimated at a fixed

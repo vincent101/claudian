@@ -705,7 +705,6 @@ export class InputController {
       // stored transaction is queued; holding live while queueing stored
       // would self-deadlock the FIFO.
       projectionLease?.release();
-      projectionLease = null;
       if (
         turnContext?.projectionDirty
         && !wasInvalidated

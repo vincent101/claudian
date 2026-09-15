@@ -40,6 +40,7 @@ import {
 import {
   buildOversizedEntryPlaceholder,
   buildOversizedTurnMarker,
+  hardCapChatProjection,
   HISTORY_SUMMARY_LIMITS,
   measureChatProjectionChars,
   summarizeChatMessages,
@@ -772,12 +773,18 @@ export class ClaudeConversationHistoryService implements ProviderConversationHis
       } else {
         produced = await this.materializeTurn(state, item.segment, item.turnIndex);
         readBytes = turnBytes;
-        if (measureChatProjectionChars(produced) > request.budget.maxProjectedChars) {
-          summarizeChatMessages(produced);
-          shrunk = true;
-        }
       }
-      const chars = measureChatProjectionChars(produced);
+      // Per-turn hard ceiling: `isNewest` only exempts the cumulative window
+      // admission below, never this cap — an anchor turn whose summary
+      // projection alone exceeds the char budget is hard-capped to the real
+      // measured value (identity and order survive, payloads shrink).
+      let chars = measureChatProjectionChars(produced);
+      if (chars > request.budget.maxProjectedChars) {
+        const capped = hardCapChatProjection(produced, request.budget.maxProjectedChars);
+        produced = capped.messages;
+        chars = capped.projectedChars;
+        shrunk = true;
+      }
       const isNewest = index === plan.end - 1;
       if (!isNewest && (
         projectedChars + chars > request.budget.maxProjectedChars
