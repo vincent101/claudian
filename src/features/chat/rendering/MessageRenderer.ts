@@ -1,7 +1,7 @@
 import type { App, Component } from 'obsidian';
 import { MarkdownRenderer, Notice } from 'obsidian';
 
-import { DEFAULT_CHAT_PROVIDER_ID, type ProviderCapabilities } from '../../../core/providers/types';
+import { DEFAULT_CHAT_PROVIDER_ID, type HistoryProjectionLevel,type ProviderCapabilities } from '../../../core/providers/types';
 import {
   isSubagentToolName,
   isWriteEditTool,
@@ -15,6 +15,7 @@ import { formatDurationMmSs } from '../../../utils/date';
 import { processFileLinks, registerFileLinkHandler } from '../../../utils/fileLink';
 import { replaceImageEmbedsWithHtml } from '../../../utils/imageEmbed';
 import { escapeMathDelimitersForStreaming } from '../../../utils/markdownMath';
+import { HISTORY_RENDER_LIMITS } from '../history/HistoryResourcePolicy';
 import { findRewindContext } from '../rewind';
 import { resolveSubagentLifecycleAdapter } from './subagentLifecycleResolution';
 import {
@@ -46,7 +47,10 @@ export class MessageRenderer {
   private liveMessageEls = new Map<string, HTMLElement>();
   private readonly contentRenderGenerations = new Map<string, number>();
   private readonly pendingContentRenders = new Map<string, Promise<void>>();
-  private readonly onMessageContentRendered?: (projectionKey: string) => void;
+  private readonly onMessageContentRendered?: (projectionKey: string, projectionLevel: HistoryProjectionLevel) => void;
+  private renderGeneration = 0;
+  private renderIdlePromise: Promise<void> = Promise.resolve();
+  private renderIdleResolver: (() => void) | null = null;
 
   private static readonly REWIND_ICON = `<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/></svg>`;
 
@@ -59,7 +63,7 @@ export class MessageRenderer {
     rewindCallback?: (messageId: string) => Promise<void>,
     forkCallback?: (messageId: string) => Promise<void>,
     getCapabilities?: () => ProviderCapabilities,
-    onMessageContentRendered?: (projectionKey: string) => void,
+    onMessageContentRendered?: (projectionKey: string, projectionLevel: HistoryProjectionLevel) => void,
   ) {
     this.app = plugin.app;
     this.plugin = plugin;
@@ -96,12 +100,16 @@ export class MessageRenderer {
     return resolveSubagentLifecycleAdapter(this.getCapabilities().providerId, toolName);
   }
 
-  async renderMessageContent(projectionKey: string, jobs: Array<Promise<void>>): Promise<void> {
+  async renderMessageContent(
+    projectionKey: string,
+    jobs: Array<Promise<void>>,
+    projectionLevel: HistoryProjectionLevel = 'detail',
+  ): Promise<void> {
     const generation = (this.contentRenderGenerations.get(projectionKey) ?? 0) + 1;
     this.contentRenderGenerations.set(projectionKey, generation);
     const pending = Promise.all(jobs).then(() => {
       if (this.contentRenderGenerations.get(projectionKey) !== generation) return;
-      this.onMessageContentRendered?.(projectionKey);
+      this.onMessageContentRendered?.(projectionKey, projectionLevel);
     });
     this.pendingContentRenders.set(projectionKey, pending);
     try {
@@ -242,6 +250,9 @@ export class MessageRenderer {
 
   /**
    * Renders all messages for conversation load/switch.
+   * The first slice mounts synchronously so small conversations appear
+   * immediately; further slices mount per animation frame so the browser can
+   * paint between them (B1 frame-batched rendering).
    * @param messages Array of messages to render
    * @param getGreeting Function to get greeting text
    * @returns The newly created welcome element
@@ -257,27 +268,79 @@ export class MessageRenderer {
     const newWelcomeEl = this.messagesEl.createDiv({ cls: 'claudian-welcome' });
     newWelcomeEl.createDiv({ cls: 'claudian-welcome-greeting', text: getGreeting() });
 
-    for (let i = 0; i < messages.length; i++) {
-      this.renderStoredMessage(messages[i], messages, i);
-    }
-
-    this.scrollToBottom();
+    this.startBatchedRender(messages, messages, false);
     return newWelcomeEl;
   }
 
   prependMessages(messages: ChatMessage[], allMessages: ChatMessage[]): void {
-    const anchor = this.messagesEl.querySelector('.claudian-message') as HTMLElement | null;
-    const before = anchor?.getBoundingClientRect().top ?? 0;
-    const fragment = document.createDocumentFragment();
-    const original = this.messagesEl;
-    this.messagesEl = fragment as unknown as HTMLElement;
-    for (let index = 0; index < messages.length; index += 1) {
-      this.renderStoredMessage(messages[index], allMessages, index);
-    }
-    this.messagesEl = original;
-    const first = original.querySelector('.claudian-message');
-    original.insertBefore(fragment, first);
-    if (anchor) original.scrollTop += anchor.getBoundingClientRect().top - before;
+    this.startBatchedRender(messages, allMessages, true);
+  }
+
+  /** Resolves once the current batched render queue has fully mounted. */
+  waitForRenderedMessages(): Promise<void> {
+    return this.renderIdlePromise;
+  }
+
+  private scheduleFrame(callback: () => void): void {
+    // Node test environments may lack requestAnimationFrame; the fallback
+    // still yields the event loop between slices.
+    if (typeof requestAnimationFrame === 'function') requestAnimationFrame(() => callback());
+    else setTimeout(() => callback(), 0);
+  }
+
+  private startBatchedRender(
+    messages: ChatMessage[],
+    allMessages: ChatMessage[],
+    prepend: boolean,
+  ): void {
+    const generation = ++this.renderGeneration;
+    // Superseding render: the previous queue stops and its waiter resolves.
+    this.renderIdleResolver?.();
+    let resolveIdle!: () => void;
+    this.renderIdlePromise = new Promise<void>(resolve => { resolveIdle = resolve; });
+    this.renderIdleResolver = resolveIdle;
+    const complete = (): void => {
+      if (this.renderIdleResolver === resolveIdle) this.renderIdleResolver = null;
+      resolveIdle();
+    };
+    const step = (from: number): void => {
+      if (generation !== this.renderGeneration) {
+        complete();
+        return;
+      }
+      const sliceStart = performance.now();
+      const original = this.messagesEl;
+      const fragment = prepend
+        ? document.createDocumentFragment()
+        : null;
+      if (fragment) this.messagesEl = fragment as unknown as HTMLElement;
+      let index = from;
+      try {
+        while (
+          index < messages.length
+          && index - from < HISTORY_RENDER_LIMITS.renderBatchMessages
+          && (index === from || performance.now() - sliceStart < HISTORY_RENDER_LIMITS.renderTimeSliceMs)
+        ) {
+          this.renderStoredMessage(messages[index], allMessages, index);
+          index += 1;
+        }
+      } finally {
+        if (fragment) this.messagesEl = original;
+      }
+      if (fragment) {
+        const anchor = original.querySelector('.claudian-message') as HTMLElement | null;
+        const before = anchor?.getBoundingClientRect().top ?? 0;
+        original.insertBefore(fragment, anchor);
+        if (anchor) original.scrollTop += anchor.getBoundingClientRect().top - before;
+      }
+      if (index < messages.length) {
+        this.scheduleFrame(() => step(index));
+        return;
+      }
+      if (!prepend) this.scrollToBottom();
+      complete();
+    };
+    step(0);
   }
 
   renderHistoryPager(
@@ -345,6 +408,20 @@ export class MessageRenderer {
   }
 
   renderStoredMessage(msg: ChatMessage, allMessages?: ChatMessage[], index?: number): void {
+    try {
+      this.renderStoredMessageBody(msg, allMessages, index);
+    } catch {
+      // One broken message must not block the rest of the batch (B1 rule).
+      const msgEl = this.messagesEl.createDiv({
+        cls: `claudian-message claudian-message-${msg.role}`,
+        attr: { 'data-message-id': msg.id, 'data-role': msg.role },
+      });
+      const contentEl = msgEl.createDiv({ cls: 'claudian-message-content' });
+      contentEl.createDiv({ cls: 'claudian-render-error', text: 'Failed to render this message.' });
+    }
+  }
+
+  private renderStoredMessageBody(msg: ChatMessage, allMessages?: ChatMessage[], index?: number): void {
     // Bare interrupt marker: user-role interrupts (Claude bracket markers) always render
     // as a standalone indicator. Assistant-role interrupts (Codex partial responses)
     // only use the bare marker when there's no content to preserve.
@@ -382,27 +459,38 @@ export class MessageRenderer {
 
     const contentEl = msgEl.createDiv({ cls: 'claudian-message-content', attr: { dir: 'auto' } });
 
-    if (msg.role === 'user') {
-      const textToShow = msg.displayContent ?? msg.content;
-      if (textToShow) {
-        const textEl = contentEl.createDiv({ cls: 'claudian-text-block' });
-        void this.renderMessageContent(msg.id, [this.renderContent(textEl, textToShow)]);
-        this.addUserCopyButton(msgEl, textToShow);
-      }
-      if (msg.userMessageId && this.isRewindEligible(allMessages, index)) {
-        if (this.rewindCallback) {
-          this.addRewindButton(msgEl, msg.id);
+    try {
+      if (msg.role === 'user') {
+        const textToShow = msg.displayContent ?? msg.content;
+        let deferred = false;
+        if (textToShow) {
+          deferred = this.renderTextContent(contentEl, textToShow, []);
+          this.addUserCopyButton(msgEl, textToShow);
         }
-        if (this.forkCallback) {
-          this.addForkButton(msgEl, msg.id);
+        // Summary completion must not masquerade as detail completion (B1
+        // rule): a message with deferred shells notifies at summary level.
+        void this.renderMessageContent(msg.id, [], deferred ? 'summary' : 'detail');
+        if (msg.userMessageId && this.isRewindEligible(allMessages, index)) {
+          if (this.rewindCallback) {
+            this.addRewindButton(msgEl, msg.id);
+          }
+          if (this.forkCallback) {
+            this.addForkButton(msgEl, msg.id);
+          }
+        }
+      } else if (msg.role === 'assistant') {
+        const jobs: Array<Promise<void>> = [];
+        const deferred = this.renderAssistantContent(msg, contentEl, jobs);
+        void this.renderMessageContent(msg.id, jobs, deferred ? 'summary' : 'detail');
+        if (msg.isInterrupt) {
+          this.appendInterruptIndicator(contentEl);
         }
       }
-    } else if (msg.role === 'assistant') {
-      const jobs = this.renderAssistantContent(msg, contentEl);
-      void this.renderMessageContent(msg.id, jobs);
-      if (msg.isInterrupt) {
-        this.appendInterruptIndicator(contentEl);
-      }
+    } catch {
+      // Replace partial content with an error card instead of leaving a
+      // half-built message or appending a duplicate bubble.
+      contentEl.empty();
+      contentEl.createDiv({ cls: 'claudian-render-error', text: 'Failed to render this message.' });
     }
     this.addMessageTimestamp(msgEl, msg.timestamp);
   }
@@ -433,9 +521,14 @@ export class MessageRenderer {
 
   /**
    * Renders assistant message content (content blocks or fallback).
+   * Returns whether any large text block was deferred to a lazy shell.
    */
-  private renderAssistantContent(msg: ChatMessage, contentEl: HTMLElement): Array<Promise<void>> {
-    const jobs: Array<Promise<void>> = [];
+  private renderAssistantContent(
+    msg: ChatMessage,
+    contentEl: HTMLElement,
+    jobs: Array<Promise<void>>,
+  ): boolean {
+    let deferred = false;
     if (msg.contentBlocks && msg.contentBlocks.length > 0) {
       const renderedToolIds = new Set<string>();
       for (const block of msg.contentBlocks) {
@@ -451,9 +544,7 @@ export class MessageRenderer {
           if (!block.content || !block.content.trim()) {
             continue;
           }
-          const textEl = contentEl.createDiv({ cls: 'claudian-text-block' });
-          jobs.push(this.renderContent(textEl, block.content));
-          this.addTextCopyButton(textEl, block.content);
+          if (this.renderTextContent(contentEl, block.content, jobs)) deferred = true;
         } else if (block.type === 'tool_use') {
           const toolCall = msg.toolCalls?.find(tc => tc.id === block.toolId);
           if (toolCall) {
@@ -485,9 +576,7 @@ export class MessageRenderer {
     } else {
       // Fallback for old conversations without contentBlocks
       if (msg.content) {
-        const textEl = contentEl.createDiv({ cls: 'claudian-text-block' });
-        jobs.push(this.renderContent(textEl, msg.content));
-        this.addTextCopyButton(textEl, msg.content);
+        if (this.renderTextContent(contentEl, msg.content, jobs)) deferred = true;
       }
       if (msg.toolCalls) {
         for (const toolCall of msg.toolCalls) {
@@ -506,7 +595,63 @@ export class MessageRenderer {
         cls: 'claudian-baked-duration',
       });
     }
-    return jobs;
+    return deferred;
+  }
+
+  /**
+   * Renders one text block: small blocks render Markdown immediately; large
+   * blocks mount a plain-text shell first and only invoke the Markdown
+   * renderer on explicit expand (B1 lazy body).
+   * Returns whether the block was deferred.
+   */
+  private renderTextContent(
+    contentEl: HTMLElement,
+    text: string,
+    jobs: Array<Promise<void>>,
+  ): boolean {
+    if (text.length <= HISTORY_RENDER_LIMITS.lazyTextChars) {
+      const textEl = contentEl.createDiv({ cls: 'claudian-text-block' });
+      jobs.push(this.renderContent(textEl, text));
+      this.addTextCopyButton(textEl, text);
+      return false;
+    }
+    this.addLazyTextShell(contentEl, text);
+    return true;
+  }
+
+  private addLazyTextShell(contentEl: HTMLElement, text: string): void {
+    const shell = contentEl.createDiv({ cls: 'claudian-text-block claudian-text-lazy' });
+    const excerptEl = shell.createDiv({ cls: 'claudian-text-lazy-excerpt' });
+    excerptEl.setText(text.slice(0, HISTORY_RENDER_LIMITS.shellExcerptChars));
+    shell.createDiv({
+      cls: 'claudian-text-lazy-note',
+      text: t('chat.message.contentTruncatedNote', { count: String(text.length) }),
+    });
+    const expandBtn = shell.createDiv({
+      cls: 'claudian-text-lazy-expand',
+      text: t('chat.message.expandFullContent'),
+      attr: { role: 'button', tabindex: '0' },
+    });
+    expandBtn.addEventListener('click', () => {
+      void this.expandLazyTextShell(shell, text);
+    });
+  }
+
+  private async expandLazyTextShell(shell: HTMLElement, text: string): Promise<void> {
+    if (text.length > HISTORY_RENDER_LIMITS.expandRenderMaxChars) {
+      // Chunked detail loading lands with B2; until then an explicit notice
+      // is the honest alternative to a multi-second Markdown freeze.
+      if (!shell.querySelector('.claudian-text-lazy-toolarge')) {
+        shell.createDiv({
+          cls: 'claudian-text-lazy-toolarge',
+          text: t('chat.message.tooLargeToRender', { count: String(text.length) }),
+        });
+      }
+      return;
+    }
+    shell.removeClass('claudian-text-lazy');
+    await this.renderContent(shell, text);
+    this.addTextCopyButton(shell, text);
   }
 
   /**

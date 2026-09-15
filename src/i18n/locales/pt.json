@@ -95,7 +95,10 @@
       "projectionMismatch": "Este resultado não corresponde mais à mensagem renderizada."
     },
     "message": {
-      "timestamp": "Enviado: {time}"
+      "timestamp": "Enviado: {time}",
+      "expandFullContent": "Mostrar conteúdo completo",
+      "contentTruncatedNote": "Prévia — {count} caracteres no total",
+      "tooLargeToRender": "Conteúdo grande demais para renderizar inline ({count} caracteres)."
     }
   },
   "settings": {

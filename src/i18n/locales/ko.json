@@ -95,7 +95,10 @@
       "projectionMismatch": "이 결과는 더 이상 렌더링된 메시지와 일치하지 않습니다."
     },
     "message": {
-      "timestamp": "보낸 시간: {time}"
+      "timestamp": "보낸 시간: {time}",
+      "expandFullContent": "전체 내용 보기",
+      "contentTruncatedNote": "미리보기 — 총 {count}자",
+      "tooLargeToRender": "내용이 너무 커서 인라인 렌더링할 수 없습니다({count}자)."
     }
   },
   "settings": {

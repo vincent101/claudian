@@ -527,6 +527,9 @@ export class ConversationController {
     if (!target) {
       const start = Math.max(0, Math.min(result.turnIndex, state.historyLease!.totalTurns - 50));
       await this.loadRange(start, Math.min(state.historyLease!.totalTurns, start + 50));
+      // Frame-batched rendering mounts asynchronously; the element can only be
+      // located after the queue drains.
+      await renderer.waitForRenderedMessages?.();
       target = renderer.findMessageElement(result.projectionKey);
     }
     if (!target) throw new Error('projection_mismatch');

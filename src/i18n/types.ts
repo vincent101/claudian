@@ -73,6 +73,9 @@ export type TranslationKey =
   | 'chat.search.retryError'
   | 'chat.search.projectionMismatch'
   | 'chat.message.timestamp'
+  | 'chat.message.expandFullContent'
+  | 'chat.message.contentTruncatedNote'
+  | 'chat.message.tooLargeToRender'
 
   // Chat - Fork
   | 'chat.fork.ariaLabel'

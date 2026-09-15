@@ -381,3 +381,36 @@
   font-size: 11px;
   white-space: nowrap;
 }
+
+/* Lazy text shell (B1): large bodies mount a plain-text excerpt first; the
+   Markdown renderer only runs on explicit expand. */
+.claudian-text-lazy .claudian-text-lazy-excerpt {
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: var(--text-normal);
+}
+
+.claudian-text-lazy .claudian-text-lazy-note {
+  color: var(--text-muted);
+  font-size: var(--font-smallest);
+  margin-top: 6px;
+}
+
+.claudian-text-lazy .claudian-text-lazy-expand {
+  display: inline-block;
+  margin-top: 6px;
+  color: var(--text-accent);
+  font-size: var(--font-small);
+  cursor: pointer;
+  user-select: none;
+}
+
+.claudian-text-lazy .claudian-text-lazy-expand:hover {
+  text-decoration: underline;
+}
+
+.claudian-text-lazy .claudian-text-lazy-toolarge {
+  color: var(--text-error);
+  font-size: var(--font-small);
+  margin-top: 6px;
+}

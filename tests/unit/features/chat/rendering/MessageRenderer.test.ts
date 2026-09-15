@@ -133,7 +133,16 @@ describe('MessageRenderer', () => {
       release();
       await rendering;
       expect(onRendered).toHaveBeenCalledTimes(1);
-      expect(onRendered).toHaveBeenCalledWith('message');
+      expect(onRendered).toHaveBeenCalledWith('message', 'detail');
+    });
+
+    it('notifies summary level separately from detail level', async () => {
+      const onRendered = jest.fn();
+      const { renderer } = createRenderer(undefined, 'claude', onRendered);
+      await renderer.renderMessageContent('summary-message', [], 'summary');
+      await renderer.renderMessageContent('detail-message', [Promise.resolve()]);
+      expect(onRendered).toHaveBeenCalledWith('summary-message', 'summary');
+      expect(onRendered).toHaveBeenCalledWith('detail-message', 'detail');
     });
 
     it('does not notify on failure and suppresses stale generations', async () => {
@@ -148,7 +157,7 @@ describe('MessageRenderer', () => {
       await expect(renderer.renderMessageContent('failed', [Promise.reject(new Error('render failed'))])).rejects.toThrow('render failed');
 
       expect(onRendered).toHaveBeenCalledTimes(1);
-      expect(onRendered).toHaveBeenCalledWith('same');
+      expect(onRendered).toHaveBeenCalledWith('same', 'detail');
     });
   });
 
@@ -1904,6 +1913,190 @@ describe('MessageRenderer', () => {
         undefined,
         expect.any(Function)
       );
+    });
+  });
+
+  // ============================================
+  // B1 frame-batched rendering and lazy shells
+  // ============================================
+
+  describe('frame-batched rendering', () => {
+    let rafQueue: FrameRequestCallback[];
+    let originalRaf: typeof requestAnimationFrame | undefined;
+
+    beforeEach(() => {
+      rafQueue = [];
+      originalRaf = (globalThis as any).requestAnimationFrame;
+      (globalThis as any).requestAnimationFrame = (cb: FrameRequestCallback) => {
+        rafQueue.push(cb);
+        return rafQueue.length;
+      };
+    });
+
+    afterEach(() => {
+      if (originalRaf === undefined) delete (globalThis as any).requestAnimationFrame;
+      else (globalThis as any).requestAnimationFrame = originalRaf;
+    });
+
+    const flushFrames = async (): Promise<void> => {
+      while (rafQueue.length > 0) {
+        const callbacks = rafQueue.splice(0);
+        for (const callback of callbacks) callback(0);
+        await Promise.resolve();
+      }
+    };
+
+    const countRenderedMessages = (el: any): number =>
+      el._children.filter((child: any) => child.hasClass('claudian-message')).length;
+
+    it('mounts the first slice synchronously and defers the rest across frames', async () => {
+      const { renderer, messagesEl } = createRenderer();
+      jest.spyOn(renderer, 'renderContent').mockResolvedValue(undefined);
+      const messages = Array.from({ length: 45 }, (_, index) => ({
+        id: `m${index}`, role: 'user' as const, content: `m${index}`, timestamp: index,
+      }));
+
+      renderer.renderMessages(messages, () => 'Hello');
+
+      expect(countRenderedMessages(messagesEl)).toBe(20);
+      expect(rafQueue.length).toBeGreaterThan(0);
+
+      await flushFrames();
+
+      expect(countRenderedMessages(messagesEl)).toBe(45);
+      await expect(renderer.waitForRenderedMessages()).resolves.toBeUndefined();
+    });
+
+    it('resolves waitForRenderedMessages only after the queue drains', async () => {
+      const { renderer, messagesEl } = createRenderer();
+      jest.spyOn(renderer, 'renderContent').mockResolvedValue(undefined);
+      const messages = Array.from({ length: 25 }, (_, index) => ({
+        id: `m${index}`, role: 'user' as const, content: `m${index}`, timestamp: index,
+      }));
+
+      renderer.renderMessages(messages, () => 'Hello');
+      let drained = false;
+      void renderer.waitForRenderedMessages().then(() => { drained = true; });
+
+      await Promise.resolve();
+      expect(drained).toBe(false);
+      expect(countRenderedMessages(messagesEl)).toBe(20);
+
+      await flushFrames();
+      expect(drained).toBe(true);
+    });
+
+    it('stops a superseded render queue when a new render starts', async () => {
+      const { renderer } = createRenderer();
+      jest.spyOn(renderer, 'renderContent').mockResolvedValue(undefined);
+      const rendered: string[] = [];
+      jest.spyOn(renderer, 'renderStoredMessage').mockImplementation(msg => { rendered.push(msg.id); });
+      const first = Array.from({ length: 45 }, (_, index) => ({
+        id: `a${index}`, role: 'user' as const, content: `a${index}`, timestamp: index,
+      }));
+      const second = Array.from({ length: 3 }, (_, index) => ({
+        id: `b${index}`, role: 'user' as const, content: `b${index}`, timestamp: index,
+      }));
+
+      renderer.renderMessages(first, () => 'Hello');
+      renderer.renderMessages(second, () => 'Hello');
+      await flushFrames();
+
+      // First slice of the superseded render already mounted; its pending
+      // frames are discarded instead of appending to the cleared container.
+      expect(rendered.filter(id => id.startsWith('a'))).toHaveLength(20);
+      expect(rendered.filter(id => id.startsWith('b'))).toHaveLength(3);
+    });
+
+    it('isolates a single failing message behind an error card without blocking the rest', async () => {
+      const { renderer, messagesEl } = createRenderer();
+      jest.spyOn(renderer, 'renderContent').mockResolvedValue(undefined);
+      const storedToolCall = renderStoredToolCall as jest.Mock;
+      storedToolCall.mockImplementationOnce(() => { throw new Error('boom'); });
+      const messages: ChatMessage[] = [
+        { id: 'm0', role: 'user', content: 'first', timestamp: 1 },
+        { id: 'm1', role: 'assistant', content: '', timestamp: 2, toolCalls: [{ id: 't1', name: 'Read', input: {}, status: 'completed' }], contentBlocks: [{ type: 'tool_use', toolId: 't1' }] },
+        { id: 'm2', role: 'user', content: 'last', timestamp: 3 },
+      ];
+
+      renderer.renderMessages(messages, () => 'Hello');
+
+      const rendered = messagesEl._children.filter((child: any) => child.hasClass('claudian-message'));
+      expect(rendered).toHaveLength(3);
+      expect(messagesEl.querySelectorAll('.claudian-render-error')).toHaveLength(1);
+      expect(jest.spyOn(renderer, 'renderContent')).toHaveBeenCalled();
+    });
+  });
+
+  describe('lazy text shells', () => {
+    it('does not invoke the Markdown renderer for a large text block until expand', async () => {
+      const { renderer, messagesEl } = createRenderer();
+      const renderContent = jest.spyOn(renderer, 'renderContent').mockResolvedValue(undefined);
+      const large = 'x'.repeat(5000);
+      const messages: ChatMessage[] = [{
+        id: 'a1', role: 'assistant', content: large, timestamp: 1,
+        contentBlocks: [{ type: 'text', content: large }],
+      }];
+
+      renderer.renderMessages(messages, () => 'Hello');
+
+      expect(renderContent).not.toHaveBeenCalled();
+      expect(messagesEl.querySelectorAll('.claudian-text-lazy')).toHaveLength(1);
+      expect(messagesEl.querySelectorAll('.claudian-text-lazy-excerpt')[0].textContent.length).toBe(2048);
+
+      const expandBtn = messagesEl.querySelectorAll('.claudian-text-lazy-expand')[0];
+      expandBtn.click();
+      await Promise.resolve();
+
+      expect(renderContent).toHaveBeenCalledTimes(1);
+      expect(messagesEl.querySelectorAll('.claudian-text-lazy')).toHaveLength(0);
+    });
+
+    it('keeps blocks under the lazy threshold on the direct Markdown path', () => {
+      const { renderer, messagesEl } = createRenderer();
+      const renderContent = jest.spyOn(renderer, 'renderContent').mockResolvedValue(undefined);
+      const messages: ChatMessage[] = [{
+        id: 'a1', role: 'assistant', content: 'small', timestamp: 1,
+        contentBlocks: [{ type: 'text', content: 'small' }],
+      }];
+
+      renderer.renderMessages(messages, () => 'Hello');
+
+      expect(renderContent).toHaveBeenCalledTimes(1);
+      expect(messagesEl.querySelectorAll('.claudian-text-lazy')).toHaveLength(0);
+    });
+
+    it('shows an inline notice instead of rendering beyond the expand cap', async () => {
+      const { renderer, messagesEl } = createRenderer();
+      const renderContent = jest.spyOn(renderer, 'renderContent').mockResolvedValue(undefined);
+      const huge = 'y'.repeat(300 * 1024);
+      const messages: ChatMessage[] = [{
+        id: 'a1', role: 'assistant', content: huge, timestamp: 1,
+        contentBlocks: [{ type: 'text', content: huge }],
+      }];
+
+      renderer.renderMessages(messages, () => 'Hello');
+      messagesEl.querySelectorAll('.claudian-text-lazy-expand')[0].click();
+      await Promise.resolve();
+
+      expect(renderContent).not.toHaveBeenCalled();
+      expect(messagesEl.querySelectorAll('.claudian-text-lazy-toolarge')).toHaveLength(1);
+    });
+
+    it('notifies message content at summary level when a block is deferred', async () => {
+      const onRendered = jest.fn();
+      const { renderer } = createRenderer(undefined, 'claude', onRendered);
+      jest.spyOn(renderer, 'renderContent').mockResolvedValue(undefined);
+      const large = 'x'.repeat(5000);
+      const messages: ChatMessage[] = [{
+        id: 'a1', role: 'assistant', content: large, timestamp: 1,
+        contentBlocks: [{ type: 'text', content: large }],
+      }];
+
+      renderer.renderMessages(messages, () => 'Hello');
+      await Promise.resolve();
+
+      expect(onRendered).toHaveBeenCalledWith('a1', 'summary');
     });
   });
 });

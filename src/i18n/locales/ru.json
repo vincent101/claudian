@@ -95,7 +95,10 @@
       "projectionMismatch": "Результат больше не соответствует отображённому сообщению."
     },
     "message": {
-      "timestamp": "Отправлено: {time}"
+      "timestamp": "Отправлено: {time}",
+      "expandFullContent": "Показать полное содержимое",
+      "contentTruncatedNote": "Предпросмотр — всего {count} символов",
+      "tooLargeToRender": "Содержимое слишком велико для отображения inline ({count} символов)."
     }
   },
   "settings": {

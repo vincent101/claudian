@@ -95,7 +95,10 @@
       "projectionMismatch": "此結果與目前顯示內容不再相符。"
     },
     "message": {
-      "timestamp": "傳送於 {time}"
+      "timestamp": "傳送於 {time}",
+      "expandFullContent": "顯示完整內容",
+      "contentTruncatedNote": "預覽 — 共 {count} 字元",
+      "tooLargeToRender": "內容過大，無法內聯渲染（{count} 字元）。"
     }
   },
   "settings": {

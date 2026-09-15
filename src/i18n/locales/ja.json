@@ -95,7 +95,10 @@
       "projectionMismatch": "この結果は表示されたメッセージと一致しなくなりました。"
     },
     "message": {
-      "timestamp": "送信日時: {time}"
+      "timestamp": "送信日時: {time}",
+      "expandFullContent": "全文を表示",
+      "contentTruncatedNote": "プレビュー — 全 {count} 文字",
+      "tooLargeToRender": "内容が大きすぎてインライン表示できません（{count} 文字）。"
     }
   },
   "settings": {

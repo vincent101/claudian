@@ -1060,13 +1060,23 @@ export function renderStoredToolCall(
     setToolStatus(statusEl, toolCall.status);
   }
 
-  renderToolContent(content, toolCall);
+  // Header/status mount immediately; the result DOM is only built on first
+  // expand so a page of collapsed tool calls never pays full content
+  // construction (B1 lazy tool shell).
+  let contentBuilt = false;
+  const ensureContent = (): void => {
+    if (contentBuilt) return;
+    contentBuilt = true;
+    renderToolContent(content, toolCall);
+  };
 
   const state = { isExpanded: false };
   const todoStatusEl = toolCall.name === TOOL_TODO_WRITE ? statusEl : null;
   setupCollapsible(toolEl, header, content, state, {
     initiallyExpanded: false,
-    onToggle: createTodoToggleHandler(currentTaskEl, todoStatusEl),
+    onToggle: createTodoToggleHandler(currentTaskEl, todoStatusEl, expanded => {
+      if (expanded) ensureContent();
+    }),
     baseAriaLabel: getToolLabel(toolCall.name, toolCall.input)
   });
 

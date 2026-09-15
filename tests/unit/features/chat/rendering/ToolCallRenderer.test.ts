@@ -108,6 +108,8 @@ describe('ToolCallRenderer', () => {
       });
 
       const toolEl = renderStoredToolCall(parentEl, toolCall);
+      // Stored tool content is lazy: first expand builds the result DOM.
+      ((toolEl as any)._children[0] as any).click();
       const answerEls = toolEl.querySelectorAll('.claudian-ask-review-a-text');
 
       expect(answerEls).toHaveLength(1);
@@ -124,6 +126,8 @@ describe('ToolCallRenderer', () => {
       });
 
       const toolEl = renderStoredToolCall(parentEl, toolCall);
+      // Stored tool content is lazy: first expand builds the result DOM.
+      ((toolEl as any)._children[0] as any).click();
       const answerEls = toolEl.querySelectorAll('.claudian-ask-review-a-text');
 
       expect(answerEls).toHaveLength(1);
@@ -148,6 +152,7 @@ describe('ToolCallRenderer', () => {
       });
 
       const toolEl = renderStoredToolCall(parentEl, toolCall);
+      ((toolEl as any)._children[0] as any).click();
       const labelEls = toolEl.querySelectorAll('.claudian-ask-item-label');
       const descEls = toolEl.querySelectorAll('.claudian-ask-item-desc');
       const checkEls = toolEl.querySelectorAll('.claudian-ask-check');
@@ -155,6 +160,26 @@ describe('ToolCallRenderer', () => {
       expect(Array.from(labelEls, el => el.textContent)).toEqual(['Non-blocking', 'Blocking']);
       expect(Array.from(descEls, el => el.textContent)).toEqual(['Generate title later.', 'Wait for title first.']);
       expect(checkEls).toHaveLength(2);
+    });
+  });
+
+  describe('renderStoredToolCall lazy content', () => {
+    it('builds the result DOM only on first expand and reuses it afterwards', () => {
+      const parentEl = createMockEl();
+      const toolCall = createToolCall({ name: 'Read', status: 'completed', result: 'line1\nline2' });
+
+      const toolEl = renderStoredToolCall(parentEl, toolCall);
+      const content = toolEl.querySelector('.claudian-tool-content') as any;
+      expect(content._children).toHaveLength(0);
+
+      const header = (toolEl as any)._children[0] as any;
+      header.click();
+      expect(content._children.length).toBeGreaterThan(0);
+
+      header.click(); // collapse
+      header.click(); // expand again
+      const childCountAfterRetoggle = content._children.length;
+      expect(childCountAfterRetoggle).toBeGreaterThan(0);
     });
   });
 
@@ -525,6 +550,7 @@ describe('ToolCallRenderer', () => {
       });
 
       const toolEl = renderStoredToolCall(parentEl, toolCall);
+      ((toolEl as any)._children[0] as any).click();
       const lines = Array.from(toolEl.querySelectorAll('.claudian-tool-line')).map(line => line.textContent);
 
       expect(lines).toContain('Query: obsidian plugin API');
@@ -545,6 +571,7 @@ describe('ToolCallRenderer', () => {
       });
 
       const toolEl = renderStoredToolCall(parentEl, toolCall);
+      ((toolEl as any)._children[0] as any).click();
       const links = toolEl.querySelectorAll('.claudian-tool-link');
       const lines = Array.from(toolEl.querySelectorAll('.claudian-tool-line')).map(line => line.textContent);
 
@@ -575,6 +602,7 @@ describe('ToolCallRenderer', () => {
       });
 
       const toolEl = renderStoredToolCall(parentEl, toolCall);
+      ((toolEl as any)._children[0] as any).click();
       const headers = Array.from(toolEl.querySelectorAll('.claudian-tool-patch-header')).map(el => el.textContent);
       const diffTexts = Array.from(toolEl.querySelectorAll('.claudian-diff-text')).map(el => el.textContent);
 
@@ -595,6 +623,7 @@ describe('ToolCallRenderer', () => {
       });
 
       const toolEl = renderStoredToolCall(parentEl, toolCall);
+      ((toolEl as any)._children[0] as any).click();
       const lines = Array.from(toolEl.querySelectorAll('.claudian-tool-line')).map(el => el.textContent);
 
       expect(lines).toContain('update: src/main.ts');
