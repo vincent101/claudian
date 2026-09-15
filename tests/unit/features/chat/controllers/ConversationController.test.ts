@@ -513,6 +513,110 @@ describe('ConversationController', () => {
       expect(lease.loadWindow).toHaveBeenCalledTimes(2);
       expect(deps.state.loadedRanges).toEqual(expect.arrayContaining([{ start: 25, end: 26 }, { start: 100, end: 200 }]));
     });
+
+    // ============================================
+    // Conversation revalidation inside granted stored tasks (design §3.6)
+    // ============================================
+
+    it('discards a granted search locate when the conversation switches during loadWindow', async () => {
+      const coordinator = new ProjectionWriteCoordinator();
+      deps.getProjectionCoordinator = () => coordinator;
+      deps.state.currentConversationId = 'large';
+      deps.state.messages = [{ id: 'old-1', role: 'user', content: 'old', timestamp: 1 }] as any;
+      const lease = makeLease(200);
+      deps.state.historyLease = lease as any;
+      deps.state.loadedRanges = [{ start: 150, end: 200 }];
+      lease.loadWindow.mockImplementationOnce(async () => {
+        // switchTo does not set isStreaming: the user can switch while the
+        // already-granted transaction is suspended on the window load.
+        deps.state.currentConversationId = 'switched';
+        deps.state.messages = [{ id: 'new-1', role: 'user', content: 'new', timestamp: 1 }] as any;
+        deps.state.loadedRanges = [];
+        return { messages: [{ id: 'hit', role: 'user', content: 'needle', timestamp: 0 }], range: { start: 25, end: 26 }, snapshotOffset: 5, sourceBytes: 1, projectedChars: 1, oversizedTurnCount: 0, pageKey: 'w:25:26', hasMoreBefore: true, hasMoreAfter: true };
+      });
+      (deps.renderer.findMessageElement as jest.Mock).mockReturnValue(null);
+
+      await expect(controller.locateHistorySearchResult({ projectionKey: 'hit', turnIndex: 25, matchOrdinal: 0, matchedText: 'needle' })).rejects.toThrow('projection_mismatch');
+
+      // The stale page never merges into, renders into, or paginates the
+      // switched-to conversation.
+      expect(deps.renderer.renderMessages).not.toHaveBeenCalled();
+      expect(deps.state.messages.map(message => message.id)).toEqual(['new-1']);
+      expect(deps.state.loadedRanges).toEqual([]);
+    });
+
+    it('leaves pagination state untouched when the conversation switches while the rebuild drains', async () => {
+      const coordinator = new ProjectionWriteCoordinator();
+      deps.getProjectionCoordinator = () => coordinator;
+      deps.state.currentConversationId = 'large';
+      deps.state.messages = [{ id: 'old-1', role: 'user', content: 'old', timestamp: 1 }] as any;
+      const lease = makeLease(200);
+      deps.state.historyLease = lease as any;
+      deps.state.loadedRanges = [{ start: 150, end: 200 }];
+      lease.loadWindow.mockResolvedValueOnce({ messages: [{ id: 'hit', role: 'user', content: 'needle', timestamp: 0 }], range: { start: 25, end: 26 }, snapshotOffset: 5, sourceBytes: 1, projectedChars: 1, oversizedTurnCount: 0, pageKey: 'w:25:26', hasMoreBefore: true, hasMoreAfter: true });
+      (deps.renderer.findMessageElement as jest.Mock).mockReturnValueOnce(null).mockReturnValue({} as HTMLElement);
+      (deps.renderer.waitForRenderedMessages as jest.Mock).mockImplementationOnce(async () => {
+        // The rebuild already rendered; switchTo's restoreConversation reset
+        // the pagination state of the conversation this transaction served.
+        deps.state.currentConversationId = 'switched';
+        deps.state.loadedRanges = [];
+      });
+
+      await controller.locateHistorySearchResult({ projectionKey: 'hit', turnIndex: 25, matchOrdinal: 0, matchedText: 'needle' });
+
+      expect(deps.state.loadedRanges).toEqual([]);
+      expect(deps.state.historyHasMore).toBe(false);
+    });
+
+    it('discards an in-flight older-window page when the conversation switches mid-load', async () => {
+      const coordinator = new ProjectionWriteCoordinator();
+      deps.getProjectionCoordinator = () => coordinator;
+      deps.state.currentConversationId = 'large';
+      const existing = { id: 'latest', role: 'user', content: 'latest', timestamp: 100 } as any;
+      deps.state.messages = [existing];
+      const lease = makeLease(100);
+      deps.state.historyLease = lease as any;
+      deps.state.loadedRanges = [{ start: 50, end: 100 }];
+      deps.state.historyHasMore = true;
+      lease.loadWindow.mockImplementationOnce(async () => {
+        deps.state.currentConversationId = 'switched';
+        deps.state.messages = [{ id: 'new-1', role: 'user', content: 'new', timestamp: 1 }] as any;
+        deps.state.loadedRanges = [];
+        return { messages: [{ id: 'older', role: 'user', content: 'older', timestamp: 1 }], range: { start: 0, end: 50 }, snapshotOffset: 5, sourceBytes: 1, projectedChars: 1, oversizedTurnCount: 0, pageKey: 'w:0:50', hasMoreBefore: false, hasMoreAfter: true };
+      });
+
+      await controller.loadOlderHistory();
+
+      expect(deps.renderer.prependMessages).not.toHaveBeenCalled();
+      expect(deps.state.messages.map(message => message.id)).toEqual(['new-1']);
+      expect(deps.state.loadedRanges).toEqual([]);
+      expect(deps.state.historyError).toBeNull();
+    });
+
+    it('discards a legacy loadRange page when the conversation switches mid-load', async () => {
+      // No coordinator: the legacy path runs the task directly, but the
+      // mid-await switch must abort it all the same.
+      deps.state.currentConversationId = 'large';
+      deps.state.messages = [{ id: 'latest', role: 'user', content: 'latest', timestamp: 100 }] as any;
+      const lease = makeLease(120);
+      delete (lease as any).loadWindow;
+      deps.state.historyLease = lease as any;
+      deps.state.loadedRanges = [{ start: 70, end: 120 }];
+      deps.state.historyHasMore = true;
+      lease.loadRange.mockImplementationOnce(async () => {
+        deps.state.currentConversationId = 'switched';
+        deps.state.messages = [{ id: 'new-1', role: 'user', content: 'new', timestamp: 1 }] as any;
+        deps.state.loadedRanges = [];
+        return { messages: [{ id: 'older', role: 'user', content: 'older', timestamp: 1 }], range: { start: 20, end: 70 } };
+      });
+
+      await controller.loadOlderHistory();
+
+      expect(deps.renderer.prependMessages).not.toHaveBeenCalled();
+      expect(deps.renderer.renderMessages).not.toHaveBeenCalled();
+      expect(deps.state.messages.map(message => message.id)).toEqual(['new-1']);
+      expect(deps.state.loadedRanges).toEqual([]);
+    });
   });
 
   describe('Queue Management', () => {
