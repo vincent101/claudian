@@ -104,6 +104,8 @@ function createMockDeps(): StreamControllerDeps {
     renderer: {
       renderContent: jest.fn(),
       addTextCopyButton: jest.fn(),
+      domEpoch: 0,
+      isMounted: () => true,
     } as any,
     subagentManager: {
       isAsyncTask: jest.fn().mockReturnValue(false),
@@ -154,6 +156,7 @@ function ctx(message: ChatMessage, overrides?: Partial<TurnProjectionContext>): 
     message,
     renderTarget: deps.state.currentContentEl,
     generation: 0,
+    domEpoch: (deps.renderer as any).domEpoch ?? 0,
   });
   return Object.assign(context, overrides);
 }
@@ -213,8 +216,8 @@ describe("StreamController - Text Content", () => {
     it('should coalesce text renders until the next animation frame', async () => {
       deps.state.currentTextEl = createMockEl();
 
-      await controller.appendText('Hello ');
-      await controller.appendText('World');
+      await controller.appendText('Hello ', deps.state.currentContentEl ?? createMockEl());
+      await controller.appendText('World', deps.state.currentContentEl ?? createMockEl());
 
       expect(deps.renderer.renderContent).not.toHaveBeenCalled();
 
@@ -231,7 +234,7 @@ describe("StreamController - Text Content", () => {
     it('should defer math rendering during live text renders', async () => {
       deps.state.currentTextEl = createMockEl();
 
-      await controller.appendText('Euler: $e^{i\\pi} + 1 = 0$');
+      await controller.appendText('Euler: $e^{i\\pi} + 1 = 0$', deps.state.currentContentEl ?? createMockEl());
 
       jest.advanceTimersByTime(16);
       await Promise.resolve();
@@ -247,7 +250,7 @@ describe("StreamController - Text Content", () => {
       (deps.plugin.settings as any).deferMathRenderingDuringStreaming = false;
       deps.state.currentTextEl = createMockEl();
 
-      await controller.appendText('Euler: $e^{i\\pi} + 1 = 0$');
+      await controller.appendText('Euler: $e^{i\\pi} + 1 = 0$', deps.state.currentContentEl ?? createMockEl());
 
       jest.advanceTimersByTime(16);
       await Promise.resolve();
@@ -261,7 +264,7 @@ describe("StreamController - Text Content", () => {
     it('should flush a pending text render before finalizing text', async () => {
       const msg = createTestMessage();
 
-      await controller.appendText('Hello');
+      await controller.appendText('Hello', deps.state.currentContentEl ?? createMockEl());
       await controller.finalizeCurrentTextBlock(msg);
 
       expect(deps.renderer.renderContent).toHaveBeenCalledWith(
@@ -281,7 +284,7 @@ describe("StreamController - Text Content", () => {
     it('should render original math once when finalizing a deferred text block', async () => {
       const msg = createTestMessage();
 
-      await controller.appendText('Final $x^2$');
+      await controller.appendText('Final $x^2$', deps.state.currentContentEl ?? createMockEl());
       await controller.finalizeCurrentTextBlock(msg);
 
       expect(deps.renderer.renderContent).toHaveBeenNthCalledWith(
@@ -2982,7 +2985,7 @@ describe('StreamController - Turn-lease hotfix (fix 3: cancellable render flush)
     );
     deps.state.currentTextEl = createMockEl();
 
-    await controller.appendText('tail block');
+    await controller.appendText('tail block', deps.state.currentContentEl ?? createMockEl());
     // Fire the scheduled render frame so renderPendingText is stuck inside
     // the hung renderContent await.
     jest.advanceTimersByTime(16);
@@ -3011,7 +3014,7 @@ describe('StreamController - Turn-lease hotfix (fix 3: cancellable render flush)
       () => new Promise<void>(() => {})
     );
 
-    await controller.appendThinking('deep thought');
+    await controller.appendThinking('deep thought', deps.state.currentContentEl ?? createMockEl());
     jest.advanceTimersByTime(16);
     await Promise.resolve();
 
@@ -3038,7 +3041,7 @@ describe('StreamController - Turn-lease hotfix (fix 3: cancellable render flush)
 
     controller.invalidateRenderFlush();
 
-    await controller.appendText('cancelled tail');
+    await controller.appendText('cancelled tail', deps.state.currentContentEl ?? createMockEl());
     const msg = createTestMessage();
     const finalize = controller.finalizeCurrentTextBlock(msg, ctx(msg));
     let settled = false;
@@ -3053,7 +3056,7 @@ describe('StreamController - Turn-lease hotfix (fix 3: cancellable render flush)
     // A new user turn opens a fresh scope: flushes wait for the render again.
     controller.beginRenderFlushScope();
     deps.state.currentTextEl = createMockEl();
-    await controller.appendText('new turn');
+    await controller.appendText('new turn', deps.state.currentContentEl ?? createMockEl());
     const msg2 = createTestMessage();
     const finalize2 = controller.finalizeCurrentTextBlock(msg2, ctx(msg2));
     let settled2 = false;
@@ -3172,5 +3175,100 @@ describe('StreamController - Turn-lease hotfix follow-up (cancellable finalize r
     expect(deps.renderer.renderContent).toHaveBeenCalledWith(textEl, 'plain math $x$');
     expect(msg.contentBlocks).toContainEqual({ type: 'text', content: 'plain math $x$' });
     expect(deps.state.currentTextEl).toBeNull();
+  });
+});
+
+// ============================================
+// Projection mount validation (coord protocol P4/P5)
+// ============================================
+
+describe('StreamController - projection mount validation', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    jest.useRealTimers();
+    deps = createMockDeps();
+    controller = new StreamController(deps);
+  });
+
+  it('keeps updating domain data and stops DOM writes when the render target is evicted', async () => {
+    deps.state.currentContentEl = createMockEl();
+    const msg = createTestMessage();
+    const context = ctx(msg);
+    (deps.renderer as any).isMounted = () => false;
+
+    await controller.handleStreamChunk({ type: 'text', content: 'partial' }, context);
+
+    // Domain truth still updated (P5): text lands in message + buffer.
+    expect(msg.content).toBe('partial');
+    expect(context.textBuffer).toBe('partial');
+    // DOM projection stopped and the turn is flagged for boundary re-projection.
+    expect(context.renderTarget).toBeNull();
+    expect(context.projectionDirty).toBe(true);
+    expect(deps.state.currentContentEl).toBeNull();
+    expect(deps.state.currentTextEl).toBeNull();
+    expect(deps.state.currentThinkingState).toBeNull();
+  });
+
+  it('flags projectionDirty on DOM epoch drift even while the node is still attached', async () => {
+    deps.state.currentContentEl = createMockEl();
+    const msg = createTestMessage();
+    const context = ctx(msg);
+    // A clear-rebuild happened after the context captured epoch 0.
+    (deps.renderer as any).domEpoch = 7;
+
+    await controller.handleStreamChunk({ type: 'text', content: 'x' }, context);
+
+    expect(context.projectionDirty).toBe(true);
+    expect(context.renderTarget).toBeNull();
+  });
+
+  it('keeps writing DOM while the captured target stays mounted', async () => {
+    deps.state.currentContentEl = createMockEl();
+    const msg = createTestMessage();
+    const context = ctx(msg);
+
+    await controller.handleStreamChunk({ type: 'text', content: 'ok' }, context);
+
+    expect(context.renderTarget).not.toBeNull();
+    expect(context.projectionDirty).toBe(false);
+    expect(deps.state.currentTextContent).toBe('ok');
+  });
+
+  it('registers tool_use domain data while detached and clears stale DOM projection maps', async () => {
+    deps.state.currentContentEl = createMockEl();
+    const msg = createTestMessage();
+    const context = ctx(msg);
+    // Cached projections pointing into the soon-to-be-evicted DOM.
+    deps.state.toolCallElements.set('stale', createMockEl());
+    deps.state.pendingTools.set('stale', { toolCall: {} as any, parentEl: createMockEl() });
+    (deps.renderer as any).isMounted = () => false;
+
+    await controller.handleStreamChunk(
+      { type: 'tool_use', id: 'toolu_1', name: 'Read', input: { file_path: '/x' } },
+      context,
+    );
+
+    // Domain registration survives (message toolCalls + contentBlocks).
+    expect(msg.toolCalls).toHaveLength(1);
+    expect(msg.toolCalls![0].id).toBe('toolu_1');
+    expect(msg.contentBlocks).toContainEqual({ type: 'tool_use', toolId: 'toolu_1' });
+    // The old DOM's projection caches are dropped with the mount.
+    expect(context.projectionDirty).toBe(true);
+    expect(deps.state.toolCallElements.size).toBe(0);
+    expect(deps.state.pendingTools.size).toBe(0);
+  });
+
+  it('finalizes detached turns through the context buffer so the data is never lost', async () => {
+    deps.state.currentContentEl = createMockEl();
+    const msg = createTestMessage();
+    const context = ctx(msg);
+    (deps.renderer as any).isMounted = () => false;
+
+    await controller.handleStreamChunk({ type: 'text', content: 'before eviction' }, context);
+    await controller.finalizeCurrentTextBlock(msg, context);
+
+    // Detached finalize: block lands from the context buffer, no DOM wait.
+    expect(msg.contentBlocks).toContainEqual({ type: 'text', content: 'before eviction' });
+    expect(context.textBuffer).toBe('');
   });
 });

@@ -3,6 +3,7 @@ import { Notice } from 'obsidian';
 
 import { InputController, type InputControllerDeps } from '@/features/chat/controllers/InputController';
 import { TurnCoordinator } from '@/features/chat/controllers/TurnCoordinator';
+import { ProjectionWriteCoordinator as ProjectionWriteCoordinatorForTest } from '@/features/chat/rendering/ProjectionWriteCoordinator';
 import { ChatState } from '@/features/chat/state/ChatState';
 import { encodeClaudeTurn } from '@/providers/claude/prompt/ClaudeTurnEncoder';
 import { ResumeSessionDropdown } from '@/shared/components/ResumeSessionDropdown';
@@ -153,6 +154,7 @@ function createMockDeps(overrides: Partial<InputControllerDeps> = {}): InputCont
       finalizeCurrentTextBlock: jest.fn(),
       finalizeCurrentThinkingBlock: jest.fn(),
       appendText: jest.fn(),
+      appendTurnText: jest.fn(),
     } as any,
     selectionController: {
       getContext: jest.fn().mockReturnValue(null),
@@ -1960,7 +1962,7 @@ describe('InputController - Message Queue', () => {
 
       await controller.sendMessage();
 
-      expect(deps.streamController.appendText).toHaveBeenCalledWith('\n\n**Error:** Network timeout');
+      expect(deps.streamController.appendTurnText).toHaveBeenCalledWith('\n\n**Error:** Network timeout', expect.anything());
       expect(deps.state.isStreaming).toBe(false);
     });
 
@@ -1977,7 +1979,7 @@ describe('InputController - Message Queue', () => {
 
       await controller.sendMessage();
 
-      expect(deps.streamController.appendText).toHaveBeenCalledWith('\n\n**Error:** Unknown error');
+      expect(deps.streamController.appendTurnText).toHaveBeenCalledWith('\n\n**Error:** Unknown error', expect.anything());
     });
   });
 
@@ -1999,8 +2001,9 @@ describe('InputController - Message Queue', () => {
 
       await controller.sendMessage();
 
-      expect(deps.streamController.appendText).toHaveBeenCalledWith(
-        expect.stringContaining('Interrupted')
+      expect(deps.streamController.appendTurnText).toHaveBeenCalledWith(
+        expect.stringContaining('Interrupted'),
+        expect.anything()
       );
       expect(deps.state.isStreaming).toBe(false);
       expect(deps.state.cancelRequested).toBe(false);
@@ -2024,8 +2027,9 @@ describe('InputController - Message Queue', () => {
 
       await controller.sendMessage();
 
-      expect(deps.streamController.appendText).toHaveBeenCalledWith(
-        expect.stringContaining('Interrupted')
+      expect(deps.streamController.appendTurnText).toHaveBeenCalledWith(
+        expect.stringContaining('Interrupted'),
+        expect.anything()
       );
       expect(deps.state.isStreaming).toBe(false);
       expect(deps.state.cancelRequested).toBe(false);
@@ -3591,6 +3595,155 @@ describe('InputController - Message Queue', () => {
       expect(coordinator.isBusy()).toBe(false);
       expect(releaseSpy).toHaveBeenCalledWith(firstTurnId());
       expect(pump).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  // ============================================
+  // Projection write lease (coord protocol P2)
+  // ============================================
+
+  describe('Projection write lease', () => {
+    const prepareDeps = (coordinator: import('@/features/chat/rendering/ProjectionWriteCoordinator').ProjectionWriteCoordinator) => {
+      deps = createSendableDeps({
+        getProjectionCoordinator: () => coordinator,
+      });
+      deps.renderer.renderMessages = jest.fn().mockReturnValue(createMockEl());
+      deps.renderer.waitForRenderedMessages = jest.fn().mockResolvedValue(undefined);
+      (deps as any).setWelcomeEl = jest.fn();
+      ((deps as any).mockAgentService.query as jest.Mock).mockImplementation(() =>
+        createMockStream([{ type: 'text', content: 'streamed' }]));
+      inputEl = deps.getInputEl() as ReturnType<typeof createMockInputEl>;
+      controller = new InputController(deps);
+    };
+
+    it('does not create user/assistant DOM before the stored render queue drains', async () => {
+      const coordinator = new ProjectionWriteCoordinatorForTest();
+      let releaseStored!: () => void;
+      const storedDone = coordinator.runStored(
+        () => false,
+        () => new Promise<void>(resolve => { releaseStored = resolve; }),
+      );
+      await Promise.resolve();
+
+      prepareDeps(coordinator);
+      inputEl.value = 'send during drain';
+      const sendPromise = controller.sendMessage();
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+
+      // P2: still queued behind the stored render — no turn DOM, no message.
+      expect(deps.renderer.addMessage).not.toHaveBeenCalled();
+      expect(deps.state.messages).toHaveLength(0);
+
+      releaseStored();
+      await storedDone;
+      await sendPromise;
+
+      // The turn mounts only after the stored queue drained, in order.
+      expect(deps.renderer.addMessage).toHaveBeenCalledTimes(2);
+      expect(deps.state.messages.map(m => m.role)).toEqual(['user', 'assistant']);
+
+      // The live lease was released with the turn: a follow-up stored
+      // transaction must run without waiting.
+      let storedRan = false;
+      await coordinator.runStored(() => false, async () => { storedRan = true; });
+      expect(storedRan).toBe(true);
+    });
+
+    it('queues the message and leaks no lease when invalidated during the live wait', async () => {
+      const coordinator = new ProjectionWriteCoordinatorForTest();
+      let releaseStored!: () => void;
+      const storedDone = coordinator.runStored(
+        () => false,
+        () => new Promise<void>(resolve => { releaseStored = resolve; }),
+      );
+      await Promise.resolve();
+
+      prepareDeps(coordinator);
+      inputEl.value = 'invalidated during wait';
+      const sendPromise = controller.sendMessage();
+      await Promise.resolve();
+      await Promise.resolve();
+
+      // A newer generation takes over while the send waits for the drain.
+      deps.state.bumpStreamGeneration();
+      releaseStored();
+      await storedDone;
+      await sendPromise;
+
+      // No send, no residual lease, no DOM.
+      expect(deps.renderer.addMessage).not.toHaveBeenCalled();
+      expect(deps.state.messages).toHaveLength(0);
+      expect(deps.state.queuedMessage?.content).toBe('invalidated during wait');
+      let storedRan = false;
+      await coordinator.runStored(() => false, async () => { storedRan = true; });
+      expect(storedRan).toBe(true);
+    });
+
+    it('keeps one live lease across Codex provider boundaries', async () => {
+      const coordinator = new ProjectionWriteCoordinatorForTest();
+      const acquireSpy = jest.spyOn(coordinator, 'acquireLive');
+      prepareDeps(coordinator);
+      ((deps as any).mockAgentService.query as jest.Mock).mockImplementation(() =>
+        createMockStream([
+          { type: 'user_message_start', content: 'boundary user' },
+          { type: 'text', content: 'first' },
+          { type: 'assistant_message_start' },
+          { type: 'text', content: 'second' },
+          { type: 'assistant_message_start' },
+          { type: 'text', content: 'third' },
+        ]));
+
+      inputEl.value = 'multi-message turn';
+      await controller.sendMessage();
+
+      // P2/Codex: every provider boundary reuses the turn's live lease —
+      // one acquisition for the whole turn.
+      expect(acquireSpy).toHaveBeenCalledTimes(1);
+      // Initial pair plus the boundary-created assistant message, in order.
+      expect(deps.renderer.addMessage).toHaveBeenCalledTimes(3);
+      // Lease released with the turn.
+      let storedRan = false;
+      await coordinator.runStored(() => false, async () => { storedRan = true; });
+      expect(storedRan).toBe(true);
+    });
+
+    it('re-projects once from the latest ChatState after a dirty turn (P5)', async () => {
+      const coordinator = new ProjectionWriteCoordinatorForTest();
+      prepareDeps(coordinator);
+      // Simulate the mount point being evicted mid-turn: the stream layer
+      // flags projectionDirty and writes only domain data.
+      (deps.streamController.handleStreamChunk as jest.Mock).mockImplementation(
+        async (_chunk: unknown, context: { projectionDirty: boolean }) => {
+          context.projectionDirty = true;
+        },
+      );
+
+      inputEl.value = 'dirty turn';
+      await controller.sendMessage();
+
+      // Turn-end re-projection: one clear-rebuild from state.messages — the
+      // user + assistant pair, exactly once, no duplicates.
+      expect(deps.renderer.renderMessages).toHaveBeenCalledTimes(1);
+      const reprojected = (deps.renderer.renderMessages as jest.Mock).mock.calls[0][0];
+      expect(reprojected).toHaveLength(2);
+      expect(reprojected.map((message: any) => message.role)).toEqual(['user', 'assistant']);
+      // Lease order held: the re-projection released live before running,
+      // so the coordinator is idle again afterwards.
+      let storedRan = false;
+      await coordinator.runStored(() => false, async () => { storedRan = true; });
+      expect(storedRan).toBe(true);
+    });
+
+    it('does not re-project when the turn never went dirty', async () => {
+      const coordinator = new ProjectionWriteCoordinatorForTest();
+      prepareDeps(coordinator);
+
+      inputEl.value = 'clean turn';
+      await controller.sendMessage();
+
+      expect(deps.renderer.renderMessages).not.toHaveBeenCalled();
     });
   });
 });

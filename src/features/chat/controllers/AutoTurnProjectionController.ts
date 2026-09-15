@@ -125,6 +125,7 @@ export class AutoTurnProjectionController {
         message: assistantMessage,
         renderTarget: contentEl,
         generation: event.generation,
+        domEpoch: this.deps.renderer.domEpoch,
       }),
       replaySeenIdentities: new Set(),
       replayTextCursor: 0,

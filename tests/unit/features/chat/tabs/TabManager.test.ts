@@ -448,6 +448,46 @@ describe('TabManager - Tab Lifecycle', () => {
       expect(tab?.hydrationState).toBe('READY');
     });
 
+    it('stays non-READY until the initial render queue drains (coord P6)', async () => {
+      let resolveDrain!: () => void;
+      const drain = new Promise<void>(resolve => { resolveDrain = resolve; });
+      const loadActive = jest.fn().mockResolvedValue(undefined);
+      const manager = createManager({
+        callbacks,
+        tabFactory: (n) => createMockTabData({
+          id: `tab-${n}`,
+          conversationId: `conv-${n}`,
+          hydrationState: 'SHELL',
+          renderer: { waitForRenderedMessages: () => drain },
+          controllers: {
+            conversationController: {
+              save: jest.fn().mockResolvedValue(undefined),
+              loadActive,
+              initializeWelcome: jest.fn(),
+            },
+          },
+        }),
+      });
+
+      jest.useFakeTimers();
+      const tab = await manager.createTab('conv-1');
+      jest.runAllTimers();
+      await flushMicrotasks(10);
+
+      // loadActive returned and the runtime is wired, but the frame-batched
+      // render queue has not drained: hydration must not be READY yet.
+      expect(loadActive).toHaveBeenCalledTimes(1);
+      expect(mockInitializeTabService).toHaveBeenCalled();
+      expect(mockSetupServiceCallbacks).toHaveBeenCalled();
+      expect(tab?.hydrationState).not.toBe('READY');
+
+      resolveDrain();
+      await flushMicrotasks(10);
+      jest.useRealTimers();
+
+      expect(tab?.hydrationState).toBe('READY');
+    });
+
     it('keeps an inactive shell runtime-free so peer transcript events wait for hydration', async () => {
       const manager = createManager({
         callbacks,

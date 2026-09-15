@@ -404,6 +404,16 @@ export class TabManager implements TabManagerInterface {
         return;
       }
 
+      // P6: READY means the first-screen DOM is settled, not just that the
+      // data and runtime are back — the frame-batched render queue must
+      // drain before the input unblocks. The hard race protection is the
+      // projection lease; this wait is the UX readiness semantics.
+      await tab.renderer?.waitForRenderedMessages();
+      if (this.isStaleHydration(tab, generation)) {
+        cleanupTabRuntime(tab);
+        return;
+      }
+
       this.setHydrationState(tab, 'READY');
       tab.hydrationDiagnostic = null;
       tab.historyLoadProgress = null;

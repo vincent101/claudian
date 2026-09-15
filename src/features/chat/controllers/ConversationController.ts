@@ -19,6 +19,7 @@ import { confirm } from '../../../shared/modals/ConfirmModal';
 import { getVaultPath } from '../../../utils/path';
 import { HISTORY_RESOURCE_POLICY } from '../history/HistoryResourcePolicy';
 import type { MessageRenderer } from '../rendering/MessageRenderer';
+import type { ProjectionWriteCoordinator } from '../rendering/ProjectionWriteCoordinator';
 import { cleanupThinkingBlock } from '../rendering/ThinkingBlockRenderer';
 import { findRewindContext } from '../rewind';
 import type { SubagentManager } from '../services/SubagentManager';
@@ -52,6 +53,13 @@ export interface ConversationControllerDeps {
   clearQueuedMessage: () => void;
   /** S2 lifecycle cancellation: invalidate the feature turn lease (generation++). */
   invalidateTurnLifecycle?: () => void;
+  /**
+   * Per-tab projection write lease (coord protocol P1/P3): stored
+   * transactions (paging prepend, search re-locate clear-rebuild) queue
+   * behind any live streaming turn instead of clearing its DOM. Absent in
+   * legacy tests → transactions run unguarded as before.
+   */
+  getProjectionCoordinator?: () => ProjectionWriteCoordinator | null;
   getTitleGenerationService: () => TitleGenerationService | null;
   getStatusPanel: () => StatusPanel | null;
   getAgentService?: () => ChatRuntime | null;
@@ -348,6 +356,25 @@ export class ConversationController {
     }
   }
 
+  /**
+   * P3 stored transaction: history load + ChatState merge + render + queue
+   * drain runs as one unit under the projection write lease, FIFO-queued
+   * behind any live streaming turn so it can never clear the turn's DOM.
+   * A conversation switch cancels the queued transaction (P7: conditional,
+   * no timers). Without a coordinator (legacy wiring) the task runs directly.
+   */
+  private async runStoredTransaction<T>(task: () => Promise<T>): Promise<T | null> {
+    const coordinator = this.deps.getProjectionCoordinator?.() ?? null;
+    if (!coordinator) {
+      return task();
+    }
+    const conversationId = this.deps.state.currentConversationId;
+    return coordinator.runStored(
+      () => this.deps.state.currentConversationId !== conversationId,
+      task,
+    );
+  }
+
   /** Budget-window first screen; every oversized turn arrives as a summary projection. */
   private async loadFirstScreenWindow(lease: HistoryIndexLease): Promise<{
     messages: ChatMessage[];
@@ -410,23 +437,26 @@ export class ConversationController {
     state.historyError = null;
     this.renderHistoryPager();
     try {
-      const page = await lease.loadWindow!({
-        anchorTurn: anchor,
-        direction: 'older',
-        budget: HISTORY_RESOURCE_POLICY.paging,
-        projectionLevel: 'summary',
-        minTurn: older ? older.end : 0,
+      await this.runStoredTransaction(async () => {
+        const page = await lease.loadWindow!({
+          anchorTurn: anchor,
+          direction: 'older',
+          budget: HISTORY_RESOURCE_POLICY.paging,
+          projectionLevel: 'summary',
+          minTurn: older ? older.end : 0,
+        });
+        const existingIds = new Set(state.messages.map(message => message.id));
+        const added = page.messages.filter(message => !existingIds.has(message.id));
+        const combined = [...state.messages, ...added].sort((a, b) => a.timestamp - b.timestamp);
+        state.messages = combined;
+        const addedIds = new Set(added.map(message => message.id));
+        const prepend = combined.filter(message => addedIds.has(message.id));
+        this.deps.renderer.prependMessages(prepend, combined);
+        await this.deps.renderer.waitForRenderedMessages();
+        state.loadedRanges = this.mergeRanges([...state.loadedRanges, page.range]);
+        state.historyHasMore = !this.coversAll(state.loadedRanges, total);
+        state.historySnapshotOffset = page.snapshotOffset ?? state.historySnapshotOffset;
       });
-      const existingIds = new Set(state.messages.map(message => message.id));
-      const added = page.messages.filter(message => !existingIds.has(message.id));
-      const combined = [...state.messages, ...added].sort((a, b) => a.timestamp - b.timestamp);
-      state.messages = combined;
-      const addedIds = new Set(added.map(message => message.id));
-      const prepend = combined.filter(message => addedIds.has(message.id));
-      this.deps.renderer.prependMessages(prepend, combined);
-      state.loadedRanges = this.mergeRanges([...state.loadedRanges, page.range]);
-      state.historyHasMore = !this.coversAll(state.loadedRanges, total);
-      state.historySnapshotOffset = page.snapshotOffset ?? state.historySnapshotOffset;
     } catch (error) {
       state.historyError = error instanceof Error ? error.message : String(error);
     } finally {
@@ -553,20 +583,26 @@ export class ConversationController {
     const lease = state.historyLease;
     if (!lease) throw new Error('History lease unavailable');
     if (lease.loadWindow) {
-      const page = await lease.loadWindow({
-        anchorTurn: turnIndex,
-        direction: 'around',
-        budget: HISTORY_RESOURCE_POLICY.searchLocate,
-        projectionLevel: 'summary',
+      // P3: the whole re-locate (load → merge → clear-rebuild → drain) is one
+      // stored transaction, queued behind a live turn when one is streaming —
+      // the rebuild then merges the latest ChatState including stream output.
+      await this.runStoredTransaction(async () => {
+        const page = await lease.loadWindow!({
+          anchorTurn: turnIndex,
+          direction: 'around',
+          budget: HISTORY_RESOURCE_POLICY.searchLocate,
+          projectionLevel: 'summary',
+        });
+        const existingIds = new Set(state.messages.map(message => message.id));
+        const added = page.messages.filter(message => !existingIds.has(message.id));
+        const combined = [...state.messages, ...added].sort((a, b) => a.timestamp - b.timestamp);
+        state.messages = combined;
+        this.deps.renderer.renderMessages(combined, () => this.getGreeting());
+        await this.deps.renderer.waitForRenderedMessages();
+        state.loadedRanges = this.mergeRanges([...state.loadedRanges, page.range]);
+        state.historyHasMore = !this.coversAll(state.loadedRanges, lease.totalTurns);
+        state.historySnapshotOffset = page.snapshotOffset ?? state.historySnapshotOffset;
       });
-      const existingIds = new Set(state.messages.map(message => message.id));
-      const added = page.messages.filter(message => !existingIds.has(message.id));
-      const combined = [...state.messages, ...added].sort((a, b) => a.timestamp - b.timestamp);
-      state.messages = combined;
-      this.deps.renderer.renderMessages(combined, () => this.getGreeting());
-      state.loadedRanges = this.mergeRanges([...state.loadedRanges, page.range]);
-      state.historyHasMore = !this.coversAll(state.loadedRanges, lease.totalTurns);
-      state.historySnapshotOffset = page.snapshotOffset ?? state.historySnapshotOffset;
       return;
     }
     const start = Math.max(0, Math.min(turnIndex, lease.totalTurns - 50));
@@ -581,21 +617,24 @@ export class ConversationController {
     const existing = this.rangeRequests.get(key);
     if (existing) return existing;
     const request = (async () => {
-      const page = await lease.loadRange(start, end);
-      const existingIds = new Set(state.messages.map(message => message.id));
-      const added = page.messages.filter(message => !existingIds.has(message.id));
-      const combined = [...state.messages, ...added].sort((a, b) => a.timestamp - b.timestamp);
-      state.messages = combined;
-      if (rerenderAll) {
-        renderer.renderMessages(combined, () => this.getGreeting());
-      } else {
-        const addedIds = new Set(added.map(message => message.id));
-        const prepend = combined.filter(message => addedIds.has(message.id));
-        renderer.prependMessages(prepend, combined);
-      }
-      state.loadedRanges = this.mergeRanges([...state.loadedRanges, page.range]);
-      state.historyHasMore = !this.coversAll(state.loadedRanges, lease.totalTurns);
-      state.historySnapshotOffset = page.snapshotOffset ?? state.historySnapshotOffset;
+      await this.runStoredTransaction(async () => {
+        const page = await lease.loadRange(start, end);
+        const existingIds = new Set(state.messages.map(message => message.id));
+        const added = page.messages.filter(message => !existingIds.has(message.id));
+        const combined = [...state.messages, ...added].sort((a, b) => a.timestamp - b.timestamp);
+        state.messages = combined;
+        if (rerenderAll) {
+          renderer.renderMessages(combined, () => this.getGreeting());
+        } else {
+          const addedIds = new Set(added.map(message => message.id));
+          const prepend = combined.filter(message => addedIds.has(message.id));
+          renderer.prependMessages(prepend, combined);
+        }
+        await renderer.waitForRenderedMessages();
+        state.loadedRanges = this.mergeRanges([...state.loadedRanges, page.range]);
+        state.historyHasMore = !this.coversAll(state.loadedRanges, lease.totalTurns);
+        state.historySnapshotOffset = page.snapshotOffset ?? state.historySnapshotOffset;
+      });
     })();
     this.rangeRequests.set(key, request);
     try {
@@ -722,6 +761,11 @@ export class ConversationController {
 
       this.deps.getHistoryDropdown()?.removeClass('visible');
       this.updateWelcomeVisibility();
+
+      // P6: READY must mean the first-screen DOM is settled, not just that
+      // the data arrived — the restored render queue drains first (the real
+      // race protection is the projection lease; this is the UX semantics).
+      await this.deps.renderer.waitForRenderedMessages();
 
       this.deps.markHydrationReady?.();
 

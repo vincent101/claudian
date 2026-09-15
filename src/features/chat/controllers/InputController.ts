@@ -34,6 +34,7 @@ import { type InlineAskQuestionConfig, InlineAskUserQuestion } from '../renderin
 import { InlineExitPlanMode } from '../rendering/InlineExitPlanMode';
 import { InlinePlanApproval,type PlanApprovalDecision } from '../rendering/InlinePlanApproval';
 import type { MessageRenderer } from '../rendering/MessageRenderer';
+import type { ProjectionWriteLease } from '../rendering/ProjectionWriteCoordinator';
 import { setToolIcon, updateToolCallResult } from '../rendering/ToolCallRenderer';
 import type { SubagentManager } from '../services/SubagentManager';
 import type { ChatState } from '../state/ChatState';
@@ -74,6 +75,7 @@ export interface InputControllerDeps {
   conversationController: ConversationController;
   getInputEl: () => HTMLTextAreaElement;
   getWelcomeEl: () => HTMLElement | null;
+  setWelcomeEl?: (el: HTMLElement | null) => void;
   getMessagesEl: () => HTMLElement;
   getFileContextManager: () => FileContextManager | null;
   getImageContextManager: () => ImageContextManager | null;
@@ -94,6 +96,14 @@ export interface InputControllerDeps {
   getSubagentManager: () => SubagentManager;
   /** Feature-layer turn lease (S2); absent in legacy tests → state-only checks. */
   getTurnCoordinator?: () => TurnCoordinator | null;
+  /**
+   * Per-tab projection write lease (coord protocol P1/P2); absent in legacy
+   * tests → sends proceed without waiting for the stored render queue.
+   */
+  getProjectionCoordinator?: () => {
+    acquireLive: (isCancelled?: () => boolean) => Promise<ProjectionWriteLease | null>;
+    runStored: <T>(isCancelled: () => boolean, task: () => Promise<T>) => Promise<T | null>;
+  } | null;
   /** Tab-level provider fallback for blank tabs (derived from draft model). */
   getTabProviderId?: () => ProviderId;
   /** Returns true if ready. */
@@ -307,9 +317,51 @@ export class InputController {
     // pending renders.
     streamController.beginRenderFlushScope?.();
 
+    // P2 live projection lease: the user/assistant DOM pair must wait for any
+    // stored render queue (initial history framing, search re-locate) to
+    // drain before mounting, or the new turn interleaves with pending slices.
+    // The wait is conditional — no timers; stale waits are cancelled through
+    // generation/turn-lease invalidation.
+    const projectionCoordinator = this.deps.getProjectionCoordinator?.() ?? null;
+    let projectionLease: ProjectionWriteLease | null = null;
+    if (projectionCoordinator) {
+      const turnLeaseLost = (): boolean =>
+        !!turnCoordinator && !turnCoordinator.isCurrentTurn(turnId, streamGeneration);
+      projectionLease = await projectionCoordinator.acquireLive(() =>
+        state.streamGeneration !== streamGeneration || turnLeaseLost()
+      );
+      if (projectionLease && (state.streamGeneration !== streamGeneration || turnLeaseLost())) {
+        // The turn was invalidated while queued behind the stored drain.
+        projectionLease.release();
+        projectionLease = null;
+      }
+      if (!projectionLease) {
+        // Queue instead of dropping — the cancelled wait lost the race, the
+        // message itself is still wanted. No user/assistant DOM was created,
+        // so no projection cleanup is needed.
+        state.queuedMessage = this.mergeQueuedMessages(state.queuedMessage, {
+          content,
+          images: hasImages ? [...(imageContextManager?.getAttachedImages() || [])] : undefined,
+          editorContext: selectionController.getContext(),
+          browserContext: browserSelectionController?.getContext() ?? null,
+          canvasContext: canvasSelectionController.getContext(),
+        });
+        imageContextManager?.clearImages();
+        this.updateQueueIndicator();
+        if (state.streamGeneration === streamGeneration && state.isStreaming) {
+          state.isStreaming = false;
+          streamController.hideThinkingIndicator();
+        }
+        this.getTurnCoordinator()?.finish(turnId);
+        return;
+      }
+    }
+
+    let turnContext: TurnProjectionContext | null = null;
     let shouldReleaseUserTurn = false;
     let deferredAutoSendContent: string | null = null;
     let deferredNewSessionPlan: string | null = null;
+    let wasInvalidated = false;
 
     try {
     // Hide welcome message when sending first message
@@ -370,11 +422,13 @@ export class InputController {
     // v3 §5.1: explicit projection context — the data truth for this turn.
     // message/renderTarget are refreshed per chunk because provider boundary
     // chunks switch the active assistant message and its content element.
-    const turnContext = createTurnProjectionContext({
+    // domEpoch captures the DOM generation the mount point belongs to (P4).
+    turnContext = createTurnProjectionContext({
       turnId,
       message: assistantMsg,
       renderTarget: state.currentContentEl,
       generation: streamGeneration,
+      domEpoch: renderer.domEpoch,
     });
     this.activeTurnContext = turnContext;
     this.pendingProviderUserMessages = [{
@@ -391,7 +445,6 @@ export class InputController {
     state.responseStartTime = performance.now();
 
     let wasInterrupted = false;
-    let wasInvalidated = false;
     let didEnqueueToSdk = false;
     let planCompleted = false;
 
@@ -460,7 +513,7 @@ export class InputController {
       }
     } catch (error) {
       const errorMsg = error instanceof Error ? error.message : 'Unknown error';
-      await streamController.appendText(`\n\n**Error:** ${errorMsg}`);
+      await streamController.appendTurnText(`\n\n**Error:** ${errorMsg}`, turnContext!);
     } finally {
       // Nested finally: the cleanup body below contains throwing awaits
       // (finalize, plan approval prompt, save, title refresh, createNew).
@@ -482,7 +535,7 @@ export class InputController {
       if (!wasInvalidated && state.streamGeneration === streamGeneration) {
         const didCancelThisTurn = wasInterrupted || state.cancelRequested;
         if (didCancelThisTurn && !state.pendingNewSessionPlan) {
-          await streamController.appendText('\n\n<span class="claudian-interrupted">Interrupted</span> <span class="claudian-interrupted-hint">· What should Claudian do instead?</span>');
+          await streamController.appendTurnText('\n\n<span class="claudian-interrupted">Interrupted</span> <span class="claudian-interrupted-hint">· What should Claudian do instead?</span>', turnContext!);
         }
         streamController.hideThinkingIndicator();
         state.isStreaming = false;
@@ -513,8 +566,8 @@ export class InputController {
 
         state.currentContentEl = null;
 
-        await streamController.finalizeCurrentThinkingBlock(finalAssistantMsg, turnContext);
-        await streamController.finalizeCurrentTextBlock(finalAssistantMsg, turnContext);
+        await streamController.finalizeCurrentThinkingBlock(finalAssistantMsg, turnContext!);
+        await streamController.finalizeCurrentTextBlock(finalAssistantMsg, turnContext!);
         this.deps.getSubagentManager().resetStreamingState();
 
         // Auto-hide completed todo panel on response end
@@ -644,6 +697,33 @@ export class InputController {
       } catch {
         // Best-effort acknowledgement: a failing observer handoff must not
         // break the turn-cleanup path (matches runtime callback isolation).
+      }
+
+      // P5 turn-boundary re-projection: when chunks skipped DOM writes
+      // (mount evicted by a clear-rebuild), rebuild from the latest domain
+      // state. Lock order is fixed — the live lease releases BEFORE the
+      // stored transaction is queued; holding live while queueing stored
+      // would self-deadlock the FIFO.
+      projectionLease?.release();
+      projectionLease = null;
+      if (
+        turnContext?.projectionDirty
+        && !wasInvalidated
+        && state.streamGeneration === streamGeneration
+      ) {
+        const reproject = async (): Promise<void> => {
+          const welcomeEl = renderer.renderMessages(state.messages, () => conversationController.getGreeting());
+          this.deps.setWelcomeEl?.(welcomeEl);
+          await renderer.waitForRenderedMessages();
+        };
+        if (projectionCoordinator) {
+          await projectionCoordinator.runStored(
+            () => state.streamGeneration !== streamGeneration,
+            reproject,
+          );
+        } else {
+          await reproject();
+        }
       }
 
       if (shouldReleaseUserTurn) {
@@ -1011,6 +1091,13 @@ export class InputController {
     state.currentTextEl = null;
     state.currentTextContent = '';
     state.currentThinkingState = null;
+
+    // Provider boundary (P4): the new mount point belongs to the current DOM
+    // generation, so the turn context re-captures the epoch. renderTarget is
+    // refreshed by the next chunk from state.currentContentEl.
+    if (this.activeTurnContext) {
+      this.activeTurnContext.domEpoch = renderer.domEpoch;
+    }
   }
 
   private resetProviderMessageBoundaryState(): void {

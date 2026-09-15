@@ -36,6 +36,7 @@ import { SelectionController } from '../controllers/SelectionController';
 import { StreamController } from '../controllers/StreamController';
 import { TurnCoordinator } from '../controllers/TurnCoordinator';
 import { MessageRenderer } from '../rendering/MessageRenderer';
+import { ProjectionWriteCoordinator } from '../rendering/ProjectionWriteCoordinator';
 import { cleanupThinkingBlock } from '../rendering/ThinkingBlockRenderer';
 import { findRewindContext } from '../rewind';
 import { BangBashService } from '../services/BangBashService';
@@ -414,6 +415,7 @@ export function createTab(options: TabCreateOptions): TabData {
       inputController: null,
       navigationController: null,
       turnCoordinator: null,
+      projectionWriteCoordinator: null,
     },
     services: {
       subagentManager,
@@ -1284,6 +1286,7 @@ export function initializeTabControllers(
       getMcpServerSelector: () => ui.mcpServerSelector,
       getExternalContextSelector: () => ui.externalContextSelector,
       clearQueuedMessage: () => tab.controllers.inputController?.clearQueuedMessage(),
+      getProjectionCoordinator: () => tab.controllers.projectionWriteCoordinator,
       /**
        * S2 lifecycle cancellation: feature lease generation++ on reset/switch.
        * Also settles pending render flushes (turn-lease hotfix fix 3) so a
@@ -1385,6 +1388,12 @@ export function initializeTabControllers(
     processQueuedMessage: () => tab.controllers.inputController?.processQueuedMessage(),
   });
 
+  // Per-tab projection write lease (coord protocol): UI-level shared
+  // facility, deliberately separate from the business TurnCoordinator — this
+  // one arbitrates who may write the messagesEl projection (stored history
+  // transactions vs live streaming turns), not turn ownership.
+  tab.controllers.projectionWriteCoordinator = new ProjectionWriteCoordinator();
+
   tab.controllers.autoTurnProjectionController = new AutoTurnProjectionController({
     state,
     renderer: tab.renderer,
@@ -1409,6 +1418,8 @@ export function initializeTabControllers(
     canvasSelectionController: tab.controllers.canvasSelectionController,
     conversationController: tab.controllers.conversationController,
     getTurnCoordinator: () => tab.controllers.turnCoordinator,
+    getProjectionCoordinator: () => tab.controllers.projectionWriteCoordinator,
+    setWelcomeEl: (el) => { dom.welcomeEl = el; },
     getInputEl: () => dom.inputEl,
     getInputContainerEl: () => dom.inputContainerEl,
     getWelcomeEl: () => dom.welcomeEl,
@@ -1738,6 +1749,10 @@ export async function destroyTab(tab: TabData): Promise<void> {
   // without triggering the queued-message pump.
   tab.controllers.turnCoordinator?.invalidateLifecycle();
   tab.controllers.autoTurnProjectionController?.invalidate();
+
+  // Projection lease teardown (coord protocol P7): settle every queued
+  // stored/live waiter so a closing tab cannot leave them parked forever.
+  tab.controllers.projectionWriteCoordinator?.dispose();
 
   tab.controllers.selectionController?.stop();
   tab.controllers.selectionController?.clear();

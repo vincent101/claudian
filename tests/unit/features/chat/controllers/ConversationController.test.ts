@@ -4,6 +4,7 @@ import { Menu, Notice } from 'obsidian';
 import { ProviderRegistry } from '@/core/providers/ProviderRegistry';
 import { ConversationHistoryHydrationError } from '@/core/providers/types';
 import { ConversationController, type ConversationControllerDeps } from '@/features/chat/controllers/ConversationController';
+import { ProjectionWriteCoordinator } from '@/features/chat/rendering/ProjectionWriteCoordinator';
 import { ChatState } from '@/features/chat/state/ChatState';
 import { confirm } from '@/shared/modals/ConfirmModal';
 
@@ -71,6 +72,7 @@ function createMockDeps(overrides: Partial<ConversationControllerDeps> = {}): Co
       prependMessages: jest.fn(),
       renderSearchCandidate: jest.fn(),
       waitForMessageContentRendered: jest.fn().mockResolvedValue(undefined),
+      waitForRenderedMessages: jest.fn().mockResolvedValue(undefined),
       findMessageElement: jest.fn(),
       highlightSearchMatch: jest.fn(),
     } as any,
@@ -412,6 +414,104 @@ describe('ConversationController', () => {
 
       expect(service.acquireHistoryIndex).toHaveBeenCalledWith(conversation, '/vault', undefined, true);
       expect(previous.release).toHaveBeenCalled();
+    });
+
+    // ============================================
+    // Projection write lease (coord protocol P3)
+    // ============================================
+
+    it('defers an unloaded search locate behind a live streaming turn and merges the streamed messages', async () => {
+      const coordinator = new ProjectionWriteCoordinator();
+      deps.getProjectionCoordinator = () => coordinator;
+      deps.state.currentConversationId = 'large';
+      deps.state.messages = [
+        { id: 'old-1', role: 'user', content: 'old', timestamp: 1 },
+        { id: 'streamed', role: 'assistant', content: 'live turn output', timestamp: 2 },
+      ] as any;
+      const lease = makeLease(200);
+      deps.state.historyLease = lease as any;
+      deps.state.loadedRanges = [{ start: 150, end: 200 }];
+      lease.loadWindow.mockResolvedValue({ messages: [{ id: 'hit', role: 'user', content: 'needle', timestamp: 0 }], range: { start: 25, end: 26 }, snapshotOffset: 5, sourceBytes: 1, projectedChars: 1, oversizedTurnCount: 0, pageKey: 'w:25:26', hasMoreBefore: true, hasMoreAfter: true });
+      (deps.renderer.findMessageElement as jest.Mock).mockReturnValueOnce(null).mockReturnValue({} as HTMLElement);
+      const liveLease = await coordinator.acquireLive();
+
+      const locatePromise = controller.locateHistorySearchResult({ projectionKey: 'hit', turnIndex: 25, matchOrdinal: 0, matchedText: 'needle' });
+      await Promise.resolve();
+      await Promise.resolve();
+
+      // P3: the live turn is streaming — the re-locate must not clear-rebuild.
+      expect(lease.loadWindow).not.toHaveBeenCalled();
+      expect(deps.renderer.renderMessages).not.toHaveBeenCalled();
+
+      liveLease!.release();
+      await locatePromise;
+
+      // After the live turn ends, the rebuild merges the latest ChatState —
+      // including the streamed message — with the materialized hit window.
+      expect(lease.loadWindow).toHaveBeenCalledWith(expect.objectContaining({ anchorTurn: 25, direction: 'around' }));
+      const rendered = (deps.renderer.renderMessages as jest.Mock).mock.calls[0][0] as Array<{ id: string }>;
+      expect(rendered.map(message => message.id)).toEqual(expect.arrayContaining(['old-1', 'streamed', 'hit']));
+    });
+
+    it('drops a queued search locate when the conversation switches while waiting', async () => {
+      const coordinator = new ProjectionWriteCoordinator();
+      deps.getProjectionCoordinator = () => coordinator;
+      deps.state.currentConversationId = 'large';
+      const lease = makeLease(200);
+      deps.state.historyLease = lease as any;
+      (deps.renderer.findMessageElement as jest.Mock).mockReturnValue(null);
+      const liveLease = await coordinator.acquireLive();
+
+      const locatePromise = controller.locateHistorySearchResult({ projectionKey: 'hit', turnIndex: 25, matchOrdinal: 0, matchedText: 'needle' });
+      await Promise.resolve();
+
+      // Switch away while the locate waits for the live turn: the stale
+      // transaction must never redraw into the new conversation.
+      deps.state.currentConversationId = 'switched';
+      liveLease!.release();
+
+      await expect(locatePromise).rejects.toThrow('projection_mismatch');
+      expect(lease.loadWindow).not.toHaveBeenCalled();
+      expect(deps.renderer.renderMessages).not.toHaveBeenCalled();
+    });
+
+    it('serializes paging and search locate stored transactions', async () => {
+      const coordinator = new ProjectionWriteCoordinator();
+      deps.getProjectionCoordinator = () => coordinator;
+      deps.state.currentConversationId = 'large';
+      deps.state.messages = [{ id: 'latest', role: 'user', content: 'latest', timestamp: 100 }] as any;
+      const lease = makeLease(200);
+      deps.state.historyLease = lease as any;
+      deps.state.loadedRanges = [{ start: 150, end: 200 }];
+      lease.loadWindow
+        .mockResolvedValueOnce({ messages: [{ id: 'older', role: 'user', content: 'older', timestamp: 50 }], range: { start: 100, end: 150 }, snapshotOffset: 5, sourceBytes: 1, projectedChars: 1, oversizedTurnCount: 0, pageKey: 'w:100:150', hasMoreBefore: true, hasMoreAfter: false })
+        .mockResolvedValueOnce({ messages: [{ id: 'hit', role: 'user', content: 'needle', timestamp: 0 }], range: { start: 25, end: 26 }, snapshotOffset: 5, sourceBytes: 1, projectedChars: 1, oversizedTurnCount: 0, pageKey: 'w:25:26', hasMoreBefore: true, hasMoreAfter: true });
+      (deps.renderer.findMessageElement as jest.Mock).mockReturnValueOnce(null).mockReturnValue({} as HTMLElement);
+
+      // A stored transaction already in flight (e.g. an earlier paging load).
+      let releaseInFlight!: () => void;
+      const inFlight = coordinator.runStored(
+        () => false,
+        () => new Promise<void>(resolve => { releaseInFlight = resolve; }),
+      );
+      await Promise.resolve();
+
+      const pagingPromise = controller.loadOlderHistory();
+      const locatePromise = controller.locateHistorySearchResult({ projectionKey: 'hit', turnIndex: 25, matchOrdinal: 0, matchedText: 'needle' });
+      await Promise.resolve();
+      await Promise.resolve();
+
+      // Both queue behind the in-flight transaction: nothing interleaves.
+      expect(lease.loadWindow).not.toHaveBeenCalled();
+
+      releaseInFlight();
+      await inFlight;
+      await pagingPromise;
+      await locatePromise;
+
+      // Each ran exactly once, serialized through the FIFO.
+      expect(lease.loadWindow).toHaveBeenCalledTimes(2);
+      expect(deps.state.loadedRanges).toEqual(expect.arrayContaining([{ start: 25, end: 26 }, { start: 100, end: 200 }]));
     });
   });
 

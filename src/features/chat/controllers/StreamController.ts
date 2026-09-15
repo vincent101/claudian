@@ -87,6 +87,14 @@ export interface TurnProjectionContext {
   turnId: string;
   message: ChatMessage;
   renderTarget: HTMLElement | null;
+  /** DOM epoch captured when the context (or its latest mount point) was created (P4). */
+  domEpoch: number;
+  /**
+   * Set when a DOM projection was skipped because the captured mount point
+   * was evicted (epoch drift / detachment). The turn boundary re-projects
+   * from ChatState under a stored lease (P5); domain buffers keep updating.
+   */
+  projectionDirty: boolean;
   /** Text accumulated for the current assistant message (data layer). */
   textBuffer: string;
   /** Thinking accumulated for the current assistant message (data layer). */
@@ -101,11 +109,14 @@ export function createTurnProjectionContext(init: {
   message: ChatMessage;
   renderTarget: HTMLElement | null;
   generation: number;
+  domEpoch: number;
 }): TurnProjectionContext {
   return {
     turnId: init.turnId,
     message: init.message,
     renderTarget: init.renderTarget,
+    domEpoch: init.domEpoch,
+    projectionDirty: false,
     textBuffer: '',
     thinkingBuffer: '',
     pendingToolIds: new Set<string>(),
@@ -230,6 +241,12 @@ export class StreamController {
     this.activeContext = context;
     const msg = context.message;
 
+    // P4: validate the captured mount point before any DOM projection in
+    // this chunk. On epoch drift or detachment the turn stops writing DOM
+    // (renderTarget nulled, projectionDirty set); every branch below then
+    // falls back to the domain-only path (P5).
+    this.resolveMountedRenderTarget(context);
+
     switch (chunk.type) {
       case 'thinking':
         // Flush pending tools before rendering new content type
@@ -240,7 +257,7 @@ export class StreamController {
         // Thinking always accumulates in the context buffer (data layer)
         context.thinkingBuffer += chunk.content;
         if (context.renderTarget) {
-          await this.appendThinking(chunk.content);
+          await this.appendThinking(chunk.content, context.renderTarget);
         }
         break;
 
@@ -254,7 +271,7 @@ export class StreamController {
         msg.content += chunk.content;
         context.textBuffer += chunk.content;
         if (context.renderTarget) {
-          await this.appendText(chunk.content);
+          await this.appendText(chunk.content, context.renderTarget);
         }
         break;
 
@@ -311,7 +328,7 @@ export class StreamController {
         msg.content += noticeText;
         context.textBuffer += noticeText;
         if (context.renderTarget) {
-          await this.appendText(noticeText);
+          await this.appendText(noticeText, context.renderTarget);
         }
         break;
       }
@@ -323,7 +340,7 @@ export class StreamController {
         msg.content += errorText;
         context.textBuffer += errorText;
         if (context.renderTarget) {
-          await this.appendText(errorText);
+          await this.appendText(errorText, context.renderTarget);
         }
         break;
       }
@@ -803,14 +820,48 @@ export class StreamController {
   // Text Block Management
   // ============================================
 
-  async appendText(text: string): Promise<void> {
+  /**
+   * P4/P5 mount validation: returns the render target only when the captured
+   * DOM epoch still matches and the node is still attached. On failure the
+   * streaming DOM state (currentContentEl/currentTextEl/currentThinkingState
+   * plus the renderer maps cached for the evicted DOM) is cleared and the
+   * turn is flagged projection-dirty — domain buffers are never touched.
+   */
+  resolveMountedRenderTarget(context: TurnProjectionContext): HTMLElement | null {
+    const { state, renderer } = this.deps;
+    if (!context.renderTarget) return null;
+    if (renderer.domEpoch === context.domEpoch && renderer.isMounted(context.renderTarget)) {
+      return context.renderTarget;
+    }
+    context.renderTarget = null;
+    context.projectionDirty = true;
+    state.currentContentEl = null;
+    state.currentTextEl = null;
+    state.currentTextContent = '';
+    state.currentThinkingState = null;
+    // Cached projections of the evicted DOM; message-level toolCalls survive
+    // as domain data for the turn-boundary re-projection.
+    state.toolCallElements.clear();
+    state.writeEditStates.clear();
+    state.pendingTools.clear();
+    return null;
+  }
+
+  /** Turn-bound appendText: re-validates the mount point before writing (P4). */
+  async appendTurnText(text: string, context: TurnProjectionContext): Promise<void> {
+    const target = this.resolveMountedRenderTarget(context);
+    if (!target) return;
+    await this.appendText(text, target);
+  }
+
+  async appendText(text: string, target: HTMLElement): Promise<void> {
     const { state } = this.deps;
-    if (!state.currentContentEl) return;
+    if (!target) return;
 
     this.hideThinkingIndicator();
 
     if (!state.currentTextEl) {
-      state.currentTextEl = state.currentContentEl.createDiv({ cls: 'claudian-text-block' });
+      state.currentTextEl = target.createDiv({ cls: 'claudian-text-block' });
       state.currentTextContent = '';
     }
 
@@ -978,14 +1029,14 @@ export class StreamController {
   // Thinking Block Management
   // ============================================
 
-  async appendThinking(content: string): Promise<void> {
+  async appendThinking(content: string, target: HTMLElement): Promise<void> {
     const { state, renderer } = this.deps;
-    if (!state.currentContentEl) return;
+    if (!target) return;
 
     this.hideThinkingIndicator();
     if (!state.currentThinkingState) {
       state.currentThinkingState = createThinkingBlock(
-        state.currentContentEl,
+        target,
         (el, md) => renderer.renderContent(el, md)
       );
     }

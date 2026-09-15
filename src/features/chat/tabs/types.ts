@@ -14,6 +14,7 @@ import type { SelectionController } from '../controllers/SelectionController';
 import type { StreamController } from '../controllers/StreamController';
 import type { TurnCoordinator } from '../controllers/TurnCoordinator';
 import type { MessageRenderer } from '../rendering/MessageRenderer';
+import type { ProjectionWriteCoordinator } from '../rendering/ProjectionWriteCoordinator';
 import type { SubagentManager } from '../services/SubagentManager';
 import type { ChatState } from '../state/ChatState';
 import type { BangBashModeManager } from '../ui/BangBashModeManager';
@@ -142,6 +143,12 @@ export interface TabControllers {
   navigationController: NavigationController | null;
   /** Feature-layer turn lease (S2): user sends and auto turns arbitrate here. */
   turnCoordinator: TurnCoordinator | null;
+  /**
+   * Per-tab projection write lease (coord protocol): stored history
+   * transactions and live streaming turns arbitrate messagesEl writes here.
+   * Disposed on tab close to settle queued waiters.
+   */
+  projectionWriteCoordinator: ProjectionWriteCoordinator | null;
 }
 
 /**
