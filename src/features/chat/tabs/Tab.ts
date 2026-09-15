@@ -1697,6 +1697,36 @@ export function deactivateTab(tab: TabData): void {
 }
 
 /**
+ * Mod+F entry from the view-scope binding (see ClaudianView.wireEventHandlers):
+ * opens the visible tab's in-place history search. Returns true when consumed.
+ *
+ * The shortcut cannot ride a document-capture listener alone: Obsidian's
+ * keymap consumes Mod+F at window capture (default editor:open-search hotkey
+ * dispatches via the app-scope catch-all and "succeeds" even when its
+ * checkCallback finds no searchable view), so the event never reaches
+ * document listeners on stock hotkey setups.
+ */
+export function openHistorySearchForTab(tab: TabData): boolean {
+  if (tab.lifecycleState === 'closing') return false;
+  const controller = tab.controllers.historySearchController;
+  if (!controller) return false;
+  controller.open();
+  return true;
+}
+
+/**
+ * Escape arbitration from the view-scope binding: an open history-search
+ * panel closes (restoring the pre-open focus) before streaming-cancel runs.
+ * Returns true when consumed.
+ */
+export function closeHistorySearchForTab(tab: TabData): boolean {
+  const controller = tab.controllers.historySearchController;
+  if (!controller?.isActive()) return false;
+  controller.close();
+  return true;
+}
+
+/**
  * Cleans up a tab and releases all resources.
  * Made async to ensure proper cleanup ordering.
  */

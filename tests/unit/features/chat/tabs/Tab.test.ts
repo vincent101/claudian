@@ -9,6 +9,7 @@ import { TurnCoordinator } from '@/features/chat/controllers/TurnCoordinator';
 import { ChatState } from '@/features/chat/state/ChatState';
 import {
   activateTab,
+  closeHistorySearchForTab,
   createTab,
   deactivateTab,
   destroyTab,
@@ -19,6 +20,7 @@ import {
   initializeTabService,
   initializeTabUI,
   onProviderAvailabilityChanged,
+  openHistorySearchForTab,
   renderTabHydrationPlaceholder,
   setupServiceCallbacks,
   type TabCreateOptions,
@@ -520,6 +522,59 @@ describe('Tab - History load progress gate', () => {
 
     expect(tab.historyLoadProgress).toEqual({ phase: 'queued' });
     expect(tab.dom.messagesEl.children[0]?.children[0]?.textContent).toContain('Waiting for index');
+  });
+});
+
+describe('Tab - History search view-scope shortcuts', () => {
+  it('opens the active tab history search and reports the shortcut consumed', () => {
+    const tab = createTab(createMockOptions());
+    const open = jest.fn();
+    tab.controllers.historySearchController = {
+      open, close: jest.fn(), isActive: jest.fn().mockReturnValue(false),
+    } as any;
+
+    expect(openHistorySearchForTab(tab)).toBe(true);
+    expect(open).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not open the search for a closing tab or a missing controller', () => {
+    const tab = createTab(createMockOptions());
+    const open = jest.fn();
+    tab.controllers.historySearchController = { open } as any;
+    tab.lifecycleState = 'closing';
+
+    expect(openHistorySearchForTab(tab)).toBe(false);
+    expect(open).not.toHaveBeenCalled();
+
+    tab.lifecycleState = 'bound_active';
+    tab.controllers.historySearchController = null;
+    expect(openHistorySearchForTab(tab)).toBe(false);
+  });
+
+  it('closes an open search panel (focus restored) and reports the Escape consumed', () => {
+    const tab = createTab(createMockOptions());
+    const close = jest.fn();
+    tab.controllers.historySearchController = {
+      open: jest.fn(), close, isActive: jest.fn().mockReturnValue(true),
+    } as any;
+
+    expect(closeHistorySearchForTab(tab)).toBe(true);
+    // Default close options restore the pre-open focus.
+    expect(close).toHaveBeenCalledWith();
+  });
+
+  it('leaves Escape to the caller when no search panel is open', () => {
+    const tab = createTab(createMockOptions());
+    const close = jest.fn();
+    tab.controllers.historySearchController = {
+      open: jest.fn(), close, isActive: jest.fn().mockReturnValue(false),
+    } as any;
+
+    expect(closeHistorySearchForTab(tab)).toBe(false);
+    expect(close).not.toHaveBeenCalled();
+
+    tab.controllers.historySearchController = null;
+    expect(closeHistorySearchForTab(tab)).toBe(false);
   });
 });
 

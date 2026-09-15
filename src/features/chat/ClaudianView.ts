@@ -9,7 +9,13 @@ import { VIEW_TYPE_CLAUDIAN } from '../../core/types';
 import type ClaudianPlugin from '../../main';
 import { createProviderIconSvg } from '../../shared/icons';
 import type { HistoryConversationOpenState } from './controllers/ConversationController';
-import { getTabProviderId, onProviderAvailabilityChanged, updatePlanModeUI } from './tabs/Tab';
+import {
+  closeHistorySearchForTab,
+  getTabProviderId,
+  onProviderAvailabilityChanged,
+  openHistorySearchForTab,
+  updatePlanModeUI,
+} from './tabs/Tab';
 import { TabBar } from './tabs/TabBar';
 import { TabManager } from './tabs/TabManager';
 import type { TabData, TabId } from './tabs/types';
@@ -562,8 +568,20 @@ export class ClaudianView extends ItemView {
     // navigating away when Claudian is open as a main-area tab.
     // Returning false consumes the event (preventDefault + stops scope propagation).
     this.scope = new Scope(this.app.scope);
+    // Mod+F for the in-place history search must ride the view scope: Obsidian's
+    // keymap consumes Mod+F at window capture (default editor:open-search hotkey
+    // dispatch), so the controller's document-capture fallback never sees it.
+    // The view scope outranks app scope exactly while this view is the active
+    // leaf, and modals push their own scope so the shortcut stays gated.
+    this.scope.register(['Mod'], 'F', () => {
+      const activeTab = this.tabManager?.getActiveTab();
+      if (activeTab && openHistorySearchForTab(activeTab)) return false;
+    });
     this.scope.register([], 'Escape', () => {
       const activeTab = this.tabManager?.getActiveTab();
+      // An open history-search panel outranks streaming-cancel in Escape
+      // arbitration; both consume the event.
+      if (activeTab && closeHistorySearchForTab(activeTab)) return false;
       if (activeTab?.state.isStreaming) {
         activeTab.controllers.inputController?.cancelStreaming();
       }
