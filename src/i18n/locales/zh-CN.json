@@ -91,6 +91,7 @@
       "searching": "搜索中…",
       "indexing": "索引中…",
       "locating": "定位中…",
+      "locateDeferred": "响应进行中，将在响应完成后定位该结果。",
       "retryError": "无法定位该结果，请重试。",
       "projectionMismatch": "该结果与当前渲染内容不再匹配。"
     },

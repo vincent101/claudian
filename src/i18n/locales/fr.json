@@ -91,6 +91,7 @@
       "searching": "Recherche…",
       "indexing": "Indexation…",
       "locating": "Localisation…",
+      "locateDeferred": "Réponse en cours — cette correspondance sera localisée une fois terminée.",
       "retryError": "Impossible de localiser ce résultat. Réessayez.",
       "projectionMismatch": "Ce résultat ne correspond plus au message affiché."
     },

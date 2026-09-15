@@ -70,6 +70,7 @@ export type TranslationKey =
   | 'chat.search.searching'
   | 'chat.search.indexing'
   | 'chat.search.locating'
+  | 'chat.search.locateDeferred'
   | 'chat.search.retryError'
   | 'chat.search.projectionMismatch'
   | 'chat.message.timestamp'

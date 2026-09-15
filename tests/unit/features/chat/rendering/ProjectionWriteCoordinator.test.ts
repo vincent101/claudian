@@ -163,4 +163,33 @@ describe('ProjectionWriteCoordinator', () => {
     expect(second).not.toBeNull();
     second!.release();
   });
+
+  it('reports hasLiveTurn only while a live turn holds or waits for the lease', async () => {
+    const coordinator = new ProjectionWriteCoordinator();
+    expect(coordinator.hasLiveTurn()).toBe(false);
+
+    const stored = coordinator.runStored(() => false, async () => {
+      // A stored transaction alone must not read as a live turn.
+      expect(coordinator.hasLiveTurn()).toBe(false);
+    });
+    await stored;
+    expect(coordinator.hasLiveTurn()).toBe(false);
+
+    // Live waiter queued behind the stored transaction still defers stored work.
+    let releaseStored!: () => void;
+    const gate = new Promise<void>(resolve => { releaseStored = resolve; });
+    const stored2 = coordinator.runStored(() => false, () => gate);
+    const livePromise = coordinator.acquireLive();
+    await Promise.resolve();
+    expect(coordinator.hasLiveTurn()).toBe(true);
+
+    releaseStored();
+    await stored2;
+    const live = await livePromise;
+    expect(coordinator.hasLiveTurn()).toBe(true);
+
+    live!.release();
+    await Promise.resolve();
+    expect(coordinator.hasLiveTurn()).toBe(false);
+  });
 });

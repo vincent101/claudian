@@ -91,6 +91,7 @@
       "searching": "検索中…",
       "indexing": "インデックス作成中…",
       "locating": "移動中…",
+      "locateDeferred": "応答が進行中のため、完了後にこの検索結果へ移動します。",
       "retryError": "結果を表示できません。再試行してください。",
       "projectionMismatch": "この結果は表示されたメッセージと一致しなくなりました。"
     },

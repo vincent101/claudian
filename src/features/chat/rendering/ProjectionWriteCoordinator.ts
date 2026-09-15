@@ -16,6 +16,8 @@ export interface ProjectionWriteLease {
 
 interface QueueEntry {
   isCancelled: () => boolean;
+  /** Whether the waiter is a live streaming turn (vs a stored transaction). */
+  isLive: boolean;
   /** Grants the lease to the waiter. */
   start: (lease: ProjectionWriteLease) => void;
   /** Cancels the wait without running any task. */
@@ -25,6 +27,8 @@ interface QueueEntry {
 export class ProjectionWriteCoordinator {
   private queue: QueueEntry[] = [];
   private active = false;
+  private activeIsLive = false;
+  private queuedLiveCount = 0;
   private disposed = false;
 
   /**
@@ -33,18 +37,7 @@ export class ProjectionWriteCoordinator {
    * callers must treat null as "do not write".
    */
   acquireLive(isCancelled?: () => boolean): Promise<ProjectionWriteLease | null> {
-    return new Promise(resolve => {
-      if (this.disposed || isCancelled?.()) {
-        resolve(null);
-        return;
-      }
-      this.queue.push({
-        isCancelled: isCancelled ?? (() => false),
-        start: granted => resolve(granted),
-        cancel: () => resolve(null),
-      });
-      this.pump();
-    });
+    return this.acquire(true, isCancelled);
   }
 
   /**
@@ -54,7 +47,7 @@ export class ProjectionWriteCoordinator {
    * so successors never overtake a still-running predecessor.
    */
   async runStored<T>(isCancelled: () => boolean, task: () => Promise<T>): Promise<T | null> {
-    const lease = await this.acquireLive(isCancelled);
+    const lease = await this.acquire(false, isCancelled);
     if (!lease) return null;
     try {
       return await task();
@@ -63,15 +56,44 @@ export class ProjectionWriteCoordinator {
     }
   }
 
+  /**
+   * Whether a live streaming turn holds the lease or is queued ahead of a
+   * stored transaction queued right now — i.e. stored work would wait for
+   * the turn to finish. UX signal (e.g. the deferred search-locate notice),
+   * not a synchronization primitive.
+   */
+  hasLiveTurn(): boolean {
+    return this.activeIsLive || this.queuedLiveCount > 0;
+  }
+
   /** Settles every queued waiter as cancelled and rejects new ones. */
   dispose(): void {
     this.disposed = true;
     this.active = false;
+    this.activeIsLive = false;
     this.drainCancelled();
+  }
+
+  private acquire(isLive: boolean, isCancelled?: () => boolean): Promise<ProjectionWriteLease | null> {
+    return new Promise(resolve => {
+      if (this.disposed || isCancelled?.()) {
+        resolve(null);
+        return;
+      }
+      this.queue.push({
+        isCancelled: isCancelled ?? (() => false),
+        isLive,
+        start: granted => resolve(granted),
+        cancel: () => resolve(null),
+      });
+      if (isLive) this.queuedLiveCount += 1;
+      this.pump();
+    });
   }
 
   private releaseActive(): void {
     this.active = false;
+    this.activeIsLive = false;
     this.pump();
   }
 
@@ -85,10 +107,13 @@ export class ProjectionWriteCoordinator {
       // Cancellation is re-checked at grant time: a waiter cancelled while
       // queued exits without running its task and without blocking successors.
       if (next.isCancelled()) {
+        if (next.isLive) this.queuedLiveCount -= 1;
         next.cancel();
         continue;
       }
       this.active = true;
+      this.activeIsLive = next.isLive;
+      if (next.isLive) this.queuedLiveCount -= 1;
       let released = false;
       next.start({
         release: () => {
@@ -103,6 +128,7 @@ export class ProjectionWriteCoordinator {
 
   private drainCancelled(): void {
     const queue = this.queue.splice(0);
+    this.queuedLiveCount = 0;
     for (const entry of queue) entry.cancel();
   }
 }

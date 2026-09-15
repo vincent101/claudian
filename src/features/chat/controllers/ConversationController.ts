@@ -569,6 +569,12 @@ export class ConversationController {
     if (result.status === 'projection_mismatch') throw new Error('projection_mismatch');
     let target = renderer.findMessageElement(result.projectionKey);
     if (!target) {
+      // UX (coord protocol risk 1): the re-locate queues behind a live
+      // streaming turn (P3) — say so instead of letting the click look dead
+      // until the response completes.
+      if (this.deps.getProjectionCoordinator?.()?.hasLiveTurn()) {
+        new Notice(t('chat.search.locateDeferred'));
+      }
       await this.loadSearchResultWindow(result.turnIndex);
       // Frame-batched rendering mounts asynchronously; the element can only be
       // located after the queue drains.

@@ -91,6 +91,7 @@
       "searching": "Buscando…",
       "indexing": "Indexando…",
       "locating": "Localizando…",
+      "locateDeferred": "Respuesta en curso: se localizará este resultado al finalizar.",
       "retryError": "No se pudo localizar el resultado. Inténtalo de nuevo.",
       "projectionMismatch": "Este resultado ya no coincide con el mensaje renderizado."
     },

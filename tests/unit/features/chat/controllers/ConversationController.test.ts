@@ -617,6 +617,28 @@ describe('ConversationController', () => {
       expect(deps.state.messages.map(message => message.id)).toEqual(['new-1']);
       expect(deps.state.loadedRanges).toEqual([]);
     });
+
+    it('notifies when an unloaded search locate is deferred behind a live turn', async () => {
+      const coordinator = new ProjectionWriteCoordinator();
+      deps.getProjectionCoordinator = () => coordinator;
+      deps.state.currentConversationId = 'large';
+      deps.state.messages = [{ id: 'latest', role: 'user', content: 'latest', timestamp: 100 }] as any;
+      const lease = makeLease(200);
+      deps.state.historyLease = lease as any;
+      deps.state.loadedRanges = [{ start: 150, end: 200 }];
+      lease.loadWindow.mockResolvedValue({ messages: [{ id: 'hit', role: 'user', content: 'needle', timestamp: 0 }], range: { start: 25, end: 26 }, snapshotOffset: 5, sourceBytes: 1, projectedChars: 1, oversizedTurnCount: 0, pageKey: 'w:25:26', hasMoreBefore: true, hasMoreAfter: true });
+      (deps.renderer.findMessageElement as jest.Mock).mockReturnValue(null);
+      const liveLease = await coordinator.acquireLive();
+
+      const locatePromise = controller.locateHistorySearchResult({ projectionKey: 'hit', turnIndex: 25, matchOrdinal: 0, matchedText: 'needle' });
+      await Promise.resolve();
+
+      // UX: the click must not look dead while it waits for the live turn.
+      expect(mockNotice).toHaveBeenCalledTimes(1);
+
+      liveLease!.release();
+      await expect(locatePromise).rejects.toThrow('projection_mismatch');
+    });
   });
 
   describe('Queue Management', () => {
