@@ -1,9 +1,12 @@
 import type {
   ConversationHistoryHydrationResult,
   HistoryIndexLease,
+  HistoryLoadBudget,
   HistoryLoadProgress,
   HistoryRangePage,
   HistorySearchResult,
+  HistoryWindowPage,
+  HistoryWindowRequest,
   ProviderConversationHistoryService,
 } from '../../../core/providers/types';
 import { isSubagentToolName, TOOL_TASK } from '../../../core/tools/toolNames';
@@ -27,6 +30,7 @@ import {
 import {
   buildTranscriptIndex,
   clearTranscriptIndexCache,
+  materializeTranscriptEntries,
   materializeTranscriptPage,
   materializeTranscriptToolAssociations,
   protectTranscriptIndex,
@@ -34,6 +38,15 @@ import {
   setTranscriptIndexDiagnosticSink,
   type TranscriptHistoryIndex,
 } from './ClaudeTranscriptHistoryIndex';
+import {
+  buildOversizedEntryPlaceholder,
+  buildOversizedTurnMarker,
+  HISTORY_SUMMARY_LIMITS,
+  measureChatProjectionChars,
+  summarizeChatMessages,
+} from './HistorySummaryProjection';
+import { planHistoryWindow } from './HistoryWindowPlanner';
+import type { SDKNativeMessage } from './sdkHistoryTypes';
 import { getSDKSessionPath } from './sdkSessionPaths';
 
 function chooseRicherResult(sdkResult?: string, cachedResult?: string): string | undefined {
@@ -541,6 +554,12 @@ export class ClaudeConversationHistoryService implements ProviderConversationHis
       ready,
       search: async query => this.searchIndex(await fixed.ready, query),
       loadRange: async (start, end) => this.materializeRange(await fixed.ready, start, end),
+      loadWindow: async request => this.materializeWindow(await fixed.ready, request),
+      planWindow: request => {
+        if (!fixed.state) throw new Error('History index is not ready for window planning');
+        const plan = this.planWindowFor(fixed.state, request);
+        return { start: plan.start, end: plan.end };
+      },
       release: () => {
         if (released) return;
         released = true;
@@ -646,6 +665,136 @@ export class ClaudeConversationHistoryService implements ProviderConversationHis
       messages: dedupeMessages(messages).sort((a, b) => a.timestamp - b.timestamp),
       range: { start, end },
       snapshotOffset: current.index.snapshotSize,
+    };
+  }
+
+  private turnSourceBytes(state: ConversationIndexState): number[] {
+    return state.flattenedTurns.map(item => item.segment.index.turns[item.turnIndex].sourceBytes ?? 0);
+  }
+
+  private planWindowFor(state: ConversationIndexState, request: HistoryWindowRequest) {
+    return planHistoryWindow(this.turnSourceBytes(state), {
+      anchorTurn: request.anchorTurn,
+      direction: request.direction,
+      budget: request.budget,
+      minTurn: request.minTurn,
+      maxTurn: request.maxTurn,
+    });
+  }
+
+  private async materializeTurn(
+    state: ConversationIndexState,
+    segment: IndexedSegment,
+    turnIndex: number,
+  ): Promise<ChatMessage[]> {
+    const native = await materializeTranscriptPage(segment.index, turnIndex, 1);
+    const associations = await materializeTranscriptToolAssociations(segment.index, native);
+    return materializeSDKMessages(state.vaultPath, segment.sessionId, native, associations);
+  }
+
+  /**
+   * Bounded materialization of one oversized turn. Entries are read from the
+   * head (turn opener) and tail (final answer) within the byte budget; giant
+   * entries and the squeezed middle are replaced by explicit omission markers.
+   */
+  private async materializeSummaryTurn(
+    state: ConversationIndexState,
+    segment: IndexedSegment,
+    turnIndex: number,
+    budget: HistoryLoadBudget,
+  ): Promise<{ messages: ChatMessage[]; readBytes: number }> {
+    const index = segment.index;
+    const turn = index.turns[turnIndex];
+    const entries = index.entries.slice(turn.startEntry, turn.endEntry + 1);
+    const selected = new Array<boolean>(entries.length).fill(false);
+    const headBudget = Math.floor(budget.maxSourceBytes * 0.6);
+    let readBytes = 0;
+    for (let i = 0; i < entries.length; i += 1) {
+      const entry = entries[i];
+      if (entry.length > HISTORY_SUMMARY_LIMITS.entryReadBytes || readBytes + entry.length > headBudget) continue;
+      selected[i] = true;
+      readBytes += entry.length;
+    }
+    for (let i = entries.length - 1; i >= 0; i -= 1) {
+      if (selected[i]) continue;
+      const entry = entries[i];
+      if (entry.length > HISTORY_SUMMARY_LIMITS.entryReadBytes || readBytes + entry.length > budget.maxSourceBytes) continue;
+      selected[i] = true;
+      readBytes += entry.length;
+    }
+    const read = entries.filter((_, i) => selected[i]);
+    const skipped = entries.filter((_, i) => !selected[i]);
+    const native = read.length > 0 ? await materializeTranscriptEntries(index, read) : [];
+    const synthetic: SDKNativeMessage[] = skipped
+      .map(entry => buildOversizedEntryPlaceholder(entry))
+      .filter((message): message is SDKNativeMessage => message !== null);
+    if (skipped.length > 0) {
+      synthetic.push(buildOversizedTurnMarker(turn.turnId, skipped, entries[entries.length - 1]?.timestamp));
+    }
+    const combined = [...native, ...synthetic];
+    const messages = await materializeSDKMessages(state.vaultPath, segment.sessionId, combined, combined);
+    summarizeChatMessages(messages);
+    return { messages, readBytes };
+  }
+
+  private async materializeWindow(
+    state: ConversationIndexState,
+    request: HistoryWindowRequest,
+  ): Promise<HistoryWindowPage> {
+    const total = state.flattenedTurns.length;
+    const plan = this.planWindowFor(state, request);
+    const messages: ChatMessage[] = [];
+    let actualStart = plan.end;
+    let sourceBytes = 0;
+    let projectedChars = 0;
+    let oversizedTurnCount = 0;
+    // Materialize newest-first so budget overruns drop older turns and the
+    // anchor-adjacent turn always survives (giant turn -> summary, not empty;
+    // the planner already guarantees a non-empty plan includes that turn).
+    for (let index = plan.end - 1; index >= plan.start; index -= 1) {
+      const item = state.flattenedTurns[index];
+      const turnBytes = item.segment.index.turns[item.turnIndex].sourceBytes ?? 0;
+      const oversized = turnBytes > request.budget.maxSourceBytes;
+      let produced: ChatMessage[];
+      let readBytes: number;
+      let shrunk = oversized;
+      if (oversized) {
+        const summary = await this.materializeSummaryTurn(state, item.segment, item.turnIndex, request.budget);
+        produced = summary.messages;
+        readBytes = summary.readBytes;
+      } else {
+        produced = await this.materializeTurn(state, item.segment, item.turnIndex);
+        readBytes = turnBytes;
+        if (measureChatProjectionChars(produced) > request.budget.maxProjectedChars) {
+          summarizeChatMessages(produced);
+          shrunk = true;
+        }
+      }
+      const chars = measureChatProjectionChars(produced);
+      const isNewest = index === plan.end - 1;
+      if (!isNewest && (
+        projectedChars + chars > request.budget.maxProjectedChars
+        || sourceBytes + readBytes > request.budget.maxSourceBytes
+      )) {
+        break;
+      }
+      messages.push(...produced);
+      sourceBytes += readBytes;
+      projectedChars += chars;
+      if (shrunk) oversizedTurnCount += 1;
+      actualStart = index;
+    }
+    const current = state.segments[state.segments.length - 1];
+    return {
+      messages: dedupeMessages(messages).sort((a, b) => a.timestamp - b.timestamp),
+      range: { start: actualStart, end: plan.end },
+      snapshotOffset: current.index.snapshotSize,
+      sourceBytes,
+      projectedChars,
+      oversizedTurnCount,
+      pageKey: `w:${actualStart}:${plan.end}`,
+      hasMoreBefore: actualStart > 0,
+      hasMoreAfter: plan.end < total,
     };
   }
 

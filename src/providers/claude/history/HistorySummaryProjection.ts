@@ -1,0 +1,159 @@
+import type { ChatMessage, ToolCallInfo } from '../../../core/types';
+import type { TranscriptIndexEntry } from './ClaudeTranscriptHistoryIndex';
+import type { SDKNativeMessage } from './sdkHistoryTypes';
+
+/**
+ * Summary-projection caps for oversized turns. Reading and projecting stay
+ * bounded even when a single turn dwarfs the whole window budget; omitted
+ * content is always marked, never silently dropped.
+ */
+export const HISTORY_SUMMARY_LIMITS = {
+  /** Per-entry read cap while materializing an oversized turn at summary level. */
+  entryReadBytes: 512 * 1024,
+  /** Head+tail excerpt budget for text blocks (split half/half). */
+  textExcerptChars: 2048,
+  /** Head excerpt cap for tool results. */
+  toolResultChars: 256,
+  /** Per-string cap inside tool inputs. */
+  toolInputChars: 256,
+  /** Tool input array cap; longer arrays are cut with an explicit marker. */
+  toolInputArrayItems: 32,
+} as const;
+
+export function excerptHeadTail(text: string, limit = HISTORY_SUMMARY_LIMITS.textExcerptChars): string {
+  if (text.length <= limit) return text;
+  const half = Math.floor(limit / 2);
+  const omitted = text.length - half * 2;
+  return `${text.slice(0, half)}\n\n[… ${omitted} characters omitted …]\n\n${text.slice(text.length - half)}`;
+}
+
+function excerptHead(text: string, limit: number): string {
+  if (text.length <= limit) return text;
+  return `${text.slice(0, limit)}\n[… ${text.length - limit} characters omitted …]`;
+}
+
+function shrinkJsonish(value: unknown, limit: number, depth: number): unknown {
+  if (typeof value === 'string') return value.length > limit ? excerptHead(value, limit) : value;
+  if (Array.isArray(value)) {
+    const capped = value.slice(0, HISTORY_SUMMARY_LIMITS.toolInputArrayItems)
+      .map(item => shrinkJsonish(item, limit, depth + 1));
+    if (value.length > HISTORY_SUMMARY_LIMITS.toolInputArrayItems) {
+      capped.push(`[… ${value.length - HISTORY_SUMMARY_LIMITS.toolInputArrayItems} more items omitted …]`);
+    }
+    return capped;
+  }
+  if (value && typeof value === 'object') {
+    if (depth >= 4) return '[object]';
+    const out: Record<string, unknown> = {};
+    for (const [key, entry] of Object.entries(value)) out[key] = shrinkJsonish(entry, limit, depth + 1);
+    return out;
+  }
+  return value;
+}
+
+function summarizeToolCall(toolCall: ToolCallInfo): void {
+  if (typeof toolCall.result === 'string' && toolCall.result.length > HISTORY_SUMMARY_LIMITS.toolResultChars) {
+    toolCall.result = excerptHead(toolCall.result, HISTORY_SUMMARY_LIMITS.toolResultChars);
+  }
+  toolCall.input = shrinkJsonish(toolCall.input, HISTORY_SUMMARY_LIMITS.toolInputChars, 0) as Record<string, unknown>;
+  // Diff payloads and nested subagent tool calls are detail-level content.
+  toolCall.diffData = undefined;
+  if (toolCall.subagent) {
+    if (typeof toolCall.subagent.result === 'string'
+      && toolCall.subagent.result.length > HISTORY_SUMMARY_LIMITS.toolResultChars) {
+      toolCall.subagent.result = excerptHead(toolCall.subagent.result, HISTORY_SUMMARY_LIMITS.toolResultChars);
+    }
+    // SubagentInfo.toolCalls is required; empty marks "detail omitted".
+    toolCall.subagent.toolCalls = [];
+  }
+}
+
+/** Shrinks a materialized message in place to the summary projection. */
+export function summarizeChatMessage(message: ChatMessage): void {
+  message.content = excerptHeadTail(message.content);
+  if (message.displayContent) message.displayContent = excerptHeadTail(message.displayContent);
+  // Base64 attachments never enter the summary projection.
+  message.images = undefined;
+  if (message.contentBlocks) {
+    message.contentBlocks = message.contentBlocks
+      .filter(block => block.type !== 'thinking')
+      .map(block => block.type === 'text' ? { ...block, content: excerptHeadTail(block.content) } : block);
+  }
+  for (const toolCall of message.toolCalls ?? []) summarizeToolCall(toolCall);
+}
+
+export function summarizeChatMessages(messages: ChatMessage[]): void {
+  for (const message of messages) summarizeChatMessage(message);
+}
+
+/**
+ * Deterministic projection-size estimate used for budget enforcement. String
+ * payloads count exactly; non-string input values are estimated at a fixed
+ * cost so structured inputs cannot bypass the char budget.
+ */
+export function measureChatProjectionChars(messages: ReadonlyArray<ChatMessage>): number {
+  let total = 0;
+  for (const message of messages) {
+    total += message.content.length + (message.displayContent?.length ?? 0);
+    for (const block of message.contentBlocks ?? []) {
+      if (block.type === 'text' || block.type === 'thinking') total += block.content.length;
+    }
+    for (const toolCall of message.toolCalls ?? []) {
+      total += toolCall.result?.length ?? 0;
+      for (const value of Object.values(toolCall.input ?? {})) {
+        total += typeof value === 'string' ? value.length : 64;
+      }
+      if (toolCall.subagent?.toolCalls) total += toolCall.subagent.toolCalls.length * 256;
+    }
+  }
+  return total;
+}
+
+const OMITTED_ENTRY_BYTES_TEXT = (bytes: number): string => `[… transcript entry of ${bytes} bytes omitted …]`;
+
+/**
+ * Placeholder for an oversized entry skipped during summary materialization.
+ * Tool-result entries keep a synthetic result so their paired tool calls show
+ * a completed status with an honest omission marker instead of "running".
+ * Returns null for entries with no projectable summary (tool_use/text/meta);
+ * those are covered by the aggregate turn marker.
+ */
+export function buildOversizedEntryPlaceholder(entry: TranscriptIndexEntry): SDKNativeMessage | null {
+  if (entry.toolResultIds.length === 0) return null;
+  return {
+    type: 'user',
+    uuid: `oversized-${entry.messageKey}`,
+    parentUuid: entry.parentUuid ?? null,
+    timestamp: entry.timestamp,
+    // Mirrors a real tool-result row: sourceToolUseID marks it system-injected
+    // so it feeds collectToolResults without breaking assistant grouping.
+    sourceToolUseID: entry.toolResultIds[0],
+    message: {
+      content: entry.toolResultIds.map(toolUseId => ({
+        type: 'tool_result' as const,
+        tool_use_id: toolUseId,
+        content: OMITTED_ENTRY_BYTES_TEXT(entry.length),
+      })),
+    },
+  };
+}
+
+/** Aggregate end-of-turn marker listing everything the summary left unread. */
+export function buildOversizedTurnMarker(
+  turnId: string,
+  skippedEntries: ReadonlyArray<TranscriptIndexEntry>,
+  fallbackTimestamp?: string,
+): SDKNativeMessage {
+  const omittedBytes = skippedEntries.reduce((sum, entry) => sum + entry.length, 0);
+  return {
+    type: 'assistant',
+    uuid: `oversized-marker-${turnId}`,
+    timestamp: fallbackTimestamp,
+    message: {
+      content: [{
+        type: 'text',
+        text: `[… ${skippedEntries.length} transcript entries (${omittedBytes} bytes) omitted from this oversized turn …]`,
+      }],
+    },
+  };
+}

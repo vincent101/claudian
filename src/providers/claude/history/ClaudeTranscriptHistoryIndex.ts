@@ -717,6 +717,14 @@ async function readIndexEntries(
   }
 }
 
+/** Reads an explicit entry subset (summary materialization path). */
+export async function materializeTranscriptEntries(
+  index: TranscriptHistoryIndex,
+  entries: TranscriptIndexEntry[],
+): Promise<SDKNativeMessage[]> {
+  return readIndexEntries(index, entries);
+}
+
 export async function materializeTranscriptPage(
   index: TranscriptHistoryIndex,
   startTurn: number,
