@@ -419,7 +419,55 @@ export interface HistoryIndexLease {
   ready: Promise<void>;
   search(query: string): Promise<HistorySearchResult[]>;
   loadRange(startInclusive: number, endExclusive: number): Promise<HistoryRangePage>;
+  /**
+   * Budget-bounded window materialization for interactive UI. `loadRange` stays
+   * for full-export style internal paths and must not be used by first-screen
+   * or paging flows.
+   */
+  loadWindow?(request: HistoryWindowRequest): Promise<HistoryWindowPage>;
+  /** Metadata-only window plan (no reads); used for progress reporting. */
+  planWindow?(request: HistoryWindowRequest): { start: number; end: number };
   release(): void;
+}
+
+/** Hard resource bounds shared by every history entry point. */
+export interface HistoryLoadBudget {
+  maxTurns: number;
+  maxSourceBytes: number;
+  maxProjectedChars: number;
+  /** Cooperative main-thread slice; lowers long tasks, never replaces the byte/char caps. */
+  timeSliceMs: number;
+}
+
+export type HistoryWindowDirection = 'older' | 'newer' | 'around';
+
+export type HistoryProjectionLevel = 'summary' | 'detail';
+
+export interface HistoryWindowRequest {
+  /** Global turn index the window grows from (exclusive end for 'older', start for 'newer', center for 'around'). */
+  anchorTurn: number;
+  direction: HistoryWindowDirection;
+  budget: HistoryLoadBudget;
+  projectionLevel: HistoryProjectionLevel;
+  /** Inclusive floor for 'older' planning: turns below are already loaded. */
+  minTurn?: number;
+  /** Exclusive ceiling for 'newer' planning. */
+  maxTurn?: number;
+}
+
+export interface HistoryWindowPage {
+  messages: ChatMessage[];
+  /** Actual half-open turn range that satisfied the budgets. */
+  range: LoadedTurnRange;
+  snapshotOffset?: number;
+  sourceBytes: number;
+  projectedChars: number;
+  /** Turns materialized through the oversized summary projection. */
+  oversizedTurnCount: number;
+  /** Stable per-range key for page-level caching. */
+  pageKey: string;
+  hasMoreBefore: boolean;
+  hasMoreAfter: boolean;
 }
 
 export interface ProviderConversationHistoryService {

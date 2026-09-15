@@ -42,6 +42,8 @@ export interface TranscriptTurnIndex {
   turnId: string;
   startEntry: number;
   endEntry: number;
+  /** Sum of entry byte lengths inside the turn; aggregated at finalize, no content read. */
+  sourceBytes: number;
 }
 
 export interface TranscriptSearchCorpusItem {
@@ -166,6 +168,7 @@ async function finalizeIndex(
   await yieldToMainThread(signal);
   let currentTurn: TranscriptTurnIndex | undefined;
   let currentTurnIndex = -1;
+  let currentTurnBytes = 0;
   const projection = createSDKProjectionState();
   const turns: TranscriptTurnIndex[] = [];
   const searchCorpus: TranscriptSearchCorpusItem[] = [];
@@ -175,16 +178,22 @@ async function finalizeIndex(
     const entry = canonical[index];
     const projectionKey = advanceSDKProjection(projection, entry.projectionKind, entry.messageKey);
     if (entry.realUser) {
-      if (currentTurn) currentTurn.endEntry = index - 1;
+      if (currentTurn) {
+        currentTurn.endEntry = index - 1;
+        currentTurn.sourceBytes = currentTurnBytes;
+      }
       currentTurn = {
         turnId: entry.uuid ?? entry.originMessageId!,
         startEntry: index,
         endEntry: index,
+        sourceBytes: 0,
       };
+      currentTurnBytes = entry.length;
       turns.push(currentTurn);
       currentTurnIndex = turns.length - 1;
     } else if (currentTurn) {
       currentTurn.endEntry = index;
+      currentTurnBytes += entry.length;
     }
     entry.turnId = currentTurn?.turnId;
     if (entry.searchText && currentTurnIndex >= 0 && projectionKey) {
@@ -210,6 +219,7 @@ async function finalizeIndex(
     delete (entry as Partial<RawIndexEntry>).projectionKind;
     if ((index + 1) % FINALIZE_BATCH_SIZE === 0) await yieldToMainThread(signal);
   }
+  if (currentTurn) currentTurn.sourceBytes = currentTurnBytes;
   return {
     filePath,
     dev: snapshot.dev,

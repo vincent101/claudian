@@ -133,6 +133,27 @@ describe('ClaudeTranscriptHistoryIndex', () => {
     ]);
   });
 
+  it('aggregates per-turn source bytes at finalize without reading content', async () => {
+    const path = join(process.env.TMPDIR ?? '/tmp', `claudian-turn-bytes-${process.pid}.jsonl`);
+    const lines = [
+      JSON.stringify({ type: 'user', uuid: 'u1', message: { content: 'one' } }),
+      JSON.stringify({ type: 'assistant', uuid: 'a1', parentUuid: 'u1', message: { content: 'first' } }),
+      JSON.stringify({ type: 'user', uuid: 'u2', parentUuid: 'a1', message: { content: 'second question' } }),
+      JSON.stringify({ type: 'assistant', uuid: 'a2', parentUuid: 'u2', message: { content: 'later' } }),
+    ];
+    await writeFile(path, `${lines.join('\n')}\n`);
+    const result = await buildTranscriptIndex(path, { useWorker: false });
+    expect(result.status).toBe('complete');
+    if (result.status !== 'complete') return;
+    expect(result.index.turns.map(turn => turn.turnId)).toEqual(['u1', 'u2']);
+    expect(result.index.turns[0].sourceBytes).toBe(
+      Buffer.byteLength(lines[0]) + Buffer.byteLength(lines[1]),
+    );
+    expect(result.index.turns[1].sourceBytes).toBe(
+      Buffer.byteLength(lines[2]) + Buffer.byteLength(lines[3]),
+    );
+  });
+
   it('pins snapshot size and ignores an appended half-line', async () => {
     const path = join(process.env.TMPDIR ?? '/tmp', `claudian-snapshot-${process.pid}.jsonl`);
     await writeFile(path, '{"type":"user","uuid":"u1","message":{"content":"one"}}\n{"type":"assistant"');

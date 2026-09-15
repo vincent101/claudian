@@ -106,7 +106,7 @@ describe('ClaudeConversationHistoryService M1 fuse', () => {
   });
 
   it('shares one build across leases and loads exact stateless ranges', async () => {
-    const turns = Array.from({ length: 120 }, (_, index) => ({ turnId: `u${index}`, startEntry: index, endEntry: index }));
+    const turns = Array.from({ length: 120 }, (_, index) => ({ turnId: `u${index}`, startEntry: index, endEntry: index, sourceBytes: 1024 }));
     mockBuildTranscriptIndex.mockResolvedValue({ status: 'complete', index: { filePath: '/current', dev: 1, ino: 1, snapshotSize: 999, mtimeMs: 1, entries: [], turns, searchCorpus: [], searchText: '', skippedLines: 0, buildDurationMs: 1, peakWorkerHeapBytes: 1 } });
     mockSdkSessionExists.mockImplementation((_vault, session) => session === 'current-session');
     mockMaterializeTranscriptPage.mockResolvedValue([]); mockMaterializeTranscriptToolAssociations.mockResolvedValue([]); mockMaterializeSDKMessages.mockResolvedValue([]);
@@ -126,7 +126,7 @@ describe('ClaudeConversationHistoryService M1 fuse', () => {
       { projectionKey: 'same', turnIndex: 1, timestamp: '', textOffset: 0, textLength: 13 },
       { projectionKey: 'same', turnIndex: 1, timestamp: '', textOffset: 14, textLength: 12 },
     ];
-    mockBuildTranscriptIndex.mockResolvedValue({ status: 'complete', index: { filePath: '/current', dev: 1, ino: 1, snapshotSize: 1, mtimeMs: 1, entries: [], turns: [{ turnId: '0', startEntry: 0, endEntry: 0 }, { turnId: '1', startEntry: 1, endEntry: 1 }], searchCorpus, searchText, skippedLines: 0, buildDurationMs: 1, peakWorkerHeapBytes: 1 } });
+    mockBuildTranscriptIndex.mockResolvedValue({ status: 'complete', index: { filePath: '/current', dev: 1, ino: 1, snapshotSize: 1, mtimeMs: 1, entries: [], turns: [{ turnId: '0', startEntry: 0, endEntry: 0, sourceBytes: 1024 }, { turnId: '1', startEntry: 1, endEntry: 1, sourceBytes: 1024 }], searchCorpus, searchText, skippedLines: 0, buildDurationMs: 1, peakWorkerHeapBytes: 1 } });
     mockSdkSessionExists.mockImplementation((_vault, session) => session === 'current-session');
     const service = new ClaudeConversationHistoryService(); const lease = service.acquireHistoryIndex(createConversation(), '/vault'); await lease.ready;
     await expect(lease.search('needle')).resolves.toEqual([
