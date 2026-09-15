@@ -29,7 +29,6 @@ import {
 } from './ClaudeHistoryStore';
 import {
   buildTranscriptIndex,
-  clearTranscriptIndexCache,
   materializeTranscriptEntries,
   materializeTranscriptPage,
   materializeTranscriptToolAssociations,
@@ -463,13 +462,9 @@ export class ClaudeConversationHistoryService implements ProviderConversationHis
 
       if (result.status === 'oversize') {
         oversizeSegments.push({ sessionId, sizeBytes: result.sizeBytes ?? 0 });
-        // M2 shadow only: build the paged-history index without changing M1's
-        // blocked UI or starting the runtime/observer. M3 will consume it.
-        // Shadow-mode fire-and-forget: snapshotKey stat failures on vanishing
-        // transcripts (file-race) must not surface as unhandled rejections.
-        void buildTranscriptIndex(getSDKSessionPath(vaultPath, sessionId), {
-          resumeAtMessageId: truncateAt,
-        }).catch(() => {});
+        // Oversize hydration only reports structured state; the active tab
+        // builds the index exclusively through acquireHistoryIndex so the same
+        // snapshot is never rebuilt twice from split entry points.
         continue;
       }
       if (result.status === 'failed') {
@@ -565,11 +560,13 @@ export class ClaudeConversationHistoryService implements ProviderConversationHis
         released = true;
         fixed.refs -= 1;
         if (fixed.refs > 0) return;
-        fixed.controller.abort();
+        // Unfinished builds abort; completed indexes only lose their lease
+        // protection and stay in the global completed cache as idle entries
+        // so reopening the same snapshot hits instead of rebuilding.
+        if (!fixed.state) fixed.controller.abort();
         fixed.protectedPaths.forEach(releaseTranscriptIndex);
         if (this.sharedIndexes.get(conversation.id) === fixed) {
           this.sharedIndexes.delete(conversation.id);
-          clearTranscriptIndexCache();
         }
       },
     };

@@ -6,16 +6,18 @@ import {
   type HistoryIndexLease,
   type HistoryLoadProgress,
   type HistorySearchResult,
+  type HistoryWindowRequest,
   type LoadedTurnRange,
   type ProviderId,
   type TitleGenerationService,
 } from '../../../core/providers/types';
 import type { ChatRuntime } from '../../../core/runtime/ChatRuntime';
-import type { Conversation } from '../../../core/types';
+import type { ChatMessage, Conversation } from '../../../core/types';
 import { t } from '../../../i18n/i18n';
 import type ClaudianPlugin from '../../../main';
 import { confirm } from '../../../shared/modals/ConfirmModal';
 import { getVaultPath } from '../../../utils/path';
+import { HISTORY_RESOURCE_POLICY } from '../history/HistoryResourcePolicy';
 import type { MessageRenderer } from '../rendering/MessageRenderer';
 import { cleanupThinkingBlock } from '../rendering/ThinkingBlockRenderer';
 import { findRewindContext } from '../rewind';
@@ -235,19 +237,18 @@ export class ConversationController {
       // placeholder; rethrowing the oversize error instead would show only
       // the segment-size list and hide the cause (M3: any segment error
       // must be visible).
+      const lease = this.acquireLease(conversation, historyService);
+      // Single ownership transfer: only a successful write to
+      // state.historyLease hands the lease over; every earlier failure
+      // (ready, window load, generation invalidation) releases it exactly
+      // once in the finally below.
+      let transferred = false;
       try {
-        const lease = this.acquireLease(conversation, historyService);
-        try {
-          await lease.ready;
-        } catch (error) {
-          lease.release();
-          throw error;
-        }
-        const start = Math.max(0, lease.totalTurns - 50);
-        this.deps.onHistoryLoadProgress?.({ phase: 'loading', turnCount: lease.totalTurns - start });
-        const page = await lease.loadRange(start, lease.totalTurns);
+        await lease.ready;
+        const firstScreen = lease.loadWindow
+          ? await this.loadFirstScreenWindow(lease)
+          : await this.loadLegacyFirstScreen(lease);
         if (!shouldApply()) {
-          lease.release();
           return;
         }
         // Write the page back into the stored conversation so every later
@@ -255,14 +256,16 @@ export class ConversationController {
         // view the tab renders. Mirrors full hydration mutating the stored
         // conversation in place; session metadata never persists messages,
         // so this stays an in-memory view only.
-        conversation.messages = page.messages;
+        conversation.messages = firstScreen.messages;
         paged = true;
         state.historyLease = lease;
-        state.loadedRanges = [page.range];
-        state.historyHasMore = page.range.start > 0;
-        state.historySnapshotOffset = page.snapshotOffset ?? null;
+        transferred = true;
+        state.loadedRanges = [firstScreen.range];
+        state.historyHasMore = firstScreen.hasMoreBefore;
+        state.historySnapshotOffset = firstScreen.snapshotOffset ?? null;
         state.historyError = null;
       } finally {
+        if (!transferred) lease.release();
         state.historyLoading = false;
       }
     }
@@ -322,6 +325,10 @@ export class ConversationController {
     const { state } = this.deps;
     const lease = state.historyLease;
     if (!lease || state.historyLoading) return;
+    if (lease.loadWindow) {
+      await this.loadOlderWindow(lease);
+      return;
+    }
     const range = this.nextOlderRange(state.loadedRanges, lease.totalTurns, 50);
     if (!range) return;
     state.historyLoading = true;
@@ -329,6 +336,93 @@ export class ConversationController {
     this.renderHistoryPager();
     try {
       await this.loadRange(range.start, range.end, false);
+    } catch (error) {
+      state.historyError = error instanceof Error ? error.message : String(error);
+    } finally {
+      state.historyLoading = false;
+      this.renderHistoryPager();
+    }
+  }
+
+  /** Budget-window first screen; every oversized turn arrives as a summary projection. */
+  private async loadFirstScreenWindow(lease: HistoryIndexLease): Promise<{
+    messages: ChatMessage[];
+    range: LoadedTurnRange;
+    hasMoreBefore: boolean;
+    snapshotOffset?: number;
+  }> {
+    const request: HistoryWindowRequest = {
+      anchorTurn: lease.totalTurns,
+      direction: 'older',
+      budget: HISTORY_RESOURCE_POLICY.firstScreen,
+      projectionLevel: 'summary',
+    };
+    const planned = lease.planWindow?.(request);
+    this.deps.onHistoryLoadProgress?.({
+      phase: 'loading',
+      turnCount: planned ? Math.max(0, planned.end - planned.start) : HISTORY_RESOURCE_POLICY.firstScreen.maxTurns,
+    });
+    const page = await lease.loadWindow!(request);
+    return {
+      messages: page.messages,
+      range: page.range,
+      hasMoreBefore: page.hasMoreBefore,
+      snapshotOffset: page.snapshotOffset,
+    };
+  }
+
+  /** Legacy providers without loadWindow keep the fixed 50-turn first page. */
+  private async loadLegacyFirstScreen(lease: HistoryIndexLease): Promise<{
+    messages: ChatMessage[];
+    range: LoadedTurnRange;
+    hasMoreBefore: boolean;
+    snapshotOffset?: number;
+  }> {
+    const start = Math.max(0, lease.totalTurns - 50);
+    this.deps.onHistoryLoadProgress?.({ phase: 'loading', turnCount: lease.totalTurns - start });
+    const page = await lease.loadRange(start, lease.totalTurns);
+    return {
+      messages: page.messages,
+      range: page.range,
+      hasMoreBefore: page.range.start > 0,
+      snapshotOffset: page.snapshotOffset,
+    };
+  }
+
+  /**
+   * "Load earlier" through a budget window anchored at the newest loaded
+   * range start, floored at the adjacent older range so already-loaded turns
+   * are never re-materialized.
+   */
+  private async loadOlderWindow(lease: HistoryIndexLease): Promise<void> {
+    const { state } = this.deps;
+    const total = lease.totalTurns;
+    const merged = this.mergeRanges(state.loadedRanges);
+    const newest = merged.find(range => range.start <= total - 1 && range.end >= total);
+    const anchor = newest ? newest.start : total;
+    if (anchor <= 0) return;
+    const older = [...merged].reverse().find(range => range.end <= anchor);
+    state.historyLoading = true;
+    state.historyError = null;
+    this.renderHistoryPager();
+    try {
+      const page = await lease.loadWindow!({
+        anchorTurn: anchor,
+        direction: 'older',
+        budget: HISTORY_RESOURCE_POLICY.paging,
+        projectionLevel: 'summary',
+        minTurn: older ? older.end : 0,
+      });
+      const existingIds = new Set(state.messages.map(message => message.id));
+      const added = page.messages.filter(message => !existingIds.has(message.id));
+      const combined = [...state.messages, ...added].sort((a, b) => a.timestamp - b.timestamp);
+      state.messages = combined;
+      const addedIds = new Set(added.map(message => message.id));
+      const prepend = combined.filter(message => addedIds.has(message.id));
+      this.deps.renderer.prependMessages(prepend, combined);
+      state.loadedRanges = this.mergeRanges([...state.loadedRanges, page.range]);
+      state.historyHasMore = !this.coversAll(state.loadedRanges, total);
+      state.historySnapshotOffset = page.snapshotOffset ?? state.historySnapshotOffset;
     } catch (error) {
       state.historyError = error instanceof Error ? error.message : String(error);
     } finally {

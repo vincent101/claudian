@@ -164,6 +164,18 @@ describe('ClaudeTranscriptHistoryIndex', () => {
     expect(result.error).toMatch(/incomplete/i);
   });
 
+  it('keeps a released completed index as an idle cache hit', async () => {
+    clearTranscriptIndexCache();
+    const path = join(process.env.TMPDIR ?? '/tmp', `claudian-idle-${process.pid}.jsonl`);
+    await writeFile(path, `${JSON.stringify({ type: 'user', uuid: 'u1', message: { content: 'x' } })}\n`);
+    const first = await buildTranscriptIndex(path, { useWorker: false });
+    expect(first.status).toBe('complete');
+    // A released lease must not wipe the completed cache; the same snapshot
+    // rebuild resolves to the cached result object without a second scan.
+    const second = await buildTranscriptIndex(path, { useWorker: false });
+    expect(second).toBe(first);
+  });
+
   it('keeps at most two unprotected completed indexes', async () => {
     clearTranscriptIndexCache();
     for (let index = 0; index < 3; index += 1) {

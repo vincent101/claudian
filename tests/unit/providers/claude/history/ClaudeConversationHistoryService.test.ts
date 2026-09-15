@@ -4,6 +4,7 @@ import { ClaudeConversationHistoryService } from '@/providers/claude/history/Cla
 import { loadSDKSessionMessages, materializeSDKMessages, sdkSessionExists } from '@/providers/claude/history/ClaudeHistoryStore';
 import {
   buildTranscriptIndex,
+  clearTranscriptIndexCache,
   materializeTranscriptEntries,
   materializeTranscriptPage,
   materializeTranscriptToolAssociations,
@@ -31,6 +32,7 @@ const mockLoadSDKSessionMessages = loadSDKSessionMessages as jest.MockedFunction
 const mockSdkSessionExists = sdkSessionExists as jest.MockedFunction<typeof sdkSessionExists>;
 const mockBuildTranscriptIndex = buildTranscriptIndex as jest.MockedFunction<typeof buildTranscriptIndex>;
 const mockMaterializeTranscriptEntries = materializeTranscriptEntries as jest.MockedFunction<typeof materializeTranscriptEntries>;
+const mockClearTranscriptIndexCache = clearTranscriptIndexCache as jest.MockedFunction<typeof clearTranscriptIndexCache>;
 const mockMaterializeTranscriptPage = materializeTranscriptPage as jest.MockedFunction<typeof materializeTranscriptPage>;
 const mockMaterializeTranscriptToolAssociations = materializeTranscriptToolAssociations as jest.MockedFunction<typeof materializeTranscriptToolAssociations>;
 const mockMaterializeSDKMessages = materializeSDKMessages as jest.MockedFunction<typeof materializeSDKMessages>;
@@ -105,8 +107,9 @@ describe('ClaudeConversationHistoryService M1 fuse', () => {
       segments: [{ sessionId: 'current-session', sizeBytes: 65 * 1024 * 1024 }],
     });
     expect(conversation.messages).toEqual([]);
-    expect(mockBuildTranscriptIndex).toHaveBeenCalledTimes(1);
-    expect(mockBuildTranscriptIndex.mock.calls[0][0]).toContain('current-session.jsonl');
+    // Shadow prewarm removed: the oversize hydration only reports structured
+    // state; the active tab builds the index through acquireHistoryIndex.
+    expect(mockBuildTranscriptIndex).not.toHaveBeenCalled();
   });
 
   it('shares one build across leases and loads exact stateless ranges', async () => {
@@ -321,6 +324,23 @@ describe('ClaudeConversationHistoryService M1 fuse', () => {
 
       expect(page.range).toEqual({ start: 7, end: 15 });
       expect(mockMaterializeTranscriptPage).toHaveBeenCalledTimes(8);
+    });
+
+    it('unprotects the snapshot without clearing the global transcript cache', async () => {
+      const turns = Array.from({ length: 3 }, (_, index) => ({ turnId: `u${index}`, startEntry: index, endEntry: index, sourceBytes: 1024 }));
+      mockBuildTranscriptIndex.mockResolvedValue(mockIndex(turns));
+      mockSdkSessionExists.mockImplementation((_vault, session) => session === 'current-session');
+      mockMaterializeTranscriptPage.mockResolvedValue([]);
+      const service = new ClaudeConversationHistoryService();
+      const lease = service.acquireHistoryIndex(createConversation(), '/vault');
+      await lease.ready;
+
+      lease.release();
+
+      // release() unprotects the snapshot for LRU but never wipes the global
+      // completed cache; the idle-cache hit itself is covered by the index
+      // module tests against the real cache.
+      expect(mockClearTranscriptIndexCache).not.toHaveBeenCalled();
     });
   });
 
