@@ -14,6 +14,7 @@ import {
   destroyTab,
   getBlankTabModelOptions,
   getTabTitle,
+  handleTabHistoryLoadProgress,
   initializeTabControllers,
   initializeTabService,
   initializeTabUI,
@@ -491,6 +492,34 @@ describe('Tab - History hydration progress', () => {
     renderTabHydrationPlaceholder(tab);
 
     expect(tab.dom.messagesEl.children[0]?.children[0]?.textContent).toContain(expected);
+  });
+});
+
+describe('Tab - History load progress gate', () => {
+  it('ignores progress once hydration is READY so late index builds cannot clobber rendered messages', () => {
+    const tab = createTab(createMockOptions());
+    tab.hydrationState = 'READY';
+    tab.historyLoadProgress = null;
+    const rendered = tab.dom.messagesEl.createDiv({ text: 'rendered message' });
+    const childrenBefore = [...tab.dom.messagesEl.children];
+
+    handleTabHistoryLoadProgress(tab, { phase: 'indexing', percent: 50 });
+
+    // Placeholder rendering empties messagesEl first; both the preserved
+    // child count and the surviving rendered node prove it never ran.
+    expect(tab.dom.messagesEl.children).toHaveLength(childrenBefore.length);
+    expect(tab.dom.messagesEl.children).toContain(rendered);
+    expect(tab.historyLoadProgress).toBeNull();
+  });
+
+  it('renders the placeholder for progress while hydration is in flight', () => {
+    const tab = createTab(createMockOptions());
+    tab.hydrationState = 'LOADING';
+
+    handleTabHistoryLoadProgress(tab, { phase: 'queued' });
+
+    expect(tab.historyLoadProgress).toEqual({ phase: 'queued' });
+    expect(tab.dom.messagesEl.children[0]?.children[0]?.textContent).toContain('Waiting for index');
   });
 });
 

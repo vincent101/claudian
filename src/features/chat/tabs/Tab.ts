@@ -9,6 +9,7 @@ import { ProviderRegistry } from '../../../core/providers/ProviderRegistry';
 import { ProviderSettingsCoordinator } from '../../../core/providers/ProviderSettingsCoordinator';
 import { ProviderWorkspaceRegistry } from '../../../core/providers/ProviderWorkspaceRegistry';
 import type {
+  HistoryLoadProgress,
   ProviderCapabilities,
   ProviderChatUIConfig,
   ProviderId,
@@ -1300,10 +1301,7 @@ export function initializeTabControllers(
       switchToHydrationShell: hydrationHooks?.switchToHydrationShell,
       markHydrationReady: hydrationHooks?.markHydrationReady,
       isHydrationReady: hydrationHooks?.isHydrationReady,
-      onHistoryLoadProgress: progress => {
-        tab.historyLoadProgress = progress;
-        renderTabHydrationPlaceholder(tab);
-      },
+      onHistoryLoadProgress: progress => handleTabHistoryLoadProgress(tab, progress),
       ensureServiceForConversation: async (conversation) => {
         const nextProviderId = getTabProviderId(tab, plugin, conversation);
         const providerChanged = tab.providerId !== nextProviderId;
@@ -1660,6 +1658,19 @@ export function renderTabHydrationPlaceholder(
     const retry = placeholder.createEl('button', { text: t('chat.history.retry') });
     retry.addEventListener('click', () => onRetry?.());
   }
+}
+
+/**
+ * Gate for history-index progress events. Past READY the rendered messages
+ * are the tab's truth and hydrateTab already nulled historyLoadProgress, so
+ * a late event belongs to a stale request (background index build reaching
+ * the tab after hydration finished) and must neither resurrect the
+ * placeholder nor leave a stale field a later shell re-render would pick up.
+ */
+export function handleTabHistoryLoadProgress(tab: TabData, progress: HistoryLoadProgress): void {
+  if (tab.hydrationState === 'READY') return;
+  tab.historyLoadProgress = progress;
+  renderTabHydrationPlaceholder(tab);
 }
 
 /**

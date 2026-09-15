@@ -512,7 +512,9 @@ export class ConversationController {
     const previous = state.historyLease;
     // Rollback path: the old lease stays live until the new snapshot is ready,
     // so a failed refresh keeps pagination and search usable on stale data.
-    const next = this.acquireLease(conversation, service, true);
+    // Silent acquire: the refresh runs after stream completion with the tab
+    // already READY, so index progress must not touch the rendered messages.
+    const next = this.acquireLease(conversation, service, true, false);
     state.historyLease = next;
     try {
       await next.ready;
@@ -642,7 +644,10 @@ export class ConversationController {
       return;
     }
     this.deps.state.historyLease?.release();
-    this.deps.state.historyLease = this.acquireLease(conversation, service);
+    // Silent acquire: this lease only pre-warms the index for search and
+    // paging; the conversation is already rendered and its late progress
+    // events must not resurrect the hydration placeholder.
+    this.deps.state.historyLease = this.acquireLease(conversation, service, false, false);
     this.deps.state.loadedRanges = [];
     this.deps.state.historyHasMore = false;
   }
@@ -652,8 +657,14 @@ export class ConversationController {
     vaultPath: string | null,
     onProgress?: (progress: HistoryLoadProgress) => void,
     forceNewSnapshot?: boolean,
-  ) => HistoryIndexLease }, forceNewSnapshot = false): HistoryIndexLease {
-    const progress = (value: HistoryLoadProgress) => this.deps.onHistoryLoadProgress?.(value);
+  ) => HistoryIndexLease }, forceNewSnapshot = false, notifyProgress = true): HistoryIndexLease {
+    // Silent acquires (warm-up lease, search snapshot refresh) omit the
+    // callback entirely — the service only emits progress when one is
+    // passed — so their async index events can never drive the hydration
+    // placeholder over messages that are already rendered.
+    const progress = notifyProgress
+      ? (value: HistoryLoadProgress) => this.deps.onHistoryLoadProgress?.(value)
+      : undefined;
     const lease = forceNewSnapshot
       ? service.acquireHistoryIndex?.(conversation, getVaultPath(this.deps.plugin.app), progress, true)
       : service.acquireHistoryIndex?.(conversation, getVaultPath(this.deps.plugin.app), progress);

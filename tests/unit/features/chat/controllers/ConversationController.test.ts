@@ -363,6 +363,56 @@ describe('ConversationController', () => {
       (deps.renderer.findMessageElement as jest.Mock).mockReturnValue(null);
       await expect(controller.locateHistorySearchResult({ projectionKey: 'missing', turnIndex: 3, matchOrdinal: 0, matchedText: 'needle' })).rejects.toThrow('projection_mismatch');
     });
+
+    it('binds the warm-up lease silently so index building cannot drive the hydration placeholder', async () => {
+      const conversation = { id: 'small', providerId: 'claude', title: 'Small', messages: [{ id: 'm1', role: 'user', content: 'hi', timestamp: 1 }], sessionId: 'session', createdAt: 1, updatedAt: 1 } as any;
+      deps.state.currentConversationId = 'small';
+      (deps.plugin.getConversationById as jest.Mock).mockResolvedValue(conversation);
+      const lease = makeLease(10);
+      const service = { acquireHistoryIndex: jest.fn().mockReturnValue(lease) };
+      jest.spyOn(ProviderRegistry, 'getConversationHistoryService').mockReturnValue(service as any);
+
+      await controller.loadActive();
+
+      // Non-paged loadActive renders the full transcript first; the warm-up
+      // acquire must not pass a progress callback or its async index events
+      // replace the rendered messages with the hydration placeholder.
+      expect(service.acquireHistoryIndex).toHaveBeenCalledWith(conversation, '/vault', undefined);
+      expect(deps.state.historyLease).toBe(lease);
+    });
+
+    it('keeps progress reporting for the paged first-screen acquire', async () => {
+      const conversation = { id: 'large', providerId: 'claude', title: 'Large', messages: [], sessionId: 'session', createdAt: 1, updatedAt: 1 } as any;
+      deps.state.currentConversationId = 'large';
+      (deps.plugin.getConversationById as jest.Mock).mockRejectedValue(new ConversationHistoryHydrationError({ status: 'oversize', segments: [{ sessionId: 'session', sizeBytes: 99 }] }));
+      (deps.plugin.getConversationSync as jest.Mock).mockReturnValue(conversation);
+      const lease = makeLease();
+      lease.loadWindow.mockResolvedValue({ messages: [{ id: 'latest', role: 'user', content: 'latest', timestamp: 1 }], range: { start: 110, end: 120 }, snapshotOffset: 123, sourceBytes: 1024, projectedChars: 7, oversizedTurnCount: 0, pageKey: 'w:110:120', hasMoreBefore: true, hasMoreAfter: false });
+      const service = { acquireHistoryIndex: jest.fn().mockReturnValue(lease) };
+      jest.spyOn(ProviderRegistry, 'getConversationHistoryService').mockReturnValue(service as any);
+
+      await controller.loadActive();
+
+      // The oversize first screen shows index phases on the placeholder, so
+      // this acquire keeps its progress callback (default semantics).
+      expect(service.acquireHistoryIndex).toHaveBeenCalledWith(conversation, '/vault', expect.any(Function));
+    });
+
+    it('refreshes the search snapshot silently (runs after READY with rendered messages)', async () => {
+      deps.state.currentConversationId = 'large';
+      const conversation = { id: 'large', providerId: 'claude', title: 'Large', messages: [], sessionId: 'session', createdAt: 1, updatedAt: 1 } as any;
+      (deps.plugin.getConversationSync as jest.Mock).mockReturnValue(conversation);
+      const previous = makeLease(100);
+      deps.state.historyLease = previous as any;
+      const next = makeLease(100);
+      const service = { acquireHistoryIndex: jest.fn().mockReturnValue(next) };
+      jest.spyOn(ProviderRegistry, 'getConversationHistoryService').mockReturnValue(service as any);
+
+      await controller.refreshHistorySearchSnapshot();
+
+      expect(service.acquireHistoryIndex).toHaveBeenCalledWith(conversation, '/vault', undefined, true);
+      expect(previous.release).toHaveBeenCalled();
+    });
   });
 
   describe('Queue Management', () => {
