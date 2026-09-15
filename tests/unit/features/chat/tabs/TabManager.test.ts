@@ -1848,6 +1848,60 @@ describe('TabManager - SDK Commands', () => {
     expect(readyClaudeService.getSupportedCommands).toHaveBeenCalledTimes(1);
   });
 
+  it('keeps the command warmup chain alive for a READY paged (oversize) conversation', async () => {
+    // Regression: a paged conversation never caches as hydrated in the history
+    // service, so plugin.getConversationById re-throws the oversize error on
+    // every call. The warmup context must fall back to the in-memory snapshot
+    // instead of rejecting, or the slash dropdown loses all provider entries
+    // (including runtime-supported commands like /compact).
+    const supportedCommands = [{ id: 'sdk:compact', name: 'compact', content: '' }];
+    const readyClaudeService = {
+      providerId: 'claude',
+      isReady: jest.fn().mockReturnValue(true),
+      getSupportedCommands: jest.fn().mockResolvedValue(supportedCommands),
+    };
+    const pagedConversation = {
+      id: 'conv-paged',
+      providerId: 'claude',
+      messages: [{ id: 'm1', role: 'user' as const, content: 'hi', timestamp: 1 }],
+    };
+    const plugin = createMockPlugin({
+      getConversationById: jest.fn().mockImplementation(async () => {
+        throw new ConversationHistoryHydrationError({
+          status: 'oversize',
+          segments: [{ sessionId: 'session-huge', sizeBytes: 95_871_725 }],
+        });
+      }),
+      getConversationSync: jest.fn().mockReturnValue(pagedConversation),
+    });
+    const mockCatalog = { setRuntimeCommands: jest.fn() };
+    ProviderWorkspaceRegistry.setServices('claude', {
+      commandCatalog: mockCatalog as any,
+      tabWarmupPolicy: commandWarmupPolicy as any,
+    });
+    const manager = createManager({
+      plugin,
+      tabFactory: (n) => createMockTabData(
+        n === 1
+          ? { id: 'tab-ready', providerId: 'claude', service: readyClaudeService }
+          : {
+            id: 'tab-paged',
+            providerId: 'claude',
+            conversationId: 'conv-paged',
+            lifecycleState: 'bound_active',
+            hydrationState: 'READY',
+          },
+      ),
+    });
+
+    await manager.createTab();
+    const pagedTab = await manager.createTab(undefined, 'tab-paged', { activate: false });
+
+    await expect(manager.getSdkCommands(pagedTab!.id)).resolves.toEqual(supportedCommands);
+    expect(plugin.getConversationSync).toHaveBeenCalledWith('conv-paged');
+    expect(mockCatalog.setRuntimeCommands).toHaveBeenLastCalledWith(supportedCommands);
+  });
+
   it('should not leak commands across providers', async () => {
     const claudeCommands = [{ id: 'sdk:commit', name: 'commit', content: '' }];
     const readyClaudeService = {

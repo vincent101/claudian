@@ -1023,11 +1023,33 @@ export class TabManager implements TabManagerInterface {
     tab: TabData,
     providerId: ProviderId,
   ): Promise<ProviderWarmupContext> {
-    const conversation = tab.conversationId
-      ? (tab.hydrationState === 'READY'
-          ? await this.plugin.getConversationById(tab.conversationId)
-          : this.plugin.getConversationSync(tab.conversationId))
-      : null;
+    // A READY tab may carry a paged (oversize) conversation whose
+    // getConversationById re-throws the oversize hydration error on every
+    // call — that throw is load-bearing for switch/restore paths, but here it
+    // would reject getSdkCommands and silently kill the provider command
+    // catalog (runtime-supported commands like /compact would never appear in
+    // the dropdown). Fall back to the in-memory snapshot the paged tab
+    // actually renders, mirroring hydrateTab's initializeTabService override.
+    // Inlined (no helper) so the success path keeps its single await.
+    let conversation: Conversation | null = null;
+    if (tab.conversationId) {
+      if (tab.hydrationState === 'READY') {
+        try {
+          conversation = await this.plugin.getConversationById(tab.conversationId);
+        } catch (error) {
+          if (
+            error instanceof ConversationHistoryHydrationError
+            && error.result.status === 'oversize'
+          ) {
+            conversation = this.plugin.getConversationSync(tab.conversationId);
+          } else {
+            throw error;
+          }
+        }
+      } else {
+        conversation = this.plugin.getConversationSync(tab.conversationId);
+      }
+    }
     const hasConversationContext = (conversation?.messages.length ?? 0) > 0;
     const externalContextPaths = tab.ui.externalContextSelector?.getExternalContexts()
       ?? (hasConversationContext
