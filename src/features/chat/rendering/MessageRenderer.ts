@@ -349,12 +349,18 @@ export class MessageRenderer {
     const complete = (): void => {
       if (this.renderIdleResolver === resolveIdle) this.renderIdleResolver = null;
       if (generation === this.renderGeneration) {
-        recordHistoryRenderEvent({
-          kind: 'render_complete',
-          messages: messages.length,
-          batches,
-          elapsedMs: performance.now() - startedAt,
-        });
+        try {
+          recordHistoryRenderEvent({
+            kind: 'render_complete',
+            messages: messages.length,
+            batches,
+            elapsedMs: performance.now() - startedAt,
+          });
+        } catch {
+          // Diagnostics must never block idle settlement: a throwing sink
+          // here would wedge waitForRenderedMessages — and hydration READY —
+          // forever.
+        }
       }
       resolveIdle();
     };
@@ -363,44 +369,53 @@ export class MessageRenderer {
         complete();
         return;
       }
-      const sliceStart = performance.now();
-      const original = this.messagesEl;
-      const fragment = prepend
-        ? document.createDocumentFragment()
-        : null;
-      if (fragment) this.messagesEl = fragment as unknown as HTMLElement;
-      let index = from;
+      let handedOff = false;
       try {
-        while (
-          index < messages.length
-          && index - from < HISTORY_RENDER_LIMITS.renderBatchMessages
-          && (index === from || performance.now() - sliceStart < HISTORY_RENDER_LIMITS.renderTimeSliceMs)
-        ) {
-          this.renderStoredMessage(messages[index], allMessages, index);
-          index += 1;
+        const sliceStart = performance.now();
+        const original = this.messagesEl;
+        const fragment = prepend
+          ? document.createDocumentFragment()
+          : null;
+        if (fragment) this.messagesEl = fragment as unknown as HTMLElement;
+        let index = from;
+        try {
+          while (
+            index < messages.length
+            && index - from < HISTORY_RENDER_LIMITS.renderBatchMessages
+            && (index === from || performance.now() - sliceStart < HISTORY_RENDER_LIMITS.renderTimeSliceMs)
+          ) {
+            this.renderStoredMessage(messages[index], allMessages, index);
+            index += 1;
+          }
+        } finally {
+          if (fragment) this.messagesEl = original;
         }
+        if (fragment) {
+          const anchor = original.querySelector('.claudian-message') as HTMLElement | null;
+          const before = anchor?.getBoundingClientRect().top ?? 0;
+          original.insertBefore(fragment, anchor);
+          if (anchor) original.scrollTop += anchor.getBoundingClientRect().top - before;
+        }
+        batches += 1;
+        recordHistoryRenderEvent({
+          kind: 'render_batch',
+          mounted: index - from,
+          total: messages.length,
+          elapsedMs: performance.now() - sliceStart,
+        });
+        if (index < messages.length) {
+          this.scheduleFrame(() => step(index));
+          handedOff = true;
+          return;
+        }
+        if (!prepend) this.scrollToBottom();
       } finally {
-        if (fragment) this.messagesEl = original;
+        // Top-level guard: a throw between the per-message catch and the
+        // frame handoff (fragment insert, diagnostics sink, scroll) must
+        // still settle idle — a wedged resolver leaves hydration LOADING
+        // forever. Only a successfully handed-off frame defers completion.
+        if (!handedOff) complete();
       }
-      if (fragment) {
-        const anchor = original.querySelector('.claudian-message') as HTMLElement | null;
-        const before = anchor?.getBoundingClientRect().top ?? 0;
-        original.insertBefore(fragment, anchor);
-        if (anchor) original.scrollTop += anchor.getBoundingClientRect().top - before;
-      }
-      batches += 1;
-      recordHistoryRenderEvent({
-        kind: 'render_batch',
-        mounted: index - from,
-        total: messages.length,
-        elapsedMs: performance.now() - sliceStart,
-      });
-      if (index < messages.length) {
-        this.scheduleFrame(() => step(index));
-        return;
-      }
-      if (!prepend) this.scrollToBottom();
-      complete();
     };
     step(0);
   }

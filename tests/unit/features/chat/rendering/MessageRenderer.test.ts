@@ -2051,6 +2051,34 @@ describe('MessageRenderer', () => {
       }
     });
 
+    it('still settles render idle when a frame step throws mid-render', async () => {
+      let batches = 0;
+      setHistoryRenderDiagnosticsSink(() => {
+        batches += 1;
+        // The sink throws after the first frame mounts (e.g. a failing
+        // diagnostics log write) — idle must still settle or hydration
+        // stays LOADING forever.
+        if (batches > 1) throw new Error('sink failure');
+      });
+      try {
+        const { renderer } = createRenderer();
+        jest.spyOn(renderer, 'renderContent').mockResolvedValue(undefined);
+        const messages = Array.from({ length: 45 }, (_, index) => ({
+          id: `m${index}`, role: 'user' as const, content: `m${index}`, timestamp: index,
+        }));
+
+        renderer.renderMessages(messages, () => 'Hello');
+        const callbacks = rafQueue.splice(0);
+        expect(() => {
+          for (const callback of callbacks) callback(0);
+        }).toThrow('sink failure');
+
+        await expect(renderer.waitForRenderedMessages()).resolves.toBeUndefined();
+      } finally {
+        setHistoryRenderDiagnosticsSink(null);
+      }
+    });
+
     it('stops a superseded render queue when a new render starts', async () => {
       const { renderer } = createRenderer();
       jest.spyOn(renderer, 'renderContent').mockResolvedValue(undefined);
