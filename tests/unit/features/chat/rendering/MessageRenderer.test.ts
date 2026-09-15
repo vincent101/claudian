@@ -2073,6 +2073,66 @@ describe('MessageRenderer', () => {
       expect(rendered.filter(id => id.startsWith('b'))).toHaveLength(3);
     });
 
+    it('does not let a superseded render read as global idle (condition wait)', async () => {
+      const { renderer } = createRenderer();
+      jest.spyOn(renderer, 'renderContent').mockResolvedValue(undefined);
+      const first = Array.from({ length: 45 }, (_, index) => ({
+        id: `a${index}`, role: 'user' as const, content: `a${index}`, timestamp: index,
+      }));
+      const second = Array.from({ length: 45 }, (_, index) => ({
+        id: `b${index}`, role: 'user' as const, content: `b${index}`, timestamp: index,
+      }));
+
+      renderer.renderMessages(first, () => 'Hello');
+      let drained = false;
+      void renderer.waitForRenderedMessages().then(() => { drained = true; });
+
+      // Supersede before the first queue drains; the early idle resolution of
+      // the superseded promise must NOT release the waiter.
+      renderer.renderMessages(second, () => 'Hello');
+      await Promise.resolve();
+      await Promise.resolve();
+      expect(drained).toBe(false);
+
+      // Flush only the second queue's frames; the waiter resolves once the
+      // current generation actually drains.
+      await flushFrames();
+      expect(drained).toBe(true);
+    });
+
+    it('increments the DOM epoch on each clear-rebuild render', () => {
+      const { renderer } = createRenderer();
+      const before = renderer.domEpoch;
+      renderer.renderMessages([], () => 'Hello');
+      expect(renderer.domEpoch).toBe(before + 1);
+      renderer.renderMessages([], () => 'Hello');
+      expect(renderer.domEpoch).toBe(before + 2);
+    });
+
+    it('reports nodes evicted by a clear-rebuild as unmounted', async () => {
+      const { renderer, messagesEl } = createRenderer();
+      jest.spyOn(renderer, 'renderContent').mockResolvedValue(undefined);
+      const first = Array.from({ length: 3 }, (_, index) => ({
+        id: `a${index}`, role: 'user' as const, content: `a${index}`, timestamp: index,
+      }));
+      const second = Array.from({ length: 3 }, (_, index) => ({
+        id: `b${index}`, role: 'user' as const, content: `b${index}`, timestamp: index,
+      }));
+
+      const firstMessage = (el: any) =>
+        el._children.find((child: any) => child.hasClass('claudian-message'));
+
+      renderer.renderMessages(first, () => 'Hello');
+      const firstNode = firstMessage(messagesEl);
+      expect(renderer.isMounted(firstNode)).toBe(true);
+
+      renderer.renderMessages(second, () => 'Hello');
+      expect(renderer.isMounted(firstNode)).toBe(false);
+      const secondNode = firstMessage(messagesEl);
+      expect(renderer.isMounted(secondNode)).toBe(true);
+      expect(renderer.isMounted(null)).toBe(false);
+    });
+
     it('isolates a single failing message behind an error card without blocking the rest', async () => {
       const { renderer, messagesEl } = createRenderer();
       jest.spyOn(renderer, 'renderContent').mockResolvedValue(undefined);

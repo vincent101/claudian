@@ -52,6 +52,12 @@ export class MessageRenderer {
   private renderGeneration = 0;
   private renderIdlePromise: Promise<void> = Promise.resolve();
   private renderIdleResolver: (() => void) | null = null;
+  /**
+   * DOM epoch (coord protocol P4): incremented on every clear-rebuild render
+   * so streaming contexts can detect that their captured mount points were
+   * evicted. Prepend framing keeps the epoch — it never evicts live nodes.
+   */
+  private domEpochValue = 0;
 
   private static readonly REWIND_ICON = `<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/></svg>`;
 
@@ -262,6 +268,10 @@ export class MessageRenderer {
     messages: ChatMessage[],
     getGreeting: () => string
   ): HTMLElement {
+    // Clear-rebuild evicts every previously mounted node (P4): bump the epoch
+    // before emptying so live streaming contexts invalidate on their next
+    // projection instead of writing into detached nodes.
+    this.domEpochValue += 1;
     this.messagesEl.empty();
     this.liveMessageEls.clear();
 
@@ -277,9 +287,43 @@ export class MessageRenderer {
     this.startBatchedRender(messages, allMessages, true);
   }
 
-  /** Resolves once the current batched render queue has fully mounted. */
-  waitForRenderedMessages(): Promise<void> {
-    return this.renderIdlePromise;
+  /** Current DOM epoch; see `domEpochValue`. */
+  get domEpoch(): number {
+    return this.domEpochValue;
+  }
+
+  /** Whether a node is still attached under the messages container (P4). */
+  isMounted(node: HTMLElement | null): boolean {
+    return !!node && this.messagesEl.contains(node);
+  }
+
+  /**
+   * Resolves once the batched render queue has fully drained (condition
+   * wait, P6). A superseding render resolves the captured promise early, but
+   * that must not read as global idle: the waiter re-checks that the captured
+   * generation is still current and its resolver has settled, and otherwise
+   * re-captures and keeps waiting.
+   */
+  async waitForRenderedMessages(): Promise<void> {
+    for (;;) {
+      const generation = this.renderGeneration;
+      const idle = this.renderIdlePromise;
+      await idle;
+      if (generation === this.renderGeneration && this.renderIdleResolver === null) return;
+    }
+  }
+
+  /**
+   * Clear-rebuild render that also waits for the frame queue to drain —
+   * thin wrapper so stored-transaction callers cannot forget the wait.
+   */
+  async renderMessagesAndWait(
+    messages: ChatMessage[],
+    getGreeting: () => string
+  ): Promise<HTMLElement> {
+    const welcomeEl = this.renderMessages(messages, getGreeting);
+    await this.waitForRenderedMessages();
+    return welcomeEl;
   }
 
   private scheduleFrame(callback: () => void): void {
