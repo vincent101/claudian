@@ -354,6 +354,7 @@ function evictCompleted(): void {
     }) ?? completed.keys().next().value;
     if (!candidate) return;
     completed.delete(candidate);
+    diagnosticSink?.({ phase: 'cache_evict' });
   }
 }
 
@@ -464,7 +465,7 @@ function buildInWorker(filePath: string, options: BuildOptions): Promise<Transcr
 const requests = new Map<string, Promise<TranscriptIndexResult>>();
 
 export interface TranscriptIndexDiagnosticEvent {
-  phase: 'index_worker_fallback' | 'queued' | 'start' | 'progress' | 'finalize' | 'complete' | 'failed' | 'aborted' | 'stalled';
+  phase: 'index_worker_fallback' | 'queued' | 'start' | 'progress' | 'finalize' | 'complete' | 'failed' | 'aborted' | 'stalled' | 'cache_hit' | 'cache_evict';
   errorName?: string;
   buildId?: string;
   mode?: 'worker' | 'direct';
@@ -637,6 +638,7 @@ export function buildTranscriptIndex(filePath: string, options: BuildOptions = {
     const cached = completed.get(key);
     if (cached) {
       touchCompleted(key, cached);
+      diagnosticSink?.({ phase: 'cache_hit' });
       return cached;
     }
     const existing = inFlight.get(key);

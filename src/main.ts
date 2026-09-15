@@ -34,10 +34,12 @@ import {
 } from './core/types';
 import type { ChatViewPlacement, EnvironmentScope } from './core/types/settings';
 import { ClaudianView } from './features/chat/ClaudianView';
+import { setHistoryRenderDiagnosticsSink } from './features/chat/history/HistoryDiagnostics';
 import { type InlineEditContext, InlineEditModal } from './features/inline-edit/ui/InlineEditModal';
 import { ClaudianSettingTab } from './features/settings/ClaudianSettings';
 import { setLocale } from './i18n/i18n';
 import type { Locale } from './i18n/types';
+import { ClaudeTranscriptDiagnosticLog } from './providers/claude/transcript/ClaudeTranscriptDiagnosticLog';
 import { OPENCODE_PLAN_MODE_ID, OPENCODE_SAFE_MODE_ID } from './providers/opencode/modes';
 import { buildCursorContext } from './utils/editor';
 import { getVaultPath } from './utils/path';
@@ -57,6 +59,20 @@ export default class ClaudianPlugin extends Plugin {
   async onload() {
     await this.loadSettings();
     await ProviderWorkspaceRegistry.initializeAll(this);
+
+    // B1: route frame-batched render diagnostics into the shared
+    // .claudian/diagnostics jsonl logs next to the index/window channels.
+    const vaultPath = getVaultPath(this.app);
+    if (vaultPath) {
+      const renderDiagnostics = new ClaudeTranscriptDiagnosticLog(vaultPath, () => {}, 'history-render');
+      setHistoryRenderDiagnosticsSink(event => renderDiagnostics.record({
+        phase: event.kind === 'render_batch' ? 'render_batch' : 'render_complete',
+        batchLines: event.kind === 'render_batch' ? event.mounted : undefined,
+        entries: event.kind === 'render_batch' ? event.total : event.messages,
+        turns: event.kind === 'render_complete' ? event.batches : undefined,
+        elapsedMs: event.elapsedMs,
+      }));
+    }
 
     this.registerView(
       VIEW_TYPE_CLAUDIAN,

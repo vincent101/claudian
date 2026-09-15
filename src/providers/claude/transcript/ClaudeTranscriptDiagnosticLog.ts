@@ -5,10 +5,12 @@ import { dirname, join } from 'path';
 export type TranscriptDiagnosticPhase =
   | 'tick_start' | 'tick_end' | 'map'
   | 'lease_begin' | 'lease_finish' | 'lease_release'
-  | 'render_start' | 'render_end'
+  | 'render_start' | 'render_end' | 'render_batch' | 'render_complete'
   | 'save_start' | 'save_end' | 'save_timeout' | 'callback_error'
   | 'index_worker_fallback'
-  | 'queued' | 'start' | 'progress' | 'finalize' | 'complete' | 'failed' | 'aborted' | 'stalled';
+  | 'queued' | 'start' | 'progress' | 'finalize' | 'complete' | 'failed' | 'aborted' | 'stalled'
+  | 'window_planned' | 'window_complete'
+  | 'cache_hit' | 'cache_evict';
 
 export interface TranscriptDiagnosticEvent {
   phase: TranscriptDiagnosticPhase;
@@ -27,6 +29,10 @@ export interface TranscriptDiagnosticEvent {
   totalBytes?: number;
   entries?: number;
   turns?: number;
+  turnCount?: number;
+  sourceBytes?: number;
+  projectedChars?: number;
+  oversizedTurns?: number;
 }
 
 const SEGMENT_BYTES = 128 * 1024;
@@ -74,7 +80,7 @@ export class ClaudeTranscriptDiagnosticLog {
 
   private serialize(event: TranscriptDiagnosticEvent): string {
     const clean: Record<string, unknown> = { ts: Date.now(), seq: ++this.seq, phase: event.phase };
-    for (const key of ['tabIdHash', 'turnIdHash', 'generation', 'leaseKind', 'batchBytes', 'batchLines', 'elapsedMs', 'errorName', 'buildId', 'mode', 'queueMs', 'bytes', 'totalBytes', 'entries', 'turns'] as const) {
+    for (const key of ['tabIdHash', 'turnIdHash', 'generation', 'leaseKind', 'batchBytes', 'batchLines', 'elapsedMs', 'errorName', 'buildId', 'mode', 'queueMs', 'bytes', 'totalBytes', 'entries', 'turns', 'turnCount', 'sourceBytes', 'projectedChars', 'oversizedTurns'] as const) {
       const value = event[key];
       if (value !== undefined) clean[key] = typeof value === 'string' ? value.slice(0, 128) : value;
     }

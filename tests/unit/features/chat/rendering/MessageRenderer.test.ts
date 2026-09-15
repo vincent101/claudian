@@ -9,6 +9,11 @@ import {
   TOOL_WAIT_AGENT,
 } from '@/core/tools/toolNames';
 import type { ChatMessage, ImageAttachment } from '@/core/types';
+import {
+  type HistoryRenderDiagnosticEvent,
+  recordHistoryRenderEvent,
+  setHistoryRenderDiagnosticsSink,
+} from '@/features/chat/history/HistoryDiagnostics';
 import { MessageRenderer } from '@/features/chat/rendering/MessageRenderer';
 import { renderStoredAsyncSubagent, renderStoredSubagent } from '@/features/chat/rendering/SubagentRenderer';
 import { renderStoredThinkingBlock } from '@/features/chat/rendering/ThinkingBlockRenderer';
@@ -1984,6 +1989,29 @@ describe('MessageRenderer', () => {
 
       await flushFrames();
       expect(drained).toBe(true);
+    });
+
+    it('emits render batch and completion diagnostics', async () => {
+      const events: HistoryRenderDiagnosticEvent[] = [];
+      setHistoryRenderDiagnosticsSink(event => events.push(event));
+      try {
+        const { renderer } = createRenderer();
+        jest.spyOn(renderer, 'renderContent').mockResolvedValue(undefined);
+        const messages = Array.from({ length: 45 }, (_, index) => ({
+          id: `m${index}`, role: 'user' as const, content: `m${index}`, timestamp: index,
+        }));
+
+        renderer.renderMessages(messages, () => 'Hello');
+        await flushFrames();
+
+        const batches = events.filter(event => event.kind === 'render_batch');
+        expect(batches.length).toBeGreaterThanOrEqual(3);
+        expect(batches.reduce((sum, event) => sum + (event.kind === 'render_batch' ? event.mounted : 0), 0)).toBe(45);
+        const complete = events.find(event => event.kind === 'render_complete');
+        expect(complete).toMatchObject({ kind: 'render_complete', messages: 45 });
+      } finally {
+        setHistoryRenderDiagnosticsSink(null);
+      }
     });
 
     it('stops a superseded render queue when a new render starts', async () => {

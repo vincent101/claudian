@@ -164,6 +164,27 @@ describe('ClaudeTranscriptHistoryIndex', () => {
     expect(result.error).toMatch(/incomplete/i);
   });
 
+  it('records cache hit and eviction diagnostic events', async () => {
+    const events: TranscriptIndexDiagnosticEvent[] = [];
+    setTranscriptIndexDiagnosticSink(event => events.push(event));
+    clearTranscriptIndexCache();
+    const paths: string[] = [];
+    try {
+      for (let index = 0; index < 3; index += 1) {
+        const path = join(process.env.TMPDIR ?? '/tmp', `claudian-cache-diag-${process.pid}-${index}.jsonl`);
+        paths.push(path);
+        await writeFile(path, `${JSON.stringify({ type: 'user', uuid: `u${index}`, message: { content: 'x' } })}\n`);
+        await buildTranscriptIndex(path, { useWorker: false });
+      }
+      // Rebuild the newest snapshot: served from the completed cache.
+      await buildTranscriptIndex(paths[2], { useWorker: false });
+      expect(events.filter(event => event.phase === 'cache_evict').length).toBeGreaterThan(0);
+      expect(events.filter(event => event.phase === 'cache_hit')).toHaveLength(1);
+    } finally {
+      setTranscriptIndexDiagnosticSink(null);
+    }
+  });
+
   it('keeps a released completed index as an idle cache hit', async () => {
     clearTranscriptIndexCache();
     const path = join(process.env.TMPDIR ?? '/tmp', `claudian-idle-${process.pid}.jsonl`);

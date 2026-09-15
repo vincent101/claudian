@@ -1,4 +1,4 @@
-import { existsSync } from 'fs';
+import { existsSync, readFileSync } from 'fs';
 import { appendFile, mkdir, rm, writeFile } from 'fs/promises';
 import { join } from 'path';
 
@@ -69,7 +69,8 @@ describe('HistoryBudgetMaterialization on a ~71MB giant session', () => {
 
   it('serves a bounded readable first screen without materializing 50 turns', async () => {
     const service = new ClaudeConversationHistoryService();
-    const lease = service.acquireHistoryIndex(giantConversation(), '/vault');
+    // Real vault path so the window diagnostics channel writes jsonl events.
+    const lease = service.acquireHistoryIndex(giantConversation(), fixtureDir);
     await lease.ready;
 
     expect(lease.totalTurns).toBe(7);
@@ -102,6 +103,18 @@ describe('HistoryBudgetMaterialization on a ~71MB giant session', () => {
     expect(toolCalls[0].result).toContain('bytes omitted');
 
     lease.release();
+
+    const diagnosticsPath = join(fixtureDir, '.claudian', 'diagnostics', 'history-window.current.jsonl');
+    expect(existsSync(diagnosticsPath)).toBe(true);
+    const events = readFileSync(diagnosticsPath, 'utf8').trim().split('\n').map(line => JSON.parse(line));
+    expect(events.filter(event => event.phase === 'window_planned')).toHaveLength(1);
+    const completed = events.filter(event => event.phase === 'window_complete');
+    expect(completed.length).toBeGreaterThanOrEqual(1);
+    for (const event of completed) {
+      expect(event.sourceBytes).toBeLessThanOrEqual(HISTORY_RESOURCE_POLICY.firstScreen.maxSourceBytes);
+      expect(event.oversizedTurns).toBe(1);
+    }
+    expect(events.some(event => event.phase === 'lease_release')).toBe(true);
   });
 
   it('loads earlier windows page by page without exceeding the budget', async () => {

@@ -366,14 +366,17 @@ export class ClaudeConversationHistoryService implements ProviderConversationHis
   private hydratedConversationIds = new Set<string>();
   private sharedIndexes = new Map<string, SharedHistoryIndex>();
   private indexDiagnostics: ClaudeTranscriptDiagnosticLog | null = null;
+  private windowDiagnostics: ClaudeTranscriptDiagnosticLog | null = null;
 
   // The index module probes worker_threads once per process; route its fallback
   // event into a dedicated diagnostics file so worker degradation stays visible
-  // without surfacing anything in the UI.
+  // without surfacing anything in the UI. Window materialization gets its own
+  // log so budget/oversized behavior is observable on real giant sessions.
   private ensureIndexDiagnostics(vaultPath: string): void {
     if (this.indexDiagnostics) return;
     const diagnostics = new ClaudeTranscriptDiagnosticLog(vaultPath, () => {}, 'history-index');
     this.indexDiagnostics = diagnostics;
+    this.windowDiagnostics = new ClaudeTranscriptDiagnosticLog(vaultPath, () => {}, 'history-window');
     setTranscriptIndexDiagnosticSink(event => diagnostics.record(event));
   }
 
@@ -568,6 +571,7 @@ export class ClaudeConversationHistoryService implements ProviderConversationHis
         if (this.sharedIndexes.get(conversation.id) === fixed) {
           this.sharedIndexes.delete(conversation.id);
         }
+        this.windowDiagnostics?.record({ phase: 'lease_release' });
       },
     };
   }
@@ -738,8 +742,14 @@ export class ClaudeConversationHistoryService implements ProviderConversationHis
     state: ConversationIndexState,
     request: HistoryWindowRequest,
   ): Promise<HistoryWindowPage> {
+    const startedAt = performance.now();
     const total = state.flattenedTurns.length;
     const plan = this.planWindowFor(state, request);
+    this.windowDiagnostics?.record({
+      phase: 'window_planned',
+      turnCount: plan.end - plan.start,
+      sourceBytes: plan.plannedSourceBytes,
+    });
     const messages: ChatMessage[] = [];
     let actualStart = plan.end;
     let sourceBytes = 0;
@@ -782,6 +792,14 @@ export class ClaudeConversationHistoryService implements ProviderConversationHis
       actualStart = index;
     }
     const current = state.segments[state.segments.length - 1];
+    this.windowDiagnostics?.record({
+      phase: 'window_complete',
+      turnCount: actualStart < plan.end ? plan.end - actualStart : 0,
+      sourceBytes,
+      projectedChars,
+      oversizedTurns: oversizedTurnCount,
+      elapsedMs: performance.now() - startedAt,
+    });
     return {
       messages: dedupeMessages(messages).sort((a, b) => a.timestamp - b.timestamp),
       range: { start: actualStart, end: plan.end },

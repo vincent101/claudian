@@ -15,6 +15,7 @@ import { formatDurationMmSs } from '../../../utils/date';
 import { processFileLinks, registerFileLinkHandler } from '../../../utils/fileLink';
 import { replaceImageEmbedsWithHtml } from '../../../utils/imageEmbed';
 import { escapeMathDelimitersForStreaming } from '../../../utils/markdownMath';
+import { recordHistoryRenderEvent } from '../history/HistoryDiagnostics';
 import { HISTORY_RENDER_LIMITS } from '../history/HistoryResourcePolicy';
 import { findRewindContext } from '../rewind';
 import { resolveSubagentLifecycleAdapter } from './subagentLifecycleResolution';
@@ -299,8 +300,18 @@ export class MessageRenderer {
     let resolveIdle!: () => void;
     this.renderIdlePromise = new Promise<void>(resolve => { resolveIdle = resolve; });
     this.renderIdleResolver = resolveIdle;
+    const startedAt = performance.now();
+    let batches = 0;
     const complete = (): void => {
       if (this.renderIdleResolver === resolveIdle) this.renderIdleResolver = null;
+      if (generation === this.renderGeneration) {
+        recordHistoryRenderEvent({
+          kind: 'render_complete',
+          messages: messages.length,
+          batches,
+          elapsedMs: performance.now() - startedAt,
+        });
+      }
       resolveIdle();
     };
     const step = (from: number): void => {
@@ -333,6 +344,13 @@ export class MessageRenderer {
         original.insertBefore(fragment, anchor);
         if (anchor) original.scrollTop += anchor.getBoundingClientRect().top - before;
       }
+      batches += 1;
+      recordHistoryRenderEvent({
+        kind: 'render_batch',
+        mounted: index - from,
+        total: messages.length,
+        elapsedMs: performance.now() - sliceStart,
+      });
       if (index < messages.length) {
         this.scheduleFrame(() => step(index));
         return;
