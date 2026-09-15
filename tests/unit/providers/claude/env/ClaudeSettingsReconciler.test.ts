@@ -53,5 +53,33 @@ describe('claudeSettingsReconciler', () => {
       expect(result.changed).toBe(true);
       expect(settings.model).toBe('sonnet');
     });
+
+    it('counts ANTHROPIC_DEFAULT_FABLE_MODEL into the env hash and invalidates sessions', () => {
+      const conversation = {
+        providerId: 'claude',
+        sessionId: 'session-1',
+        messages: [],
+      } as unknown as Conversation;
+      const settings: Record<string, unknown> = {
+        settingsProvider: 'claude',
+        model: 'fable',
+        providerConfigs: {
+          claude: {
+            lastModel: 'haiku',
+            environmentVariables: 'ANTHROPIC_DEFAULT_FABLE_MODEL=claude-opus[1m]',
+            environmentHash: '',
+          },
+        },
+      };
+
+      const result = claudeSettingsReconciler.reconcileModelWithEnvironment(settings, [conversation]);
+
+      expect(result.changed).toBe(true);
+      expect(result.invalidatedConversations).toEqual([conversation]);
+      expect(getClaudeProviderSettings(settings).environmentHash).toBe(
+        'ANTHROPIC_DEFAULT_FABLE_MODEL=claude-opus[1m]',
+      );
+      expect(settings.model).toBe('fable');
+    });
   });
 });
