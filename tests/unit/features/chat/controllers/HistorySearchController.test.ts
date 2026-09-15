@@ -1,10 +1,14 @@
 /** @jest-environment jsdom */
 
 import type { HistorySearchResult } from '@/core/providers/types';
-import { HistorySearchController } from '@/features/chat/controllers/HistorySearchController';
+import {
+  enumerateVisibleMatches,
+  HistorySearchController,
+  projectVisibleText,
+} from '@/features/chat/controllers/HistorySearchController';
 
 function result(messageKey: string, snippet = 'before Needle after'): HistorySearchResult {
-  return { projectionKey: messageKey, turnIndex: 0, matchOrdinal: 0, cursor: `cursor:${messageKey}`, timestamp: 1, snippet, matchStart: 7, matchLength: 6, matchedText: 'Needle' };
+  return { projectionKey: messageKey, turnIndex: 0, matchOrdinal: 0, matchedText: 'Needle' };
 }
 
 describe('HistorySearchController', () => {
@@ -31,6 +35,7 @@ describe('HistorySearchController', () => {
       getConversationId: () => 'conversation',
       searchHistory,
       locateResult: locate,
+      waitForResultRender: jest.fn().mockResolvedValue(undefined),
     });
   });
 
@@ -125,59 +130,115 @@ describe('HistorySearchController', () => {
     expect(controller.isActive()).toBe(false);
   });
 
-  it('debounces case-insensitive search and renders empty state', async () => {
+  it('debounces search, defaults to newest, and uses non-circular Enter navigation', async () => {
     controller.open();
     const input = root.querySelector('input') as HTMLInputElement;
-    input.value = 'NeEdLe';
-    input.dispatchEvent(new Event('input'));
-    expect(searchHistory).not.toHaveBeenCalled();
-    jest.advanceTimersByTime(299);
-    expect(searchHistory).not.toHaveBeenCalled();
-    jest.advanceTimersByTime(1);
-    await Promise.resolve();
-    expect(searchHistory).toHaveBeenCalledWith('conversation', 'NeEdLe');
-
-    searchHistory.mockResolvedValueOnce([]);
-    input.value = 'absent';
-    input.dispatchEvent(new Event('input'));
-    jest.advanceTimersByTime(300);
-    await Promise.resolve();
-    expect(root.querySelector('.claudian-history-search-empty')).not.toBeNull();
-  });
-
-  it('navigates with Enter and arrows and locates the selected result', async () => {
-    controller.open();
-    const input = root.querySelector('input') as HTMLInputElement;
-    input.value = 'needle';
-    input.dispatchEvent(new Event('input'));
-    jest.advanceTimersByTime(300);
-    await Promise.resolve();
-
-    input.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true }));
-    input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
-    await Promise.resolve();
+    input.value = 'NeEdLe'; input.dispatchEvent(new Event('input'));
+    jest.advanceTimersByTime(300); await Promise.resolve(); await Promise.resolve();
+    expect(searchHistory).toHaveBeenCalledWith('conversation', 'NeEdLe', expect.any(Function));
     expect(locate).toHaveBeenCalledWith(expect.objectContaining({ projectionKey: 'm2' }));
+    const next = root.querySelector('[aria-label] + button') as HTMLButtonElement | null;
+    input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+    expect(locate).toHaveBeenCalledTimes(1);
+    expect(next).toBeDefined();
   });
 
-  it('shows an in-panel error instead of failing silently when locating a result rejects', async () => {
-    // e.g. cursor expired: the history service can no longer resolve the page
-    locate.mockRejectedValueOnce(new Error('cursor expired'));
+  it('shows localized projection mismatch text when locating fails', async () => {
+    locate.mockRejectedValueOnce(new Error('projection_mismatch'));
+    controller.open();
+    const input = root.querySelector('input') as HTMLInputElement;
+    input.value = 'needle'; input.dispatchEvent(new Event('input'));
+    jest.advanceTimersByTime(300); await Promise.resolve(); await Promise.resolve(); await Promise.resolve();
+    const text = root.querySelector('.claudian-history-search-error')?.textContent ?? '';
+    expect(text).toBeTruthy();
+    expect(text).not.toContain('projection_mismatch');
+  });
+
+  it('waits for an asynchronously rendered located result before applying marks', async () => {
+    let releaseRender!: () => void;
+    const renderGate = new Promise<void>(resolve => { releaseRender = resolve; });
+    const message = document.createElement('div');
+    message.className = 'claudian-message';
+    message.dataset.messageId = 'm2';
+    const block = document.createElement('div');
+    block.className = 'claudian-text-block';
+    message.appendChild(block);
+    messages.appendChild(message);
+    locate.mockResolvedValue(message);
+    const waitForResultRender = jest.fn(async () => {
+      await renderGate;
+      block.textContent = 'before needle after';
+    });
+    controller.destroy();
+    controller = new HistorySearchController({
+      rootEl: root,
+      messagesEl: messages,
+      isActive,
+      getConversationId: () => 'conversation',
+      searchHistory,
+      locateResult: locate,
+      waitForResultRender,
+    });
+
     controller.open();
     const input = root.querySelector('input') as HTMLInputElement;
     input.value = 'needle';
-    input.dispatchEvent(new Event('input'));
-    jest.advanceTimersByTime(300);
+    (controller as any).results = [result('m2')];
+    (controller as any).selectedIndex = 0;
+    const search = (controller as any).locateCurrent() as Promise<void>;
     await Promise.resolve();
+    expect(waitForResultRender).toHaveBeenCalledWith('m2');
+    expect(message.querySelector('mark')).toBeNull();
 
-    const firstResult = root.querySelector('.claudian-history-search-result') as HTMLElement;
-    firstResult.click();
-    await Promise.resolve();
-    await Promise.resolve();
+    releaseRender();
+    await search;
+    expect(waitForResultRender).toHaveBeenCalledWith('m2');
+    expect(message.querySelector('mark')?.textContent).toBe('needle');
+    expect(message.querySelector('mark')?.classList.contains('is-current')).toBe(true);
+  });
 
-    expect(locate).toHaveBeenCalled();
-    const error = root.querySelector('.claudian-history-search-error');
-    expect(error).not.toBeNull();
-    expect(error?.textContent).toBeTruthy();
+  it('projects inline nodes, excludes controls, and rejects cross-block pseudo matches', () => {
+    const message = document.createElement('div');
+    message.innerHTML = '<div class="claudian-text-block"><p>nee<em>dl</em><a>e</a></p><p>other</p><table><tr><td>left</td><td>right</td></tr></table><button>needle</button></div>';
+    expect(projectVisibleText(message).text).toBe('needle\nother\nleft\tright');
+    expect(enumerateVisibleMatches(message, 'needle')).toHaveLength(1);
+    expect(enumerateVisibleMatches(message, 'eother')).toHaveLength(0);
+    expect(enumerateVisibleMatches(message, 'leftright')).toHaveLength(0);
+  });
+
+  it('enumerates three non-overlapping matches before marks mutate text nodes', () => {
+    const message = document.createElement('div');
+    message.innerHTML = '<div class="claudian-text-block"><code>x x</code> <span>x</span></div>';
+    const matches = enumerateVisibleMatches(message, 'x');
+    expect(matches.map(match => match.ordinal)).toEqual([0, 1, 2]);
+    const ranges = matches.flatMap(match => match.ranges);
+    expect(ranges).toHaveLength(3);
+  });
+
+  it('shows no-results for a non-empty query with an empty result set', async () => {
+    searchHistory.mockResolvedValueOnce([]);
+    controller.open();
+    const input = root.querySelector('input') as HTMLInputElement;
+    input.value = 'absent'; input.dispatchEvent(new Event('input'));
+    await jest.advanceTimersByTimeAsync(300);
+
+    expect(root.querySelector('.claudian-history-search-status')?.textContent).toBeTruthy();
+    expect(locate).not.toHaveBeenCalled();
+  });
+
+  it('shows searching after index readiness and before results resolve', async () => {
+    let release!: (value: HistorySearchResult[]) => void;
+    searchHistory.mockImplementation(async (_id, _query, onPhase) => {
+      onPhase?.('searching');
+      return new Promise<HistorySearchResult[]>(resolve => { release = resolve; });
+    });
+    controller.open();
+    const input = root.querySelector('input') as HTMLInputElement;
+    input.value = 'needle'; input.dispatchEvent(new Event('input'));
+    await jest.advanceTimersByTimeAsync(300);
+    expect(root.querySelector('.claudian-history-search-status')?.textContent).toBeTruthy();
+    release([]);
+    await Promise.resolve();
   });
 
   it('shows an in-panel error instead of failing silently when searchHistory rejects', async () => {

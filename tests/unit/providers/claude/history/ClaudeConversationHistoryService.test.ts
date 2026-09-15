@@ -105,71 +105,46 @@ describe('ClaudeConversationHistoryService M1 fuse', () => {
     expect(mockBuildTranscriptIndex.mock.calls[0][0]).toContain('current-session.jsonl');
   });
 
-  it('loads the newest 50 turns and advances an opaque cursor', async () => {
+  it('shares one build across leases and loads exact stateless ranges', async () => {
     const turns = Array.from({ length: 120 }, (_, index) => ({ turnId: `u${index}`, startEntry: index, endEntry: index }));
-    mockBuildTranscriptIndex.mockResolvedValue({
-      status: 'complete',
-      index: { filePath: '/current', dev: 1, ino: 1, snapshotSize: 999, mtimeMs: 1, entries: [], turns, searchCorpus: [], searchText: '', skippedLines: 0, buildDurationMs: 1, peakWorkerHeapBytes: 1 },
-    });
+    mockBuildTranscriptIndex.mockResolvedValue({ status: 'complete', index: { filePath: '/current', dev: 1, ino: 1, snapshotSize: 999, mtimeMs: 1, entries: [], turns, searchCorpus: [], searchText: '', skippedLines: 0, buildDurationMs: 1, peakWorkerHeapBytes: 1 } });
     mockSdkSessionExists.mockImplementation((_vault, session) => session === 'current-session');
-    mockMaterializeTranscriptPage.mockResolvedValue([]);
-    mockMaterializeTranscriptToolAssociations.mockResolvedValue([]);
-    mockMaterializeSDKMessages.mockResolvedValue([]);
-    const service = new ClaudeConversationHistoryService();
-
-    const first = await service.loadInitialHistory(createConversation(), '/vault', 50);
+    mockMaterializeTranscriptPage.mockResolvedValue([]); mockMaterializeTranscriptToolAssociations.mockResolvedValue([]); mockMaterializeSDKMessages.mockResolvedValue([]);
+    const service = new ClaudeConversationHistoryService(); const conversation = createConversation();
+    const first = service.acquireHistoryIndex(conversation, '/vault'); const second = service.acquireHistoryIndex(conversation, '/vault');
+    await first.ready; await second.ready;
+    expect(mockBuildTranscriptIndex).toHaveBeenCalledTimes(1); expect(first.totalTurns).toBe(120);
+    await first.loadRange(70, 120);
     expect(mockMaterializeTranscriptPage).toHaveBeenCalledWith(expect.anything(), 70, 50);
-    expect(first).toMatchObject({ hasMore: true, snapshotOffset: 999 });
-    expect(first.cursor).toMatch(/^claude-history:/);
-
-    await service.loadOlderHistory(first.cursor!, 50);
-    expect(mockMaterializeTranscriptPage).toHaveBeenLastCalledWith(expect.anything(), 20, 50);
+    await expect(first.loadRange(-1, 2)).rejects.toThrow(RangeError);
+    first.release(); first.release(); await expect(second.loadRange(0, 1)).resolves.toBeDefined(); second.release();
   });
 
-  it('searches case-insensitive substrings and returns snippets with page cursors', async () => {
-    const searchText = 'Alpha NEEDLE omegaanother needle result';
+  it('enumerates every non-overlapping match with stable projection ordinals', async () => {
+    const searchText = 'needle needle needleneedle';
     const searchCorpus = [
-      { projectionKey: 'u1', turnIndex: 0, timestamp: '2026-01-01T00:00:00Z', textOffset: 0, textLength: 18 },
-      { projectionKey: 'a1', turnIndex: 1, timestamp: '2026-01-02T00:00:00Z', textOffset: 18, textLength: 21 },
+      { projectionKey: 'same', turnIndex: 1, timestamp: '', textOffset: 0, textLength: 13 },
+      { projectionKey: 'same', turnIndex: 1, timestamp: '', textOffset: 14, textLength: 12 },
     ];
-    mockBuildTranscriptIndex.mockResolvedValue({
-      status: 'complete',
-      index: { filePath: '/current', dev: 1, ino: 1, snapshotSize: 999, mtimeMs: 1, entries: [], turns: [{ turnId: 'u1', startEntry: 0, endEntry: 0 }, { turnId: 'u2', startEntry: 1, endEntry: 1 }], searchCorpus, searchText, skippedLines: 0, buildDurationMs: 1, peakWorkerHeapBytes: 1 },
-    });
+    mockBuildTranscriptIndex.mockResolvedValue({ status: 'complete', index: { filePath: '/current', dev: 1, ino: 1, snapshotSize: 1, mtimeMs: 1, entries: [], turns: [{ turnId: '0', startEntry: 0, endEntry: 0 }, { turnId: '1', startEntry: 1, endEntry: 1 }], searchCorpus, searchText, skippedLines: 0, buildDurationMs: 1, peakWorkerHeapBytes: 1 } });
     mockSdkSessionExists.mockImplementation((_vault, session) => session === 'current-session');
-    mockMaterializeTranscriptPage.mockResolvedValue([]);
-    mockMaterializeTranscriptToolAssociations.mockResolvedValue([]);
-    mockMaterializeSDKMessages.mockResolvedValue([]);
-    const service = new ClaudeConversationHistoryService();
-    await service.loadInitialHistory(createConversation(), '/vault', 50);
-
-    await expect(service.searchHistory!(createConversation(), '/vault', 'needle')).resolves.toEqual([
-      expect.objectContaining({ projectionKey: 'u1', turnIndex: 0, matchOrdinal: 0, cursor: expect.stringMatching(/^claude-search:/), matchLength: 6 }),
-      expect.objectContaining({ projectionKey: 'a1', turnIndex: 1, matchOrdinal: 0, cursor: expect.stringMatching(/^claude-search:/), matchLength: 6 }),
+    const service = new ClaudeConversationHistoryService(); const lease = service.acquireHistoryIndex(createConversation(), '/vault'); await lease.ready;
+    await expect(lease.search('needle')).resolves.toEqual([
+      expect.objectContaining({ projectionKey: 'same', turnIndex: 1, matchOrdinal: 0 }),
+      expect.objectContaining({ projectionKey: 'same', turnIndex: 1, matchOrdinal: 1 }),
+      expect.objectContaining({ projectionKey: 'same', turnIndex: 1, matchOrdinal: 2 }),
+      expect.objectContaining({ projectionKey: 'same', turnIndex: 1, matchOrdinal: 3 }),
     ]);
-    await expect(service.searchHistory!(createConversation(), '/vault', 'missing')).resolves.toEqual([]);
   });
 
-  it('restores a cursor whose page failed to materialize so retry succeeds', async () => {
-    const turns = Array.from({ length: 120 }, (_, index) => ({ turnId: `u${index}`, startEntry: index, endEntry: index }));
-    mockBuildTranscriptIndex.mockResolvedValue({
-      status: 'complete',
-      index: { filePath: '/current', dev: 1, ino: 1, snapshotSize: 999, mtimeMs: 1, entries: [], turns, searchCorpus: [], searchText: '', skippedLines: 0, buildDurationMs: 1, peakWorkerHeapBytes: 1 },
-    });
+  it('drops a failed shared build so acquire can retry', async () => {
     mockSdkSessionExists.mockImplementation((_vault, session) => session === 'current-session');
-    mockMaterializeTranscriptPage.mockResolvedValue([]);
-    mockMaterializeTranscriptToolAssociations.mockResolvedValue([]);
-    mockMaterializeSDKMessages.mockResolvedValue([]);
-    const service = new ClaudeConversationHistoryService();
-
-    const first = await service.loadInitialHistory(createConversation(), '/vault', 50);
-    mockMaterializeTranscriptPage.mockRejectedValueOnce(new Error('transient read failure'));
-
-    await expect(service.loadOlderHistory(first.cursor!, 50)).rejects.toThrow('transient read failure');
-
-    const older = await service.loadOlderHistory(first.cursor!, 50);
-    expect(mockMaterializeTranscriptPage).toHaveBeenLastCalledWith(expect.anything(), 20, 50);
-    expect(older).toMatchObject({ hasMore: true });
+    mockBuildTranscriptIndex.mockResolvedValueOnce({ status: 'failed', error: 'worker crashed' }).mockResolvedValueOnce({ status: 'complete', index: { filePath: '/current', dev: 1, ino: 1, snapshotSize: 1, mtimeMs: 1, entries: [], turns: [], searchCorpus: [], searchText: '', skippedLines: 0, buildDurationMs: 1, peakWorkerHeapBytes: 1 } });
+    const service = new ClaudeConversationHistoryService(); const conversation = createConversation();
+    const callsBefore = mockBuildTranscriptIndex.mock.calls.length;
+    const failed = service.acquireHistoryIndex(conversation, '/vault'); await expect(failed.ready).rejects.toThrow('worker crashed');
+    const retried = service.acquireHistoryIndex(conversation, '/vault'); await expect(retried.ready).resolves.toBeUndefined();
+    expect(mockBuildTranscriptIndex.mock.calls.length - callsBefore).toBe(2);
   });
 
   it('does not cache failures so hydration can be retried', async () => {
@@ -185,13 +160,4 @@ describe('ClaudeConversationHistoryService M1 fuse', () => {
     expect(mockLoadSDKSessionMessages).toHaveBeenCalledTimes(2);
   });
 
-  it('clears the index build controller when the initial history build fails', async () => {
-    mockBuildTranscriptIndex.mockResolvedValue({ status: 'failed', error: 'History index build aborted' });
-    mockSdkSessionExists.mockImplementation((_vault, session) => session === 'current-session');
-    const service = new ClaudeConversationHistoryService();
-
-    await expect(service.loadInitialHistory(createConversation(), '/vault', 50))
-      .rejects.toThrow('History index build aborted');
-    expect((service as unknown as { indexBuildControllers: Map<string, unknown> }).indexBuildControllers.size).toBe(0);
-  });
 });

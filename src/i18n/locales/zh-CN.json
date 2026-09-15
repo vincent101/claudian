@@ -85,7 +85,14 @@
       "noResults": "无结果",
       "error": "搜索失败",
       "resultCount": "第 {current} 项，共 {total} 项",
-      "close": "关闭搜索"
+      "close": "关闭搜索",
+      "previous": "上一个匹配",
+      "next": "下一个匹配",
+      "searching": "搜索中…",
+      "indexing": "索引中…",
+      "locating": "定位中…",
+      "retryError": "无法定位该结果，请重试。",
+      "projectionMismatch": "该结果与当前渲染内容不再匹配。"
     },
     "message": {
       "timestamp": "发送于 {time}"

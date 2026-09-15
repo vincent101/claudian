@@ -505,9 +505,8 @@ export class TabManager implements TabManagerInterface {
 
     // Save conversation before closing
     await tab.controllers.conversationController?.save();
-    if (tab.conversationId) {
-      ProviderRegistry.getConversationHistoryService(tab.providerId).releaseHistory?.(tab.conversationId);
-    }
+    tab.state.historyLease?.release();
+    tab.state.historyLease = null;
 
     // Capture tab order BEFORE deletion for fallback calculation
     const tabIdsBefore = Array.from(this.tabs.keys());

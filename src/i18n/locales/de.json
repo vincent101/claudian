@@ -85,7 +85,14 @@
       "noResults": "Keine Ergebnisse",
       "error": "Suche fehlgeschlagen",
       "resultCount": "{current} von {total}",
-      "close": "Suche schließen"
+      "close": "Suche schließen",
+      "previous": "Vorheriger Treffer",
+      "next": "Nächster Treffer",
+      "searching": "Suche…",
+      "indexing": "Indizierung…",
+      "locating": "Wird gesucht…",
+      "retryError": "Ergebnis konnte nicht gefunden werden. Erneut versuchen.",
+      "projectionMismatch": "Dieses Ergebnis stimmt nicht mehr mit der gerenderten Nachricht überein."
     },
     "message": {
       "timestamp": "Gesendet: {time}"

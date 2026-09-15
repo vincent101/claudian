@@ -85,7 +85,14 @@
       "noResults": "No results",
       "error": "Search failed",
       "resultCount": "{current} of {total}",
-      "close": "Close search"
+      "close": "Close search",
+      "previous": "Previous match",
+      "next": "Next match",
+      "searching": "Searching…",
+      "indexing": "Indexing…",
+      "locating": "Locating…",
+      "retryError": "Unable to locate this result. Try again.",
+      "projectionMismatch": "This result no longer matches the rendered message."
     },
     "message": {
       "timestamp": "Sent {time}"

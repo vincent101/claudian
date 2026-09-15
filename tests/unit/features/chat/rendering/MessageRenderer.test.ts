@@ -62,7 +62,7 @@ function mockCapabilities(providerId: 'claude' | 'codex' = 'claude') {
   });
 }
 
-function createRenderer(messagesEl?: any, providerId: 'claude' | 'codex' = 'claude') {
+function createRenderer(messagesEl?: any, providerId: 'claude' | 'codex' = 'claude', onRendered?: (projectionKey: string) => void) {
   const el = messagesEl ?? createMockEl();
   const comp = createMockComponent();
   const plugin = {
@@ -77,6 +77,7 @@ function createRenderer(messagesEl?: any, providerId: 'claude' | 'codex' = 'clau
       undefined,
       undefined,
       mockCapabilities(providerId),
+      onRendered,
     ),
     messagesEl: el,
   };
@@ -118,6 +119,37 @@ describe('MessageRenderer', () => {
 
     expect(renderStoredSpy).not.toHaveBeenCalled();
     expect(welcomeEl.hasClass('claudian-welcome')).toBe(true);
+  });
+
+  describe('renderMessageContent aggregation', () => {
+    it('notifies once after all content jobs complete', async () => {
+      const onRendered = jest.fn();
+      const { renderer } = createRenderer(undefined, 'claude', onRendered);
+      let release!: () => void;
+      const gate = new Promise<void>(resolve => { release = resolve; });
+      const rendering = renderer.renderMessageContent('message', [Promise.resolve(), gate]);
+      await Promise.resolve();
+      expect(onRendered).not.toHaveBeenCalled();
+      release();
+      await rendering;
+      expect(onRendered).toHaveBeenCalledTimes(1);
+      expect(onRendered).toHaveBeenCalledWith('message');
+    });
+
+    it('does not notify on failure and suppresses stale generations', async () => {
+      const onRendered = jest.fn();
+      const { renderer } = createRenderer(undefined, 'claude', onRendered);
+      let release!: () => void;
+      const old = new Promise<void>(resolve => { release = resolve; });
+      const oldRender = renderer.renderMessageContent('same', [old]);
+      await renderer.renderMessageContent('same', [Promise.resolve()]);
+      release();
+      await oldRender;
+      await expect(renderer.renderMessageContent('failed', [Promise.reject(new Error('render failed'))])).rejects.toThrow('render failed');
+
+      expect(onRendered).toHaveBeenCalledTimes(1);
+      expect(onRendered).toHaveBeenCalledWith('same');
+    });
   });
 
   // ============================================

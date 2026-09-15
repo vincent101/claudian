@@ -3,8 +3,10 @@ import { Menu, Notice, setIcon } from 'obsidian';
 import { ProviderRegistry } from '../../../core/providers/ProviderRegistry';
 import {
   ConversationHistoryHydrationError,
+  type HistoryIndexLease,
   type HistoryLoadProgress,
   type HistorySearchResult,
+  type LoadedTurnRange,
   type ProviderId,
   type TitleGenerationService,
 } from '../../../core/providers/types';
@@ -23,6 +25,7 @@ import type { FileContextManager } from '../ui/FileContext';
 import type { ImageContextManager } from '../ui/ImageContext';
 import type { ExternalContextSelector, McpServerSelector } from '../ui/InputToolbar';
 import type { StatusPanel } from '../ui/StatusPanel';
+import { enumerateVisibleMatches } from './HistorySearchController';
 
 export interface ConversationCallbacks {
   onNewConversation?: () => void;
@@ -88,6 +91,8 @@ type HistoryRenderOptions = {
 export class ConversationController {
   private deps: ConversationControllerDeps;
   private callbacks: ConversationCallbacks;
+  private rangeRequests = new Map<string, Promise<void>>();
+  private projectionCache = new Map<string, HTMLElement>();
 
   constructor(deps: ConversationControllerDeps, callbacks: ConversationCallbacks = {}) {
     this.deps = deps;
@@ -114,11 +119,6 @@ export class ConversationController {
     if (state.isStreaming && !force) return;
     if (state.isCreatingConversation) return;
     if (state.isSwitchingConversation) return;
-
-    const previousConversationId = state.currentConversationId;
-    const previousProviderId = previousConversationId
-      ? plugin.getConversationSync(previousConversationId)?.providerId
-      : undefined;
 
     // Set flag to block message sending during reset
     state.isCreatingConversation = true;
@@ -200,7 +200,6 @@ export class ConversationController {
       this.deps.clearQueuedMessage();
 
       this.deps.markHydrationReady?.();
-      this.releaseSwitchedAwayHistory(previousConversationId, previousProviderId);
 
       this.callbacks.onNewConversation?.();
     } finally {
@@ -229,7 +228,7 @@ export class ConversationController {
       conversation = plugin.getConversationSync(conversationId);
       if (!conversation) throw error;
       const historyService = ProviderRegistry.getConversationHistoryService(conversation.providerId);
-      if (!historyService.loadInitialHistory) throw error;
+      if (!historyService.acquireHistoryIndex) throw error;
       state.historyLoading = true;
       // No catch on purpose: a failed initial page must propagate its real
       // error so the tab-level catch renders it as a retryable ERROR
@@ -237,14 +236,18 @@ export class ConversationController {
       // the segment-size list and hide the cause (M3: any segment error
       // must be visible).
       try {
-        const page = await historyService.loadInitialHistory(
-          conversation,
-          getVaultPath(plugin.app),
-          50,
-          progress => this.deps.onHistoryLoadProgress?.(progress),
-        );
+        const lease = this.acquireLease(conversation, historyService);
+        try {
+          await lease.ready;
+        } catch (error) {
+          lease.release();
+          throw error;
+        }
+        const start = Math.max(0, lease.totalTurns - 50);
+        this.deps.onHistoryLoadProgress?.({ phase: 'loading', turnCount: lease.totalTurns - start });
+        const page = await lease.loadRange(start, lease.totalTurns);
         if (!shouldApply()) {
-          historyService.releaseHistory?.(conversation.id);
+          lease.release();
           return;
         }
         // Write the page back into the stored conversation so every later
@@ -254,8 +257,9 @@ export class ConversationController {
         // so this stays an in-memory view only.
         conversation.messages = page.messages;
         paged = true;
-        state.historyCursor = page.cursor;
-        state.historyHasMore = page.hasMore;
+        state.historyLease = lease;
+        state.loadedRanges = [page.range];
+        state.historyHasMore = page.range.start > 0;
         state.historySnapshotOffset = page.snapshotOffset ?? null;
         state.historyError = null;
       } finally {
@@ -307,7 +311,7 @@ export class ConversationController {
 
     await this.deps.ensureServiceForConversation?.(conversation);
     this.restoreConversation(conversation, { autoAttachFile: true });
-    if (!paged) state.resetHistoryPagination();
+    if (!paged) this.bindHistoryLease(conversation);
     this.updateWelcomeVisibility();
 
     this.renderHistoryPager();
@@ -315,24 +319,16 @@ export class ConversationController {
   }
 
   async loadOlderHistory(): Promise<void> {
-    const { state, plugin, renderer } = this.deps;
-    if (!state.historyCursor || state.historyLoading || !state.currentConversationId) return;
-    const conversation = plugin.getConversationSync(state.currentConversationId);
-    if (!conversation) return;
-    const service = ProviderRegistry.getConversationHistoryService(conversation.providerId);
-    if (!service.loadOlderHistory) return;
+    const { state } = this.deps;
+    const lease = state.historyLease;
+    if (!lease || state.historyLoading) return;
+    const range = this.nextOlderRange(state.loadedRanges, lease.totalTurns, 50);
+    if (!range) return;
     state.historyLoading = true;
     state.historyError = null;
     this.renderHistoryPager();
     try {
-      const page = await service.loadOlderHistory(state.historyCursor, 50);
-      const existing = new Set(state.messages.map(message => message.id));
-      const added = page.messages.filter(message => !existing.has(message.id));
-      const combined = [...added, ...state.messages];
-      state.prependMessages(added);
-      renderer.prependMessages(added, combined);
-      state.historyCursor = page.cursor;
-      state.historyHasMore = page.hasMore;
+      await this.loadRange(range.start, range.end, false);
     } catch (error) {
       state.historyError = error instanceof Error ? error.message : String(error);
     } finally {
@@ -350,37 +346,187 @@ export class ConversationController {
     );
   }
 
-  async searchHistory(query: string): Promise<HistorySearchResult[]> {
-    const { state, plugin } = this.deps;
-    if (!state.currentConversationId) return [];
-    const conversation = plugin.getConversationSync(state.currentConversationId);
-    if (!conversation) return [];
-    const service = ProviderRegistry.getConversationHistoryService(conversation.providerId);
-    return service.searchHistory?.(conversation, getVaultPath(plugin.app), query) ?? [];
+  async searchHistory(
+    query: string,
+    onPhase?: (phase: 'indexing' | 'searching') => void,
+  ): Promise<HistorySearchResult[]> {
+    const lease = this.deps.state.historyLease;
+    if (!lease) return [];
+    onPhase?.('indexing');
+    await lease.ready;
+    onPhase?.('searching');
+    const candidates = await lease.search(query);
+    const grouped = new Map<string, HistorySearchResult[]>();
+    for (const candidate of candidates) {
+      const group = grouped.get(candidate.projectionKey) ?? [];
+      group.push(candidate);
+      grouped.set(candidate.projectionKey, group);
+    }
+    const results: HistorySearchResult[] = [];
+    for (const group of grouped.values()) {
+      const loaded = this.deps.renderer.findMessageElement(group[0].projectionKey);
+      let count: number;
+      if (loaded) {
+        await this.deps.renderer.waitForMessageContentRendered(group[0].projectionKey);
+        count = enumerateVisibleMatches(loaded, query).length;
+      } else {
+        const message = await this.loadSearchCandidate(group[0].turnIndex, group[0].projectionKey);
+        if (!message) {
+          results.push(...group.map(item => ({ ...item, status: 'projection_mismatch' as const })));
+          continue;
+        }
+        const hash = this.contentHash(JSON.stringify(message));
+        const key = `${group[0].projectionKey}:${hash}`;
+        let detached = this.projectionCache.get(key);
+        if (!detached) {
+          detached = await this.deps.renderer.renderSearchCandidate(message);
+          this.projectionCache.set(key, detached);
+          if (this.projectionCache.size > 100) this.projectionCache.delete(this.projectionCache.keys().next().value!);
+        }
+        count = enumerateVisibleMatches(detached, query).length;
+      }
+      results.push(...group.map(item => item.matchOrdinal < count ? item : ({ ...item, status: 'projection_mismatch' as const })));
+    }
+    return results;
   }
 
-  async locateHistorySearchResult(result: HistorySearchResult): Promise<void> {
-    const { state, plugin, renderer } = this.deps;
-    if (!state.currentConversationId) return;
+  private async loadSearchCandidate(turnIndex: number, projectionKey: string) {
+    const lease = this.deps.state.historyLease;
+    if (!lease) return null;
+    const page = await lease.loadRange(turnIndex, Math.min(lease.totalTurns, turnIndex + 1));
+    return page.messages.find(message => message.id === projectionKey) ?? null;
+  }
+
+  private contentHash(value: string): string {
+    let hash = 2166136261;
+    for (let index = 0; index < value.length; index += 1) hash = Math.imul(hash ^ value.charCodeAt(index), 16777619);
+    return (hash >>> 0).toString(36);
+  }
+
+  async refreshHistorySearchSnapshot(): Promise<void> {
+    const { plugin, state } = this.deps;
+    const conversationId = state.currentConversationId;
+    if (!conversationId || !state.historyLease) return;
+    const conversation = plugin.getConversationSync(conversationId);
+    if (!conversation) return;
+    const service = ProviderRegistry.getConversationHistoryService(conversation.providerId);
+    if (!service.acquireHistoryIndex) return;
+    const previous = state.historyLease;
+    // Rollback path: the old lease stays live until the new snapshot is ready,
+    // so a failed refresh keeps pagination and search usable on stale data.
+    const next = this.acquireLease(conversation, service, true);
+    state.historyLease = next;
+    try {
+      await next.ready;
+      previous.release();
+    } catch (error) {
+      next.release();
+      if (state.historyLease === next) state.historyLease = previous;
+      throw error;
+    }
+  }
+
+  async locateHistorySearchResult(result: HistorySearchResult): Promise<HTMLElement> {
+    const { state, renderer } = this.deps;
+    if (result.status === 'projection_mismatch') throw new Error('projection_mismatch');
     let target = renderer.findMessageElement(result.projectionKey);
     if (!target) {
-      const conversation = plugin.getConversationSync(state.currentConversationId);
-      if (!conversation) return;
-      const service = ProviderRegistry.getConversationHistoryService(conversation.providerId);
-      if (!service.loadHistoryAt) return;
-      const page = await service.loadHistoryAt(result.cursor, 50);
-      const existing = new Set(state.messages.map(message => message.id));
-      const added = page.messages.filter(message => !existing.has(message.id));
-      const combined = [...added, ...state.messages];
-      state.prependMessages(added);
-      renderer.prependMessages(added, combined);
-      state.historyCursor = page.cursor;
-      state.historyHasMore = page.hasMore;
-      this.renderHistoryPager();
+      const start = Math.max(0, Math.min(result.turnIndex, state.historyLease!.totalTurns - 50));
+      await this.loadRange(start, Math.min(state.historyLease!.totalTurns, start + 50));
       target = renderer.findMessageElement(result.projectionKey);
     }
-    if (!target) throw new Error(`History search target not found: ${result.projectionKey}`);
-    renderer.highlightSearchMatch(target, result.matchedText, result.matchOrdinal);
+    if (!target) throw new Error('projection_mismatch');
+    return target;
+  }
+
+  private async loadRange(start: number, end: number, rerenderAll = true): Promise<void> {
+    const { state, renderer } = this.deps;
+    const lease = state.historyLease;
+    if (!lease) throw new Error('History lease unavailable');
+    const key = `${start}:${end}`;
+    const existing = this.rangeRequests.get(key);
+    if (existing) return existing;
+    const request = (async () => {
+      const page = await lease.loadRange(start, end);
+      const existingIds = new Set(state.messages.map(message => message.id));
+      const added = page.messages.filter(message => !existingIds.has(message.id));
+      const combined = [...state.messages, ...added].sort((a, b) => a.timestamp - b.timestamp);
+      state.messages = combined;
+      if (rerenderAll) {
+        renderer.renderMessages(combined, () => this.getGreeting());
+      } else {
+        const addedIds = new Set(added.map(message => message.id));
+        const prepend = combined.filter(message => addedIds.has(message.id));
+        renderer.prependMessages(prepend, combined);
+      }
+      state.loadedRanges = this.mergeRanges([...state.loadedRanges, page.range]);
+      state.historyHasMore = !this.coversAll(state.loadedRanges, lease.totalTurns);
+      state.historySnapshotOffset = page.snapshotOffset ?? state.historySnapshotOffset;
+    })();
+    this.rangeRequests.set(key, request);
+    try {
+      await request;
+    } finally {
+      this.rangeRequests.delete(key);
+    }
+  }
+
+  private mergeRanges(ranges: LoadedTurnRange[]): LoadedTurnRange[] {
+    const sorted = ranges.slice().sort((a, b) => a.start - b.start);
+    const merged: LoadedTurnRange[] = [];
+    for (const range of sorted) {
+      const last = merged[merged.length - 1];
+      if (!last || range.start > last.end) merged.push({ ...range });
+      else last.end = Math.max(last.end, range.end);
+    }
+    return merged;
+  }
+
+  private coversAll(ranges: LoadedTurnRange[], total: number): boolean {
+    return total === 0 || (ranges.length === 1 && ranges[0].start === 0 && ranges[0].end >= total);
+  }
+
+  private nextOlderRange(ranges: LoadedTurnRange[], total: number, pageSize: number): LoadedTurnRange | null {
+    const merged = this.mergeRanges(ranges);
+    const newest = merged.find(range => range.start <= total - 1 && range.end >= total);
+    if (!newest) return total > 0 ? { start: Math.max(0, total - pageSize), end: total } : null;
+    const older = [...merged].reverse().find(range => range.end <= newest!.start);
+    const end = newest.start;
+    if (end === 0) return null;
+    const start = older ? Math.max(older.end, end - pageSize) : Math.max(0, end - pageSize);
+    return start < end ? { start, end } : null;
+  }
+
+  private bindHistoryLease(conversation: Conversation): void {
+    let service;
+    try {
+      service = ProviderRegistry.getConversationHistoryService(conversation.providerId);
+    } catch {
+      this.deps.state.resetHistoryPagination();
+      return;
+    }
+    if (!service.acquireHistoryIndex) {
+      this.deps.state.resetHistoryPagination();
+      return;
+    }
+    this.deps.state.historyLease?.release();
+    this.deps.state.historyLease = this.acquireLease(conversation, service);
+    this.deps.state.loadedRanges = [];
+    this.deps.state.historyHasMore = false;
+  }
+
+  private acquireLease(conversation: Conversation, service: { acquireHistoryIndex?: (
+    conversation: Conversation,
+    vaultPath: string | null,
+    onProgress?: (progress: HistoryLoadProgress) => void,
+    forceNewSnapshot?: boolean,
+  ) => HistoryIndexLease }, forceNewSnapshot = false): HistoryIndexLease {
+    const progress = (value: HistoryLoadProgress) => this.deps.onHistoryLoadProgress?.(value);
+    const lease = forceNewSnapshot
+      ? service.acquireHistoryIndex?.(conversation, getVaultPath(this.deps.plugin.app), progress, true)
+      : service.acquireHistoryIndex?.(conversation, getVaultPath(this.deps.plugin.app), progress);
+    if (!lease) throw new Error('Paged history is unavailable');
+    return lease;
   }
 
   /** Switches to a different conversation. */
@@ -427,9 +573,9 @@ export class ConversationController {
       this.deps.getInputEl().value = '';
       this.deps.clearQueuedMessage();
 
-      this.restoreConversation(conversation);
-
       this.releaseSwitchedAwayHistory(previousConversationId, previousProviderId);
+      this.restoreConversation(conversation);
+      this.bindHistoryLease(conversation);
 
       this.deps.getHistoryDropdown()?.removeClass('visible');
       this.updateWelcomeVisibility();
@@ -464,10 +610,12 @@ export class ConversationController {
    */
   private releaseSwitchedAwayHistory(
     conversationId: string | null,
-    providerId: ProviderId | undefined,
+    _providerId: ProviderId | undefined,
   ): void {
-    if (!conversationId || !providerId) return;
-    ProviderRegistry.getConversationHistoryService(providerId).releaseHistory?.(conversationId);
+    if (!conversationId || !_providerId) return;
+    this.deps.state.historyLease?.release();
+    this.deps.state.historyLease = null;
+    this.deps.state.loadedRanges = [];
   }
 
   async rewind(userMessageId: string): Promise<void> {

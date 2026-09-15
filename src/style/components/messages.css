@@ -84,9 +84,8 @@
   position: absolute;
   inset: 8px 8px auto 8px;
   z-index: 20;
-  max-height: min(60%, 420px);
   display: flex;
-  flex-direction: column;
+  align-items: center;
   gap: 6px;
   padding: 8px;
   border: 1px solid var(--background-modifier-border);
@@ -96,14 +95,21 @@
 }
 
 .claudian-history-search input {
-  width: 100%;
-  padding-inline-end: 28px;
+  min-width: 0;
+  flex: 1;
+}
+
+.claudian-history-search-status {
+  flex: none;
+  color: var(--text-muted);
+  font-size: var(--font-smallest);
+}
+
+.claudian-history-search button {
+  flex: none;
 }
 
 .claudian-history-search-close {
-  position: absolute;
-  top: 10px;
-  inset-inline-end: 12px;
   border: 0;
   background: transparent;
   color: var(--text-muted);
@@ -116,45 +122,6 @@
   color: var(--text-normal);
 }
 
-.claudian-history-search-results {
-  overflow-y: auto;
-}
-
-.claudian-history-search-result {
-  width: 100%;
-  display: flex;
-  justify-content: space-between;
-  gap: 12px;
-  padding: 7px 8px;
-  border: 0;
-  background: transparent;
-  color: var(--text-normal);
-  text-align: start;
-}
-
-.claudian-history-search-result:hover,
-.claudian-history-search-result.is-selected {
-  background: var(--background-modifier-hover);
-}
-
-.claudian-history-search-snippet {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.claudian-history-search-time,
-.claudian-history-search-empty {
-  flex: none;
-  color: var(--text-muted);
-  font-size: var(--font-smallest);
-}
-
-.claudian-history-search-empty {
-  padding: 8px;
-  text-align: center;
-}
-
 .claudian-history-search-error {
   flex: none;
   padding: 8px;
@@ -165,8 +132,13 @@
 
 .claudian-search-match {
   padding: 0;
-  background: var(--text-highlight-bg);
+  background: color-mix(in srgb, var(--text-highlight-bg) 55%, transparent);
   color: inherit;
+}
+
+.claudian-search-match.is-current {
+  background: var(--text-highlight-bg);
+  outline: 1px solid var(--interactive-accent);
 }
 
 .claudian-message.claudian-search-highlight {

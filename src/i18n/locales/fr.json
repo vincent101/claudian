@@ -85,7 +85,14 @@
       "noResults": "Aucun résultat",
       "error": "Échec de la recherche",
       "resultCount": "{current} sur {total}",
-      "close": "Fermer la recherche"
+      "close": "Fermer la recherche",
+      "previous": "Résultat précédent",
+      "next": "Résultat suivant",
+      "searching": "Recherche…",
+      "indexing": "Indexation…",
+      "locating": "Localisation…",
+      "retryError": "Impossible de localiser ce résultat. Réessayez.",
+      "projectionMismatch": "Ce résultat ne correspond plus au message affiché."
     },
     "message": {
       "timestamp": "Envoyé à {time}"

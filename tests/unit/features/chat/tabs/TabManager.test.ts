@@ -965,15 +965,13 @@ describe('TabManager - Tab Lifecycle', () => {
         createdAt: 1,
         updatedAt: 1,
       };
-      const loadInitialHistory = jest.fn().mockResolvedValue({
+      const lease = { conversationId: 'large-conv', totalTurns: 100, ready: Promise.resolve(), search: jest.fn(), release: jest.fn(), loadRange: jest.fn().mockResolvedValue({
         messages: [{ id: 'turn-50', role: 'user', content: 'latest', timestamp: 2 }],
-        cursor: 'opaque',
-        hasMore: true,
-        snapshotOffset: 4096,
-      });
+        range: { start: 50, end: 100 }, snapshotOffset: 4096,
+      }) };
+      const acquireHistoryIndex = jest.fn().mockReturnValue(lease);
       const historyService = {
-        loadInitialHistory,
-        releaseHistory: jest.fn(),
+        acquireHistoryIndex,
         exportFullHistory: jest.fn(),
         buildForkProviderState: mockBuildForkProviderState,
       };
@@ -1012,11 +1010,11 @@ describe('TabManager - Tab Lifecycle', () => {
         await flushMicrotasks(10);
         jest.useRealTimers();
 
-        expect(loadInitialHistory).toHaveBeenCalledWith(storedConversation, '/vault', 50, expect.any(Function));
+        expect(acquireHistoryIndex).toHaveBeenCalledWith(storedConversation, '/vault', expect.any(Function));
         expect(tab?.hydrationState).toBe('READY');
         expect(tab?.dom.inputEl.disabled).toBe(false);
         expect(tab?.state.messages.map((message: any) => message.id)).toEqual(['turn-50']);
-        expect(tab?.state.historyCursor).toBe('opaque');
+        expect(tab?.state.historyLease).toBe(lease);
         // The stored conversation carries the materialized page so the tab
         // service handoff and passive tab sync see the same view the tab
         // renders (mirrors full hydration mutating the stored conversation).
@@ -1040,13 +1038,11 @@ describe('TabManager - Tab Lifecycle', () => {
         createdAt: 1,
         updatedAt: 1,
       };
-      const loadInitialHistory = jest.fn()
-        .mockRejectedValue(new Error('index build failed: worker crashed'));
+      const acquireHistoryIndex = jest.fn().mockReturnValue({ conversationId: 'large-conv', totalTurns: 0, ready: Promise.reject(new Error('index build failed: worker crashed')), search: jest.fn(), loadRange: jest.fn(), release: jest.fn() });
       const serviceSpy = jest.spyOn(ProviderRegistry, 'getConversationHistoryService')
         .mockReturnValue({
-          loadInitialHistory,
-          releaseHistory: jest.fn(),
-          buildForkProviderState: mockBuildForkProviderState,
+          acquireHistoryIndex,
+            buildForkProviderState: mockBuildForkProviderState,
         } as any);
       const plugin = createMockPlugin({
         app: {
@@ -1081,7 +1077,7 @@ describe('TabManager - Tab Lifecycle', () => {
         await flushMicrotasks(10);
         jest.useRealTimers();
 
-        expect(loadInitialHistory).toHaveBeenCalledWith(storedConversation, '/vault', 50, expect.any(Function));
+        expect(acquireHistoryIndex).toHaveBeenCalledWith(storedConversation, '/vault', expect.any(Function));
         expect(tab?.hydrationState).toBe('ERROR');
         expect(tab?.hydrationDiagnostic?.message).toBe('index build failed: worker crashed');
         expect(tab?.dom.inputEl.disabled).toBe(true);

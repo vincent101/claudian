@@ -64,7 +64,14 @@ export type TranslationKey =
   | 'chat.search.noResults'
   | 'chat.search.error'
   | 'chat.search.resultCount'
+  | 'chat.search.previous'
+  | 'chat.search.next'
   | 'chat.search.close'
+  | 'chat.search.searching'
+  | 'chat.search.indexing'
+  | 'chat.search.locating'
+  | 'chat.search.retryError'
+  | 'chat.search.projectionMismatch'
   | 'chat.message.timestamp'
 
   // Chat - Fork

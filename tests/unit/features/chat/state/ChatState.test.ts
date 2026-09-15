@@ -7,7 +7,7 @@ describe('ChatState', () => {
       const state = createInitialState();
 
       expect(state.messages).toEqual([]);
-      expect(state.historyCursor).toBeNull();
+      expect(state.historyLease).toBeNull();
       expect(state.historyHasMore).toBe(false);
       expect(state.historyLoading).toBe(false);
       expect(state.historyError).toBeNull();

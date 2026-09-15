@@ -72,6 +72,7 @@ export interface StreamControllerDeps {
   updateQueueIndicator: () => void;
   /** Get the agent service from the tab. */
   getAgentService?: () => ChatRuntime | null;
+  onStreamComplete?: () => void;
 }
 
 /**
@@ -328,8 +329,13 @@ export class StreamController {
       }
 
       case 'done':
-        // Flush any remaining pending tools
         this.flushPendingTools();
+        if (state.currentThinkingState || context.thinkingBuffer) {
+          await this.finalizeCurrentThinkingBlock(msg, context);
+        }
+        await this.finalizeCurrentTextBlock(msg, context);
+        await this.deps.renderer.renderMessageContent?.(msg.id, []);
+        this.deps.onStreamComplete?.();
         break;
 
       case 'context_compacted': {

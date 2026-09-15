@@ -85,7 +85,14 @@
       "noResults": "沒有結果",
       "error": "搜尋失敗",
       "resultCount": "第 {current} 項，共 {total} 項",
-      "close": "關閉搜尋"
+      "close": "關閉搜尋",
+      "previous": "上一個符合項目",
+      "next": "下一個符合項目",
+      "searching": "搜尋中…",
+      "indexing": "建立索引中…",
+      "locating": "定位中…",
+      "retryError": "無法定位此結果，請重試。",
+      "projectionMismatch": "此結果與目前顯示內容不再相符。"
     },
     "message": {
       "timestamp": "傳送於 {time}"

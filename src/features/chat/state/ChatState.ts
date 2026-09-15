@@ -13,7 +13,8 @@ import type {
 function createInitialState(): ChatStateData {
   return {
     messages: [],
-    historyCursor: null,
+    historyLease: null,
+    loadedRanges: [],
     historyHasMore: false,
     historyLoading: false,
     historyError: null,
@@ -100,8 +101,10 @@ export class ChatState {
     this._callbacks.onMessagesChanged?.();
   }
 
-  get historyCursor(): string | null { return this.state.historyCursor; }
-  set historyCursor(value: string | null) { this.state.historyCursor = value; }
+  get historyLease() { return this.state.historyLease; }
+  set historyLease(value) { this.state.historyLease = value; }
+  get loadedRanges() { return [...this.state.loadedRanges]; }
+  set loadedRanges(value) { this.state.loadedRanges = value; }
   get historyHasMore(): boolean { return this.state.historyHasMore; }
   set historyHasMore(value: boolean) { this.state.historyHasMore = value; }
   get historyLoading(): boolean { return this.state.historyLoading; }
@@ -112,7 +115,9 @@ export class ChatState {
   set historySnapshotOffset(value: number | null) { this.state.historySnapshotOffset = value; }
 
   resetHistoryPagination(): void {
-    this.state.historyCursor = null;
+    this.state.historyLease?.release();
+    this.state.historyLease = null;
+    this.state.loadedRanges = [];
     this.state.historyHasMore = false;
     this.state.historyLoading = false;
     this.state.historyError = null;

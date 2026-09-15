@@ -1,7 +1,8 @@
 import type {
   ConversationHistoryHydrationResult,
+  HistoryIndexLease,
   HistoryLoadProgress,
-  HistoryPage,
+  HistoryRangePage,
   HistorySearchResult,
   ProviderConversationHistoryService,
 } from '../../../core/providers/types';
@@ -334,22 +335,24 @@ interface IndexedSegment {
   index: TranscriptHistoryIndex;
 }
 
-interface PageCursorState {
+interface ConversationIndexState {
   conversationId: string;
   vaultPath: string;
   segments: IndexedSegment[];
-  endTurn: number;
   flattenedTurns: Array<{ segment: IndexedSegment; turnIndex: number }>;
+}
+
+interface SharedHistoryIndex {
+  refs: number;
+  controller: AbortController;
+  ready: Promise<ConversationIndexState>;
+  state?: ConversationIndexState;
+  protectedPaths: string[];
 }
 
 export class ClaudeConversationHistoryService implements ProviderConversationHistoryService {
   private hydratedConversationIds = new Set<string>();
-  private pageCursors = new Map<string, PageCursorState>();
-  private searchCursors = new Map<string, PageCursorState>();
-  private conversationIndexes = new Map<string, PageCursorState>();
-  private protectedConversations = new Map<string, string>();
-  private indexBuildControllers = new Map<string, AbortController>();
-  private cursorSequence = 0;
+  private sharedIndexes = new Map<string, SharedHistoryIndex>();
   private indexDiagnostics: ClaudeTranscriptDiagnosticLog | null = null;
 
   // The index module probes worker_threads once per process; route its fallback
@@ -498,168 +501,138 @@ export class ClaudeConversationHistoryService implements ProviderConversationHis
     return { status: 'ready' };
   }
 
-  async loadInitialHistory(
+  acquireHistoryIndex(
     conversation: Conversation,
     vaultPath: string | null,
-    pageSize: number,
     onProgress?: (progress: HistoryLoadProgress) => void,
-  ): Promise<HistoryPage> {
+    forceNewSnapshot = false,
+  ): HistoryIndexLease {
     if (!vaultPath) throw new Error('Vault path is unavailable');
     this.ensureIndexDiagnostics(vaultPath);
-    const state = getClaudeState(conversation.providerState);
-    const currentSessionId = state.providerSessionId ?? conversation.sessionId ?? state.forkSource?.sessionId;
-    if (!currentSessionId) throw new Error('Conversation has no Claude session');
-    const sessionIds = [...(state.previousProviderSessionIds ?? []), currentSessionId];
-    this.indexBuildControllers.get(conversation.id)?.abort();
-    const buildController = new AbortController();
-    this.indexBuildControllers.set(conversation.id, buildController);
-    const segments: IndexedSegment[] = [];
-    try {
-      onProgress?.({ phase: 'queued' });
-      for (const sessionId of sessionIds) {
-        if (!sdkSessionExists(vaultPath, sessionId)) continue;
-        const result = await buildTranscriptIndex(getSDKSessionPath(vaultPath, sessionId), {
-          resumeAtMessageId: sessionId === currentSessionId
-            ? (state.forkSource?.resumeAt ?? conversation.resumeAtMessageId)
-            : undefined,
-          signal: buildController.signal,
-          onProgress: (bytes, totalBytes) => onProgress?.({
-            phase: 'indexing',
-            percent: totalBytes > 0 ? Math.min(100, Math.round(bytes / totalBytes * 100)) : 100,
-          }),
-          onFinalize: () => onProgress?.({ phase: 'finalizing' }),
-        });
-        if (result.status === 'failed' || result.status === 'partial') throw new Error(result.error);
-        segments.push({ sessionId, index: result.index });
-      }
-      if (segments.length === 0) throw new Error('Conversation transcript is unavailable');
-    } finally {
-      // A failed build must not leave its controller registered: a superseding
-      // loadInitialHistory owns the slot, so only remove it if still ours.
-      if (this.indexBuildControllers.get(conversation.id) === buildController) {
-        this.indexBuildControllers.delete(conversation.id);
-      }
+    if (forceNewSnapshot) this.sharedIndexes.delete(conversation.id);
+    let shared = this.sharedIndexes.get(conversation.id);
+    if (!shared) {
+      const controller = new AbortController();
+      shared = {
+        refs: 0,
+        controller,
+        protectedPaths: [],
+        ready: this.buildConversationIndex(conversation, vaultPath, controller.signal, onProgress),
+      };
+      this.sharedIndexes.set(conversation.id, shared);
+      void shared.ready.then(state => {
+        if (this.sharedIndexes.get(conversation.id) !== shared) return;
+        shared!.state = state;
+        shared!.protectedPaths = state.segments.map(segment => segment.index.filePath);
+        shared!.protectedPaths.forEach(protectTranscriptIndex);
+      }).catch(() => {
+        if (this.sharedIndexes.get(conversation.id) === shared) {
+          this.sharedIndexes.delete(conversation.id);
+        }
+      });
     }
-    this.releaseHistory(conversation.id);
-    for (const segment of segments) protectTranscriptIndex(segment.index.filePath);
-    this.protectedConversations.set(conversation.id, segments.map(segment => segment.index.filePath).join('\n'));
+    shared.refs += 1;
+    const fixed = shared;
+    let released = false;
+    const ready = fixed.ready.then(() => undefined);
+    return {
+      conversationId: conversation.id,
+      get totalTurns() { return fixed.state?.flattenedTurns.length ?? 0; },
+      ready,
+      search: async query => this.searchIndex(await fixed.ready, query),
+      loadRange: async (start, end) => this.materializeRange(await fixed.ready, start, end),
+      release: () => {
+        if (released) return;
+        released = true;
+        fixed.refs -= 1;
+        if (fixed.refs > 0) return;
+        fixed.controller.abort();
+        fixed.protectedPaths.forEach(releaseTranscriptIndex);
+        if (this.sharedIndexes.get(conversation.id) === fixed) {
+          this.sharedIndexes.delete(conversation.id);
+          clearTranscriptIndexCache();
+        }
+      },
+    };
+  }
+
+  private async buildConversationIndex(
+    conversation: Conversation,
+    vaultPath: string,
+    signal: AbortSignal,
+    onProgress?: (progress: HistoryLoadProgress) => void,
+  ): Promise<ConversationIndexState> {
+    const providerState = getClaudeState(conversation.providerState);
+    const currentSessionId = providerState.providerSessionId ?? conversation.sessionId ?? providerState.forkSource?.sessionId;
+    if (!currentSessionId) throw new Error('Conversation has no Claude session');
+    const sessionIds = [...(providerState.previousProviderSessionIds ?? []), currentSessionId];
+    const segments: IndexedSegment[] = [];
+    onProgress?.({ phase: 'queued' });
+    for (const sessionId of sessionIds) {
+      if (!sdkSessionExists(vaultPath, sessionId)) continue;
+      const result = await buildTranscriptIndex(getSDKSessionPath(vaultPath, sessionId), {
+        resumeAtMessageId: sessionId === currentSessionId
+          ? (providerState.forkSource?.resumeAt ?? conversation.resumeAtMessageId)
+          : undefined,
+        signal,
+        onProgress: (bytes, totalBytes) => onProgress?.({
+          phase: 'indexing',
+          percent: totalBytes > 0 ? Math.min(100, Math.round(bytes / totalBytes * 100)) : 100,
+        }),
+        onFinalize: () => onProgress?.({ phase: 'finalizing' }),
+      });
+      if (result.status === 'failed' || result.status === 'partial') throw new Error(result.error);
+      segments.push({ sessionId, index: result.index });
+    }
+    if (segments.length === 0) throw new Error('Conversation transcript is unavailable');
     const flattenedTurns = segments.flatMap(segment =>
       segment.index.turns.map((_, turnIndex) => ({ segment, turnIndex }))
     );
-    const startTurn = Math.max(0, flattenedTurns.length - pageSize);
-    const cursorState = { conversationId: conversation.id, vaultPath, segments, endTurn: startTurn, flattenedTurns };
-    this.conversationIndexes.set(conversation.id, cursorState);
-    onProgress?.({ phase: 'loading', turnCount: Math.min(pageSize, flattenedTurns.length) });
-    return this.materializePage(cursorState, pageSize);
+    return { conversationId: conversation.id, vaultPath, segments, flattenedTurns };
   }
 
-  async searchHistory(
-    conversation: Conversation,
-    vaultPath: string | null,
-    query: string,
-  ): Promise<HistorySearchResult[]> {
-    let state = this.conversationIndexes.get(conversation.id);
-    if (!state && vaultPath) {
-      await this.loadInitialHistory(conversation, vaultPath, 50);
-      state = this.conversationIndexes.get(conversation.id);
-    }
+  private searchIndex(state: ConversationIndexState, query: string): HistorySearchResult[] {
     const needle = query.trim().toLocaleLowerCase();
-    if (!state || !needle) return [];
+    if (!needle) return [];
     const results: HistorySearchResult[] = [];
+    const ordinals = new Map<string, number>();
     let globalTurnOffset = 0;
     for (const segment of state.segments) {
       for (const item of segment.index.searchCorpus) {
         const text = segment.index.searchText.slice(item.textOffset, item.textOffset + item.textLength);
         const lowerText = text.toLocaleLowerCase();
         let matchStart = lowerText.indexOf(needle);
-        let matchOrdinal = 0;
         while (matchStart >= 0) {
-          const turnIndex = globalTurnOffset + item.turnIndex;
-          const cursor = `claude-search:${++this.cursorSequence}`;
-          this.searchCursors.set(cursor, { ...state, endTurn: turnIndex });
-          const contextStart = Math.max(0, matchStart - 48);
-          const contextEnd = Math.min(text.length, matchStart + query.length + 48);
+          const matchOrdinal = ordinals.get(item.projectionKey) ?? 0;
           results.push({
             projectionKey: item.projectionKey,
-            turnIndex,
+            turnIndex: globalTurnOffset + item.turnIndex,
             matchOrdinal,
-            cursor,
-            timestamp: item.timestamp ? new Date(item.timestamp).getTime() : 0,
-            snippet: `${contextStart > 0 ? '…' : ''}${text.slice(contextStart, contextEnd)}${contextEnd < text.length ? '…' : ''}`,
-            matchStart: matchStart - contextStart + (contextStart > 0 ? 1 : 0),
-            matchLength: query.length,
-            matchedText: text.slice(matchStart, matchStart + query.length),
+            matchedText: text.slice(matchStart, matchStart + query.trim().length),
           });
-          matchOrdinal += 1;
+          ordinals.set(item.projectionKey, matchOrdinal + 1);
           matchStart = lowerText.indexOf(needle, matchStart + needle.length);
         }
       }
       globalTurnOffset += segment.index.turns.length;
     }
-    return results;
+    return results.sort((a, b) =>
+      a.turnIndex - b.turnIndex
+      || a.projectionKey.localeCompare(b.projectionKey)
+      || a.matchOrdinal - b.matchOrdinal
+    );
   }
 
-  async loadHistoryAt(cursor: string, pageSize: number): Promise<HistoryPage> {
-    const state = this.searchCursors.get(cursor);
-    if (!state) throw new Error('History search cursor expired');
-    return this.materializePage(state, pageSize);
-  }
-
-  async loadOlderHistory(cursor: string, pageSize: number): Promise<HistoryPage> {
-    const state = this.pageCursors.get(cursor);
-    if (!state) throw new Error('History cursor expired');
-    this.pageCursors.delete(cursor);
-    const startTurn = Math.max(0, state.endTurn - pageSize);
-    try {
-      return await this.materializePage({ ...state, endTurn: startTurn }, pageSize);
-    } catch (error) {
-      // A failed page must not burn the cursor: restore it so the pager's
-      // Retry replays this page instead of failing with "cursor expired".
-      this.pageCursors.set(cursor, state);
-      throw error;
+  private async materializeRange(
+    state: ConversationIndexState,
+    start: number,
+    end: number,
+  ): Promise<HistoryRangePage> {
+    const total = state.flattenedTurns.length;
+    if (!Number.isInteger(start) || !Number.isInteger(end) || start < 0 || start >= end || end > total) {
+      throw new RangeError(`Invalid history range [${start}, ${end}) for ${total} turns`);
     }
-  }
-
-  async exportFullHistory(conversation: Conversation, vaultPath: string | null): Promise<ChatMessage[]> {
-    if (!vaultPath) return [...conversation.messages];
-    this.ensureIndexDiagnostics(vaultPath);
-    const state = getClaudeState(conversation.providerState);
-    const currentSessionId = state.providerSessionId ?? conversation.sessionId ?? state.forkSource?.sessionId;
-    if (!currentSessionId) return [...conversation.messages];
-    const sessionIds = [...(state.previousProviderSessionIds ?? []), currentSessionId];
-    const messages: ChatMessage[] = [];
-    for (const sessionId of sessionIds) {
-      if (!sdkSessionExists(vaultPath, sessionId)) continue;
-      const result = await buildTranscriptIndex(getSDKSessionPath(vaultPath, sessionId), {
-        resumeAtMessageId: sessionId === currentSessionId
-          ? (state.forkSource?.resumeAt ?? conversation.resumeAtMessageId)
-          : undefined,
-      });
-      if (result.status !== 'complete') throw new Error(result.error);
-      const native = await materializeTranscriptPage(result.index, 0, result.index.turns.length);
-      messages.push(...await materializeSDKMessages(vaultPath, sessionId, native));
-    }
-    return dedupeMessages(messages).sort((a, b) => a.timestamp - b.timestamp);
-  }
-
-  releaseHistory(conversationId: string): void {
-    this.indexBuildControllers.get(conversationId)?.abort();
-    this.indexBuildControllers.delete(conversationId);
-    const filePaths = this.protectedConversations.get(conversationId);
-    for (const filePath of filePaths?.split('\n') ?? []) releaseTranscriptIndex(filePath);
-    this.protectedConversations.delete(conversationId);
-    this.conversationIndexes.delete(conversationId);
-    clearTranscriptIndexCache();
-    for (const [cursor, state] of this.searchCursors) {
-      if (state.conversationId === conversationId) this.searchCursors.delete(cursor);
-    }
-    for (const [cursor, state] of this.pageCursors) {
-      if (state.conversationId === conversationId) this.pageCursors.delete(cursor);
-    }
-  }
-
-  private async materializePage(state: PageCursorState, pageSize: number): Promise<HistoryPage> {
-    const selected = state.flattenedTurns.slice(state.endTurn, state.endTurn + pageSize);
+    const selected = state.flattenedTurns.slice(start, end);
     const messages: ChatMessage[] = [];
     for (const segment of state.segments) {
       const indexes = selected.filter(item => item.segment === segment).map(item => item.turnIndex);
@@ -668,16 +641,24 @@ export class ClaudeConversationHistoryService implements ProviderConversationHis
       const associations = await materializeTranscriptToolAssociations(segment.index, native);
       messages.push(...await materializeSDKMessages(state.vaultPath, segment.sessionId, native, associations));
     }
-    const hasMore = state.endTurn > 0;
-    const cursor = hasMore ? `claude-history:${++this.cursorSequence}` : null;
-    if (cursor) this.pageCursors.set(cursor, state);
     const current = state.segments[state.segments.length - 1];
     return {
       messages: dedupeMessages(messages).sort((a, b) => a.timestamp - b.timestamp),
-      cursor,
-      hasMore,
+      range: { start, end },
       snapshotOffset: current.index.snapshotSize,
     };
+  }
+
+  async exportFullHistory(conversation: Conversation, vaultPath: string | null): Promise<ChatMessage[]> {
+    if (!vaultPath) return [...conversation.messages];
+    const lease = this.acquireHistoryIndex(conversation, vaultPath);
+    try {
+      await lease.ready;
+      if (lease.totalTurns === 0) return [];
+      return (await lease.loadRange(0, lease.totalTurns)).messages;
+    } finally {
+      lease.release();
+    }
   }
 
   async deleteConversationSession(

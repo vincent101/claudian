@@ -1210,6 +1210,7 @@ export function initializeTabControllers(
       ? (id) => handleForkRequest(tab, plugin, id, forkRequestCallback)
       : undefined,
     () => getTabCapabilities(tab, plugin),
+    projectionKey => tab.controllers.historySearchController?.onMessageContentRendered(projectionKey),
   );
 
   // Selection controller
@@ -1247,6 +1248,7 @@ export function initializeTabControllers(
     getFileContextManager: () => ui.fileContextManager,
     updateQueueIndicator: () => tab.controllers.inputController?.updateQueueIndicator(),
     getAgentService: () => tab.service,
+    onStreamComplete: () => tab.controllers.historySearchController?.onStreamComplete(),
   });
 
   // Wire subagent callback now that StreamController exists
@@ -1369,8 +1371,10 @@ export function initializeTabControllers(
       && plugin.app.workspace.activeLeaf === (component as Component & { leaf?: unknown }).leaf
     ),
     getConversationId: () => state.currentConversationId,
-    searchHistory: (_conversationId, query) => tab.controllers.conversationController!.searchHistory(query),
+    searchHistory: (_conversationId, query, onPhase) => tab.controllers.conversationController!.searchHistory(query, onPhase),
     locateResult: result => tab.controllers.conversationController!.locateHistorySearchResult(result),
+    waitForResultRender: projectionKey => tab.renderer!.waitForMessageContentRendered(projectionKey),
+    refreshSearchSnapshot: () => tab.controllers.conversationController!.refreshHistorySearchSnapshot(),
   });
   dom.eventCleanups.push(() => tab.controllers.historySearchController?.destroy());
 
@@ -1701,6 +1705,8 @@ export async function destroyTab(tab: TabData): Promise<void> {
   tab.controllers.canvasSelectionController?.stop();
   tab.controllers.canvasSelectionController?.clear();
   tab.controllers.navigationController?.dispose();
+  tab.state.historyLease?.release();
+  tab.state.historyLease = null;
 
   cleanupThinkingBlock(tab.state.currentThinkingState);
   tab.state.currentThinkingState = null;

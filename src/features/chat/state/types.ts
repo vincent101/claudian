@@ -1,5 +1,6 @@
 import type { EditorView } from '@codemirror/view';
 
+import type { HistoryIndexLease, LoadedTurnRange } from '../../../core/providers/types';
 import type { ChatRuntimeQueryOptions } from '../../../core/runtime/types';
 import type { TodoItem } from '../../../core/tools/todo';
 import type {
@@ -46,7 +47,8 @@ export interface StoredSelection {
 export interface ChatStateData {
   // Message state
   messages: ChatMessage[];
-  historyCursor: string | null;
+  historyLease: HistoryIndexLease | null;
+  loadedRanges: LoadedTurnRange[];
   historyHasMore: boolean;
   historyLoading: boolean;
   historyError: string | null;

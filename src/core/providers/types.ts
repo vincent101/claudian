@@ -382,10 +382,16 @@ export class ConversationHistoryHydrationError extends Error {
   }
 }
 
-export interface HistoryPage {
+export interface LoadedTurnRange {
+  /** Inclusive global turn index. */
+  start: number;
+  /** Exclusive global turn index. */
+  end: number;
+}
+
+export interface HistoryRangePage {
   messages: ChatMessage[];
-  cursor: string | null;
-  hasMore: boolean;
+  range: LoadedTurnRange;
   snapshotOffset?: number;
 }
 
@@ -400,14 +406,20 @@ export interface HistorySearchResult {
   projectionKey: string;
   /** Global turn containing this match. */
   turnIndex: number;
-  /** Zero-based occurrence of the query within the projected message text. */
+  /** Zero-based occurrence within all corpus items sharing projectionKey. */
   matchOrdinal: number;
-  cursor: string;
-  timestamp: number;
-  snippet: string;
-  matchStart: number;
-  matchLength: number;
   matchedText: string;
+  status?: 'projection_mismatch';
+}
+
+export interface HistoryIndexLease {
+  conversationId: string;
+  /** Fixed total from the index snapshot acquired for this lease. */
+  totalTurns: number;
+  ready: Promise<void>;
+  search(query: string): Promise<HistorySearchResult[]>;
+  loadRange(startInclusive: number, endExclusive: number): Promise<HistoryRangePage>;
+  release(): void;
 }
 
 export interface ProviderConversationHistoryService {
@@ -415,20 +427,16 @@ export interface ProviderConversationHistoryService {
     conversation: Conversation,
     vaultPath: string | null,
   ): Promise<void | ConversationHistoryHydrationResult>;
-  loadInitialHistory?(
+  acquireHistoryIndex?(
     conversation: Conversation,
     vaultPath: string | null,
-    pageSize: number,
     onProgress?: (progress: HistoryLoadProgress) => void,
-  ): Promise<HistoryPage>;
-  loadOlderHistory?(cursor: string, pageSize: number): Promise<HistoryPage>;
-  searchHistory?(conversation: Conversation, vaultPath: string | null, query: string): Promise<HistorySearchResult[]>;
-  loadHistoryAt?(cursor: string, pageSize: number): Promise<HistoryPage>;
+    forceNewSnapshot?: boolean,
+  ): HistoryIndexLease;
   exportFullHistory?(
     conversation: Conversation,
     vaultPath: string | null,
   ): Promise<ChatMessage[]>;
-  releaseHistory?(conversationId: string): void;
   deleteConversationSession(
     conversation: Conversation,
     vaultPath: string | null,

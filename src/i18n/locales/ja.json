@@ -85,7 +85,14 @@
       "noResults": "結果がありません",
       "error": "検索に失敗しました",
       "resultCount": "{total} 件中 {current} 件目",
-      "close": "検索を閉じる"
+      "close": "検索を閉じる",
+      "previous": "前の一致",
+      "next": "次の一致",
+      "searching": "検索中…",
+      "indexing": "インデックス作成中…",
+      "locating": "移動中…",
+      "retryError": "結果を表示できません。再試行してください。",
+      "projectionMismatch": "この結果は表示されたメッセージと一致しなくなりました。"
     },
     "message": {
       "timestamp": "送信日時: {time}"

@@ -44,6 +44,9 @@ export class MessageRenderer {
   private getCapabilities: () => ProviderCapabilities;
   private forkCallback?: (messageId: string) => Promise<void>;
   private liveMessageEls = new Map<string, HTMLElement>();
+  private readonly contentRenderGenerations = new Map<string, number>();
+  private readonly pendingContentRenders = new Map<string, Promise<void>>();
+  private readonly onMessageContentRendered?: (projectionKey: string) => void;
 
   private static readonly REWIND_ICON = `<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/></svg>`;
 
@@ -56,6 +59,7 @@ export class MessageRenderer {
     rewindCallback?: (messageId: string) => Promise<void>,
     forkCallback?: (messageId: string) => Promise<void>,
     getCapabilities?: () => ProviderCapabilities,
+    onMessageContentRendered?: (projectionKey: string) => void,
   ) {
     this.app = plugin.app;
     this.plugin = plugin;
@@ -63,6 +67,7 @@ export class MessageRenderer {
     this.messagesEl = messagesEl;
     this.rewindCallback = rewindCallback;
     this.forkCallback = forkCallback;
+    this.onMessageContentRendered = onMessageContentRendered;
     this.getCapabilities = getCapabilities ?? (() => ({
       providerId: DEFAULT_CHAT_PROVIDER_ID,
       supportsPersistentRuntime: false,
@@ -89,6 +94,50 @@ export class MessageRenderer {
 
   private getSubagentLifecycleAdapter(toolName?: string) {
     return resolveSubagentLifecycleAdapter(this.getCapabilities().providerId, toolName);
+  }
+
+  async renderMessageContent(projectionKey: string, jobs: Array<Promise<void>>): Promise<void> {
+    const generation = (this.contentRenderGenerations.get(projectionKey) ?? 0) + 1;
+    this.contentRenderGenerations.set(projectionKey, generation);
+    const pending = Promise.all(jobs).then(() => {
+      if (this.contentRenderGenerations.get(projectionKey) !== generation) return;
+      this.onMessageContentRendered?.(projectionKey);
+    });
+    this.pendingContentRenders.set(projectionKey, pending);
+    try {
+      await pending;
+    } finally {
+      if (this.pendingContentRenders.get(projectionKey) === pending) {
+        this.pendingContentRenders.delete(projectionKey);
+      }
+    }
+  }
+
+  async waitForMessageContentRendered(projectionKey: string): Promise<void> {
+    await this.pendingContentRenders.get(projectionKey);
+  }
+
+  async renderSearchCandidate(message: ChatMessage): Promise<HTMLElement> {
+    const root = this.messagesEl.ownerDocument.createElement('div');
+    root.className = `claudian-message claudian-message-${message.role}`;
+    root.dataset.messageId = message.id;
+    const content = root.createDiv({ cls: 'claudian-message-content' });
+    const jobs: Array<Promise<void>> = [];
+    if (message.role === 'user') {
+      const markdown = message.displayContent ?? message.content;
+      if (markdown) jobs.push(this.renderContent(content.createDiv({ cls: 'claudian-text-block' }), markdown));
+    } else {
+      for (const block of message.contentBlocks ?? []) {
+        if (block.type === 'text' && block.content.trim()) {
+          jobs.push(this.renderContent(content.createDiv({ cls: 'claudian-text-block' }), block.content));
+        }
+      }
+      if (jobs.length === 0 && message.content) {
+        jobs.push(this.renderContent(content.createDiv({ cls: 'claudian-text-block' }), message.content));
+      }
+    }
+    await Promise.all(jobs);
+    return root;
   }
 
   // ============================================
@@ -129,7 +178,7 @@ export class MessageRenderer {
       const textToShow = msg.displayContent ?? msg.content;
       if (textToShow) {
         const textEl = contentEl.createDiv({ cls: 'claudian-text-block' });
-        void this.renderContent(textEl, textToShow);
+        void this.renderMessageContent(msg.id, [this.renderContent(textEl, textToShow)]);
         this.addUserCopyButton(msgEl, textToShow);
       }
       if (this.rewindCallback || this.forkCallback) {
@@ -163,7 +212,7 @@ export class MessageRenderer {
     const textToShow = msg.displayContent ?? msg.content;
     if (textToShow) {
       const textEl = contentEl.createDiv({ cls: 'claudian-text-block' });
-      void this.renderContent(textEl, textToShow);
+      void this.renderMessageContent(msg.id, [this.renderContent(textEl, textToShow)]);
     }
 
     const toolbar = msgEl.querySelector('.claudian-message-actions') as HTMLElement | null;
@@ -337,7 +386,7 @@ export class MessageRenderer {
       const textToShow = msg.displayContent ?? msg.content;
       if (textToShow) {
         const textEl = contentEl.createDiv({ cls: 'claudian-text-block' });
-        void this.renderContent(textEl, textToShow);
+        void this.renderMessageContent(msg.id, [this.renderContent(textEl, textToShow)]);
         this.addUserCopyButton(msgEl, textToShow);
       }
       if (msg.userMessageId && this.isRewindEligible(allMessages, index)) {
@@ -349,7 +398,8 @@ export class MessageRenderer {
         }
       }
     } else if (msg.role === 'assistant') {
-      this.renderAssistantContent(msg, contentEl);
+      const jobs = this.renderAssistantContent(msg, contentEl);
+      void this.renderMessageContent(msg.id, jobs);
       if (msg.isInterrupt) {
         this.appendInterruptIndicator(contentEl);
       }
@@ -384,7 +434,8 @@ export class MessageRenderer {
   /**
    * Renders assistant message content (content blocks or fallback).
    */
-  private renderAssistantContent(msg: ChatMessage, contentEl: HTMLElement): void {
+  private renderAssistantContent(msg: ChatMessage, contentEl: HTMLElement): Array<Promise<void>> {
+    const jobs: Array<Promise<void>> = [];
     if (msg.contentBlocks && msg.contentBlocks.length > 0) {
       const renderedToolIds = new Set<string>();
       for (const block of msg.contentBlocks) {
@@ -401,7 +452,7 @@ export class MessageRenderer {
             continue;
           }
           const textEl = contentEl.createDiv({ cls: 'claudian-text-block' });
-          void this.renderContent(textEl, block.content);
+          jobs.push(this.renderContent(textEl, block.content));
           this.addTextCopyButton(textEl, block.content);
         } else if (block.type === 'tool_use') {
           const toolCall = msg.toolCalls?.find(tc => tc.id === block.toolId);
@@ -435,7 +486,7 @@ export class MessageRenderer {
       // Fallback for old conversations without contentBlocks
       if (msg.content) {
         const textEl = contentEl.createDiv({ cls: 'claudian-text-block' });
-        void this.renderContent(textEl, msg.content);
+        jobs.push(this.renderContent(textEl, msg.content));
         this.addTextCopyButton(textEl, msg.content);
       }
       if (msg.toolCalls) {
@@ -455,6 +506,7 @@ export class MessageRenderer {
         cls: 'claudian-baked-duration',
       });
     }
+    return jobs;
   }
 
   /**

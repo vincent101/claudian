@@ -69,6 +69,8 @@ function createMockDeps(overrides: Partial<ConversationControllerDeps> = {}): Co
       renderMessages: jest.fn().mockReturnValue(createMockEl()),
       renderHistoryPager: jest.fn(),
       prependMessages: jest.fn(),
+      renderSearchCandidate: jest.fn(),
+      waitForMessageContentRendered: jest.fn().mockResolvedValue(undefined),
       findMessageElement: jest.fn(),
       highlightSearchMatch: jest.fn(),
     } as any,
@@ -116,128 +118,126 @@ describe('ConversationController', () => {
   });
 
   describe('paged history', () => {
-    it('materializes an oversize initial page and enables paged rendering', async () => {
-      const conversation = {
-        id: 'large', providerId: 'claude', title: 'Large', messages: [], sessionId: 'session', createdAt: 1, updatedAt: 1,
-      } as any;
+    const makeLease = (totalTurns = 120) => ({
+      conversationId: 'large', totalTurns, ready: Promise.resolve(), release: jest.fn(), search: jest.fn(), loadRange: jest.fn(),
+    });
+
+    it('loads the newest fixed-snapshot range for oversize history', async () => {
+      const conversation = { id: 'large', providerId: 'claude', title: 'Large', messages: [], sessionId: 'session', createdAt: 1, updatedAt: 1 } as any;
       deps.state.currentConversationId = 'large';
-      (deps.plugin.getConversationById as jest.Mock).mockRejectedValue(new ConversationHistoryHydrationError({
-        status: 'oversize', segments: [{ sessionId: 'session', sizeBytes: 99 }],
-      }));
+      (deps.plugin.getConversationById as jest.Mock).mockRejectedValue(new ConversationHistoryHydrationError({ status: 'oversize', segments: [{ sessionId: 'session', sizeBytes: 99 }] }));
       (deps.plugin.getConversationSync as jest.Mock).mockReturnValue(conversation);
-      const service = { loadInitialHistory: jest.fn().mockResolvedValue({
-        messages: [{ id: 'latest', role: 'user', content: 'latest', timestamp: 1 }],
-        cursor: 'opaque', hasMore: true, snapshotOffset: 123,
-      }) };
+      const lease = makeLease();
+      lease.loadRange.mockResolvedValue({ messages: [{ id: 'latest', role: 'user', content: 'latest', timestamp: 1 }], range: { start: 70, end: 120 }, snapshotOffset: 123 });
+      const service = { acquireHistoryIndex: jest.fn().mockReturnValue(lease) };
       jest.spyOn(ProviderRegistry, 'getConversationHistoryService').mockReturnValue(service as any);
-      const loadInitialHistory = service.loadInitialHistory;
 
       await controller.loadActive();
 
-      expect(loadInitialHistory).toHaveBeenCalledWith(conversation, expect.anything(), 50, expect.any(Function));
-      expect(deps.state.messages.map(message => message.id)).toEqual(['latest']);
-      expect(deps.state.historyCursor).toBe('opaque');
+      expect(lease.loadRange).toHaveBeenCalledWith(70, 120);
+      expect(deps.state.loadedRanges).toEqual([{ start: 70, end: 120 }]);
       expect(deps.state.historySnapshotOffset).toBe(123);
     });
 
-    it('surfaces the real materialization error when the paged initial load fails', async () => {
-      const conversation = {
-        id: 'large', providerId: 'claude', title: 'Large', messages: [], sessionId: 'session', createdAt: 1, updatedAt: 1,
-      } as any;
-      deps.state.currentConversationId = 'large';
-      (deps.plugin.getConversationById as jest.Mock).mockRejectedValue(new ConversationHistoryHydrationError({
-        status: 'oversize', segments: [{ sessionId: 'session', sizeBytes: 99 }],
-      }));
-      (deps.plugin.getConversationSync as jest.Mock).mockReturnValue(conversation);
-      const service = { loadInitialHistory: jest.fn().mockRejectedValue(new Error('index build failed: worker crashed')) };
-      jest.spyOn(ProviderRegistry, 'getConversationHistoryService').mockReturnValue(service as any);
-
-      await expect(controller.loadActive()).rejects.toThrow('index build failed: worker crashed');
-      expect(deps.state.historyLoading).toBe(false);
-    });
-
-    it('locates an already loaded search result without paging and highlights it', async () => {
-      deps.state.currentConversationId = 'large';
-      const messageEl = {} as HTMLElement;
-      (deps.renderer.findMessageElement as jest.Mock).mockReturnValue(messageEl);
-      const result = { projectionKey: 'loaded', turnIndex: 0, matchOrdinal: 0, cursor: 'search', timestamp: 1, snippet: 'needle', matchStart: 0, matchLength: 6, matchedText: 'needle' };
-
-      await controller.locateHistorySearchResult(result);
-
-      expect(deps.renderer.highlightSearchMatch).toHaveBeenCalledWith(messageEl, 'needle', 0);
-    });
-
-    it('relocates pagination to an unloaded search page and continues older without gaps or duplicates', async () => {
+    it('loads a distant hit once then fills the newest-side gap when loading older', async () => {
       deps.state.currentConversationId = 'large';
       deps.state.messages = [{ id: 'latest', role: 'user', content: 'latest', timestamp: 100 }];
-      deps.state.historyCursor = 'latest-cursor';
+      const lease = makeLease(200);
+      deps.state.historyLease = lease as any;
+      deps.state.loadedRanges = [{ start: 150, end: 200 }];
       deps.state.historyHasMore = true;
-      (deps.plugin.getConversationSync as jest.Mock).mockReturnValue({ id: 'large', providerId: 'claude' });
-      const messageEl = {} as HTMLElement;
-      (deps.renderer.findMessageElement as jest.Mock).mockReturnValueOnce(null).mockReturnValueOnce(messageEl);
-      const service = {
-        loadHistoryAt: jest.fn().mockResolvedValue({
-          messages: [
-            { id: 'target', role: 'user', content: 'needle', timestamp: 50 },
-            { id: 'overlap', role: 'assistant', content: 'overlap', timestamp: 51 },
-          ],
-          cursor: 'jump-cursor', hasMore: true,
-        }),
-        loadOlderHistory: jest.fn().mockResolvedValue({
-          messages: [
-            { id: 'older', role: 'user', content: 'older', timestamp: 1 },
-            { id: 'target', role: 'user', content: 'needle', timestamp: 50 },
-          ],
-          cursor: null, hasMore: false,
-        }),
-      };
-      jest.spyOn(ProviderRegistry, 'getConversationHistoryService').mockReturnValue(service as any);
-      const result = { projectionKey: 'target', turnIndex: 0, matchOrdinal: 0, cursor: 'search', timestamp: 1, snippet: 'needle', matchStart: 0, matchLength: 6, matchedText: 'needle' };
+      lease.loadRange
+        .mockResolvedValueOnce({ messages: [{ id: 'target', role: 'user', content: 'needle', timestamp: 50 }], range: { start: 25, end: 75 } })
+        .mockResolvedValueOnce({ messages: [{ id: 'gap', role: 'user', content: 'gap', timestamp: 75 }], range: { start: 100, end: 150 } });
+      (deps.renderer.findMessageElement as jest.Mock).mockReturnValueOnce(null).mockReturnValue({} as HTMLElement);
 
-      await controller.locateHistorySearchResult(result);
+      await controller.locateHistorySearchResult({ projectionKey: 'target', turnIndex: 25, matchOrdinal: 0, matchedText: 'needle' });
       await controller.loadOlderHistory();
 
-      expect(service.loadHistoryAt).toHaveBeenCalledWith('search', 50);
-      expect(service.loadOlderHistory).toHaveBeenCalledWith('jump-cursor', 50);
-      expect(deps.state.messages.map(message => message.id)).toEqual(['older', 'target', 'overlap', 'latest']);
-      expect((deps.renderer.prependMessages as jest.Mock).mock.calls[0][0].map((message: { id: string }) => message.id)).toEqual(['target', 'overlap']);
-      expect((deps.renderer.prependMessages as jest.Mock).mock.calls[1][0].map((message: { id: string }) => message.id)).toEqual(['older']);
-      expect(deps.state.historyCursor).toBeNull();
-      expect(deps.state.historyHasMore).toBe(false);
-      expect(deps.renderer.highlightSearchMatch).toHaveBeenCalledWith(messageEl, 'needle', 0);
+      expect(lease.loadRange).toHaveBeenNthCalledWith(1, 25, 75);
+      expect(lease.loadRange).toHaveBeenNthCalledWith(2, 100, 150);
+      expect(deps.state.loadedRanges).toEqual([{ start: 25, end: 75 }, { start: 100, end: 200 }]);
+      expect(deps.renderer.prependMessages).toHaveBeenCalledTimes(1);
+      expect(deps.renderer.renderMessages).toHaveBeenCalledTimes(1);
     });
 
-    it('throws when a materialized search projection still has no DOM target', async () => {
+    it('reuses loaded message nodes and preserves the scroll anchor when loading earlier', async () => {
       deps.state.currentConversationId = 'large';
-      (deps.plugin.getConversationSync as jest.Mock).mockReturnValue({ id: 'large', providerId: 'claude' });
+      const existing = { id: 'latest', role: 'user', content: 'latest', timestamp: 100 } as any;
+      deps.state.messages = [existing];
+      const lease = makeLease(100);
+      deps.state.historyLease = lease as any;
+      deps.state.loadedRanges = [{ start: 50, end: 100 }];
+      deps.state.historyHasMore = true;
+      const older = { id: 'older', role: 'user', content: 'older', timestamp: 1 } as any;
+      lease.loadRange.mockResolvedValue({ messages: [older], range: { start: 0, end: 50 } });
+
+      await controller.loadOlderHistory();
+
+      expect(deps.renderer.prependMessages).toHaveBeenCalledWith([older], [older, existing]);
+      expect(deps.renderer.renderMessages).not.toHaveBeenCalled();
+    });
+
+    it('does not paginate when a search hit is already loaded', async () => {
+      const lease = makeLease(100);
+      deps.state.historyLease = lease as any;
+      const loaded = {} as HTMLElement;
+      (deps.renderer.findMessageElement as jest.Mock).mockReturnValue(loaded);
+
+      await expect(controller.locateHistorySearchResult({ projectionKey: 'loaded', turnIndex: 10, matchOrdinal: 0, matchedText: 'needle' })).resolves.toBe(loaded);
+
+      expect(lease.loadRange).not.toHaveBeenCalled();
+    });
+
+    it('reuses an offscreen rendered candidate across different queries', async () => {
+      const lease = makeLease(10);
+      deps.state.historyLease = lease as any;
+      lease.search
+        .mockResolvedValueOnce([{ projectionKey: 'target', turnIndex: 3, matchOrdinal: 0, matchedText: 'needle' }])
+        .mockResolvedValueOnce([{ projectionKey: 'target', turnIndex: 3, matchOrdinal: 0, matchedText: 'other' }]);
+      lease.loadRange.mockResolvedValue({
+        messages: [{ id: 'target', role: 'user', content: 'needle other', timestamp: 1 }],
+        range: { start: 3, end: 4 },
+      });
+      const detached = createMockEl() as unknown as HTMLElement;
+      (deps.renderer.renderSearchCandidate as jest.Mock).mockResolvedValue(detached);
+
+      await controller.searchHistory('needle');
+      await controller.searchHistory('other');
+
+      expect(deps.renderer.renderSearchCandidate).toHaveBeenCalledTimes(1);
+    });
+
+    it('rolls back to the previous lease when a search snapshot refresh fails', async () => {
+      deps.state.currentConversationId = 'large';
+      const conversation = { id: 'large', providerId: 'claude', title: 'Large', messages: [], sessionId: 'session', createdAt: 1, updatedAt: 1 } as any;
+      (deps.plugin.getConversationSync as jest.Mock).mockReturnValue(conversation);
+      const previous = makeLease(100);
+      deps.state.historyLease = previous as any;
+      deps.state.loadedRanges = [{ start: 50, end: 100 }];
+      deps.state.historyHasMore = true;
+      const older = { id: 'older', role: 'user', content: 'older', timestamp: 1 } as any;
+      previous.loadRange.mockResolvedValue({ messages: [older], range: { start: 0, end: 50 } });
+      const failed = { ...makeLease(100), ready: Promise.reject(new Error('index build failed')) };
+      const service = { acquireHistoryIndex: jest.fn().mockReturnValue(failed) };
+      jest.spyOn(ProviderRegistry, 'getConversationHistoryService').mockReturnValue(service as any);
+
+      await expect(controller.refreshHistorySearchSnapshot()).rejects.toThrow('index build failed');
+
+      expect(deps.state.historyLease).toBe(previous);
+      expect(previous.release).not.toHaveBeenCalled();
+      await controller.loadOlderHistory();
+      expect(deps.state.loadedRanges).toEqual([{ start: 0, end: 100 }]);
+      expect(deps.state.historyHasMore).toBe(false);
+      expect(deps.renderer.prependMessages).toHaveBeenCalledWith([older], [older]);
+    });
+
+    it('surfaces projection_mismatch after range materialization', async () => {
+      deps.state.currentConversationId = 'large';
+      const lease = makeLease(10); deps.state.historyLease = lease as any;
+      lease.loadRange.mockResolvedValue({ messages: [], range: { start: 3, end: 10 } });
       (deps.renderer.findMessageElement as jest.Mock).mockReturnValue(null);
-      jest.spyOn(ProviderRegistry, 'getConversationHistoryService').mockReturnValue({
-        loadHistoryAt: jest.fn().mockResolvedValue({ messages: [], cursor: null, hasMore: false }),
-      } as any);
-
-      await expect(controller.locateHistorySearchResult({
-        projectionKey: 'missing', turnIndex: 3, matchOrdinal: 0, cursor: 'search',
-        timestamp: 1, snippet: 'needle', matchStart: 0, matchLength: 6, matchedText: 'needle',
-      })).rejects.toThrow('History search target not found: missing');
-    });
-
-    it('prepends an older page through the opaque cursor', async () => {
-      deps.state.currentConversationId = 'large';
-      deps.state.messages = [{ id: 'new', role: 'user', content: 'new', timestamp: 2 }];
-      deps.state.historyCursor = 'opaque';
-      deps.state.historyHasMore = true;
-      (deps.plugin.getConversationSync as jest.Mock).mockReturnValue({ id: 'large', providerId: 'claude' });
-      const service = { loadOlderHistory: jest.fn().mockResolvedValue({
-        messages: [{ id: 'old', role: 'user', content: 'old', timestamp: 1 }],
-        cursor: null, hasMore: false,
-      }) };
-      jest.spyOn(ProviderRegistry, 'getConversationHistoryService').mockReturnValue(service as any);
-
-      await controller.loadOlderHistory();
-
-      expect(deps.state.messages.map(message => message.id)).toEqual(['old', 'new']);
-      expect(deps.renderer.prependMessages).toHaveBeenCalled();
-      expect(deps.state.historyHasMore).toBe(false);
+      await expect(controller.locateHistorySearchResult({ projectionKey: 'missing', turnIndex: 3, matchOrdinal: 0, matchedText: 'needle' })).rejects.toThrow('projection_mismatch');
     });
   });
 
@@ -439,13 +439,12 @@ describe('ConversationController', () => {
             ? { id: 'old-conv', providerId: 'claude', title: 'Old', messages: [], createdAt: 1, updatedAt: 1 }
             : null
         ));
-        const releaseHistory = jest.fn();
-        jest.spyOn(ProviderRegistry, 'getConversationHistoryService').mockReturnValue({ releaseHistory } as any);
+        const release = jest.fn();
+        deps.state.historyLease = { release } as any;
 
         await controller.switchTo('new-conv');
 
-        expect(releaseHistory).toHaveBeenCalledTimes(1);
-        expect(releaseHistory).toHaveBeenCalledWith('old-conv');
+        expect(release).toHaveBeenCalledTimes(1);
       });
 
       it('releases the switched-away conversation history protection when a switch lands on the hydration shell', async () => {
@@ -460,13 +459,12 @@ describe('ConversationController', () => {
           segments: [{ sessionId: 'large-session', sizeBytes: 65 * 1024 * 1024 }],
         }));
         deps.switchToHydrationShell = jest.fn();
-        const releaseHistory = jest.fn();
-        jest.spyOn(ProviderRegistry, 'getConversationHistoryService').mockReturnValue({ releaseHistory } as any);
+        const release = jest.fn();
+        deps.state.historyLease = { release } as any;
 
         await controller.switchTo('oversize-conv');
 
-        expect(releaseHistory).toHaveBeenCalledTimes(1);
-        expect(releaseHistory).toHaveBeenCalledWith('old-conv');
+        expect(release).toHaveBeenCalledTimes(1);
       });
 
       it('does not release the current conversation history when the switch does not complete', async () => {
@@ -477,23 +475,23 @@ describe('ConversationController', () => {
             : null
         ));
         (deps.plugin.switchConversation as jest.Mock).mockResolvedValue(null);
-        const releaseHistory = jest.fn();
-        jest.spyOn(ProviderRegistry, 'getConversationHistoryService').mockReturnValue({ releaseHistory } as any);
+        const release = jest.fn();
+        deps.state.historyLease = { release } as any;
 
         await controller.switchTo('missing-conv');
 
-        expect(releaseHistory).not.toHaveBeenCalled();
+        expect(release).not.toHaveBeenCalled();
       });
 
       it('releases the switched-away conversation history protection when createNew resets to blank', async () => {
         deps.state.currentConversationId = 'old-conv';
         (deps.plugin.getConversationSync as jest.Mock).mockReturnValue({ id: 'old-conv', providerId: 'claude' });
-        const releaseHistory = jest.fn();
-        jest.spyOn(ProviderRegistry, 'getConversationHistoryService').mockReturnValue({ releaseHistory } as any);
+        const release = jest.fn();
+        deps.state.historyLease = { release } as any;
 
         await controller.createNew();
 
-        expect(releaseHistory).toHaveBeenCalledWith('old-conv');
+        expect(release).toHaveBeenCalledTimes(1);
       });
 
       it('marks hydration ready after createNew resets to the entry point', async () => {
