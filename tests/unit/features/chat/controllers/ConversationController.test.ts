@@ -153,6 +153,31 @@ describe('ConversationController', () => {
       expect(lease.release).not.toHaveBeenCalled();
     });
 
+    it('releases the previous lease when a repeat oversize loadActive overwrites it', async () => {
+      const conversation = { id: 'large', providerId: 'claude', title: 'Large', messages: [], sessionId: 'session', createdAt: 1, updatedAt: 1 } as any;
+      deps.state.currentConversationId = 'large';
+      (deps.plugin.getConversationById as jest.Mock).mockRejectedValue(new ConversationHistoryHydrationError({ status: 'oversize', segments: [{ sessionId: 'session', sizeBytes: 99 }] }));
+      (deps.plugin.getConversationSync as jest.Mock).mockReturnValue(conversation);
+      const first = makeLease();
+      const second = makeLease();
+      const page = { messages: [{ id: 'latest', role: 'user', content: 'latest', timestamp: 1 }], range: { start: 110, end: 120 }, snapshotOffset: 123, sourceBytes: 1024, projectedChars: 7, oversizedTurnCount: 0, pageKey: 'w:110:120', hasMoreBefore: true, hasMoreAfter: false };
+      first.loadWindow.mockResolvedValue(page);
+      second.loadWindow.mockResolvedValue(page);
+      const service = { acquireHistoryIndex: jest.fn().mockReturnValueOnce(first).mockReturnValueOnce(second) };
+      jest.spyOn(ProviderRegistry, 'getConversationHistoryService').mockReturnValue(service as any);
+
+      await controller.loadActive();
+      expect(first.release).not.toHaveBeenCalled();
+
+      // Tab switched away before hydrate READY and back: a second oversize
+      // loadActive must release the first lease instead of leaking it.
+      await controller.loadActive();
+
+      expect(first.release).toHaveBeenCalledTimes(1);
+      expect(deps.state.historyLease).toBe(second);
+      expect(second.release).not.toHaveBeenCalled();
+    });
+
     it('releases the lease exactly once when the window load fails', async () => {
       const conversation = { id: 'large', providerId: 'claude', title: 'Large', messages: [], sessionId: 'session', createdAt: 1, updatedAt: 1 } as any;
       deps.state.currentConversationId = 'large';
@@ -208,17 +233,19 @@ describe('ConversationController', () => {
       deps.state.historyLease = lease as any;
       deps.state.loadedRanges = [{ start: 150, end: 200 }];
       deps.state.historyHasMore = true;
-      lease.loadRange.mockResolvedValueOnce({ messages: [{ id: 'target', role: 'user', content: 'needle', timestamp: 50 }], range: { start: 25, end: 75 } });
-      lease.loadWindow.mockResolvedValueOnce({ messages: [{ id: 'gap', role: 'user', content: 'gap', timestamp: 75 }], range: { start: 100, end: 150 }, snapshotOffset: 5, sourceBytes: 1, projectedChars: 1, oversizedTurnCount: 0, pageKey: 'w:100:150', hasMoreBefore: true, hasMoreAfter: false });
+      lease.loadWindow
+        .mockResolvedValueOnce({ messages: [{ id: 'target', role: 'user', content: 'needle', timestamp: 50 }], range: { start: 25, end: 26 }, snapshotOffset: 5, sourceBytes: 1, projectedChars: 1, oversizedTurnCount: 0, pageKey: 'w:25:26', hasMoreBefore: true, hasMoreAfter: true })
+        .mockResolvedValueOnce({ messages: [{ id: 'gap', role: 'user', content: 'gap', timestamp: 75 }], range: { start: 100, end: 150 }, snapshotOffset: 5, sourceBytes: 1, projectedChars: 1, oversizedTurnCount: 0, pageKey: 'w:100:150', hasMoreBefore: true, hasMoreAfter: false });
       (deps.renderer.findMessageElement as jest.Mock).mockReturnValueOnce(null).mockReturnValue({} as HTMLElement);
 
       await controller.locateHistorySearchResult({ projectionKey: 'target', turnIndex: 25, matchOrdinal: 0, matchedText: 'needle' });
       await controller.loadOlderHistory();
 
-      expect(lease.loadRange).toHaveBeenCalledWith(25, 75);
+      // Locate materializes only the hit turn through the searchLocate budget.
+      expect(lease.loadWindow).toHaveBeenNthCalledWith(1, expect.objectContaining({ anchorTurn: 25, direction: 'around', budget: expect.objectContaining({ maxTurns: 1 }) }));
       // Anchor at the newest loaded range start; floor at the older range end.
-      expect(lease.loadWindow).toHaveBeenCalledWith(expect.objectContaining({ anchorTurn: 150, direction: 'older', minTurn: 75 }));
-      expect(deps.state.loadedRanges).toEqual([{ start: 25, end: 75 }, { start: 100, end: 200 }]);
+      expect(lease.loadWindow).toHaveBeenNthCalledWith(2, expect.objectContaining({ anchorTurn: 150, direction: 'older', minTurn: 26 }));
+      expect(deps.state.loadedRanges).toEqual([{ start: 25, end: 26 }, { start: 100, end: 200 }]);
       expect(deps.renderer.prependMessages).toHaveBeenCalledTimes(1);
       expect(deps.renderer.renderMessages).toHaveBeenCalledTimes(1);
     });
@@ -239,6 +266,40 @@ describe('ConversationController', () => {
       expect(deps.renderer.prependMessages).toHaveBeenCalledWith([older], [older, existing]);
       expect(deps.renderer.renderMessages).not.toHaveBeenCalled();
       expect(deps.state.historyHasMore).toBe(false);
+    });
+
+    it('locates a distant search hit through the searchLocate budget window', async () => {
+      deps.state.currentConversationId = 'large';
+      deps.state.messages = [{ id: 'latest', role: 'user', content: 'latest', timestamp: 100 }];
+      const lease = makeLease(200);
+      deps.state.historyLease = lease as any;
+      deps.state.loadedRanges = [{ start: 150, end: 200 }];
+      lease.loadWindow.mockResolvedValueOnce({ messages: [{ id: 'target', role: 'user', content: 'needle', timestamp: 50 }], range: { start: 25, end: 26 }, snapshotOffset: 5, sourceBytes: 1, projectedChars: 1, oversizedTurnCount: 0, pageKey: 'w:25:26', hasMoreBefore: true, hasMoreAfter: true });
+      (deps.renderer.findMessageElement as jest.Mock).mockReturnValueOnce(null).mockReturnValue({} as HTMLElement);
+
+      await controller.locateHistorySearchResult({ projectionKey: 'target', turnIndex: 25, matchOrdinal: 0, matchedText: 'needle' });
+
+      expect(lease.loadWindow).toHaveBeenCalledWith(expect.objectContaining({
+        anchorTurn: 25,
+        direction: 'around',
+        projectionLevel: 'summary',
+        budget: expect.objectContaining({ maxTurns: 1, maxSourceBytes: 8 * 1024 * 1024, maxProjectedChars: 2_000_000 }),
+      }));
+      expect(lease.loadRange).not.toHaveBeenCalled();
+      expect(deps.state.loadedRanges).toEqual([{ start: 25, end: 26 }, { start: 150, end: 200 }]);
+      expect(deps.state.messages.map(message => message.id)).toEqual(['target', 'latest']);
+    });
+
+    it('keeps the legacy 50-turn page for search locate when the provider has no loadWindow', async () => {
+      const lease = makeLease(120);
+      delete (lease as any).loadWindow;
+      deps.state.historyLease = lease as any;
+      lease.loadRange.mockResolvedValue({ messages: [{ id: 'target', role: 'user', content: 'needle', timestamp: 50 }], range: { start: 25, end: 75 } });
+      (deps.renderer.findMessageElement as jest.Mock).mockReturnValueOnce(null).mockReturnValue({} as HTMLElement);
+
+      await expect(controller.locateHistorySearchResult({ projectionKey: 'target', turnIndex: 25, matchOrdinal: 0, matchedText: 'needle' })).resolves.toBeDefined();
+
+      expect(lease.loadRange).toHaveBeenCalledWith(25, 75);
     });
 
     it('does not paginate when a search hit is already loaded', async () => {
@@ -295,10 +356,10 @@ describe('ConversationController', () => {
       expect(deps.renderer.prependMessages).toHaveBeenCalledWith([older], [older]);
     });
 
-    it('surfaces projection_mismatch after range materialization', async () => {
+    it('surfaces projection_mismatch after window materialization', async () => {
       deps.state.currentConversationId = 'large';
       const lease = makeLease(10); deps.state.historyLease = lease as any;
-      lease.loadRange.mockResolvedValue({ messages: [], range: { start: 3, end: 10 } });
+      lease.loadWindow.mockResolvedValue({ messages: [], range: { start: 3, end: 4 }, snapshotOffset: 5, sourceBytes: 1, projectedChars: 1, oversizedTurnCount: 0, pageKey: 'w:3:4', hasMoreBefore: true, hasMoreAfter: true });
       (deps.renderer.findMessageElement as jest.Mock).mockReturnValue(null);
       await expect(controller.locateHistorySearchResult({ projectionKey: 'missing', turnIndex: 3, matchOrdinal: 0, matchedText: 'needle' })).rejects.toThrow('projection_mismatch');
     });

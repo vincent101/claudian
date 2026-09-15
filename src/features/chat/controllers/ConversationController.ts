@@ -258,6 +258,10 @@ export class ConversationController {
         // so this stays an in-memory view only.
         conversation.messages = firstScreen.messages;
         paged = true;
+        // A previous oversize load may still hold the lease (user switched
+        // away before hydrate READY and back); release it on takeover, same
+        // as bindHistoryLease, or its index protection stays pinned forever.
+        state.historyLease?.release();
         state.historyLease = lease;
         transferred = true;
         state.loadedRanges = [firstScreen.range];
@@ -521,12 +525,11 @@ export class ConversationController {
   }
 
   async locateHistorySearchResult(result: HistorySearchResult): Promise<HTMLElement> {
-    const { state, renderer } = this.deps;
+    const { renderer } = this.deps;
     if (result.status === 'projection_mismatch') throw new Error('projection_mismatch');
     let target = renderer.findMessageElement(result.projectionKey);
     if (!target) {
-      const start = Math.max(0, Math.min(result.turnIndex, state.historyLease!.totalTurns - 50));
-      await this.loadRange(start, Math.min(state.historyLease!.totalTurns, start + 50));
+      await this.loadSearchResultWindow(result.turnIndex);
       // Frame-batched rendering mounts asynchronously; the element can only be
       // located after the queue drains.
       await renderer.waitForRenderedMessages?.();
@@ -534,6 +537,38 @@ export class ConversationController {
     }
     if (!target) throw new Error('projection_mismatch');
     return target;
+  }
+
+  /**
+   * Search locate materializes only the hit turn through the searchLocate
+   * budget window. The summary projection matches the first screen, so the
+   * materialized ids align with the already-rendered summary messages and
+   * dedupe stays effective (a full-range loadRange would produce different
+   * ids for oversized turns and render the same turn twice).
+   */
+  private async loadSearchResultWindow(turnIndex: number): Promise<void> {
+    const { state } = this.deps;
+    const lease = state.historyLease;
+    if (!lease) throw new Error('History lease unavailable');
+    if (lease.loadWindow) {
+      const page = await lease.loadWindow({
+        anchorTurn: turnIndex,
+        direction: 'around',
+        budget: HISTORY_RESOURCE_POLICY.searchLocate,
+        projectionLevel: 'summary',
+      });
+      const existingIds = new Set(state.messages.map(message => message.id));
+      const added = page.messages.filter(message => !existingIds.has(message.id));
+      const combined = [...state.messages, ...added].sort((a, b) => a.timestamp - b.timestamp);
+      state.messages = combined;
+      this.deps.renderer.renderMessages(combined, () => this.getGreeting());
+      state.loadedRanges = this.mergeRanges([...state.loadedRanges, page.range]);
+      state.historyHasMore = !this.coversAll(state.loadedRanges, lease.totalTurns);
+      state.historySnapshotOffset = page.snapshotOffset ?? state.historySnapshotOffset;
+      return;
+    }
+    const start = Math.max(0, Math.min(turnIndex, lease.totalTurns - 50));
+    await this.loadRange(start, Math.min(lease.totalTurns, start + 50));
   }
 
   private async loadRange(start: number, end: number, rerenderAll = true): Promise<void> {

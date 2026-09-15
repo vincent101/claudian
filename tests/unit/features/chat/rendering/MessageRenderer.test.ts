@@ -11,7 +11,6 @@ import {
 import type { ChatMessage, ImageAttachment } from '@/core/types';
 import {
   type HistoryRenderDiagnosticEvent,
-  recordHistoryRenderEvent,
   setHistoryRenderDiagnosticsSink,
 } from '@/features/chat/history/HistoryDiagnostics';
 import { MessageRenderer } from '@/features/chat/rendering/MessageRenderer';
