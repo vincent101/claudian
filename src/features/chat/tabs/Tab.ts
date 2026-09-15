@@ -1406,6 +1406,8 @@ export function initializeTabControllers(
     generateId: generateMessageId,
     notify: message => { new Notice(message); },
     recordDiagnostic: event => tab.service?.recordAutoTurnDiagnostic?.(event),
+    getProjectionCoordinator: () => tab.controllers.projectionWriteCoordinator,
+    setWelcomeEl: (el) => { dom.welcomeEl = el; },
   });
 
   tab.controllers.inputController = new InputController({

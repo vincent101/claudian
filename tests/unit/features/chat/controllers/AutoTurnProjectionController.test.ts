@@ -2,10 +2,11 @@ import { createMockEl } from '@test/helpers/mockElement';
 
 import { AutoTurnProjectionController } from '@/features/chat/controllers/AutoTurnProjectionController';
 import { TurnCoordinator } from '@/features/chat/controllers/TurnCoordinator';
+import { ProjectionWriteCoordinator } from '@/features/chat/rendering/ProjectionWriteCoordinator';
 import { ChatState } from '@/features/chat/state/ChatState';
 
 describe('AutoTurnProjectionController', () => {
-  function setup() {
+  function setup(options: { coordinator?: ProjectionWriteCoordinator } = {}) {
     const state = new ChatState();
     state.currentConversationId = 'conv-1';
     const processQueuedMessage = jest.fn();
@@ -27,6 +28,9 @@ describe('AutoTurnProjectionController', () => {
       return messageEl;
     });
     const removeMessage = jest.fn();
+    const renderMessages = jest.fn().mockReturnValue(createMockEl());
+    const waitForRenderedMessages = jest.fn().mockResolvedValue(undefined);
+    const setWelcomeEl = jest.fn();
     const handleStreamChunk = jest.fn(async (chunk, context) => {
       if (chunk.type === 'text') context.message.content += chunk.content;
       if (chunk.type === 'tool_use') context.message.toolCalls.push({
@@ -50,7 +54,7 @@ describe('AutoTurnProjectionController', () => {
     } as any;
     const controller = new AutoTurnProjectionController({
       state,
-      renderer: { addMessage, removeMessage } as any,
+      renderer: { addMessage, removeMessage, renderMessages, waitForRenderedMessages, domEpoch: 0 } as any,
       streamController,
       conversationController: { save } as any,
       turnCoordinator,
@@ -59,9 +63,15 @@ describe('AutoTurnProjectionController', () => {
       isTabConnected: () => contentEl.isConnected,
       generateId: (() => { let id = 0; return () => `msg-${++id}`; })(),
       notify,
+      ...(options.coordinator ? { getProjectionCoordinator: () => options.coordinator! } : {}),
+      setWelcomeEl,
     });
     Object.defineProperty(contentEl, 'isConnected', { value: true, configurable: true });
-    return { controller, state, turnCoordinator, processQueuedMessage, finishSpy, addMessage, removeMessage, streamController, handleStreamChunk, save, notify, contentEl };
+    return {
+      controller, state, turnCoordinator, processQueuedMessage, finishSpy,
+      addMessage, removeMessage, renderMessages, waitForRenderedMessages, setWelcomeEl,
+      streamController, handleStreamChunk, save, notify, contentEl,
+    };
   }
 
   it('shows the sanitized peer source and projects text/tools before result', async () => {
@@ -362,5 +372,140 @@ describe('AutoTurnProjectionController', () => {
     expect(state.messages[1].toolCalls).toEqual([
       expect.objectContaining({ id: 't1', name: 'Read' }),
     ]);
+  });
+
+  // ============================================
+  // Projection write lease (coord protocol P1/P2/P5)
+  // ============================================
+
+  it('holds the auto-turn mount behind an in-flight stored transaction and replays buffered chunks', async () => {
+    const coordinator = new ProjectionWriteCoordinator();
+    const { controller, state, addMessage, handleStreamChunk, turnCoordinator } = setup({ coordinator });
+    let releaseStored!: () => void;
+    const stored = coordinator.runStored(
+      () => false,
+      () => new Promise<void>(resolve => { releaseStored = resolve; }),
+    );
+    await Promise.resolve();
+
+    expect(controller.started({
+      turnId: 'auto-1', generation: 0,
+      source: { kind: 'peer', label: 'researcher' },
+      displayContent: 'inspect report',
+    })).toBe(true);
+
+    // Domain truth lands immediately; the DOM pair waits for the live lease
+    // so it can neither interleave with the stored rebuild nor be cleared by it.
+    expect(state.messages.map(message => message.role)).toEqual(['user', 'assistant']);
+    expect(addMessage).not.toHaveBeenCalled();
+
+    // Chunks that arrive pre-mount buffer raw instead of projecting domain-only.
+    await controller.chunk({ turnId: 'auto-1', generation: 0, chunk: { type: 'text', content: 'early' } });
+    expect(handleStreamChunk).not.toHaveBeenCalled();
+
+    releaseStored();
+    await stored;
+    await (controller as any).active.mountTask;
+
+    expect(addMessage).toHaveBeenCalledTimes(2);
+    expect(handleStreamChunk).toHaveBeenCalledWith(
+      { type: 'text', content: 'early' },
+      expect.objectContaining({ turnId: 'auto-1' }),
+    );
+    expect(state.messages[1].content).toBe('early');
+    expect(turnCoordinator.isBusy()).toBe(true);
+  });
+
+  it('waits for a deferred mount at finish and replays buffered chunks before finalizing', async () => {
+    const coordinator = new ProjectionWriteCoordinator();
+    const { controller, state, handleStreamChunk, save } = setup({ coordinator });
+    let releaseStored!: () => void;
+    const stored = coordinator.runStored(
+      () => false,
+      () => new Promise<void>(resolve => { releaseStored = resolve; }),
+    );
+    await Promise.resolve();
+    controller.started({ turnId: 'auto-1', generation: 0, source: { kind: 'assistant-continuation' } });
+    await controller.chunk({ turnId: 'auto-1', generation: 0, chunk: { type: 'text', content: 'early' } });
+
+    const finished = controller.finished({ turnId: 'auto-1', generation: 0, metadata: {} });
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(handleStreamChunk).not.toHaveBeenCalled();
+    expect(save).not.toHaveBeenCalled();
+
+    releaseStored();
+    await stored;
+    await finished;
+
+    expect(handleStreamChunk).toHaveBeenCalledWith(
+      { type: 'text', content: 'early' },
+      expect.objectContaining({ turnId: 'auto-1' }),
+    );
+    expect(save).toHaveBeenCalledTimes(1);
+    expect(state.messages[0].content).toBe('early');
+  });
+
+  it('re-projects a projection-dirty auto turn from ChatState at finish', async () => {
+    const coordinator = new ProjectionWriteCoordinator();
+    const { controller, state, renderMessages, waitForRenderedMessages, setWelcomeEl, turnCoordinator } = setup({ coordinator });
+    controller.started({ turnId: 'auto-1', generation: 0, source: { kind: 'peer', label: 'researcher' }, displayContent: 'inspect' });
+    await (controller as any).active.mountTask;
+    await controller.chunk({ turnId: 'auto-1', generation: 0, chunk: { type: 'text', content: 'work' } });
+    // A stored clear-rebuild evicted the mount mid-turn (P4 flags the context).
+    (controller as any).active.context.projectionDirty = true;
+
+    await controller.finished({ turnId: 'auto-1', generation: 0, metadata: {} });
+
+    // P5: the streamed output becomes visible again through a full re-render
+    // from the latest ChatState, run as a stored transaction after the live
+    // lease was released (lock order: live released before stored is queued).
+    expect(renderMessages).toHaveBeenCalledTimes(1);
+    expect(renderMessages).toHaveBeenCalledWith(state.messages, expect.any(Function));
+    expect(waitForRenderedMessages).toHaveBeenCalled();
+    expect(setWelcomeEl).toHaveBeenCalledTimes(1);
+    expect(turnCoordinator.isBusy()).toBe(false);
+  });
+
+  it('does not re-project a clean auto turn at finish', async () => {
+    const { controller, renderMessages } = setup();
+    controller.started({ turnId: 'auto-1', generation: 0, source: { kind: 'assistant-continuation' } });
+    await controller.chunk({ turnId: 'auto-1', generation: 0, chunk: { type: 'text', content: 'work' } });
+
+    await controller.finished({ turnId: 'auto-1', generation: 0, metadata: {} });
+
+    expect(renderMessages).not.toHaveBeenCalled();
+  });
+
+  it('drops the deferred mount and buffered chunks when the turn is cancelled', async () => {
+    const coordinator = new ProjectionWriteCoordinator();
+    const { controller, state, handleStreamChunk, turnCoordinator } = setup({ coordinator });
+    let releaseStored!: () => void;
+    const stored = coordinator.runStored(
+      () => false,
+      () => new Promise<void>(resolve => { releaseStored = resolve; }),
+    );
+    await Promise.resolve();
+    controller.started({
+      turnId: 'auto-1', generation: 0,
+      source: { kind: 'peer', label: 'researcher' },
+      displayContent: 'do work',
+    });
+    const mountTask = (controller as any).active.mountTask as Promise<void>;
+    await controller.chunk({ turnId: 'auto-1', generation: 0, chunk: { type: 'text', content: 'early' } });
+
+    // The runtime bumps the turn generation before firing the cancel event.
+    controller.cancelled({ turnId: 'auto-1', generation: 1, reason: 'shutdown' });
+    releaseStored();
+    await stored;
+    await mountTask;
+    await Promise.resolve();
+    await Promise.resolve();
+
+    // The cancelled mount never mounts; buffered chunks never project; the
+    // empty assistant placeholder is dropped and the user bubble stays.
+    expect(handleStreamChunk).not.toHaveBeenCalled();
+    expect(turnCoordinator.isBusy()).toBe(false);
+    expect(state.messages.map(message => message.role)).toEqual(['user']);
   });
 });

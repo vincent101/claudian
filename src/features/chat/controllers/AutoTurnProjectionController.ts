@@ -7,6 +7,7 @@ import type {
 } from '../../../core/runtime/types';
 import type { ChatMessage } from '../../../core/types';
 import type { MessageRenderer } from '../rendering/MessageRenderer';
+import type { ProjectionWriteLease } from '../rendering/ProjectionWriteCoordinator';
 import type { SubagentManager } from '../services/SubagentManager';
 import type { ChatState } from '../state/ChatState';
 import type { ConversationController } from './ConversationController';
@@ -34,6 +35,17 @@ interface AutoTurnProjectionControllerDeps {
   generateId: () => string;
   notify: (message: string) => void;
   recordDiagnostic?: (event: AutoTurnDiagnosticEvent) => void;
+  /**
+   * Per-tab projection write lease (coord protocol P1/P2). The auto turn's
+   * message mount acquires the live lease FIFO-queued behind any stored
+   * transaction; absent in legacy tests → mounts synchronously like before.
+   */
+  getProjectionCoordinator?: () => {
+    acquireLive: (isCancelled?: () => boolean) => Promise<ProjectionWriteLease | null>;
+    runStored: <T>(isCancelled: () => boolean, task: () => Promise<T>) => Promise<T | null>;
+  } | null;
+  /** Updates the tab's welcome element reference after a full re-projection. */
+  setWelcomeEl?: (el: HTMLElement | null) => void;
 }
 
 interface AutoProjection {
@@ -42,6 +54,16 @@ interface AutoProjection {
   conversationId: string | null;
   assistantMessage: ChatMessage;
   context: TurnProjectionContext;
+  /**
+   * Live-lease-gated mount state (P2): the user/assistant DOM pair only
+   * mounts once the projection write lease is granted. `mountTask` settles
+   * even when the wait is cancelled (then `mounted` stays false).
+   */
+  mounted: boolean;
+  mountTask: Promise<void> | null;
+  liveLease: ProjectionWriteLease | null;
+  /** Chunks that arrived before the mount; replayed in order right after it. */
+  pendingChunks: AutoTurnChunkEvent[];
   /** Replay chunks already projected in this projection, keyed by transcript identity. */
   replaySeenIdentities: Set<string>;
   /**
@@ -75,6 +97,7 @@ export class AutoTurnProjectionController {
     const existingUserIndex = event.transcriptUserId
       ? this.deps.state.messages.findIndex(message => message.userMessageId === event.transcriptUserId)
       : -1;
+    let pendingUserMessage: ChatMessage | null = null;
     if (event.displayContent && existingUserIndex < 0) {
       const label = this.sourceLabel(event);
       const userMessage: ChatMessage = {
@@ -85,8 +108,9 @@ export class AutoTurnProjectionController {
         timestamp: Date.now(),
         userMessageId: event.transcriptUserId,
       };
+      // Domain truth is immediate; the DOM mount is gated by the live lease.
       this.deps.state.addMessage(userMessage);
-      this.deps.renderer.addMessage(userMessage);
+      pendingUserMessage = userMessage;
     }
 
     const existingAssistant = event.replay && existingUserIndex >= 0
@@ -101,11 +125,7 @@ export class AutoTurnProjectionController {
       contentBlocks: [],
     };
     if (!existingAssistant) this.deps.state.addMessage(assistantMessage);
-    const messageEl = existingAssistant
-      ? { querySelector: () => null }
-      : this.deps.renderer.addMessage(assistantMessage);
-    const contentEl = messageEl.querySelector('.claudian-message-content') as HTMLElement | null;
-    this.deps.state.currentContentEl = contentEl;
+    this.deps.state.currentContentEl = null;
     this.deps.state.currentTextEl = null;
     this.deps.state.currentTextContent = '';
     this.deps.state.currentThinkingState = null;
@@ -123,20 +143,100 @@ export class AutoTurnProjectionController {
       context: createTurnProjectionContext({
         turnId: event.turnId,
         message: assistantMessage,
-        renderTarget: contentEl,
+        // Set at mount; chunks buffer until then.
+        renderTarget: null,
         generation: event.generation,
         domEpoch: this.deps.renderer.domEpoch,
       }),
+      mounted: false,
+      mountTask: null,
+      liveLease: null,
+      pendingChunks: [],
       replaySeenIdentities: new Set(),
       replayTextCursor: 0,
     };
+    this.mountUnderLiveLease(this.active, pendingUserMessage, existingAssistant !== undefined);
     return true;
+  }
+
+  /**
+   * P2 live-lease mount: the user/assistant DOM pair may only mount once the
+   * projection write lease is granted — FIFO behind any in-flight stored
+   * transaction (search re-locate, paging) so the mount can neither interleave
+   * with pending render frames nor be cleared by a clear-rebuild. Chunks that
+   * arrive before the grant are buffered raw and replayed through the normal
+   * chunk path right after the mount, so domain projection and replay dedup
+   * stay exactly as they are post-mount. Lock order is unchanged: the
+   * business turn lease is already held when the live lease is requested.
+   */
+  private mountUnderLiveLease(
+    active: AutoProjection,
+    userMessage: ChatMessage | null,
+    hasExistingAssistant: boolean,
+  ): void {
+    const coordinator = this.deps.getProjectionCoordinator?.() ?? null;
+    if (!coordinator) {
+      this.mountLive(active, userMessage, hasExistingAssistant);
+      return;
+    }
+    active.mountTask = (async () => {
+      try {
+        const lease = await coordinator.acquireLive(() => !this.isCurrent(active, active.turnId, active.generation));
+        if (!lease) return;
+        if (!this.isCurrent(active, active.turnId, active.generation)) {
+          lease.release();
+          return;
+        }
+        active.liveLease = lease;
+        this.mountLive(active, userMessage, hasExistingAssistant);
+        const buffered = active.pendingChunks;
+        active.pendingChunks = [];
+        for (const bufferedEvent of buffered) {
+          if (this.active !== active) return;
+          await this.chunk(bufferedEvent);
+        }
+      } catch {
+        // The mount is fire-and-forget from the synchronous started()
+        // contract: a failure must not surface as an unhandled rejection.
+        // Abort like a failing chunk so the lease settles through the
+        // standard cancel path and finished() sees a dead projection.
+        this.abortActive(active.turnId, active.generation);
+      }
+    })();
+  }
+
+  private mountLive(
+    active: AutoProjection,
+    userMessage: ChatMessage | null,
+    hasExistingAssistant: boolean,
+  ): void {
+    if (userMessage) this.deps.renderer.addMessage(userMessage);
+    let contentEl: HTMLElement | null = null;
+    if (!hasExistingAssistant) {
+      const messageEl = this.deps.renderer.addMessage(active.assistantMessage);
+      contentEl = messageEl.querySelector('.claudian-message-content') as HTMLElement | null;
+    }
+    this.deps.state.currentContentEl = contentEl;
+    active.context.renderTarget = contentEl;
+    // The mount may land after a stored clear-rebuild bumped the epoch.
+    active.context.domEpoch = this.deps.renderer.domEpoch;
+    active.mounted = true;
   }
 
   async chunk(event: AutoTurnChunkEvent): Promise<void> {
     const active = this.active;
     if (!active || !this.isCurrent(active, event.turnId, event.generation)) return;
     if (event.replay && this.isDuplicateReplayChunk(active, event)) return;
+    if (!active.mounted) {
+      // Pre-mount (live lease still queued behind a stored transaction):
+      // buffer the raw event — replayed in order once the mount lands.
+      active.pendingChunks.push(event);
+      return;
+    }
+    await this.projectChunk(active, event);
+  }
+
+  private async projectChunk(active: AutoProjection, event: AutoTurnChunkEvent): Promise<void> {
     active.context.renderTarget = this.deps.state.currentContentEl;
     try {
       await this.withTimeout(
@@ -225,6 +325,11 @@ export class AutoTurnProjectionController {
     let timedOut = false;
     this.deps.recordDiagnostic?.({ phase: 'render_start', turnId: event.turnId, generation: event.generation, leaseKind: 'auto' });
     try {
+      // A deferred mount (queued behind a stored transaction) must land and
+      // replay its buffered chunks before the finalize, or the buffered
+      // output never reaches the projection.
+      if (active.mountTask) await active.mountTask;
+      if (!this.isCurrent(active, event.turnId, event.generation)) return;
       active.assistantMessage.assistantMessageId =
         event.metadata.assistantMessageId ?? active.assistantMessage.assistantMessageId;
       this.deps.streamController.hideThinkingIndicator();
@@ -281,6 +386,10 @@ export class AutoTurnProjectionController {
         } catch {
           // Lease release must survive cleanup failures.
         }
+        // P5: the live lease releases BEFORE the stored reprojection is
+        // queued — holding live while acquiring stored self-deadlocks the FIFO.
+        this.releaseLiveLease(active);
+        await this.reprojectIfDirty(active, event.turnId, event.generation);
         this.active = null;
         this.deps.turnCoordinator.finish(event.turnId);
         this.deps.recordDiagnostic?.({ phase: 'lease_finish', turnId: event.turnId, generation: event.generation, leaseKind: 'auto' });
@@ -295,6 +404,36 @@ export class AutoTurnProjectionController {
     }
   }
 
+  /**
+   * P5 turn-boundary re-projection: when the auto turn's mount was evicted
+   * mid-turn (a stored clear-rebuild ran between chunks), the streamed output
+   * stays invisible until a full render. Rebuild from the latest ChatState
+   * under a stored transaction, mirroring the user-turn path
+   * (InputController.sendMessage).
+   */
+  private async reprojectIfDirty(active: AutoProjection, turnId: string, generation: number): Promise<void> {
+    if (!active.context.projectionDirty) return;
+    if (this.active !== active || !this.isCurrent(active, turnId, generation)) return;
+    const coordinator = this.deps.getProjectionCoordinator?.() ?? null;
+    const reproject = async (): Promise<void> => {
+      const welcomeEl = this.deps.renderer.renderMessages(
+        this.deps.state.messages,
+        () => this.deps.conversationController.getGreeting(),
+      );
+      this.deps.setWelcomeEl?.(welcomeEl);
+      await this.deps.renderer.waitForRenderedMessages();
+    };
+    try {
+      if (coordinator) {
+        await coordinator.runStored(() => !this.isCurrent(active, turnId, generation), reproject);
+      } else {
+        await reproject();
+      }
+    } catch {
+      // Reprojection is a DOM repair; a failure must not break lease settlement.
+    }
+  }
+
   cancelled(event: AutoTurnCancelledEvent): void {
     const active = this.active;
     if (active && active.turnId === event.turnId) {
@@ -306,6 +445,7 @@ export class AutoTurnProjectionController {
         );
         this.deps.renderer.removeMessage(active.assistantMessage.id);
       }
+      this.releaseLiveLease(active);
       this.active = null;
     }
     this.deps.turnCoordinator.cancelAutoTurn(event.turnId, event.generation);
@@ -313,7 +453,14 @@ export class AutoTurnProjectionController {
 
   invalidate(): void {
     this.deps.streamController.invalidateRenderFlush();
+    if (this.active) this.releaseLiveLease(this.active);
     this.active = null;
+  }
+
+  private releaseLiveLease(active: AutoProjection): void {
+    // Idempotent: the coordinator tolerates double release.
+    active.liveLease?.release();
+    active.liveLease = null;
   }
 
   private abortActive(turnId: string, generation: number): void {
@@ -323,7 +470,10 @@ export class AutoTurnProjectionController {
     } catch {
       // Lease cancellation must survive cleanup failures.
     }
-    this.active = null;
+    if (this.active && this.active.turnId === turnId) {
+      this.releaseLiveLease(this.active);
+      this.active = null;
+    }
     this.deps.turnCoordinator.cancelAutoTurn(turnId, generation + 1);
   }
 
