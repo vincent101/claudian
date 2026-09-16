@@ -25,6 +25,12 @@ const locales = {
   'zh-TW': zhTW,
 } as const;
 
+/**
+ * Only keys whose non-English locales are fully localized belong here.
+ * It is NOT the i18n contract for new keys: keys added with an English
+ * placeholder in the seven non-translated locales (e.g. the Codex/OpenCode
+ * settings batch) must NOT be added, or this regression breaks by design.
+ */
 const localizedKeys = [
   'chat.fork.errorMessageNotFound',
   'chat.fork.errorNoSession',

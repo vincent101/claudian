@@ -1,3 +1,5 @@
+import { Notice } from 'obsidian';
+
 import type { ProviderCommandCatalog } from '@/core/providers/commands/ProviderCommandCatalog';
 import type { ProviderCommandEntry } from '@/core/providers/commands/ProviderCommandEntry';
 import {
@@ -202,6 +204,53 @@ describe('CodexSkillModal', () => {
       expect(savedEntries[0].persistenceKey).toBe(
         createCodexSkillPersistenceKey({ rootId: 'vault-agents' }),
       );
+    });
+  });
+
+  describe('validation notices', () => {
+    it('surfaces localized required-name and required-instructions errors', async () => {
+      const savedEntries: ProviderCommandEntry[] = [];
+      const modal = new CodexSkillModal(
+        {} as any,
+        null,
+        async (entry) => { savedEntries.push(entry); },
+      );
+
+      modal.onOpen();
+      (Notice as unknown as jest.Mock).mockClear();
+
+      await modal.getTestInputs().triggerSave();
+      expect(Notice).toHaveBeenCalledWith('Skill name is required');
+      expect(savedEntries).toHaveLength(0);
+
+      const { nameInput, contentArea } = modal.getTestInputs();
+      nameInput.value = 'analyze';
+      contentArea.value = '   ';
+
+      await modal.getTestInputs().triggerSave();
+      expect(Notice).toHaveBeenCalledWith('Instructions are required');
+      expect(savedEntries).toHaveLength(0);
+    });
+
+    it('surfaces the localized too-long error with the max parameter', async () => {
+      const savedEntries: ProviderCommandEntry[] = [];
+      const modal = new CodexSkillModal(
+        {} as any,
+        null,
+        async (entry) => { savedEntries.push(entry); },
+      );
+
+      modal.onOpen();
+      (Notice as unknown as jest.Mock).mockClear();
+
+      const { nameInput, contentArea } = modal.getTestInputs();
+      nameInput.value = 'a'.repeat(65);
+      contentArea.value = 'Content';
+
+      await modal.getTestInputs().triggerSave();
+
+      expect(Notice).toHaveBeenCalledWith('Skill name must be 64 characters or fewer');
+      expect(savedEntries).toHaveLength(0);
     });
   });
 });

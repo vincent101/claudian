@@ -1,7 +1,10 @@
+import { Notice } from 'obsidian';
+
 import type { CodexSubagentStorage } from '@/providers/codex/storage/CodexSubagentStorage';
 import { createCodexSubagentPersistenceKey } from '@/providers/codex/storage/CodexSubagentStorage';
 import type { CodexSubagentDefinition } from '@/providers/codex/types/subagent';
 import {
+  CodexSubagentModal,
   CodexSubagentSettings,
   getCodexNicknameCandidatesIssue,
   getCodexSubagentNameIssue,
@@ -184,6 +187,46 @@ describe('CodexSubagentSettings', () => {
       ).toBe(
         'Nickname candidates can only contain ASCII letters, numbers, spaces, hyphens, and underscores',
       );
+    });
+  });
+
+  describe('modal validation notices', () => {
+    it('surfaces localized required-field and duplicate-name errors with interpolation', async () => {
+      const savedAgents: CodexSubagentDefinition[] = [];
+      const existing = makeAgent('reviewer');
+
+      const modal = new CodexSubagentModal(
+        {} as any,
+        null,
+        [existing],
+        async (agent) => { savedAgents.push(agent); },
+      );
+      modal.onOpen();
+      (Notice as unknown as jest.Mock).mockClear();
+
+      await modal.getTestInputs().triggerSave();
+      expect(Notice).toHaveBeenCalledWith('Subagent name is required');
+      expect(savedAgents).toHaveLength(0);
+
+      const { nameInput, descInput, instructionsArea, nicknamesInput } = modal.getTestInputs();
+      nameInput.value = 'reviewer';
+      descInput.value = '';
+      instructionsArea.value = 'Instructions';
+
+      await modal.getTestInputs().triggerSave();
+      expect(Notice).toHaveBeenCalledWith('Description is required');
+
+      descInput.value = 'Reviews code';
+      nicknamesInput.value = 'Atlas, atlas';
+
+      await modal.getTestInputs().triggerSave();
+      expect(Notice).toHaveBeenCalledWith('Nickname candidates must be unique');
+
+      nicknamesInput.value = 'Atlas';
+
+      await modal.getTestInputs().triggerSave();
+      expect(Notice).toHaveBeenCalledWith('A subagent named "reviewer" already exists');
+      expect(savedAgents).toHaveLength(0);
     });
   });
 

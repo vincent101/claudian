@@ -1,6 +1,7 @@
 import type { App } from 'obsidian';
 import { Modal, Notice, setIcon, Setting } from 'obsidian';
 
+import { t } from '../../../i18n/i18n';
 import { confirmDelete } from '../../../shared/modals/ConfirmModal';
 import type { OpencodeAgentStorage } from '../storage/OpencodeAgentStorage';
 import type { OpencodeAgentDefinition } from '../types/agent';
@@ -63,6 +64,17 @@ export function validateOpencodeAgentName(name: string): string | null {
   }
 }
 
+function formatOpencodeAgentNameIssue(issue: OpencodeAgentNameIssue): string {
+  switch (issue.code) {
+    case 'required': return t('settings.opencode.subagents.validation.nameRequired');
+    case 'pathSegments': return t('settings.opencode.subagents.validation.namePath');
+    case 'segmentEmpty': return t('settings.opencode.subagents.validation.segmentEmpty');
+    case 'segmentWhitespace': return t('settings.opencode.subagents.validation.segmentWhitespace');
+    case 'dotSegment': return t('settings.opencode.subagents.validation.dotSegment');
+    case 'reservedCharacter': return t('settings.opencode.subagents.validation.reservedCharacter');
+  }
+}
+
 export function findOpencodeAgentNameConflict(
   agents: OpencodeAgentDefinition[],
   name: string,
@@ -93,7 +105,9 @@ class OpencodeAgentModal extends Modal {
   }
 
   onOpen() {
-    this.setTitle(this.existing ? 'Edit OpenCode Subagent' : 'Add OpenCode Subagent');
+    this.setTitle(this.existing
+      ? t('settings.opencode.subagents.modal.titleEdit')
+      : t('settings.opencode.subagents.modal.titleAdd'));
     this.modalEl.addClass('claudian-sp-modal');
 
     const { contentEl } = this;
@@ -113,8 +127,8 @@ class OpencodeAgentModal extends Modal {
     let optionsInput!: HTMLTextAreaElement;
 
     new Setting(contentEl)
-      .setName('Name')
-      .setDesc('OpenCode agent name. Use slash-separated segments for nested agents.')
+      .setName(t('settings.opencode.subagents.modal.name'))
+      .setDesc(t('settings.opencode.subagents.modal.nameDesc'))
       .addText((text) => {
         nameInput = text.inputEl;
         text.setValue(this.existing?.name ?? '')
@@ -122,17 +136,17 @@ class OpencodeAgentModal extends Modal {
       });
 
     new Setting(contentEl)
-      .setName('Description')
-      .setDesc('When OpenCode should use this subagent')
+      .setName(t('settings.opencode.subagents.modal.description'))
+      .setDesc(t('settings.opencode.subagents.modal.descriptionDesc'))
       .addText((text) => {
         descriptionInput = text.inputEl;
         text.setValue(this.existing?.description ?? '')
-          .setPlaceholder('Reviews code for correctness and maintainability');
+          .setPlaceholder(t('settings.opencode.subagents.modal.descriptionPlaceholder'));
       });
 
     const details = contentEl.createEl('details', { cls: 'claudian-sp-advanced-section' });
     details.createEl('summary', {
-      text: 'Advanced options',
+      text: t('settings.opencode.subagents.modal.advancedOptions'),
       cls: 'claudian-sp-advanced-summary',
     });
     if (
@@ -152,8 +166,8 @@ class OpencodeAgentModal extends Modal {
     }
 
     new Setting(details)
-      .setName('Model')
-      .setDesc('Model override in provider/model format')
+      .setName(t('settings.opencode.subagents.modal.model'))
+      .setDesc(t('settings.opencode.subagents.modal.modelDesc'))
       .addText((text) => {
         modelInput = text.inputEl;
         text.setValue(this.existing?.model ?? '')
@@ -161,8 +175,8 @@ class OpencodeAgentModal extends Modal {
       });
 
     new Setting(details)
-      .setName('Variant')
-      .setDesc('Model variant override')
+      .setName(t('settings.opencode.subagents.modal.variant'))
+      .setDesc(t('settings.opencode.subagents.modal.variantDesc'))
       .addText((text) => {
         variantInput = text.inputEl;
         text.setValue(this.existing?.variant ?? '')
@@ -170,8 +184,8 @@ class OpencodeAgentModal extends Modal {
       });
 
     new Setting(details)
-      .setName('Temperature')
-      .setDesc('Optional sampling temperature')
+      .setName(t('settings.opencode.subagents.modal.temperature'))
+      .setDesc(t('settings.opencode.subagents.modal.temperatureDesc'))
       .addText((text) => {
         temperatureInput = text.inputEl;
         text.setValue(this.existing?.temperature !== undefined ? String(this.existing.temperature) : '')
@@ -179,8 +193,8 @@ class OpencodeAgentModal extends Modal {
       });
 
     new Setting(details)
-      .setName('Top P')
-      .setDesc('Optional nucleus sampling value')
+      .setName(t('settings.opencode.subagents.modal.topP'))
+      .setDesc(t('settings.opencode.subagents.modal.topPDesc'))
       .addText((text) => {
         topPInput = text.inputEl;
         text.setValue(this.existing?.topP !== undefined ? String(this.existing.topP) : '')
@@ -188,8 +202,8 @@ class OpencodeAgentModal extends Modal {
       });
 
     new Setting(details)
-      .setName('Color')
-      .setDesc('Hex color or theme token')
+      .setName(t('settings.opencode.subagents.modal.color'))
+      .setDesc(t('settings.opencode.subagents.modal.colorDesc'))
       .addText((text) => {
         colorInput = text.inputEl;
         text.setValue(this.existing?.color ?? '')
@@ -197,8 +211,8 @@ class OpencodeAgentModal extends Modal {
       });
 
     new Setting(details)
-      .setName('Steps')
-      .setDesc('Maximum agentic iterations before forcing text-only output')
+      .setName(t('settings.opencode.subagents.modal.steps'))
+      .setDesc(t('settings.opencode.subagents.modal.stepsDesc'))
       .addText((text) => {
         stepsInput = text.inputEl;
         text.setValue(this.existing?.steps !== undefined ? String(this.existing.steps) : '')
@@ -206,8 +220,8 @@ class OpencodeAgentModal extends Modal {
       });
 
     new Setting(details)
-      .setName('Hide From @mention')
-      .setDesc('Hide this subagent from the @ autocomplete menu')
+      .setName(t('settings.opencode.subagents.modal.hide'))
+      .setDesc(t('settings.opencode.subagents.modal.hideDesc'))
       .addToggle((toggle) => {
         toggle.setValue(hiddenValue).onChange((value) => {
           hiddenValue = value;
@@ -215,8 +229,8 @@ class OpencodeAgentModal extends Modal {
       });
 
     new Setting(details)
-      .setName('Disable Agent')
-      .setDesc('Disable the agent without deleting the file')
+      .setName(t('settings.opencode.subagents.modal.disable'))
+      .setDesc(t('settings.opencode.subagents.modal.disableDesc'))
       .addToggle((toggle) => {
         toggle.setValue(disableValue).onChange((value) => {
           disableValue = value;
@@ -224,8 +238,8 @@ class OpencodeAgentModal extends Modal {
       });
 
     new Setting(details)
-      .setName('Enabled Tools (JSON)')
-      .setDesc('Optional deprecated tools map, e.g. {"write":false,"edit":false}')
+      .setName(t('settings.opencode.subagents.modal.tools'))
+      .setDesc(t('settings.opencode.subagents.modal.toolsDesc'))
       .addTextArea((text) => {
         toolsInput = text.inputEl;
         text.setValue(this.existing?.tools ? JSON.stringify(this.existing.tools, null, 2) : '')
@@ -233,8 +247,8 @@ class OpencodeAgentModal extends Modal {
       });
 
     new Setting(details)
-      .setName('Permission (JSON)')
-      .setDesc('Optional permission config, e.g. {"edit":"deny","bash":"allow"}')
+      .setName(t('settings.opencode.subagents.modal.permission'))
+      .setDesc(t('settings.opencode.subagents.modal.permissionDesc'))
       .addTextArea((text) => {
         permissionInput = text.inputEl;
         text.setValue(this.existing?.permission !== undefined ? JSON.stringify(this.existing.permission, null, 2) : '')
@@ -242,8 +256,8 @@ class OpencodeAgentModal extends Modal {
       });
 
     new Setting(details)
-      .setName('Options (JSON)')
-      .setDesc('Optional custom agent options')
+      .setName(t('settings.opencode.subagents.modal.options'))
+      .setDesc(t('settings.opencode.subagents.modal.optionsDesc'))
       .addTextArea((text) => {
         optionsInput = text.inputEl;
         text.setValue(this.existing?.options ? JSON.stringify(this.existing.options, null, 2) : '')
@@ -251,14 +265,14 @@ class OpencodeAgentModal extends Modal {
       });
 
     new Setting(contentEl)
-      .setName('Prompt')
-      .setDesc('Markdown body used as the agent prompt');
+      .setName(t('settings.opencode.subagents.modal.prompt'))
+      .setDesc(t('settings.opencode.subagents.modal.promptDesc'));
 
     const promptArea = contentEl.createEl('textarea', {
       cls: 'claudian-sp-content-area',
       attr: {
         rows: '10',
-        placeholder: 'Review code changes carefully and call out correctness, regressions, and missing coverage.',
+        placeholder: t('settings.opencode.subagents.modal.promptPlaceholder'),
       },
     });
     promptArea.value = this.existing?.prompt ?? '';
@@ -266,32 +280,32 @@ class OpencodeAgentModal extends Modal {
     const buttonContainer = contentEl.createDiv({ cls: 'claudian-sp-modal-buttons' });
 
     const cancelBtn = buttonContainer.createEl('button', {
-      text: 'Cancel',
+      text: t('common.cancel'),
       cls: 'claudian-cancel-btn',
     });
     cancelBtn.addEventListener('click', () => this.close());
 
     const saveBtn = buttonContainer.createEl('button', {
-      text: 'Save',
+      text: t('common.save'),
       cls: 'claudian-save-btn',
     });
     saveBtn.addEventListener('click', async () => {
       const name = nameInput.value.trim();
-      const nameError = validateOpencodeAgentName(name);
-      if (nameError) {
-        new Notice(nameError);
+      const nameIssue = getOpencodeAgentNameIssue(name);
+      if (nameIssue) {
+        new Notice(formatOpencodeAgentNameIssue(nameIssue));
         return;
       }
 
       const description = descriptionInput.value.trim();
       if (!description) {
-        new Notice('Description is required');
+        new Notice(t('settings.opencode.subagents.validation.descriptionRequired'));
         return;
       }
 
       const prompt = promptArea.value;
       if (!prompt.trim()) {
-        new Notice('Prompt is required');
+        new Notice(t('settings.opencode.subagents.validation.promptRequired'));
         return;
       }
 
@@ -301,43 +315,43 @@ class OpencodeAgentModal extends Modal {
         this.existing?.persistenceKey,
       );
       if (duplicate) {
-        new Notice(`A subagent named "${name}" already exists`);
+        new Notice(t('settings.opencode.subagents.validation.duplicateName', { name }));
         return;
       }
 
       const temperature = parseOptionalNumber(temperatureInput.value);
       if (temperature.issue) {
-        new Notice(formatAgentFieldIssue(temperature.issue, 'Temperature'));
+        new Notice(formatAgentFieldIssue(temperature.issue, t('settings.opencode.subagents.modal.temperature')));
         return;
       }
 
       const topP = parseOptionalNumber(topPInput.value);
       if (topP.issue) {
-        new Notice(formatAgentFieldIssue(topP.issue, 'Top P'));
+        new Notice(formatAgentFieldIssue(topP.issue, t('settings.opencode.subagents.modal.topP')));
         return;
       }
 
       const steps = parseOptionalPositiveInteger(stepsInput.value);
       if (steps.issue) {
-        new Notice(formatAgentFieldIssue(steps.issue, 'Steps'));
+        new Notice(formatAgentFieldIssue(steps.issue, t('settings.opencode.subagents.modal.steps')));
         return;
       }
 
       const tools = parseOptionalJsonObjectOfBooleans(toolsInput.value);
       if (tools.issue) {
-        new Notice(formatAgentFieldIssue(tools.issue, 'Enabled Tools'));
+        new Notice(formatAgentFieldIssue(tools.issue, t('settings.opencode.subagents.modal.tools')));
         return;
       }
 
       const permission = parseOptionalJson(permissionInput.value);
       if (permission.issue) {
-        new Notice(formatAgentFieldIssue(permission.issue, 'Permission'));
+        new Notice(formatAgentFieldIssue(permission.issue, t('settings.opencode.subagents.modal.permission')));
         return;
       }
 
       const options = parseOptionalJsonObject(optionsInput.value);
       if (options.issue) {
-        new Notice(formatAgentFieldIssue(options.issue, 'Options'));
+        new Notice(formatAgentFieldIssue(options.issue, t('settings.opencode.subagents.modal.options')));
         return;
       }
 
@@ -364,8 +378,8 @@ class OpencodeAgentModal extends Modal {
       try {
         await this.onSave(agent);
       } catch (error) {
-        const message = error instanceof Error ? error.message : 'Unknown error';
-        new Notice(`Failed to save subagent: ${message}`);
+        const message = error instanceof Error ? error.message : t('common.unknownError');
+        new Notice(t('settings.opencode.subagents.saveFailed', { message }));
         return;
       }
       this.close();
@@ -409,27 +423,27 @@ export class OpencodeAgentSettings {
     const visibleAgents = this.agents.filter((agent) => agent.mode === 'subagent');
 
     const headerEl = this.containerEl.createDiv({ cls: 'claudian-sp-header' });
-    headerEl.createSpan({ text: 'OpenCode Subagents', cls: 'claudian-sp-label' });
+    headerEl.createSpan({ text: t('settings.opencode.subagents.name'), cls: 'claudian-sp-label' });
 
     const actionsEl = headerEl.createDiv({ cls: 'claudian-sp-header-actions' });
 
     const refreshBtn = actionsEl.createEl('button', {
       cls: 'claudian-settings-action-btn',
-      attr: { 'aria-label': 'Refresh' },
+      attr: { 'aria-label': t('common.refresh') },
     });
     setIcon(refreshBtn, 'refresh-cw');
     refreshBtn.addEventListener('click', () => { void this.render(); });
 
     const addBtn = actionsEl.createEl('button', {
       cls: 'claudian-settings-action-btn',
-      attr: { 'aria-label': 'Add' },
+      attr: { 'aria-label': t('common.add') },
     });
     setIcon(addBtn, 'plus');
     addBtn.addEventListener('click', () => this.openModal(null));
 
     if (visibleAgents.length === 0) {
       const emptyEl = this.containerEl.createDiv({ cls: 'claudian-sp-empty-state' });
-      emptyEl.setText('No OpenCode subagents in vault. Click + to create one.');
+      emptyEl.setText(t('settings.opencode.subagents.noAgents'));
       return;
     }
 
@@ -448,7 +462,7 @@ export class OpencodeAgentSettings {
     nameEl.setText(agent.name);
 
     headerRow.createSpan({
-      text: 'subagent',
+      text: t('settings.opencode.subagents.badge'),
       cls: 'claudian-slash-item-badge',
     });
 
@@ -465,30 +479,30 @@ export class OpencodeAgentSettings {
 
     const editBtn = actionsEl.createEl('button', {
       cls: 'claudian-settings-action-btn',
-      attr: { 'aria-label': 'Edit' },
+      attr: { 'aria-label': t('common.edit') },
     });
     setIcon(editBtn, 'pencil');
     editBtn.addEventListener('click', () => this.openModal(agent));
 
     const deleteBtn = actionsEl.createEl('button', {
       cls: 'claudian-settings-action-btn claudian-settings-delete-btn',
-      attr: { 'aria-label': 'Delete' },
+      attr: { 'aria-label': t('common.delete') },
     });
     setIcon(deleteBtn, 'trash-2');
     deleteBtn.addEventListener('click', async () => {
       if (!this.app) return;
       const confirmed = await confirmDelete(
         this.app,
-        `Delete subagent "${agent.name}"?`,
+        t('settings.opencode.subagents.deleteConfirm', { name: agent.name }),
       );
       if (!confirmed) return;
       try {
         await this.storage.delete(agent);
         await this.render();
         await this.onChanged?.();
-        new Notice(`Subagent "${agent.name}" deleted`);
+        new Notice(t('settings.opencode.subagents.deleted', { name: agent.name }));
       } catch {
-        new Notice('Failed to delete subagent');
+        new Notice(t('settings.opencode.subagents.deleteFailed'));
       }
     });
   }
@@ -506,8 +520,8 @@ export class OpencodeAgentSettings {
         await this.onChanged?.();
         new Notice(
           existing
-            ? `Subagent "${agent.name}" updated`
-            : `Subagent "${agent.name}" created`,
+            ? t('settings.opencode.subagents.updated', { name: agent.name })
+            : t('settings.opencode.subagents.created', { name: agent.name }),
         );
       },
     );
@@ -523,14 +537,13 @@ export type OpencodeFieldIssueCode =
   | 'jsonObject'
   | 'booleanMap';
 
-// Temporary English formatting; switched to t() keys together with the i18n migration.
-function formatAgentFieldIssue(issue: OpencodeFieldIssueCode, label: string): string {
+function formatAgentFieldIssue(issue: OpencodeFieldIssueCode, fieldLabel: string): string {
   switch (issue) {
-    case 'validNumber': return `${label} must be a valid number`;
-    case 'positiveInteger': return `${label} must be a positive integer`;
-    case 'validJson': return `${label} must be valid JSON`;
-    case 'jsonObject': return `${label} must be a JSON object`;
-    case 'booleanMap': return `${label} must map tool names to boolean values`;
+    case 'validNumber': return t('settings.opencode.subagents.validation.validNumber', { field: fieldLabel });
+    case 'positiveInteger': return t('settings.opencode.subagents.validation.positiveInteger', { field: fieldLabel });
+    case 'validJson': return t('settings.opencode.subagents.validation.validJson', { field: fieldLabel });
+    case 'jsonObject': return t('settings.opencode.subagents.validation.jsonObject', { field: fieldLabel });
+    case 'booleanMap': return t('settings.opencode.subagents.validation.booleanMap', { field: fieldLabel });
   }
 }
 

@@ -104,7 +104,8 @@ export function validateCodexNicknameCandidates(candidates: string[]): string | 
   }
 }
 
-class CodexSubagentModal extends Modal {
+/** Exposed for unit tests (mirrors CodexSkillModal). */
+export class CodexSubagentModal extends Modal {
   private existing: CodexSubagentDefinition | null;
   private allAgents: CodexSubagentDefinition[];
   private onSave: (agent: CodexSubagentDefinition) => Promise<void>;

@@ -485,6 +485,114 @@
         "name": "Codex environment",
         "desc": "Codex-owned runtime variables only. Use this for OPENAI_* and CODEX_* settings. If Codex auto-detection needs help, add its install directory to shared PATH instead of this provider section."
       }
+    },
+    "opencode": {
+      "enable": {
+        "name": "Enable OpenCode",
+        "desc": "Launch `opencode acp` as a provider."
+      },
+      "cliPath": {
+        "name": "CLI path ({hostname})",
+        "desc": "Optional absolute path to the OpenCode CLI for this computer. Leave empty to use `opencode` from PATH.",
+        "validation": {
+          "notExist": "Path does not exist",
+          "notFile": "Path must point to a file"
+        }
+      },
+      "models": {
+        "visibleName": "Visible models",
+        "visibleDesc": "Choose which OpenCode models appear in the chat selector. Filter by provider or type to search. The current session model stays pinned even if it is not selected here.",
+        "browse": "Browse models",
+        "filterPlaceholder": "Filter by model, provider, or id…",
+        "summaryOneProvider": "Visible: {visible} of {discovered} discovered • {providerCount} provider",
+        "summaryManyProviders": "Visible: {visible} of {discovered} discovered • {providerCount} providers",
+        "available": "{count} available",
+        "noneDiscovered": "No models discovered yet",
+        "selected": "Selected ({count})",
+        "clearAllAria": "Clear all selected models",
+        "notReported": "Not currently reported by OpenCode",
+        "aliasAria": "Alias for {label}",
+        "aliasTitle": "Custom label shown in the model selector. Leave empty to use the default.",
+        "removeAria": "Remove {label}",
+        "allProviders": "All providers ({count})",
+        "startToDiscover": "Start OpenCode once to load its model catalog. Claudian will then let you pick visible models.",
+        "noMatch": "No models match your filter.",
+        "unavailable": "Unavailable",
+        "unavailableTitle": "Configured model not currently reported by OpenCode"
+      },
+      "commands": {
+        "name": "Commands and Skills",
+        "desc": "OpenCode can auto-detect vault-level Claude slash commands from .claude/commands/ and skills from .claude/skills/, .codex/skills/, and .agents/skills/. Manage those entries in the Claude or Codex settings tab. This setting only hides entries from the OpenCode dropdown.",
+        "hiddenName": "Hidden Commands and Skills",
+        "hiddenDesc": "Hide specific OpenCode commands and skills from the dropdown. Enter names without the leading slash, one per line."
+      },
+      "subagents": {
+        "name": "Subagents",
+        "desc": "Manage vault-level OpenCode subagents from .opencode/agent/ and legacy .opencode/agents/. New entries are saved as subagent-only files and appear in the @mention menu.",
+        "modal": {
+          "titleEdit": "Edit OpenCode Subagent",
+          "titleAdd": "Add OpenCode Subagent",
+          "name": "Name",
+          "nameDesc": "OpenCode agent name. Use slash-separated segments for nested agents.",
+          "description": "Description",
+          "descriptionDesc": "When OpenCode should use this subagent",
+          "descriptionPlaceholder": "Reviews code for correctness and maintainability",
+          "advancedOptions": "Advanced options",
+          "model": "Model",
+          "modelDesc": "Model override in provider/model format",
+          "variant": "Variant",
+          "variantDesc": "Model variant override",
+          "temperature": "Temperature",
+          "temperatureDesc": "Optional sampling temperature",
+          "topP": "Top P",
+          "topPDesc": "Optional nucleus sampling value",
+          "color": "Color",
+          "colorDesc": "Hex color or theme token",
+          "steps": "Steps",
+          "stepsDesc": "Maximum agentic iterations before forcing text-only output",
+          "hide": "Hide from @mention",
+          "hideDesc": "Hide this subagent from the @ autocomplete menu",
+          "disable": "Disable agent",
+          "disableDesc": "Disable the agent without deleting the file",
+          "tools": "Enabled tools (JSON)",
+          "toolsDesc": "Optional deprecated tools map, e.g. {\"write\":false,\"edit\":false}",
+          "permission": "Permission (JSON)",
+          "permissionDesc": "Optional permission config, e.g. {\"edit\":\"deny\",\"bash\":\"allow\"}",
+          "options": "Options (JSON)",
+          "optionsDesc": "Optional custom agent options",
+          "prompt": "Prompt",
+          "promptDesc": "Markdown body used as the agent prompt",
+          "promptPlaceholder": "Review code changes carefully and call out correctness, regressions, and missing coverage."
+        },
+        "validation": {
+          "nameRequired": "Agent name is required",
+          "namePath": "Agent name must use slash-separated path segments without leading or trailing slashes",
+          "segmentEmpty": "Agent name path segments cannot be empty or whitespace-only",
+          "segmentWhitespace": "Agent name path segments cannot start or end with whitespace",
+          "dotSegment": "Agent name cannot include \".\" or \"..\" path segments",
+          "reservedCharacter": "Agent name path segments cannot contain Windows-reserved filename characters",
+          "descriptionRequired": "Description is required",
+          "promptRequired": "Prompt is required",
+          "duplicateName": "A subagent named \"{name}\" already exists",
+          "validNumber": "{field} must be a valid number",
+          "positiveInteger": "{field} must be a positive integer",
+          "validJson": "{field} must be valid JSON",
+          "jsonObject": "{field} must be a JSON object",
+          "booleanMap": "{field} must map tool names to boolean values"
+        },
+        "saveFailed": "Failed to save subagent: {message}",
+        "noAgents": "No OpenCode subagents in vault. Click + to create one.",
+        "badge": "subagent",
+        "deleteConfirm": "Delete subagent \"{name}\"?",
+        "deleted": "Subagent \"{name}\" deleted",
+        "deleteFailed": "Failed to delete subagent",
+        "updated": "Subagent \"{name}\" updated",
+        "created": "Subagent \"{name}\" created"
+      },
+      "environment": {
+        "name": "Environment variables",
+        "desc": "Extra environment variables passed to OpenCode. `OPENCODE_ENABLE_EXA=1` is enabled by default."
+      }
     }
   }
 }

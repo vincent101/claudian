@@ -485,6 +485,114 @@
         "name": "Codex 環境變數",
         "desc": "僅填寫 Codex 自有的執行階段變數，例如 OPENAI_* 和 CODEX_*。若 Codex 自動偵測需要協助，請將其安裝目錄加入共用 PATH，而非此提供商區域。"
       }
+    },
+    "opencode": {
+      "enable": {
+        "name": "啟用 OpenCode",
+        "desc": "以提供商方式啟動 `opencode acp`。"
+      },
+      "cliPath": {
+        "name": "CLI 路徑（{hostname}）",
+        "desc": "此電腦上 OpenCode CLI 的可選絕對路徑。留空則使用 PATH 中的 `opencode`。",
+        "validation": {
+          "notExist": "路徑不存在",
+          "notFile": "路徑必須指向檔案"
+        }
+      },
+      "models": {
+        "visibleName": "可見模型",
+        "visibleDesc": "選擇聊天選擇器中顯示的 OpenCode 模型。可按提供商篩選或輸入文字搜尋。即使目前工作階段模型未在此選取，也會保持固定顯示。",
+        "browse": "瀏覽模型",
+        "filterPlaceholder": "按模型、提供商或 ID 篩選……",
+        "summaryOneProvider": "可見：已發現 {discovered} 個，其中顯示 {visible} 個 • {providerCount} 個提供商",
+        "summaryManyProviders": "可見：已發現 {discovered} 個，其中顯示 {visible} 個 • {providerCount} 個提供商",
+        "available": "{count} 個可用",
+        "noneDiscovered": "尚未發現模型",
+        "selected": "已選取（{count}）",
+        "clearAllAria": "清除所有已選模型",
+        "notReported": "OpenCode 目前未回報此模型",
+        "aliasAria": "{label} 的別名",
+        "aliasTitle": "模型選擇器中顯示的自訂標籤。留空使用預設標籤。",
+        "removeAria": "移除 {label}",
+        "allProviders": "所有提供商（{count}）",
+        "startToDiscover": "啟動一次 OpenCode 以載入其模型目錄，之後即可在 Claudian 中選擇可見模型。",
+        "noMatch": "沒有符合篩選條件的模型。",
+        "unavailable": "不可用",
+        "unavailableTitle": "已設定的模型目前未由 OpenCode 回報"
+      },
+      "commands": {
+        "name": "命令與技能",
+        "desc": "OpenCode 可自動發現 .claude/commands/ 中的 Vault 級 Claude 斜線命令，以及 .claude/skills/、.codex/skills/ 與 .agents/skills/ 中的技能。請在 Claude 或 Codex 設定頁管理這些項目；此設定僅控制 OpenCode 下拉選單中的隱藏項。",
+        "hiddenName": "隱藏命令與技能",
+        "hiddenDesc": "從下拉選單中隱藏特定 OpenCode 命令與技能。每行輸入一個名稱，無需前導斜線。"
+      },
+      "subagents": {
+        "name": "子代理",
+        "desc": "管理 .opencode/agent/ 與舊版 .opencode/agents/ 中的 Vault 級 OpenCode 子代理。新項目儲存為僅限子代理的檔案，並顯示在 @提及 選單中。",
+        "modal": {
+          "titleEdit": "編輯 OpenCode 子代理",
+          "titleAdd": "新增 OpenCode 子代理",
+          "name": "名稱",
+          "nameDesc": "OpenCode 代理名稱。巢狀代理使用斜線分隔路徑區段。",
+          "description": "描述",
+          "descriptionDesc": "OpenCode 應在何時使用此子代理",
+          "descriptionPlaceholder": "檢查程式碼的正確性與可維護性",
+          "advancedOptions": "進階選項",
+          "model": "模型",
+          "modelDesc": "以 provider/model 格式覆寫模型",
+          "variant": "變體",
+          "variantDesc": "覆寫模型變體",
+          "temperature": "Temperature",
+          "temperatureDesc": "可選的取樣溫度",
+          "topP": "Top P",
+          "topPDesc": "可選的核心取樣值",
+          "color": "顏色",
+          "colorDesc": "十六進位色彩或主題權杖",
+          "steps": "步數",
+          "stepsDesc": "強制僅輸出文字前允許的最大代理迭代次數",
+          "hide": "從 @提及 中隱藏",
+          "hideDesc": "從 @ 自動完成選單中隱藏此子代理",
+          "disable": "停用代理",
+          "disableDesc": "停用代理但不刪除檔案",
+          "tools": "已啟用工具（JSON）",
+          "toolsDesc": "可選的舊版工具映射，例如 {\"write\":false,\"edit\":false}",
+          "permission": "權限（JSON）",
+          "permissionDesc": "可選的權限設定，例如 {\"edit\":\"deny\",\"bash\":\"allow\"}",
+          "options": "選項（JSON）",
+          "optionsDesc": "可選的自訂代理選項",
+          "prompt": "系統提示詞",
+          "promptDesc": "用作代理系統提示詞的 Markdown 正文",
+          "promptPlaceholder": "仔細檢查程式碼變更，指出正確性問題、回歸與缺少的測試覆蓋。"
+        },
+        "validation": {
+          "nameRequired": "代理名稱為必填",
+          "namePath": "代理名稱必須使用斜線分隔路徑區段，且不能以斜線開頭或結尾",
+          "segmentEmpty": "代理名稱的路徑區段不得為空或僅含空白",
+          "segmentWhitespace": "代理名稱的路徑區段不能以空白開頭或結尾",
+          "dotSegment": "代理名稱不能包含「.」或「..」路徑區段",
+          "reservedCharacter": "代理名稱的路徑區段不能包含 Windows 保留的檔名字元",
+          "descriptionRequired": "描述為必填",
+          "promptRequired": "系統提示詞為必填",
+          "duplicateName": "已存在名為「{name}」的子代理",
+          "validNumber": "{field} 必須是有效數字",
+          "positiveInteger": "{field} 必須是正整數",
+          "validJson": "{field} 必須是有效的 JSON",
+          "jsonObject": "{field} 必須是 JSON 物件",
+          "booleanMap": "{field} 必須將工具名稱對應至布林值"
+        },
+        "saveFailed": "儲存子代理失敗：{message}",
+        "noAgents": "Vault 中沒有 OpenCode 子代理。點擊 + 建立一個。",
+        "badge": "子代理",
+        "deleteConfirm": "刪除子代理「{name}」？",
+        "deleted": "已刪除子代理「{name}」",
+        "deleteFailed": "刪除子代理失敗",
+        "updated": "已更新子代理「{name}」",
+        "created": "已建立子代理「{name}」"
+      },
+      "environment": {
+        "name": "環境變數",
+        "desc": "傳遞給 OpenCode 的額外環境變數。預設啟用 `OPENCODE_ENABLE_EXA=1`。"
+      }
     }
   }
 }
