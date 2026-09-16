@@ -7,7 +7,7 @@ tags: [architect, claudian, history, resource-budget, dom-windowing]
 
 # 背景与问题
 
-Claudian 已有预算窗口与 `ProjectionWriteCoordinator`，但完整历史消费者、Claude 小/大会话双轨和持续累积的 DOM 仍突破端到端资源边界；本方案首版以 `hotfix/notify-lease@1583ab57` 为实证基线，v2 复核修订时仓库为 `hotfix/notify-lease@d773605f`。派单所写 `5372b4ac` 是旧祖先，不能按旧 HEAD 设计。
+Claudian 已有预算窗口与 `ProjectionWriteCoordinator`，但完整历史消费者、Claude 小/大会话双轨和持续累积的 DOM 仍突破端到端资源边界；本方案首版以 `hotfix/notify-lease@1583ab57` 为实证基线，v2 复核修订时仓库为 `hotfix/notify-lease@d773605f`。[v3 修订] 终审修订基线为 `hotfix/notify-lease@ddafd3ba`，其中 A0a 已由 `b047650c` 完成并部署 2.1.2。派单所写 `5372b4ac` 是旧祖先，不能按旧 HEAD 设计。
 
 # 方案设计
 
@@ -23,18 +23,16 @@ Claudian 已有预算窗口与 `ProjectionWriteCoordinator`，但完整历史消
 
 ### 1.2 顺序
 
-正式集成顺序为 **A → B → C**：
+[v3 修订] 正式集成顺序为 **A0a（已完成）→ A0b → A1 → A2 → B → C**：
 
-1. **A** 先封闭无界入口并补 detail、around、LRU；可独立部署，降低 B 改状态机时的灾难半径。
-2. **B** 消灭 Claude 双轨，令所有 Claude tab 都有 page/range/lease 语义；这是 C 的必要前提。
-3. **C** 只管理已加载数据的 DOM 驻留，不改变 provider 读取语义。
+1. **A0a：rewind hotfix** 已于 2026-09-16 以 `b047650c` 独立完成并部署 2.1.2；后续 A 批只验证其仍被包含，不重复实现。
+2. **A0b：usage snapshot hotfix** 是下一个可独立部署、独立回滚的批次，先消除线上 context gauge 双计。
+3. **A1：iterator、导出、amnesia** 封闭全历史与恢复路径的无界入口。
+4. **A2：detail、search、`loadRange` 清理、LRU** 收口 UI 精确读取与缓存契约。
+5. **B** 消灭 Claude 双轨，令所有 Claude tab 都有 page/range/lease 语义；这是 C 的必要前提。
+6. **C** 只管理已加载数据的 DOM 驻留，不改变 provider 读取语义。
 
-A 内可并行两条开发线，但必须串行合并：
-
-- A1：完整历史迭代、amnesia、rewind detail；
-- A2：删除 UI `loadRange`、around 回归固化、LRU 修正。
-
-两线共同修改 `core/providers/types.ts`、`ClaudeConversationHistoryService.ts` 和 `ConversationController.ts`，不宜在同一工作树无序并改。先合 A1 契约，再将 A2 rebase 到该契约。A 与 B 不并行合并：B 会删除 A 所依赖的 oversize/loadActive 分支，冲突不仅是机械冲突。
+A1 与 A2 共同修改 `core/providers/types.ts`、`ClaudeConversationHistoryService.ts` 和 `ConversationController.ts`，必须串行合并：先合 A1 契约，再将 A2 rebase 到该契约。A0b 只触及 usage stream 聚合与对应测试，可先独立发布。A 与 B 不并行合并：B 会删除 A 所依赖的 oversize/loadActive 分支，冲突不仅是机械冲突。
 
 ### 1.3 共同不变量
 
@@ -82,7 +80,9 @@ type FullHistoryIterable = AsyncIterable<FullHistoryChunk>;
 1. **完整文本导出**：增加 provider-neutral `consumeHistoryText(iterable, WritableLike)`，逐消息格式化、逐块写文件；任意时刻只驻留“一个 chunk + writer buffer”。文件导出使用流式 writer。Clipboard API 不支持流式写入，设置独立硬上限（建议 4 MiB，真机校准）；预估或实际超限即提示改用文件导出，禁止先拼完整字符串或以临时文件冒充流式剪贴板。[v2 修订]
 2. **SDK amnesia rebuild**：`ChatRuntime.setFullHistoryExporter` 改为 `setHistoryRecoverySource(() => FullHistoryIterable)`；`ClaudeChatRuntime` 通过新增 `HistoryContextAccumulator` 消费 detail chunk。累计达到恢复预算后丢弃最旧完整 turn，保留 newest contiguous suffix，并加入明确的 `[Earlier history omitted: context recovery budget]` 标记。预算以模型 context token 上限换算的保守字符上限计算，并为 system prompt、当前 prompt、工具 schema 与输出留余量；首版采用现有 token/context 估算能力，不新增 tokenizer 依赖。
 
-[v2 修订：恢复确认与熔断] `SessionManager` 将布尔 `needsHistoryRebuild` 升级为 recovery state：`idle | pending{generation, lostSessionId, attempts} | awaiting_init{generation, expectedSessionId, attempts} | tripped`。检测到非 fork 的 session id 变化时创建/推进 generation；本轮注入后不得立即清标志，而是记录实际 dispatch 前的 session id 并进入 `awaiting_init`。捕获下一个 `session_init` 时，仅当 generation 仍匹配且 session id 与注入所针对的新 session 连续（未再次跳变）才 `confirmRecovery`；若再次变化则同一 generation 重试，最多 2 次。超限进入 `tripped`，本次及后续 turn 不再自动注入，向 UI 返回可诊断错误/提示用户新建会话或手动处理；显式切会话、reset、fork 建立新 generation 并清熔断。`session_init` 可能走 leased 或 lease-less 路径，确认逻辑统一放在 `applySessionInitSideEffects`，不得只挂在 query generator。
+[v3 修订：恢复确认与熔断] `SessionManager` 将布尔 `needsHistoryRebuild` 升级为 recovery state：`idle | pending{generation, lostSessionId, attempts} | awaiting_result{generation, dispatchSessionId, attempts} | tripped{generation, reason}`。`session_init` 只负责检测非 fork 的 session id 跳变并创建/推进 generation，**不再作为恢复成功确认信号**；持久 query 可能不再产生下一次 init。恢复后缀注入并成功 dispatch 时，记录该请求的 `dispatchSessionId` 与 session 快照，进入 `awaiting_result`。仅当同一 generation 收到成功 `result` 事件，且 result 所属 session id 与 `dispatchSessionId` 相等、当前 session 快照自 dispatch 后未再次跳变，才 `confirmRecovery → idle`。失败 result、query 中断或快照变化均不得清状态：仍有预算则回到 `pending`，每个 generation 最多注入 2 次；超限进入 `tripped`，后续 turn 停止自动注入。
+
+[v3 修订] `tripped` 必须有 UI 可见、原子化的手动重置入口 `retryHistoryRecovery(generation)`：仅当传入 generation 与当前熔断 generation 匹配时建立新 generation 并回到 `pending`，旧 UI/旧异步任务不得重置新状态。提示明确给出两条恢复路径：“新建会话”或“手动重试恢复”。显式切换到新会话、reset、fork 也建立新 generation 并清旧熔断；普通 `session_init` 不得隐式清除 `tripped`。
 
 这解决了两个不同问题：导出遍历全部历史且流式落地；模型恢复不可能容纳无限历史，因此只注入未摘要、未拆断 turn 的有界后缀。`buildContextFromHistory(ChatMessage[])` 保留给普通小数组调用；新增 `HistoryContextAccumulator.appendChunk()`，禁止 amnesia 再调用旧全量函数。
 
@@ -109,14 +109,18 @@ type FullHistoryIterable = AsyncIterable<FullHistoryChunk>;
 
 单条消息仍需硬边界。首版 detail `maxSourceBytes=16 MiB`；超过则拒绝预填，不提供截断 rewind。该选择比把几十 MiB 文本塞进 textarea 更可控，也保持“执行即精确”。
 
-**前置修复（并入本批）：rewind 的 lazy-runtime 契约缺陷**。真机发现（2026-09-15）：paged 会话未发言 tab 点“回退到此处”报“回退失败： No active query”。定位结论：`ConversationController.ts:879` 直接调 `runtime.rewind()` 未初始化 runtime，`ClaudeChatRuntime.ts:2493` 因 `persistentQuery === null` 抛错；且 `ClaudianService.test.ts:3445-3449` 固化了该错误行为。**非 5cb8799d..HEAD 新回归**（5cb8799d 的 rewind 代码与当前相同，缺陷源自 lazy runtime 引入时），系 B1 使超大会话从 OVERSIZE_BLOCKED 变为可交互后首次暴露；普通小会话未发言 tab 同样触发，非 paged 特有。修法：`ClaudeChatRuntime.rewind()` 自行确保 persistent query 就绪（对齐 send 路径的惰性初始化模式），失败返回语义化错误，UI 层不承担 provider 生命周期；同步修正固化旧行为的测试（红测先行）。
+**[v3 修订] 前置修复 A0a：rewind 的 lazy-runtime 契约缺陷——已完成。** 真机发现（2026-09-15）：paged 会话未发言 tab 点“回退到此处”报“回退失败： No active query”。定位结论：`ConversationController.ts:879` 直接调 `runtime.rewind()` 未初始化 runtime，`ClaudeChatRuntime.ts:2493` 因 `persistentQuery === null` 抛错；且 `ClaudianService.test.ts:3445-3449` 固化了该错误行为。**非 5cb8799d..HEAD 新回归**（5cb8799d 的 rewind 代码与当前相同，缺陷源自 lazy runtime 引入时），系 B1 使超大会话从 OVERSIZE_BLOCKED 变为可交互后首次暴露；普通小会话未发言 tab 同样触发，非 paged 特有。修法已以 commit `b047650c` 于 2026-09-16 独立 hotfix 完成并部署 2.1.2：`ClaudeChatRuntime.rewind()` 自行确保 persistent query 就绪，UI 层不承担 provider 生命周期。A 批实施时只验证该提交及回归测试被包含，不重复开发。
 
 改动文件（rewind 前置修复部分）：
 
 - `/Users/vincentwang/Documents/NoteVault/tools/claudian/src/providers/claude/runtime/ClaudeChatRuntime.ts`
 - `/Users/vincentwang/Documents/NoteVault/tools/claudian/tests/unit/providers/claude/runtime/ClaudianService.test.ts`
 
-**前置修复 2（并入本批，2026-09-16 增补）：usage 聚合跨请求双计**。真机发现：context gauge 曾显示 1016k/1000k（>100%）。取证结论：同一 turn 内请求 A 为 cache miss（input 496652 + cacheRead 22272 ≈ 519k），下一请求 B 为 cache hit（input 598 + cacheRead 518912 ≈ 520k）；`transformClaudeMessage.ts` 的 `mergePromptUsage`（约 :253-267）跨请求**按字段各取最大值**（`Math.max(current.inputTokens, next.inputTokens)` 等）拼出 496652+518912≈1016k——把 miss 请求的未缓存输入与 hit 请求的 cache_read **双计**，真实上下文 ≈522k。另发现 meta.json 的 usage.model 记录的是档位别名（opus）而非实际解析模型。修法：turn 内 usage 聚合改为**采用最后一个请求的完整 usage 快照**（assistant 消息的 usage 即当前真实上下文；多 assistant 分段时取最后一条主 agent 消息，不跨请求按字段取 max），result 消息的 modelUsage 仍作权威窗口矫正；持久化 usage.model 记录 session_init 实际解析模型（对齐 fc882a63 的 resolved-model 捕获）。注意保留两阶段合并的原始动机（assistant 给 input 侧计数、result 给权威 contextWindow，见 providers/claude/CLAUDE.md）——修正的是同字段跨请求的 max 合并，不是两阶段本身。红测：同一 turn 内 miss→hit 两请求序列后，contextTokens 应等于最后请求的 input+cacheRead 之和（≈520k）而非字段 max 拼接（≈1016k）。
+**[v3 修订] 前置修复 A0b（下一个可独立部署 hotfix）：usage 聚合跨请求双计。** 真机发现：context gauge 曾显示 1016k/1000k（>100%）。取证结论：同一 turn 内请求 A 为 cache miss（input 496652 + cacheRead 22272 ≈ 519k），下一请求 B 为 cache hit（input 598 + cacheRead 518912 ≈ 520k）；`transformClaudeMessage.ts` 的 `mergePromptUsage`（约 :253-267）跨请求**按字段各取最大值**（`Math.max(current.inputTokens, next.inputTokens)` 等）拼出 496652+518912≈1016k——把 miss 请求的未缓存输入与 hit 请求的 cache_read **双计**，真实上下文 ≈522k。
+
+[v3 修订] 修法不是简单“取最后一条”，而是 **request-boundary 快照状态机**：以 SDK 主 agent 消息流的请求边界划分快照，`assistant` 开启/更新该请求的 input 侧 usage，匹配的 `result` 关闭该请求并提供权威窗口信息；每个请求边界都以该请求的**完整 usage 对象整体替换**当前请求快照，禁止跨请求逐字段 `max`、累加或拼接。空/全零片段不得覆盖同一请求已建立的非空快照；`parent_tool_use_id` 非空的 subagent assistant/result 全部过滤，不得推进主 agent 状态机。turn 最终仍按两阶段合并：assistant 快照提供 input/cache 侧计数，匹配 result 提供权威 `contextWindow`；这保留原设计动机（见 `providers/claude/CLAUDE.md`），只消除跨请求双计。
+
+[v3 修订] 模型字段继续保留 `50214f22` 的 turn model 快照；`fc882a63` 捕获的 resolved model 只与同请求的 result 匹配并持久化，禁止较晚/较早请求串配。红测至少覆盖 miss→hit、hit→miss、多 assistant 分段、全零片段、subagent 插流、result 缺失/乱序；最终 `contextTokens` 应等于最后一个已闭合主 agent 请求的完整 input+cacheRead 快照（示例约 520k），而非字段 max 拼接（约 1016k）。
 
 改动文件（usage 聚合修复部分）：
 
@@ -151,7 +155,7 @@ type FullHistoryIterable = AsyncIterable<FullHistoryChunk>;
 
 1. 1.59 GB / 1000 turn iterator：每块均受 turn/byte 上限，顺序无重漏，中途 abort/throw 只 release 一次。
 2. 导出 sink 故意慢写：生产者受 backpressure，不预取后续块，RSS 不随总历史线性增长。
-3. amnesia 超过 context 预算：只保留完整 newest suffix、当前 prompt 不重复、出现 omission 标记；任何 chunk 都不是 summary。注入后下一个 `session_init` 同 id 才确认；连续两次再次换 id 后进入 `tripped`，后续 turn 不再注入；fork/reset 可开启新 generation。
+3. [v3 修订] amnesia 超过 context 预算：只保留完整 newest suffix、当前 prompt 不重复、出现 omission 标记；任何 chunk 都不是 summary。注入后仅“成功 `result` + result session id 等于 dispatch 快照 + 当前 session 快照未跳变”可确认；失败/跳变最多重试 2 次后进入 `tripped`，后续 turn 不再注入；旧 generation 手动重置被拒，新建会话、匹配 generation 的手动重试、fork/reset 可开启新 generation。
 4. summary user rewind：先取 exact detail；detail 失败/16 MiB 超限时不执行 rewind、不改输入框。
 5. fork 不再把当前 `state.messages` 视为完整前缀。
 6. Codex history load 不调用 index/window；删除 legacy fallback 后原测试仍绿。
@@ -162,7 +166,7 @@ type FullHistoryIterable = AsyncIterable<FullHistoryChunk>;
 
 ### 2.6 独立部署与回滚
 
-A 可独立部署。兼容期 `setFullHistoryExporter` 可保留一个版本但 Claude runtime 不再调用；下一批删除。回滚点为 A 前构建产物；回滚不会改变 transcript/meta。若 iterator 出错，显式终止导出或 amnesia 恢复，不回退全量物化。三批发布后仅允许 C→B→A 逆序回滚。
+[v3 修订] A 按 A0b→A1→A2 分批独立部署；A0a 已部署且后续只做包含性验证。A0b 可单独回滚；A1/A2 合并后共同构成 B 的前置 A 基线。兼容期 `setFullHistoryExporter` 可保留一个版本但 Claude runtime 不再调用；下一批删除。回滚不会改变 transcript/meta。若 iterator 出错，显式终止导出或 amnesia 恢复，不回退全量物化。全链路仍仅允许 C→B→A2→A1→A0b 逆序回滚；A0a 作为已发布 hotfix 不随 B4 批次回退。
 
 ## 3. 批次 B：Claude 双轨统一
 
@@ -189,7 +193,7 @@ Claude 的 `hydrateConversationHistory` 不再读 transcript。推荐从 Claude 
 
 正常 UI 不可达双开：`TabManager.openConversation` 先查本 view，再经 `findConversationAcrossViews` 跳转另一 view。但这是入口级、非提交级不变量，现状仍有三类绕过：
 
-1. **并发窗口 a：可达。** `openConversation` 检查后才调用异步 `switchTo`，而 `tab.conversationId` 在 `ensureServiceForConversation/onConversationIdChanged` 成功后回写；两个 tab 可同时通过检查。增加 plugin 级 `ConversationOpenRegistry`，以 `conversationId` 原子 `reserve(tabRef, generation)`；`switchTo` 提交前再次 `claim`，失败则取消本 tab restore 并聚焦 owner。reserve 在失败/切离/close 时释放，最终 owner 以提交点为准。
+1. **[v3 修订] 并发窗口 a：可达。** `openConversation` 检查后才调用异步 `switchTo`，而 `tab.conversationId` 在 `ensureServiceForConversation/onConversationIdChanged` 成功后回写；两个 tab 可同时通过检查。增加 plugin 级 `ConversationOpenRegistry`：registry 值固定为 `{ownerToken, conversationId}`，`reserve(conversationId)` 原子生成并返回不可复用的 `ownerToken`；异步 `switchTo` 全程携带该 token，提交前以 token 做 CAS claim，失败则取消本 tab restore 并聚焦当前 owner。`release(conversationId, ownerToken)` 必须同时匹配 conversationId 与 token；不匹配表示过期任务，拒绝释放且记录诊断，防止旧 restore/switch 任务释放后来建立的新 owner。失败、切离、close 只能释放自身 token，最终 owner 以提交点 CAS 为准。
 2. **恢复绕过 b：可达。** `restoreState` 逐项直调 `createTab`，不经过 `openConversation`；同一快照内重复 id、多个 view 同时恢复、历史脏快照均可双开。恢复前按 `conversationId` 稳定去重（保留 activeTabId 指向项，否则保留首项），每个候选仍走全局 reserve；被拒项恢复为空白 tab 或跳过并记录诊断。持久化前也去重，防脏状态再生。
 3. **直调绕过 c：受限但存在。** 生产调用仅见 `openConversation`、`forkInCurrentTab`，以及 `InputController` 在未注入 `openConversation` 时的 fallback；后者当前装配已注入但测试/未来装配可绕过。将 `switchTo` 变为 TabManager 私有提交入口（或强制注入 `claimConversation` capability），删除 InputController fallback；fork 也统一走该入口。`plugin.switchConversation` 仅做数据加载，不承担唯一性。
 
@@ -216,8 +220,8 @@ Claude 相关直接读者已逐项核对：
 
 | 读者 | 当前用途 | 窗口语义是否正确 | 修订 |
 |---|---|---|---|
-| `ConversationController.restoreConversation` | 复制到 tab state | 否；共享窗口会串 tab | indexed provider 直接接收 `HistoryWindowPage` 写 `ChatState`，不经 `Conversation.messages` |
-| `ConversationController.save` → `updateConversation` | 保存当前状态 | 否；会把窗口冒充历史 | Claude 只保存 metadata/providerState；新建 draft 另走显式 `pendingMessages`，不得回写窗口 |
+| `ConversationController.restoreConversation` / `hydrateTab` | 复制到 tab state | 否；共享窗口会串 tab | [v3 修订] 方法签名显式接收 `HistoryWindowPage`（或 page descriptor）并写目标 `ChatState`；禁止先赋给 `Conversation.messages` 再读取过桥 |
+| `ConversationController.save` → `updateConversation` | 保存当前状态 | 否；会把窗口冒充历史 | [v3 修订] `save` 显式接收当前 tab page/materialized view 与 metadata，但 Claude 持久层只保存 metadata/providerState；新建 draft 另走显式 `pendingMessages`，不得读写 `Conversation.messages` 过桥 |
 | `initializeTabService`、`ensureServiceForConversation`、TabManager passive sync/warmup、环境重启 | 判断有无历史并同步 runtime | 否；窗口为空不等于空会话 | 读取 metadata `hasHistory`；runtime 只同步 session/provider/context metadata |
 | `ClaudeConversationHistoryService.buildPersistedProviderState` | 从消息提取 subagentData | 否；窗口会丢旧记录 | providerState sidecar 增量维护；保存时不扫描窗口 |
 | `hydrateConversationHistory` merge | 全量 hydrate | B 后删除 | Claude 不再读取/写入 `conversation.messages` |
@@ -258,8 +262,8 @@ Codex 不实现 index/window，不改 `CodexConversationHistoryService`。共享
 2. Claude `getConversationById` 不读 transcript、不抛 oversize；`loadActive/switchTo` 无 catch-oversize。
 3. 小会话 planner 覆盖全 range；超过预算只显示窗口且 `historyHasMore=true`。
 4. index/load/render 任一步失败均 release 恰好一次并进入可重试 ERROR；无 partial view 冒充 ready。
-5. 正常 open、两 tab 并发 switch、单/跨 view 脏快照恢复、fork/resume 直达均只能提交一个 owner；重复候选被聚焦/去重，reserve 失败与 close/switch 后无泄漏。
-6. warmup、命令目录、环境重启、runtime 初始化、save/providerState/title/export 不依赖 `conversation.messages`；Claude 窗口只存在于目标 tab `ChatState`。
+5. [v3 修订] 正常 open、两 tab 并发 switch、单/跨 view 脏快照恢复、fork/resume 直达均只能提交一个 owner；构造旧任务延迟 release、新任务已 reserve 的交错，旧 `ownerToken` 释放必须被拒且新 owner 保持。
+6. [v3 修订] warmup、命令目录、环境重启、runtime 初始化、save/providerState/title/export 不依赖 `conversation.messages`；`save/restore/hydrateTab` 的 page 参数显式可见，Claude 窗口只存在于目标 tab `ChatState`。
 7. Codex 全套 hydration/fork/stream/plan tests 不变绿。
 
 验收：Claude 源码中无 `MAX_LEGACY_SESSION_BYTES`、`oversize` UI 分支和 `hydratedConversationIds`；四档会话行为单轨；2.9 MB 达上述 p95 门槛；1.59 GB index 期间 UI 可交互，index 后 2 秒内首屏可读。
@@ -304,17 +308,17 @@ interface HistoryPageRecord {
 
 1. scroll/IntersectionObserver 回调只采样位置并发出 intent，不同步测量/重排。
 2. 以单个 `requestAnimationFrame` 合并同帧 intent；下一帧通过 `ProjectionWriteCoordinator.runStored` 排队。
-3. 每页维护 `renderGeneration` 与 `pendingProjectionKeys`。B1 page wrapper 挂载后，收集该页每个 message 的 `renderMessageContent` promise；复用 `onMessageContentRendered(projectionKey, projectionLevel)`/`waitForMessageContentRendered`，只在 generation 未变且全部 key settle 后标记 `contentSettled`。[v2 修订]
-4. 获得租约后复验 conversation id、DOM epoch、page generation、目标 page、anchor 仍挂载与 scroll direction；过期 intent 丢弃。
-5. 摘除前等待 page-local settled 屏障；默认超时 3 秒（真机校准）。超时不得无限阻塞：按当前 `getBoundingClientRect().height` 摘除，记录 `heightQuality='estimated'` 与诊断；该 spacer 首次回到邻接区时必须重挂、等待 settle、按 anchor 差值纠正并升级为 measured。事务内记录稳定 anchor，原位替换 spacer；缺页仍先在租约外物化。
+3. **[v3 修订] 引入 page-scoped render ticket。** 每页维护单调递增 `renderTicket`；页首次挂载、重建或 generation 变化时创建新 ticket。该页所有 `renderMessageContent` 调用在发起前登记 ticket slot，包含初始分帧、lazy expand 触发的重渲染、图片/异步内容接线；每个 promise 在成功、失败或取消时核销自己的 slot。新渲染若发生在 ticket 尚未核销前继续登记同一 ticket；若发生在核销后，先递增 ticket 并把页面重新标为 unsettled。旧 ticket 的完成回调不得核销新 ticket。只有“当前 ticket 已封闭且 outstanding=0”才发出 page settled 信号；不再依赖现有 fire-and-forget 的 `onMessageContentRendered` 通知推断完成。
+4. 获得租约后复验 conversation id、DOM epoch、page generation、当前 render ticket、目标 page、anchor 仍挂载与 scroll direction；过期 intent 丢弃。
+5. [v3 修订] 摘除前等待**当前 page render ticket 核销**；spacer 精确测高只允许发生在核销之后。默认超时 3 秒（真机校准）。超时不得伪造 settled：允许按当前 `getBoundingClientRect().height` 摘除，但只记录 `heightQuality='estimated'`、超时 ticket 与诊断；该 spacer 首次回到邻接区时必须重挂，创建/等待新 ticket 核销，再按 anchor 差值纠正并升级为 measured。事务内记录稳定 anchor，原位替换 spacer；缺页仍先在租约外物化。
 6. mutation 后在同一帧校正 `scrollTop`；异步 Markdown 稳定后再做一次按 anchor 的差值修正。
 7. live lease 持有时 stored intent 排队；若用户持续滚动，只保留每个方向最新 intent，避免响应结束后回放大量陈旧窗口操作。
 8. 不允许持有 stored 租约等待网络/索引长 I/O：缺页时先在租约外物化并 pin `transaction`，完成后再申请 stored 做 DOM commit；commit 前再次 stale 校验。
 
 ### 4.3 spacer 高度
 
-- 每页必须有独立 wrapper；`ResizeObserver` 只观察 mounted page wrapper，持续更新最后稳定高度。`HistoryPageRecord` 增加 `renderGeneration/contentSettled/heightQuality: 'measured'|'estimated'`。
-- 仅 `contentSettled` 页的 `getBoundingClientRect().height` 可记为精确值；超时兜底值必须标 `estimated`，不得覆盖既有同宽度 measured 值。[v2 修订]
+- [v3 修订] 每页必须有独立 wrapper；`ResizeObserver` 只观察 mounted page wrapper。`HistoryPageRecord` 增加 `renderGeneration/renderTicket/settledTicket/heightQuality: 'measured'|'estimated'`；高度观测值须携带产生它的 ticket，不再保留可与 ticket 脱节的布尔 `contentSettled`。
+- [v3 修订] 仅当 `settledTicket === renderTicket` 且该 ticket 已封闭、outstanding=0 时，当前 `getBoundingClientRect().height` 才可写为精确 measured；ticket 未核销、已过期或超时的值只能写 estimated。estimated 不得覆盖同宽度 measured 值；新 lazy render 创建 ticket 后，旧 measured 可作占位但立即标 stale，直到新 ticket 核销后重测。
 - 容器宽度、字体族/字号、主题切换导致所有 height cache 失效。简化策略：`ResizeObserver(messages viewport)` 检测宽度变化，加 `document.fonts.ready/loadingdone` 与主题 class 变化监听；统一标记 stale，不立即全量重建。
 - stale spacer 回到邻接区时先按旧高度占位，重建后以 anchor 差值校正并写新高度。禁止尺寸变化时一次性重建所有页。
 - 图片/异步内容在 mounted 状态由 page observer 修正；摘除时冻结最终观测值。
@@ -360,7 +364,7 @@ interface HistoryPageRecord {
 2. scroll 回调内无同步 DOM mutation；同帧 20 次事件只提交一次 intent。
 3. live turn 中触边：页替换不执行；release 后仅最新 intent 执行，DOM/ChatState 顺序一致。
 4. 缺页重物化不持有 stored 租约；切会话后完成结果不 commit。
-5. 分帧尚未完成或 Markdown promise 未 settle 时摘除会等待；3 秒超时后允许 estimated spacer 并记录诊断，回访 settle 后升级 measured；上下往返锚点误差 ≤1 可见行且无累计漂移。
+5. [v3 修订] 分帧、Markdown、lazy expand 或图片 render slot 未核销时摘除会等待当前 page ticket；3 秒超时后仅允许 estimated spacer 并记录 ticket 诊断，迟到的旧 ticket 不得升级高度；回访创建的新 ticket 核销后才升级 measured。上下往返锚点误差 ≤1 可见行且无累计漂移。
 6. 宽度、字体、主题变化使缓存 stale；回访校正而非全量同步重建。
 7. tool/thinking/subagent/detail 展开态往返保持；被 data LRU 淘汰后重物化仍恢复。
 8. 搜索命中 mounted、spacer、data-evicted 三类页均可定位并恢复高亮；解除 pin 后可淘汰。
@@ -371,7 +375,7 @@ interface HistoryPageRecord {
 
 ### 4.8 独立部署与回滚
 
-C 依赖 B，可独立部署。以 feature flag（内部常量，默认开）保留一版关闭能力：关闭时 page store 仍记录数据但不摘 DOM，便于现场归因；稳定一版后删除 flag。回滚到 B 产物只失去窗口化，不影响 transcript、meta、index 或 page 重建能力。交付纪律：批次只允许按 **C→B→A** 逆序回滚；不得在保留依赖方时独立回滚底层批次。每批回滚包须声明前置版本并由脚本/清单阻断非法组合。[v2 修订]
+C 依赖 B，可独立部署。以 feature flag（内部常量，默认开）保留一版关闭能力：关闭时 page store 仍记录数据但不摘 DOM，便于现场归因；稳定一版后删除 flag。回滚到 B 产物只失去窗口化，不影响 transcript、meta、index 或 page 重建能力。[v3 修订] 交付纪律：批次只允许按 **C→B→A2→A1→A0b** 逆序回滚；A0a 是已独立部署的 2.1.2 hotfix，不纳入 B4 逆序回滚。不得在保留依赖方时独立回滚底层批次；每批回滚包须声明前置版本并由脚本/清单阻断非法组合。
 
 ## 5. 总测试门与部署节奏
 
@@ -412,8 +416,8 @@ npm run typecheck && npm run lint && npm run test && npm run build
 2. **并发**：初始分帧、live turn、向上翻页、搜索定位、DOM 摘除、切 tab 组合执行，验证 P1–P7、stale guard 与 lease release。
 3. **资源**：1.59 GB 导出、amnesia、20 页往返分别观察 RSS/heap/DOM；总历史增长不得使单次 iterator chunk、amnesia prompt、mounted DOM 或 page cache 线性增长。
 4. **双开与语义**：并发触发两个 tab `switchTo`、构造同 view/跨 view 重复恢复快照、调用所有 resume/fork 入口；断言仅一 owner，且 Claude `Conversation.messages` 从未接收窗口页。对读者清单逐项设测试，窗口变化不改变 metadata、title material、providerState、export、runtime session sync。
-5. **恢复与渲染屏障**：模拟连续三个不同 `session_init`，断言前两次重试、第三次熔断且不再注入；模拟 B1 分帧 + 延迟 Markdown，断言 settle 前不测为精确高度、超时为 estimated、回访升级 measured。
-6. **导出与回滚**：剪贴板边界内成功、超限明确引导文件导出；发布包演练 C→B→A 成功，B→A（C 尚在）与 A 单独回滚被阻断。
+5. **[v3 修订] 恢复与渲染屏障**：模拟注入后持久 query 不再发 `session_init`，仅成功 `result` 且 session/dispatch 快照一致时确认；失败、跳变与两次重试后熔断，校验手动重置 generation CAS。模拟 B1 分帧、延迟 Markdown、lazy expand 与旧 ticket 迟到，断言当前 ticket 核销前不测为精确高度、超时为 estimated、仅新 ticket 核销后升级 measured。
+6. **[v3 修订] 导出与回滚**：剪贴板边界内成功、超限明确引导文件导出；发布包演练 C→B→A2→A1→A0b 成功，跳过依赖层或回滚 A0a 被阻断。
 
 # 关联
 
@@ -484,4 +488,14 @@ npm run typecheck && npm run lint && npm run test && npm run build
 
 ### 批次 A 落地切分
 
-A0a rewind-runtime；A0b usage-snapshot；A1 iterator/导出/amnesia；A2 detail/search/LRU。A0a/A0b 独立部署回滚；A→B→C，回滚 C→B→A。
+[v3 修订说明] 终审原始建议为 A0a rewind-runtime；A0b usage-snapshot；A1 iterator/导出/amnesia；A2 detail/search/LRU。现行切分已在 §1.2 补全 A2 的 `loadRange` 清理，并将回滚细化为 C→B→A2→A1→A0b；A0a 已部署，不纳入 B4 回滚。
+
+## 修订记录 v3（2026-09-16）
+
+- [v3 修订] amnesia recovery state 改为 `idle/pending/awaiting_result/tripped`：`session_init` 仅判跳变，成功 `result` 与 dispatch session 快照共同确认；`tripped` 增加 generation-CAS 手动重试，并明示新建会话入口。
+- [v3 修订] DOM 测高改为 page-scoped 单调 render ticket；初始分帧、lazy expand、图片/异步渲染均登记并核销，当前 ticket 未核销不得 measured，超时仅降级 estimated。
+- [v3 修订] usage 修复升级为 request-boundary 快照状态机：每请求完整 usage 对象替换，过滤 subagent，保留 assistant input + result 权威窗口两阶段及 turn/resolved-model 匹配。
+- [v3 修订] `ConversationOpenRegistry` 值改为 `{ownerToken, conversationId}`，claim/release 均校验 token，拒绝过期任务释放新 owner。
+- [v3 修订] `save/restore/hydrateTab` 显式传 page/materialized view，禁止 `Conversation.messages` 过桥。
+- [v3 修订] 批次定为 A0a→A0b→A1→A2→B→C；A0a 已由 `b047650c` 于 2026-09-16 完成并部署 2.1.2，A 批只验证包含；A0b 为下一个独立 hotfix。
+- [v3 修订] 已统一正文中的 v2 冲突描述：删除 `awaiting_init`/“下一次 session_init 确认”、布尔 content-settled 精确测高及无 token registry 语义；v2 终审记录保留为历史审查证据，不作为现行设计。
