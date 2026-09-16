@@ -23,7 +23,7 @@ Claudian 已有预算窗口与 `ProjectionWriteCoordinator`，但完整历史消
 
 ### 1.2 顺序
 
-[v3 修订] 正式集成顺序为 **A0a（已完成）→ A0b → A1 → A2 → B → C**：
+[v3 修订] 正式集成顺序为 **A0a（已完成）→ A0b（已完成：commit 9536151e，2026-09-16 部署 2.1.3，reviewer 已复核放行）→ A1 → A2 → B → C**：
 
 1. **A0a：rewind hotfix** 已于 2026-09-16 以 `b047650c` 独立完成并部署 2.1.2；后续 A 批只验证其仍被包含，不重复实现。
 2. **A0b：usage snapshot hotfix** 是下一个可独立部署、独立回滚的批次，先消除线上 context gauge 双计。
@@ -116,7 +116,7 @@ type FullHistoryIterable = AsyncIterable<FullHistoryChunk>;
 - `/Users/vincentwang/Documents/NoteVault/tools/claudian/src/providers/claude/runtime/ClaudeChatRuntime.ts`
 - `/Users/vincentwang/Documents/NoteVault/tools/claudian/tests/unit/providers/claude/runtime/ClaudianService.test.ts`
 
-**[v3 修订] 前置修复 A0b（下一个可独立部署 hotfix）：usage 聚合跨请求双计。** 真机发现：context gauge 曾显示 1016k/1000k（>100%）。取证结论：同一 turn 内请求 A 为 cache miss（input 496652 + cacheRead 22272 ≈ 519k），下一请求 B 为 cache hit（input 598 + cacheRead 518912 ≈ 520k）；`transformClaudeMessage.ts` 的 `mergePromptUsage`（约 :253-267）跨请求**按字段各取最大值**（`Math.max(current.inputTokens, next.inputTokens)` 等）拼出 496652+518912≈1016k——把 miss 请求的未缓存输入与 hit 请求的 cache_read **双计**，真实上下文 ≈522k。
+**[v3 修订] 前置修复 A0b（下一个可独立部署 hotfix）：usage 聚合跨请求双计。**〔已于 2026-09-16 独立完成：commit 9536151e，部署 2.1.3，request-boundary 快照状态机 + meta usage.model 记实际解析模型；reviewer 复核可放行，4 条低危备注留档（测试名不副实/中途切模型 label 陈旧/id 缺失降级/瞬态陈旧发射）。〕真机发现：context gauge 曾显示 1016k/1000k（>100%）。取证结论：同一 turn 内请求 A 为 cache miss（input 496652 + cacheRead 22272 ≈ 519k），下一请求 B 为 cache hit（input 598 + cacheRead 518912 ≈ 520k）；`transformClaudeMessage.ts` 的 `mergePromptUsage`（约 :253-267）跨请求**按字段各取最大值**（`Math.max(current.inputTokens, next.inputTokens)` 等）拼出 496652+518912≈1016k——把 miss 请求的未缓存输入与 hit 请求的 cache_read **双计**，真实上下文 ≈522k。
 
 [v3 修订] 修法不是简单“取最后一条”，而是 **request-boundary 快照状态机**：以 SDK 主 agent 消息流的请求边界划分快照，`assistant` 开启/更新该请求的 input 侧 usage，匹配的 `result` 关闭该请求并提供权威窗口信息；每个请求边界都以该请求的**完整 usage 对象整体替换**当前请求快照，禁止跨请求逐字段 `max`、累加或拼接。空/全零片段不得覆盖同一请求已建立的非空快照；`parent_tool_use_id` 非空的 subagent assistant/result 全部过滤，不得推进主 agent 状态机。turn 最终仍按两阶段合并：assistant 快照提供 input/cache 侧计数，匹配 result 提供权威 `contextWindow`；这保留原设计动机（见 `providers/claude/CLAUDE.md`），只消除跨请求双计。
 
