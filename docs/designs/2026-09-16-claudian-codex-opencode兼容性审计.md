@@ -1,11 +1,13 @@
 ---
 type: design-decision
-status: draft
+status: confirmed
 target: /Users/vincentwang/Documents/NoteVault/tools/claudian
 tags: [architect, claudian, codex, opencode, compatibility, security]
 ---
 
 # 背景与问题
+
+> 实施记录（2026-09-16）：部分实施——P0a/P3 已实施（0a1d9ec9 / d05ab045+7e487736，2.3.0）；P0b 暂缓（无标定数据，2026-09-16 裁决，速记见 §P0b）；P1/P2 无限期暂停（用户裁决，主体可用）。
 
 审计 `hotfix/notify-lease@1d038d2d` 上 B1/投影并发/READY 门控/A0b/rewind/modelPresets/i18n/P1 搜索对 Codex、OpenCode 的真实影响：结论是发送与流式主链兼容，但非 Claude 历史仍全量物化且 P1 全历史搜索实际不可用，存在高风险可用性缺口；本记录是待用户确认的修复设计，不是实施记录。
 

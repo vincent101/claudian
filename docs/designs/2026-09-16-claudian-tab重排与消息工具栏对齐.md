@@ -1,6 +1,6 @@
 ---
 type: design-decision
-status: draft
+status: confirmed
 target: /Users/vincentwang/Documents/NoteVault/tools/claudian
 tags:
   - architect
@@ -9,6 +9,8 @@ tags:
 ---
 
 # 背景与问题
+
+> 实施记录（2026-09-16）：已实施（c8848c51 + 99a1c667，2.3.0 部署，复核通过）。
 
 Claudian 需要在不改变会话/runtime 语义的前提下，为内部 tab 增加可持久化重排和标准右键菜单，并把 assistant 消息尾部操作统一为 user 消息已有的 message-level 工具栏形态。
 

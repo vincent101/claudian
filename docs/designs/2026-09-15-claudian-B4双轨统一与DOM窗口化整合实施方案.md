@@ -73,6 +73,8 @@ type FullHistoryIterable = AsyncIterable<FullHistoryChunk>;
 
 `ProviderConversationHistoryService.iterateFullHistory(conversation, vaultPath, options)` 返回固定 snapshot 上的 oldest-first async iterable。实现内部持有一个 lease，每次用 planner 选下一段并 materialize detail；iterator `return/throw/abort` 必须释放 lease。chunk 同时受 turn、source bytes、投影字符三重上限；单 turn 超限时不得 summary，返回结构化 `HistoryEntryTooLargeError`。生产者不预取，chunk 单所有者，sink 不得留存已消费 chunk。[v2 修订：补投影后内存边界。]
 
+[v4 修订] oldest-first 顺序语义直接采用已落地的 displayOrder（ChatMessage 只读排序键 `[segmentOrdinal, entryOrdinal, projectionOrdinal]`，波次 1 commit `0a1d9ec9` + `14c69202`，2.3.0 已部署）；iterator 与物化/搜索/窗口共用同一键，不再依赖 timestamp 概念。
+
 删除公开 `HistoryIndexLease.loadRange`。如 provider 内部仍需按范围物化，保留为 `ClaudeConversationHistoryService` 私有方法，避免 UI 再绕过 policy。
 
 #### 两类消费方
@@ -85,6 +87,8 @@ type FullHistoryIterable = AsyncIterable<FullHistoryChunk>;
 [v3 修订] `tripped` 必须有 UI 可见、原子化的手动重置入口 `retryHistoryRecovery(generation)`：仅当传入 generation 与当前熔断 generation 匹配时建立新 generation 并回到 `pending`，旧 UI/旧异步任务不得重置新状态。提示明确给出两条恢复路径：“新建会话”或“手动重试恢复”。显式切换到新会话、reset、fork 也建立新 generation 并清旧熔断；普通 `session_init` 不得隐式清除 `tripped`。
 
 这解决了两个不同问题：导出遍历全部历史且流式落地；模型恢复不可能容纳无限历史，因此只注入未摘要、未拆断 turn 的有界后缀。`buildContextFromHistory(ChatMessage[])` 保留给普通小数组调用；新增 `HistoryContextAccumulator.appendChunk()`，禁止 amnesia 再调用旧全量函数。
+
+[v4 修订] A1 范围新增并入残项：统一 hydrate 段序与 index 侧段序口径——`ClaudeConversationHistoryService.ts:456-461` 按文件链下标保留 missing-session 空洞，而 `:606-621` 段压缩在中间 session 文件缺失时两路径会对同一消息赋不同段序；统一口径后补多段缺失场景测试（来源：1c 复核复验留档）。
 
 改动文件：
 
@@ -99,6 +103,8 @@ type FullHistoryIterable = AsyncIterable<FullHistoryChunk>;
 ### 2.2 rewind/fork 精确 detail
 
 不复用 `loadWindow(... detail)`：其单位是 turn，会把无关 assistant/tool 载荷带入内存。给 lease 增加 `loadMessageDetail(projectionKey, { maxSourceBytes, signal })`，返回 `exact | not_found | too_large` 与一条完整 `ChatMessage`。索引需维护 `projectionKey → turn/entry descriptor`；读取后复用既有 SDK→Chat 映射，但只返回目标可见消息。
+
+[v4 修订] `loadMessageDetail` 除 rewind/fork 预填外，同时承担搜索候选验证与目标消息替换/挂载（③ 方案修订已定边界：禁止 detail 候选配 summary 定位）；A2 实施 `loadSearchCandidate` 迁移以此为准。
 
 流程：
 
@@ -253,6 +259,7 @@ Codex 不实现 index/window，不改 `CodexConversationHistoryService`。共享
 3. Codex fork 的内存前缀语义保持现状，A 的 Claude detail/fork 调整按 capability 生效，不做 providerId if；
 4. `ConversationHistoryHydrationError(error)` 若 Codex 使用则仍能进入通用 ERROR/retry，而非 oversize shell；
 5. send/stream/provider boundary 继续受既有 `ProjectionWriteCoordinator` 保护。
+6. [v4 修订] 无 historyLease 的搜索 fallback（1c 引入，读 `state.messages` 生成候选）在 `loadActive` capability 分流重写后仍工作，Codex/OpenCode 搜索不回归。
 
 ### 3.5 红测与验收
 
@@ -330,6 +337,7 @@ interface HistoryPageRecord {
 - 滚动锚点始终使用稳定 `data-message-id`；若锚点所在页被数据 LRU 淘汰，先重物化并 pin，DOM commit 后恢复 offset。
 - 搜索定位页使用 `search` pin，定位完成且离开视口后解除。找不到 projection 仍显式 `projection_mismatch`。
 - page 摘除时必须清理 `MessageRenderer.liveMessageEls`、tool DOM maps 等易失引用；domain/page UI state 保留。该清理与 DOM epoch 校验共同防止写入脱离节点。
+- [v4 修订] 1b 引入的 message-level 工具栏 `syncMessageActions`/`syncLiveMessageActions` 幂等入口需在 page 挂载/摘除/重建时接线；`messages.css` 中 assistant `bottom:0` 特例保留至占位验收（延续 ④ 方案约定）。
 
 ### 4.5 启用阈值
 
@@ -499,3 +507,12 @@ npm run typecheck && npm run lint && npm run test && npm run build
 - [v3 修订] `save/restore/hydrateTab` 显式传 page/materialized view，禁止 `Conversation.messages` 过桥。
 - [v3 修订] 批次定为 A0a→A0b→A1→A2→B→C；A0a 已由 `b047650c` 于 2026-09-16 完成并部署 2.1.2，A 批只验证包含；A0b 为下一个独立 hotfix。
 - [v3 修订] 已统一正文中的 v2 冲突描述：删除 `awaiting_init`/“下一次 session_init 确认”、布尔 content-settled 精确测高及无 token registry 语义；v2 终审记录保留为历史审查证据，不作为现行设计。
+
+## 修订记录 v4（2026-09-16）
+
+- [v4 修订] §2.1：A1 iterator 的 oldest-first 顺序语义直接采用已落地的 displayOrder（只读排序键 `[segmentOrdinal, entryOrdinal, projectionOrdinal]`，波次 1 commit `0a1d9ec9` + `14c69202`，2.3.0 已部署）；iterator 与物化/搜索/窗口共用同一键，不再依赖 timestamp 概念。
+- [v4 修订] §2.1：A1 范围新增并入残项——统一 hydrate 段序与 index 侧段序口径（`ClaudeConversationHistoryService.ts:456-461` 按 missing-session 空洞 vs `:606-621` 段压缩，中间 session 文件缺失时两路径对同一消息赋不同段序），统一后补多段缺失场景测试（来源：1c 复核复验留档）。
+- [v4 修订] §2.2：`loadMessageDetail` 同时承担搜索候选验证与目标消息替换/挂载（③ 方案已定边界：禁止 detail 候选配 summary 定位）；A2 的 `loadSearchCandidate` 迁移以此为准。
+- [v4 修订] §3.4：B 批验证新增回归检查项——无 historyLease 的搜索 fallback（1c 引入）在 `loadActive` capability 分流重写后仍工作，Codex/OpenCode 搜索不回归。
+- [v4 修订] §4.4：1b 引入的 message-level 工具栏 `syncMessageActions`/`syncLiveMessageActions` 幂等入口需在 page 挂载/摘除/重建时接线；`messages.css` assistant `bottom:0` 特例保留至占位验收（延续 ④ 方案约定）。
+- [v4 修订] 基线说明：v3 的实证基线为旧 HEAD；波次 1 落地后基线为 `bb28bcc3`（2.3.0），实施时行号按语义定位，不按旧行号。

@@ -1,11 +1,13 @@
 ---
 type: design-decision
-status: draft
+status: confirmed
 target: /Users/vincentwang/Documents/NoteVault/tools/claudian/
 tags: [architect, claudian, history-search, bugfix]
 ---
 
 # 背景与问题
+
+> 实施记录（2026-09-16）：已实施（0a1d9ec9 + 复核阻断修复 14c69202，2.3.0 部署，复验闭合）。
 
 Cmd+F 同时使用“固定 transcript 索引结果”计数/导航和“当前 DOM 可见文本”高亮，且索引顺序与 DOM 物化顺序分别按 canonical turn 与 timestamp 排列，导致新增消息或异常时间戳下当前项、顺序、计数和高亮不再同源。
 
