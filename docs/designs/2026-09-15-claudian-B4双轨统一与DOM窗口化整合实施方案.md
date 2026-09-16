@@ -116,6 +116,13 @@ type FullHistoryIterable = AsyncIterable<FullHistoryChunk>;
 - `/Users/vincentwang/Documents/NoteVault/tools/claudian/src/providers/claude/runtime/ClaudeChatRuntime.ts`
 - `/Users/vincentwang/Documents/NoteVault/tools/claudian/tests/unit/providers/claude/runtime/ClaudianService.test.ts`
 
+**前置修复 2（并入本批，2026-09-16 增补）：usage 聚合跨请求双计**。真机发现：context gauge 曾显示 1016k/1000k（>100%）。取证结论：同一 turn 内请求 A 为 cache miss（input 496652 + cacheRead 22272 ≈ 519k），下一请求 B 为 cache hit（input 598 + cacheRead 518912 ≈ 520k）；`transformClaudeMessage.ts` 的 `mergePromptUsage`（约 :253-267）跨请求**按字段各取最大值**（`Math.max(current.inputTokens, next.inputTokens)` 等）拼出 496652+518912≈1016k——把 miss 请求的未缓存输入与 hit 请求的 cache_read **双计**，真实上下文 ≈522k。另发现 meta.json 的 usage.model 记录的是档位别名（opus）而非实际解析模型。修法：turn 内 usage 聚合改为**采用最后一个请求的完整 usage 快照**（assistant 消息的 usage 即当前真实上下文；多 assistant 分段时取最后一条主 agent 消息，不跨请求按字段取 max），result 消息的 modelUsage 仍作权威窗口矫正；持久化 usage.model 记录 session_init 实际解析模型（对齐 fc882a63 的 resolved-model 捕获）。注意保留两阶段合并的原始动机（assistant 给 input 侧计数、result 给权威 contextWindow，见 providers/claude/CLAUDE.md）——修正的是同字段跨请求的 max 合并，不是两阶段本身。红测：同一 turn 内 miss→hit 两请求序列后，contextTokens 应等于最后请求的 input+cacheRead 之和（≈520k）而非字段 max 拼接（≈1016k）。
+
+改动文件（usage 聚合修复部分）：
+
+- `/Users/vincentwang/Documents/NoteVault/tools/claudian/src/providers/claude/stream/transformClaudeMessage.ts`（mergePromptUsage / UsageState）
+- `/Users/vincentwang/Documents/NoteVault/tools/claudian/tests/unit/providers/claude/stream/`（对应红测）
+
 改动文件：
 
 - `/Users/vincentwang/Documents/NoteVault/tools/claudian/src/core/providers/types.ts`
