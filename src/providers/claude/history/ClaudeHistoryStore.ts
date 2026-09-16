@@ -68,6 +68,7 @@ export async function materializeSDKMessages(
   filteredEntries: SDKNativeMessage[],
   associationEntries: SDKNativeMessage[] = filteredEntries,
   segmentOrdinal = 0,
+  entryIndexBase = 0,
 ): Promise<ChatMessage[]> {
   const toolResults = collectToolResults(associationEntries);
   const toolUseResults = collectStructuredPatchResults(associationEntries);
@@ -88,9 +89,12 @@ export async function materializeSDKMessages(
     if (!chatMsg) continue;
 
     // Canonical structural position: the entry index within the branch-filtered
-    // segment (skipped rows still occupy their index). A merged assistant keeps
-    // its first segment's position; timestamps stay display-only.
-    chatMsg.displayOrder = [segmentOrdinal, entryIndex, 0];
+    // segment (skipped rows still occupy their index). Window/page/summary
+    // materializations pass the slice's startEntry as entryIndexBase so every
+    // path assigns the same segment-global key; local indices would collide
+    // across turns and pages. A merged assistant keeps its first segment's
+    // position; timestamps stay display-only.
+    chatMsg.displayOrder = [segmentOrdinal, entryIndexBase + entryIndex, 0];
 
     if (chatMsg.role === 'assistant') {
       // context_compacted must not merge with previous assistant (it's a standalone separator)

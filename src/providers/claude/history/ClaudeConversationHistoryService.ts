@@ -682,8 +682,11 @@ export class ClaudeConversationHistoryService implements ProviderConversationHis
       if (indexes.length === 0) continue;
       const native = await materializeTranscriptPage(segment.index, indexes[0], indexes.length);
       const associations = await materializeTranscriptToolAssociations(segment.index, native);
+      // materializeTranscriptPage reads entries[firstTurn.startEntry..], so the
+      // page slice starts at that segment-global entry index.
       messages.push(...await materializeSDKMessages(
         state.vaultPath, segment.sessionId, native, associations, state.segments.indexOf(segment),
+        segment.index.turns[indexes[0]].startEntry,
       ));
     }
     const current = state.segments[state.segments.length - 1];
@@ -715,8 +718,12 @@ export class ClaudeConversationHistoryService implements ProviderConversationHis
   ): Promise<ChatMessage[]> {
     const native = await materializeTranscriptPage(segment.index, turnIndex, 1);
     const associations = await materializeTranscriptToolAssociations(segment.index, native);
+    // The single-turn page starts at the turn's segment-global startEntry;
+    // without the base every turn would restart the entry counter and all
+    // turns of a window would collide on the same displayOrder keys.
     return materializeSDKMessages(
       state.vaultPath, segment.sessionId, native, associations, state.segments.indexOf(segment),
+      segment.index.turns[turnIndex].startEntry,
     );
   }
 
@@ -782,7 +789,18 @@ export class ClaudeConversationHistoryService implements ProviderConversationHis
     }
     const messages = await materializeSDKMessages(
       state.vaultPath, segment.sessionId, combined, combined, state.segments.indexOf(segment),
+      turn.startEntry,
     );
+    // The tail-appended marker has no real entry slot; its natural index
+    // (endEntry + 1) ties with the next turn's opener key, so a prepended
+    // older window would merge it behind that opener. Park it on the last
+    // real slot's second projection position: after every real projection of
+    // the turn, before the next turn. Markers merged into a trailing assistant
+    // projection have no standalone key and stay untouched.
+    const marker = messages.find(message => message.id === `oversized-marker-${turn.turnId}`);
+    if (marker) {
+      marker.displayOrder = [state.segments.indexOf(segment), turn.endEntry, 1];
+    }
     summarizeChatMessages(messages);
     return { messages, readBytes };
   }
