@@ -10,7 +10,7 @@ tags:
 
 # 背景与问题
 
-当前 `hotfix/notify-lease`（`99ae9fbf`，已包含 `31bdc1f1`）中，Codex/OpenCode 设置页大量用户可见文案直接写在 TypeScript 中，切换 locale 时不会变化；目标是在不改业务逻辑、CSS 和 Claude 已迁移键的前提下，将设置页文案纳入现有 `t()` 与 10-locale 体系。
+[r1 修订] 当前 `hotfix/notify-lease` 的修订核对基线为 `d476ebda`；实际实施以开工时 HEAD 为准，并在实施记录中固定该提交，避免分支继续前进导致基线失真。Codex/OpenCode 设置页大量用户可见文案直接写在 TypeScript 中，切换 locale 时不会变化；目标是在不改业务逻辑、CSS 和 Claude 已迁移键的前提下，将设置页文案纳入现有 `t()` 与 10-locale 体系。
 
 > frontmatter 使用仓库设计记录规范允许的 `draft`；用户要求的 `proposed` 语义等同于未确认草案，但不是现行合法状态值。
 
@@ -50,7 +50,7 @@ tags:
 1. 继续使用 `settings.*`，provider 根节点分别为 `settings.codex`、`settings.opencode`；可复用组件下设 `skills`、`subagents`、`models`、`environment`、`validation`、`modal`。
 2. 跨 provider 且语义完全相同的按钮只复用 `common.save/cancel/add/edit/delete/refresh/clearAll`；provider 语义或句子不同则不强行共键。
 3. `settings.subagents.*` 保留给 Claude 现有实现，禁止把 Codex/OpenCode 的差异硬塞进去。
-4. 动态内容统一 `{name}`、`{message}`、`{count}`、`{hostname}`、`{label}`、`{keys}`。不拼接可翻译句段。
+4. [r1 修订] 动态内容使用命名占位符并按下方“完整插值变量登记表”逐键登记；不拼接可翻译句段。`t(key, params?: Record<string, string | number>)` 以 `/\{(\w+)\}/g` 替换参数，因此 JSON 文案写 `{name}`，调用时通过第二参数传入字符串或数字。
 5. `src/i18n/types.ts` 显式加入全部 key；不改为无类型字符串索引。
 
 ### 2.2 新增键全表
@@ -128,7 +128,7 @@ tags:
 | `settings.codex.skills.updated` | Codex skill "${name}" updated | 已更新 Codex 技能“${name}” | 已更新 Codex 技能「${name}」 |
 | `settings.codex.skills.created` | Codex skill "${name}" created | 已创建 Codex 技能“${name}” | 已建立 Codex 技能「${name}」 |
 
-> 上表 key 值实际写入 JSON 时使用 `{name}`，表中 `${name}` 仅为避免 Markdown 与原模板字符串混淆；实现不得保留 `$`。
+> [r1 修订] 上述三个 Codex skill CRUD 键实际写入 JSON 时使用 `$` + `{name}`（即 `"${name}"` 的用户可见效果），调用统一传 `{ name: entry.name }`。选择在译文中保留字面 `$`，而不是传入 `$${entry.name}`：`$` 是 Codex skill 展示语义的一部分，固定在文案中可避免调用点漏加或重复添加，并让所有 locale 一致。
 
 #### Codex 子代理
 
@@ -250,8 +250,8 @@ tags:
 | `settings.opencode.subagents.modal.permissionDesc` | Optional permission config, e.g. {"edit":"deny","bash":"allow"} | 可选的权限配置，例如 {"edit":"deny","bash":"allow"} | 可選的權限設定，例如 {"edit":"deny","bash":"allow"} |
 | `settings.opencode.subagents.modal.options` | Options (JSON) | 选项（JSON） | 選項（JSON） |
 | `settings.opencode.subagents.modal.optionsDesc` | Optional custom agent options | 可选的自定义代理选项 | 可選的自訂代理選項 |
-| `settings.opencode.subagents.modal.prompt` | Prompt | 提示词 | 提示詞 |
-| `settings.opencode.subagents.modal.promptDesc` | Markdown body used as the agent prompt | 用作代理提示词的 Markdown 正文 | 用作代理提示詞的 Markdown 正文 |
+| `settings.opencode.subagents.modal.prompt` | Prompt | 系统提示词 | 系統提示詞 |
+| `settings.opencode.subagents.modal.promptDesc` | Markdown body used as the agent prompt | 用作代理系统提示词的 Markdown 正文 | 用作代理系統提示詞的 Markdown 正文 |
 | `settings.opencode.subagents.modal.promptPlaceholder` | Review code changes carefully and call out correctness, regressions, and missing coverage. | 仔细审查代码变更，指出正确性问题、回归和缺失的测试覆盖。 | 仔細檢查程式碼變更，指出正確性問題、回歸與缺少的測試覆蓋。 |
 | `settings.opencode.subagents.validation.nameRequired` | Agent name is required | 代理名称为必填项 | 代理名稱為必填 |
 | `settings.opencode.subagents.validation.namePath` | Agent name must use slash-separated path segments without leading or trailing slashes | 代理名称必须使用斜杠分隔路径段，且不能以斜杠开头或结尾 | 代理名稱必須使用斜線分隔路徑區段，且不能以斜線開頭或結尾 |
@@ -260,7 +260,7 @@ tags:
 | `settings.opencode.subagents.validation.dotSegment` | Agent name cannot include "." or ".." path segments | 代理名称不能包含“.”或“..”路径段 | 代理名稱不能包含「.」或「..」路徑區段 |
 | `settings.opencode.subagents.validation.reservedCharacter` | Agent name path segments cannot contain Windows-reserved filename characters | 代理名称的路径段不能包含 Windows 保留的文件名字符 | 代理名稱的路徑區段不能包含 Windows 保留的檔名字元 |
 | `settings.opencode.subagents.validation.descriptionRequired` | Description is required | 描述为必填项 | 描述為必填 |
-| `settings.opencode.subagents.validation.promptRequired` | Prompt is required | 提示词为必填项 | 提示詞為必填 |
+| `settings.opencode.subagents.validation.promptRequired` | Prompt is required | 系统提示词为必填项 | 系統提示詞為必填 |
 | `settings.opencode.subagents.validation.duplicateName` | A subagent named "{name}" already exists | 名为“{name}”的子代理已存在 | 已存在名為「{name}」的子代理 |
 | `settings.opencode.subagents.validation.validNumber` | {field} must be a valid number | {field} 必须是有效数字 | {field} 必須是有效數字 |
 | `settings.opencode.subagents.validation.positiveInteger` | {field} must be a positive integer | {field} 必须是正整数 | {field} 必須是正整數 |
@@ -275,6 +275,47 @@ tags:
 | `settings.opencode.subagents.deleteFailed` | Failed to delete subagent | 删除子代理失败 | 刪除子代理失敗 |
 | `settings.opencode.subagents.updated` | Subagent "{name}" updated | 已更新子代理“{name}” | 已更新子代理「{name}」 |
 | `settings.opencode.subagents.created` | Subagent "{name}" created | 已创建子代理“{name}” | 已建立子代理「{name}」 |
+
+[r1 修订] OpenCode 的 `Prompt` 在 zh-CN/zh-TW 中统一为现有 Claude 侧 `settings.subagents.modal.prompt` 使用的“系统提示词／系統提示詞”；相关描述和必填校验同步统一。
+
+### 2.3 完整插值变量登记表 [r1 修订]
+
+`src/i18n/i18n.ts` 已确认 `t(key, params?: Record<string, string | number>)` 支持命名参数，并通过 `{变量名}` 替换。下表列出本方案**全部**含插值键；未列键不得携带插值。
+
+| Key | 插值变量 | 调用值 |
+|---|---|---|
+| `settings.environmentReview` | `keys` | 环境变量名拼接后的字符串 |
+| `settings.codex.cliPath.name` | `hostname` | 当前主机显示名 |
+| `settings.codex.skills.validation.nameTooLong` | `max` | 名称长度上限 |
+| `settings.codex.skills.deleted` | `name` | 不含 `$` 的 `entry.name`；译文固定 `$` 前缀 |
+| `settings.codex.skills.updated` | `name` | 不含 `$` 的 `entry.name`；译文固定 `$` 前缀 |
+| `settings.codex.skills.created` | `name` | 不含 `$` 的 `entry.name`；译文固定 `$` 前缀 |
+| `settings.codex.subagents.validation.nameTooLong` | `max` | 名称长度上限 |
+| `settings.codex.subagents.validation.duplicateName` | `name` | 子代理名称 |
+| `settings.codex.subagents.saveFailed` | `message` | 底层错误详情或 `t('common.unknownError')` |
+| `settings.codex.subagents.deleteConfirm` | `name` | 子代理名称 |
+| `settings.codex.subagents.deleted` | `name` | 子代理名称 |
+| `settings.codex.subagents.updated` | `name` | 子代理名称 |
+| `settings.codex.subagents.created` | `name` | 子代理名称 |
+| `settings.opencode.cliPath.name` | `hostname` | 当前主机显示名 |
+| `settings.opencode.models.summaryOneProvider` | `visible`, `discovered`, `providerCount` | 可见数、发现数、供应商数 |
+| `settings.opencode.models.summaryManyProviders` | `visible`, `discovered`, `providerCount` | 可见数、发现数、供应商数 |
+| `settings.opencode.models.available` | `count` | 可用模型数 |
+| `settings.opencode.models.selected` | `count` | 已选模型数 |
+| `settings.opencode.models.aliasAria` | `label` | 模型显示标签 |
+| `settings.opencode.models.removeAria` | `label` | 模型显示标签 |
+| `settings.opencode.models.allProviders` | `count` | 供应商数 |
+| `settings.opencode.subagents.validation.duplicateName` | `name` | 子代理名称 |
+| `settings.opencode.subagents.validation.validNumber` | `field` | 已本地化字段名 |
+| `settings.opencode.subagents.validation.positiveInteger` | `field` | 已本地化字段名 |
+| `settings.opencode.subagents.validation.validJson` | `field` | 已本地化字段名 |
+| `settings.opencode.subagents.validation.jsonObject` | `field` | 已本地化字段名 |
+| `settings.opencode.subagents.validation.booleanMap` | `field` | 已本地化字段名 |
+| `settings.opencode.subagents.saveFailed` | `message` | 底层错误详情或 `t('common.unknownError')` |
+| `settings.opencode.subagents.deleteConfirm` | `name` | 子代理名称 |
+| `settings.opencode.subagents.deleted` | `name` | 子代理名称 |
+| `settings.opencode.subagents.updated` | `name` | 子代理名称 |
+| `settings.opencode.subagents.created` | `name` | 子代理名称 |
 
 ## 3. 翻译与 locale 策略
 
@@ -327,11 +368,12 @@ tags:
 
 ## 5. 实施切分与依赖
 
-推荐**按 provider 分两批提交、一次部署**，而不是两次独立部署：
+[r1 修订] 推荐**分三次独立提交、一次部署**：
 
-1. **Codex 批**：先加入共享 key、Codex key、10 locale、`TranslationKey`；迁移 `CodexSettingsTab`、`CodexSkillSettings`、`CodexSubagentSettings` 及相关测试。
-2. **OpenCode 批**：加入 OpenCode key（10 locale、类型）；迁移 `OpencodeSettingsTab`、`OpencodeAgentSettings`、`EnvironmentSettingsSection` 及相关测试。
-3. 两批都通过后统一 build/deploy。中途部署会造成两个 provider 汉化程度不一致，且 locale 文件变更容易在第二批冲突。
+1. **validation issue API + 兼容测试**：先新增结构化 issue API，保留旧字符串 API 作为兼容包装；覆盖 issue code、参数（含 `max`）及旧 API 行为，先隔离唯一非机械改动。
+2. **Codex 批**：加入共享 key、Codex key、10 locale、`TranslationKey`；迁移 `CodexSettingsTab`、`CodexSkillSettings`、`CodexSubagentSettings` 及相关测试。
+3. **OpenCode/共享 UI 批**：加入 OpenCode key（10 locale、类型）；迁移 `OpencodeSettingsTab`、`OpencodeAgentSettings`、`EnvironmentSettingsSection` 及相关测试。
+4. 三次提交都通过后统一 build/deploy。中途不部署，避免 provider 汉化程度不一致。locale 文件由后两批分别增补各自命名空间；共享键归入首次使用它的 Codex 批。
 
 备选：单批提交，优点是原子完成、locale 只改一次；缺点是 diff 大、审查困难、回归定位差。故不推荐。
 
@@ -363,10 +405,36 @@ tags:
      tests/unit/providers/opencode/OpencodeSettingsTab.test.ts \
      tests/unit/providers/opencode/ui/OpencodeAgentSettings.test.ts
    ```
-3. 新增两类针对性断言：
-   - `setLocale('zh-CN')` 后分别渲染 Codex/OpenCode tab，抽查标题、描述、空态、ARIA、动态 `{hostname}/{count}` 均为中文且无裸 key。
-   - 打开三类 modal，触发空值、重复名、非法数值/JSON、保存失败、删除确认，断言 Notice/confirm 为中文且变量正确插入。
-4. 增加静态防回归测试或 ESLint 级扫描：仅扫描本任务五个设置 UI 文件的 UI sink（`setName/setDesc/setTitle/setPlaceholder/setText`、`Notice`、`confirmDelete`、`aria-label`、`text`），除白名单技术字面量外不得出现英文 literal。AST 规则优于正则；首版可用测试内白名单。
+3. [r1 修订] 新增插值契约测试：按“完整插值变量登记表”**逐键**调用 `t(key, params)`，断言每个登记变量均被传递并替换、输出不残留 `{变量名}`；Codex skill CRUD 另断言结果为 `$name` 而非 `name`/`$$name`。再分别渲染 Codex/OpenCode tab 与三类 modal，覆盖标题、空态、ARIA、校验、保存失败、删除确认和 Notice，确认真实调用点传参正确。
+4. [r1 修订] 新增 **AST 级门禁测试**（推荐 `ts-morph`；若不新增依赖，可用项目现有 TypeScript AST 能力），明确不用正则。固定覆盖以下六个文件：
+   - `/Users/vincentwang/Documents/NoteVault/tools/claudian/src/providers/codex/ui/CodexSettingsTab.ts`
+   - `/Users/vincentwang/Documents/NoteVault/tools/claudian/src/providers/codex/ui/CodexSkillSettings.ts`
+   - `/Users/vincentwang/Documents/NoteVault/tools/claudian/src/providers/codex/ui/CodexSubagentSettings.ts`
+   - `/Users/vincentwang/Documents/NoteVault/tools/claudian/src/providers/opencode/ui/OpencodeSettingsTab.ts`
+   - `/Users/vincentwang/Documents/NoteVault/tools/claudian/src/providers/opencode/ui/OpencodeAgentSettings.ts`
+   - `/Users/vincentwang/Documents/NoteVault/tools/claudian/src/features/settings/ui/EnvironmentSettingsSection.ts`
+
+   伪代码级设计：
+   ```ts
+   for (const file of TARGET_FILES) {
+     const source = project.addSourceFileAtPath(file);
+     source.forEachDescendant(node => {
+       if (isUiSink(node)) {
+         for (const expr of collectAssignedTextExpressions(node)) {
+           for (const literal of flattenStringAndTemplateFragments(expr)) {
+             if (looksUserVisible(literal) && !allowlist.matches(file, node, literal)) {
+               failures.push({ file, line: node.getStartLineNumber(), sink: sinkName(node), literal });
+             }
+           }
+         }
+       }
+     });
+   }
+   expect(failures).toEqual([]);
+   ```
+   `isUiSink` 覆盖 DOM 文本/属性/title 赋值与构造：`setText`、`textContent/innerText`、`createEl/createDiv/createSpan` 的 `text/attr/title`、`setAttr('aria-label'|'title', ...)`、设置组件的 `setName/setDesc/setTitle/setPlaceholder`，以及 `new Notice(...)`、`confirm(...)`/项目确认 helper。`flattenStringAndTemplateFragments` 同时提取字符串字面量、无表达式模板字符串、带表达式模板字符串的静态片段及 `+` 拼接片段，避免模板拼接漏检。
+
+   白名单按 `{file, sink, literal, reason}` 维护，每项必须写理由，仅允许专有名词、日志/诊断文本、错误码及本方案明确保留的技术字面量；禁止只按文件或宽泛正则豁免。预估误报主要来自 CSS class、协议值、路径/命令、模型 ID、JSON 示例和用户数据：优先靠 sink/参数位置排除非展示字符串，再用窄白名单处理确属展示但无需翻译的专名/技术文本；每个误报修正都需新增对应 AST fixture，防止扩大白名单掩盖真漏项。
 5. 全量门禁：
    ```bash
    npm run typecheck && npm run lint && npm run test && npm run build
@@ -380,7 +448,11 @@ tags:
 - Windows 补验 Codex Native/WSL 分支及路径校验；macOS/Linux 补验非 Windows CLI 描述。
 - OpenCode 模型目录分别覆盖 0/1/多 provider、0/多 selected、不可用模型、筛选无结果，确认摘要和 ARIA 无残留英文。
 
-验收完成条件：10 个 locale 键集合与 en 完全一致；类型检查无漏键；zh-CN 设置页全中文、en 全英文；业务行为、持久化、CSS 和 Claude 设置页无变化。
+验收完成条件：10 个 locale 键集合与 en 完全一致；类型检查无漏键；插值登记表逐键断言通过；六文件 AST 门禁无未解释字面量；zh-CN 设置页全中文、en 全英文；业务行为、持久化、CSS 和 Claude 设置页无变化。
+
+# 修订记录
+
+- 2026-09-16 r1：[r1 修订] 按审核五项订正：保留 Codex skill 用户可见 `$name`；补全并逐键登记全部插值变量；将静态门禁细化为覆盖六文件的 AST 测试与理由白名单；OpenCode `Prompt` 统一为 Claude 侧“系统提示词”；基线改为实施时 HEAD（本次核对 `d476ebda`）。实施切分调整为 validation issue API、Codex、OpenCode/共享 UI 三次提交，一次部署。结论与总体范围不变。
 
 # 关联
 
