@@ -1178,6 +1178,22 @@ describe('ClaudianService', () => {
       expect(service.getSessionId()).toBe('new-session-42');
     });
 
+    it('captures the session-resolved model from init and hands it to later turns', async () => {
+      await (service as any).routeMessage({
+        type: 'system',
+        subtype: 'init',
+        session_id: 'sess-resolved-model',
+        model: 'claude-opus-4-5',
+      });
+
+      // A later turn owns a fresh usageState and never sees another init;
+      // transform options must still carry the session-level resolved model.
+      const laterTurn = createRuntimeTurn({ id: 'later-turn', kind: 'user' });
+      const options = (service as any).getTransformOptions(laterTurn);
+
+      expect(options.sessionResolvedModel).toBe('claude-opus-4-5');
+    });
+
     it('keeps the same transcript observer across repeated session_init for one path', async () => {
       jest.spyOn(ClaudeTranscriptTurnObserver.prototype, 'start').mockResolvedValue(undefined);
       const stop = jest.spyOn(ClaudeTranscriptTurnObserver.prototype, 'stop');

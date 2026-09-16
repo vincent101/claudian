@@ -36,6 +36,11 @@ function emitToolResult(parentToolUseId: string | null, fields: ToolResultFields
 export interface TransformOptions {
   /** The intended model from settings/query (used for context window size). */
   intendedModel?: string;
+  /**
+   * SDK-resolved model captured at session_init, owned by the runtime so it
+   * survives across turns (system/init fires once per persistent query).
+   */
+  sessionResolvedModel?: string;
   /** Custom context limits from settings (model ID → tokens). */
   customContextLimits?: Record<string, number>;
   /** Tracks active streamed tool blocks so input_json_delta can be normalized. */
@@ -60,7 +65,13 @@ interface PromptUsageSnapshot {
 
 export interface TransformUsageState {
   clear(): void;
-  mergePromptUsage(usage: MessageUsage): PromptUsageSnapshot;
+  /**
+   * Advances the request boundary without usage data (stream_event
+   * message_start). Subsequent same-request fragments merge into the new
+   * request instead of the previous one's snapshot.
+   */
+  beginRequest(messageId?: string | null): void;
+  mergePromptUsage(usage: MessageUsage, messageId?: string | null): PromptUsageSnapshot;
   getPromptUsage(): PromptUsageSnapshot;
   hasEmitted(promptUsage: PromptUsageSnapshot): boolean;
   markEmitted(promptUsage: PromptUsageSnapshot): void;
@@ -299,8 +310,17 @@ function samePromptUsage(a: PromptUsageSnapshot, b: PromptUsageSnapshot): boolea
 }
 
 function buildUsageInfo(promptUsage: PromptUsageSnapshot, options?: TransformOptions): UsageInfo {
-  const model = options?.intendedModel ?? 'sonnet';
-  const contextWindow = getContextWindowSize(model, options?.customContextLimits);
+  const intendedModel = options?.intendedModel ?? 'sonnet';
+  const contextWindow = getContextWindowSize(intendedModel, options?.customContextLimits);
+  // Label with the SDK-resolved model (system/init) so persisted usage.model
+  // records what actually served the session instead of the alias. Falls back
+  // to the runtime's session-level capture, then to the intended alias for
+  // turns that never saw a session_init (pre-init or id-less providers). The
+  // denominator stays on the turn model snapshot (50214f22): a stale session
+  // resolution must not re-denominate a turn dispatched on another model.
+  const model = options?.usageState?.getResolvedModel()
+    ?? options?.sessionResolvedModel
+    ?? intendedModel;
   const percentage = Math.min(100, Math.max(0, Math.round((promptUsage.contextTokens / contextWindow) * 100)));
 
   return {
@@ -317,6 +337,11 @@ function buildUsageInfo(promptUsage: PromptUsageSnapshot, options?: TransformOpt
 export function createTransformUsageState(): TransformUsageState {
   let promptUsage: PromptUsageSnapshot = { ...EMPTY_PROMPT_USAGE };
   let lastEmittedPromptUsage: PromptUsageSnapshot | null = null;
+  // Request-boundary tracking. SDK assistant messages carry the API message
+  // id: segments of one request share it, different requests never do. The
+  // snapshot owner records which request the current snapshot belongs to.
+  let currentRequestId: string | null = null;
+  let snapshotOwner: string | null = null;
   // Session-scoped: unlike prompt usage, the resolved model survives clear()
   // (which fires per assistant message_start) because system/init is emitted
   // once per query while later turns still need it for modelUsage matching.
@@ -326,11 +351,38 @@ export function createTransformUsageState(): TransformUsageState {
     clear(): void {
       promptUsage = { ...EMPTY_PROMPT_USAGE };
       lastEmittedPromptUsage = null;
+      currentRequestId = null;
+      snapshotOwner = null;
     },
 
-    mergePromptUsage(usage: MessageUsage): PromptUsageSnapshot {
-      promptUsage = mergePromptUsage(promptUsage, usage);
-      return promptUsage;
+    beginRequest(messageId?: string | null): void {
+      if (typeof messageId === 'string' && messageId.length > 0) {
+        currentRequestId = messageId;
+      }
+      lastEmittedPromptUsage = null;
+    },
+
+    mergePromptUsage(usage: MessageUsage, messageId?: string | null): PromptUsageSnapshot {
+      const next = toPromptUsageSnapshot(usage);
+      const id = typeof messageId === 'string' && messageId.length > 0 ? messageId : null;
+      if (id !== null) {
+        currentRequestId = id;
+      }
+      const requestKey = id ?? currentRequestId;
+      if (requestKey === null || snapshotOwner === requestKey) {
+        // No boundary signal, or same request: segments only ever grow
+        // monotonically within one request, so max-merge is safe here.
+        promptUsage = mergePromptUsage(promptUsage, usage);
+      } else if (next.contextTokens > 0) {
+        // New request boundary: replace with this request's full usage
+        // object. Field-wise max across requests double-counts context (a
+        // miss request's uncached input and a hit request's cache_read
+        // describe the same tokens, not additive ones).
+        promptUsage = next;
+        snapshotOwner = requestKey;
+      }
+      // All-zero fragment from a newer request keeps the established snapshot.
+      return { ...promptUsage };
     },
 
     getPromptUsage(): PromptUsageSnapshot {
@@ -391,6 +443,7 @@ export function* transformSDKMessage(
         yield {
           type: 'session_init',
           sessionId: message.session_id,
+          model: message.model,
           agents: message.agents,
           permissionMode: message.permissionMode,
         };
@@ -431,10 +484,13 @@ export function* transformSDKMessage(
 
       // Extract usage from main agent assistant messages only (not subagent)
       // This gives accurate per-turn context usage without subagent token pollution
-      const usage = (message.message as { usage?: MessageUsage } | undefined)?.usage;
+      const usage = (message.message as { usage?: MessageUsage; id?: string } | undefined)?.usage;
       if (parentToolUseId === null && usage) {
         if (options?.usageState) {
-          const promptUsage = options.usageState.mergePromptUsage(usage);
+          const promptUsage = options.usageState.mergePromptUsage(
+            usage,
+            message.message?.id ?? undefined,
+          );
           const usageChunk = maybeEmitUsageFromPromptUsage(promptUsage, options, { emitZeroUsage: true });
           if (usageChunk) {
             yield usageChunk;
@@ -489,7 +545,9 @@ export function* transformSDKMessage(
       const parentToolUseId = message.parent_tool_use_id ?? null;
       const event = message.event;
       if (parentToolUseId === null && event?.type === 'message_start') {
-        options?.usageState?.clear();
+        // Each main-agent message_start opens a new API request boundary; the
+        // boundary id also carries to the following assistant message.
+        options?.usageState?.beginRequest((event.message as { id?: string } | undefined)?.id ?? null);
         const usage = (event.message as { usage?: MessageUsage } | undefined)?.usage;
         if (usage && hasPromptUsageField(usage)) {
           if (options?.usageState) {
@@ -583,7 +641,9 @@ export function* transformSDKMessage(
         const selectedEntry = selectContextWindowEntry(
           modelUsage,
           options?.intendedModel,
-          options?.usageState?.getResolvedModel() ?? undefined,
+          options?.usageState?.getResolvedModel()
+            ?? options?.sessionResolvedModel
+            ?? undefined,
         );
         if (selectedEntry) {
           yield { type: 'context_window', contextWindow: selectedEntry.contextWindow };

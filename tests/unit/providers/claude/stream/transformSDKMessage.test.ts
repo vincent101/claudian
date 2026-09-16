@@ -1,5 +1,6 @@
 import { buildSDKMessage } from '@test/helpers/sdkMessages';
 
+import type { UsageInfo } from '@/core/types/chat';
 import {
   createTransformStreamState,
   createTransformUsageState,
@@ -23,6 +24,7 @@ describe('transformSDKMessage', () => {
         {
           type: 'session_init',
           sessionId: 'test-session-123',
+          model: 'claude-sonnet-4-5',
           agents: undefined,
           permissionMode: 'default',
         },
@@ -70,6 +72,7 @@ describe('transformSDKMessage', () => {
       expect(results[0]).toEqual({
         type: 'session_init',
         sessionId: 'test-session-456',
+        model: 'claude-sonnet-4-5',
         agents: ['Explore', 'Plan', 'custom-agent'],
         permissionMode: 'default',
       });
@@ -89,6 +92,7 @@ describe('transformSDKMessage', () => {
       expect(results[0]).toEqual({
         type: 'session_init',
         sessionId: 'test-session-789',
+        model: 'claude-sonnet-4-5',
         permissionMode: 'plan',
       });
     });
@@ -1845,6 +1849,242 @@ describe('transformSDKMessage', () => {
       const results = [...transformSDKMessage(message)];
 
       expect(results).toEqual([]);
+    });
+  });
+
+  describe('request-boundary usage snapshots (A0b)', () => {
+    const MISS_REQUEST = {
+      input_tokens: 496652,
+      cache_creation_input_tokens: 5000,
+      cache_read_input_tokens: 22272,
+    };
+    const HIT_REQUEST = {
+      input_tokens: 598,
+      cache_creation_input_tokens: 100,
+      cache_read_input_tokens: 518912,
+    };
+    const MISS_CONTEXT = 496652 + 5000 + 22272;
+    const HIT_CONTEXT = 598 + 100 + 518912;
+
+    const assistantUsage = (messageId: string, usage: Record<string, number>, parentToolUseId: string | null = null) => msg({
+      type: 'assistant',
+      parent_tool_use_id: parentToolUseId,
+      message: { id: messageId, content: [{ type: 'text', text: 'chunk' }], usage },
+    });
+
+    const messageStart = (messageId: string, usage: Record<string, number>) => msg({
+      type: 'stream_event',
+      event: { type: 'message_start', message: { id: messageId, usage } },
+    });
+
+    const collectUsage = (
+      messages: Parameters<typeof transformSDKMessage>[0][],
+      options?: Parameters<typeof transformSDKMessage>[1],
+    ) => {
+      const chunks: UsageInfo[] = [];
+      for (const message of messages) {
+        for (const event of transformSDKMessage(message, options)) {
+          if (event.type === 'usage') chunks.push(event.usage);
+        }
+      }
+      return chunks;
+    };
+
+    it('replaces the snapshot at each request boundary (miss -> hit)', () => {
+      const usageState = createTransformUsageState();
+      const options = { intendedModel: 'sonnet', usageState };
+
+      const chunks = collectUsage([
+        assistantUsage('msg_miss', MISS_REQUEST),
+        assistantUsage('msg_hit', HIT_REQUEST),
+        msg({ type: 'result' }),
+      ], options);
+
+      const last = chunks[chunks.length - 1];
+      expect(last.inputTokens).toBe(598);
+      expect(last.cacheReadInputTokens).toBe(518912);
+      expect(last.contextTokens).toBe(HIT_CONTEXT);
+      expect(last.contextTokens).not.toBe(496652 + 518912);
+    });
+
+    it('replaces the snapshot at each request boundary (hit -> miss)', () => {
+      const usageState = createTransformUsageState();
+      const options = { intendedModel: 'sonnet', usageState };
+
+      const chunks = collectUsage([
+        assistantUsage('msg_hit', HIT_REQUEST),
+        assistantUsage('msg_miss', MISS_REQUEST),
+        msg({ type: 'result' }),
+      ], options);
+
+      const last = chunks[chunks.length - 1];
+      expect(last.inputTokens).toBe(496652);
+      expect(last.cacheReadInputTokens).toBe(22272);
+      expect(last.contextTokens).toBe(MISS_CONTEXT);
+    });
+
+    it('merges same-request assistant segments by monotonic max', () => {
+      const usageState = createTransformUsageState();
+      const options = { intendedModel: 'sonnet', usageState };
+
+      const chunks = collectUsage([
+        assistantUsage('msg_a', { input_tokens: 50, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 }),
+        assistantUsage('msg_a', { input_tokens: 100, cache_creation_input_tokens: 40, cache_read_input_tokens: 60 }),
+        msg({ type: 'result' }),
+      ], options);
+
+      const last = chunks[chunks.length - 1];
+      expect(last.inputTokens).toBe(100);
+      expect(last.cacheCreationInputTokens).toBe(40);
+      expect(last.cacheReadInputTokens).toBe(60);
+      expect(last.contextTokens).toBe(200);
+    });
+
+    it('does not let an all-zero fragment clobber an established snapshot, and later non-zero data of the new request replaces it', () => {
+      const usageState = createTransformUsageState();
+      const options = { intendedModel: 'sonnet', usageState };
+
+      const chunks = collectUsage([
+        assistantUsage('msg_miss', MISS_REQUEST),
+        assistantUsage('msg_hit', { input_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 }),
+        assistantUsage('msg_hit', HIT_REQUEST),
+        msg({ type: 'result' }),
+      ], options);
+
+      const last = chunks[chunks.length - 1];
+      expect(last.contextTokens).toBe(HIT_CONTEXT);
+      expect(last.inputTokens).toBe(598);
+    });
+
+    it('keeps the last non-empty snapshot when a new request only ever reports all-zero usage', () => {
+      const usageState = createTransformUsageState();
+      const options = { intendedModel: 'sonnet', usageState };
+
+      const chunks = collectUsage([
+        assistantUsage('msg_miss', MISS_REQUEST),
+        assistantUsage('msg_hit', { input_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 }),
+        msg({ type: 'result' }),
+      ], options);
+
+      const last = chunks[chunks.length - 1];
+      expect(last.contextTokens).toBe(MISS_CONTEXT);
+    });
+
+    it('filters subagent assistant and stream_event usage out of the main-agent state machine', () => {
+      const usageState = createTransformUsageState();
+      const options = { intendedModel: 'sonnet', usageState };
+
+      const chunks = collectUsage([
+        assistantUsage('msg_miss', MISS_REQUEST),
+        assistantUsage('msg_sub', { input_tokens: 900000, cache_creation_input_tokens: 0, cache_read_input_tokens: 900000 }, 'task-1'),
+        msg({ type: 'stream_event', parent_tool_use_id: 'task-1', event: { type: 'message_start', message: { id: 'msg_sub_start', usage: { input_tokens: 800000, cache_read_input_tokens: 800000 } } } }),
+        assistantUsage('msg_hit', HIT_REQUEST),
+        msg({ type: 'result' }),
+      ], options);
+
+      const last = chunks[chunks.length - 1];
+      expect(last.contextTokens).toBe(HIT_CONTEXT);
+    });
+
+    it('isolates usage across turns when a result is missing', () => {
+      const usageState = createTransformUsageState();
+      const options = { intendedModel: 'sonnet', usageState };
+
+      const chunks = collectUsage([
+        assistantUsage('msg_miss', MISS_REQUEST),
+        assistantUsage('msg_hit', HIT_REQUEST),
+        msg({ type: 'result' }),
+      ], options);
+
+      expect(chunks[chunks.length - 1].contextTokens).toBe(HIT_CONTEXT);
+    });
+
+    it('starts a fresh snapshot after a result even when the next turn reuses stale boundaries', () => {
+      const usageState = createTransformUsageState();
+      const options = { intendedModel: 'sonnet', usageState };
+
+      const chunks = collectUsage([
+        assistantUsage('msg_miss', MISS_REQUEST),
+        msg({ type: 'result' }),
+        assistantUsage('msg_hit', HIT_REQUEST),
+        msg({ type: 'result' }),
+      ], options);
+
+      const last = chunks[chunks.length - 1];
+      expect(last.contextTokens).toBe(HIT_CONTEXT);
+    });
+
+    it('treats stream_event message_start as the request boundary on the streaming path', () => {
+      const usageState = createTransformUsageState();
+      const options = { intendedModel: 'sonnet', usageState };
+
+      const chunks = collectUsage([
+        messageStart('msg_miss', MISS_REQUEST),
+        assistantUsage('msg_miss', MISS_REQUEST),
+        messageStart('msg_hit', HIT_REQUEST),
+        assistantUsage('msg_hit', HIT_REQUEST),
+        msg({ type: 'result' }),
+      ], options);
+
+      const last = chunks[chunks.length - 1];
+      expect(last.contextTokens).toBe(HIT_CONTEXT);
+      expect(last.inputTokens).toBe(598);
+    });
+
+    it('reports the SDK-resolved model on usage chunks instead of the intended alias', () => {
+      const usageState = createTransformUsageState();
+      const options = { intendedModel: 'sonnet', usageState };
+
+      const chunks = collectUsage([
+        msg({ type: 'system', subtype: 'init', session_id: 'test-session', model: 'claude-sonnet-4-5-20260929' }),
+        assistantUsage('msg_miss', MISS_REQUEST),
+      ], options);
+
+      expect(chunks[chunks.length - 1].model).toBe('claude-sonnet-4-5-20260929');
+    });
+
+    it('falls back to the intended model when no resolved model was captured', () => {
+      const usageState = createTransformUsageState();
+      const options = { intendedModel: 'sonnet[1m]', usageState };
+
+      const chunks = collectUsage([
+        assistantUsage('msg_miss', MISS_REQUEST),
+      ], options);
+
+      expect(chunks[chunks.length - 1].model).toBe('sonnet[1m]');
+    });
+
+    it('matches result modelUsage against the session-resolved model captured in an earlier turn', () => {
+      const usageState = createTransformUsageState();
+      const options = { intendedModel: 'fable', sessionResolvedModel: 'claude-opus[1m]', usageState };
+
+      const results = [...transformSDKMessage(msg({
+        type: 'result',
+        modelUsage: {
+          'claude-haiku-4-5-20251001': {
+            inputTokens: 1000,
+            outputTokens: 300,
+            cacheReadInputTokens: 0,
+            cacheCreationInputTokens: 0,
+            webSearchRequests: 0,
+            costUSD: 0.01,
+            contextWindow: 200000,
+            maxOutputTokens: 32000,
+          },
+          'claude-opus[1m]': {
+            inputTokens: 1000,
+            outputTokens: 300,
+            cacheReadInputTokens: 0,
+            cacheCreationInputTokens: 0,
+            webSearchRequests: 0,
+            costUSD: 0.01,
+            contextWindow: 1000000,
+            maxOutputTokens: 32000,
+          },
+        },
+      }), options)];
+
+      expect(results).toEqual([{ type: 'context_window', contextWindow: 1000000 }]);
     });
   });
 

@@ -209,6 +209,11 @@ export class ClaudianService implements ChatRuntime {
   // SDK command cache — populated on system/init, cleared on persistent query close
   private cachedSdkCommands: SlashCommand[] = [];
 
+  // SDK-resolved model from system/init (concrete id, not the settings alias).
+  // Session-scoped so turns after the first still label usage and match
+  // result modelUsage against what actually serves the query.
+  private sessionResolvedModel: string | null = null;
+
   // Subagent hook state provider (set from feature layer to avoid core→feature dependency)
   private _subagentStateProvider: (() => SubagentHookState) | null = null;
 
@@ -925,6 +930,7 @@ export class ClaudianService implements ChatRuntime {
     const settings = this.getScopedSettings();
     return {
       intendedModel: modelOverride ?? turn.model ?? settings.model,
+      sessionResolvedModel: this.sessionResolvedModel ?? undefined,
       customContextLimits: settings.customContextLimits,
       streamState: turn.streamState,
       usageState: turn.usageState,
@@ -1068,6 +1074,9 @@ export class ClaudianService implements ChatRuntime {
 
   /** Session-level side effects of a session_init event, shared by the leased and lease-less routing paths. */
   private applySessionInitSideEffects(event: SessionInitEvent): void {
+    if (event.model) {
+      this.sessionResolvedModel = event.model;
+    }
     // Fork: suppress needsHistoryRebuild since SDK returns a different session ID by design
     const wasFork = this.pendingForkSession;
     this.sessionManager.captureSession(event.sessionId);
@@ -2335,6 +2344,9 @@ export class ClaudianService implements ChatRuntime {
 
     // Reset crash recovery for fresh start
     this.crashRecoveryAttempted = false;
+
+    // The next session's system/init reports its own resolved model.
+    this.sessionResolvedModel = null;
 
     this.sessionManager.reset();
   }
