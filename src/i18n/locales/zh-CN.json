@@ -19,7 +19,8 @@
     "disabled": "已禁用",
     "platform": "平台",
     "refresh": "刷新",
-    "rewind": "回退"
+    "rewind": "回退",
+    "unknownError": "未知错误"
   },
   "chat": {
     "rewind": {
@@ -350,6 +351,140 @@
     "language": {
       "name": "语言",
       "desc": "更改插件界面的显示语言"
+    },
+    "environmentReview": "请检查以下环境变量的归属：{keys}",
+    "codex": {
+      "enable": {
+        "name": "启用 Codex 提供商",
+        "desc": "启用后，Codex 模型会出现在新对话的模型选择器中。现有 Codex 会话将保留。"
+      },
+      "installation": {
+        "name": "安装方式",
+        "desc": "Claudian 在 Windows 上启动 Codex 的方式。原生 Windows 使用 Windows 可执行文件路径；WSL 在所选发行版中启动 Linux CLI。",
+        "nativeWindows": "原生 Windows",
+        "wsl": "WSL"
+      },
+      "cliPath": {
+        "name": "Codex CLI 路径（{hostname}）",
+        "descUnix": "本地 Codex CLI 的自定义路径。留空则从 PATH 自动检测。",
+        "descWsl": "在 WSL 内运行的 Linux 侧 Codex 命令或绝对路径。留空则在所选发行版的 PATH 中查找。",
+        "descWindows": "本地 Codex CLI 的自定义路径。留空则从 PATH 自动检测。请使用原生 Windows 可执行文件路径，通常为 `codex.exe`。",
+        "validation": {
+          "wslWindowsPath": "WSL 模式需要 Linux 命令或 Linux 绝对路径，不能使用 Windows 可执行文件路径。"
+        }
+      },
+      "wslDistro": {
+        "name": "覆盖 WSL 发行版",
+        "desc": "可选的高级覆盖项。留空时尽可能从 \\\\wsl$ 工作区路径推断发行版，否则使用默认 WSL 发行版。"
+      },
+      "summary": {
+        "auto": "自动",
+        "concise": "简洁",
+        "detailed": "详细",
+        "off": "关闭"
+      },
+      "customModels": {
+        "name": "自定义模型",
+        "desc": "向选择器添加其他 Codex 模型 ID，每行一个。设置 OPENAI_MODEL 后仍以其为准。"
+      },
+      "reasoningSummary": {
+        "name": "推理摘要",
+        "desc": "在思考区块中显示模型推理过程的摘要。"
+      },
+      "skills": {
+        "name": "Codex 技能",
+        "desc": "管理存储在 .codex/skills/ 或 .agents/skills/ 中的 Vault 级 Codex 技能。此处不包含用户主目录级技能。",
+        "hiddenName": "隐藏技能",
+        "hiddenDesc": "从下拉菜单中隐藏特定 Codex 技能。每行输入一个技能名称，无需前导 $。",
+        "modal": {
+          "titleEdit": "编辑 Codex 技能",
+          "titleAdd": "添加 Codex 技能",
+          "directory": "目录",
+          "directoryDesc": "技能的存储位置",
+          "name": "技能名称",
+          "nameDesc": "$ 后使用的名称（例如 $analyze 对应“analyze”）",
+          "description": "描述",
+          "descriptionDesc": "显示在下拉菜单中的可选描述",
+          "instructions": "指令",
+          "instructionsDesc": "技能指令（SKILL.md 内容）",
+          "instructionsPlaceholder": "分析代码中的……"
+        },
+        "validation": {
+          "nameRequired": "技能名称为必填项",
+          "nameTooLong": "技能名称不能超过 {max} 个字符",
+          "nameInvalid": "技能名称只能包含小写字母、数字和连字符",
+          "nameReserved": "技能名称不能是 YAML 保留字（true、false、null、yes、no、on、off）",
+          "instructionsRequired": "指令为必填项"
+        },
+        "saveFailed": "保存 Codex 技能失败",
+        "noSkills": "Vault 中没有 Codex 技能。点击 + 创建一个。",
+        "badge": "技能",
+        "deleted": "已删除 Codex 技能“${name}”",
+        "deleteFailed": "删除 Codex 技能失败",
+        "updated": "已更新 Codex 技能“${name}”",
+        "created": "已创建 Codex 技能“${name}”"
+      },
+      "subagents": {
+        "name": "Codex 子代理",
+        "desc": "管理存储在 .codex/agents/ 中的 Vault 级 Codex 子代理。每个 TOML 文件定义一个自定义代理。",
+        "options": {
+          "inherit": "继承",
+          "low": "低",
+          "medium": "中",
+          "high": "高",
+          "extraHigh": "超高",
+          "readOnly": "只读",
+          "dangerFullAccess": "完全访问（危险）",
+          "workspaceWrite": "工作区可写"
+        },
+        "modal": {
+          "titleEdit": "编辑 Codex 子代理",
+          "titleAdd": "添加 Codex 子代理",
+          "name": "名称",
+          "nameDesc": "Codex 启动代理时使用的名称（小写字母、连字符、下划线）",
+          "description": "描述",
+          "descriptionDesc": "Codex 应在何时使用此代理",
+          "descriptionPlaceholder": "审查代码的正确性与安全性",
+          "advancedOptions": "高级选项",
+          "model": "模型",
+          "modelDesc": "覆盖模型（留空则继承）",
+          "reasoningEffort": "推理强度",
+          "reasoningEffortDesc": "模型推理强度级别",
+          "sandboxMode": "沙箱模式",
+          "sandboxModeDesc": "此代理的沙箱限制",
+          "nicknames": "候选昵称",
+          "nicknamesDesc": "用逗号分隔的显示昵称（例如 Atlas、Delta、Echo）",
+          "instructions": "开发者指令",
+          "instructionsDesc": "定义代理行为的核心指令",
+          "instructionsPlaceholder": "以代码负责人的标准审查代码。\n优先检查正确性、安全性和缺失的测试覆盖。"
+        },
+        "validation": {
+          "nameRequired": "子代理名称为必填项",
+          "nameTooLong": "子代理名称不能超过 {max} 个字符",
+          "nameInvalid": "子代理名称只能包含小写字母、数字、连字符和下划线",
+          "nicknameInvalid": "候选昵称只能包含 ASCII 字母、数字、空格、连字符和下划线",
+          "nicknameDuplicate": "候选昵称不能重复",
+          "descriptionRequired": "描述为必填项",
+          "instructionsRequired": "开发者指令为必填项",
+          "duplicateName": "名为“{name}”的子代理已存在"
+        },
+        "saveFailed": "保存子代理失败：{message}",
+        "noAgents": "Vault 中没有 Codex 子代理。点击 + 创建一个。",
+        "deleteConfirm": "删除子代理“{name}”？",
+        "deleted": "已删除子代理“{name}”",
+        "deleteFailed": "删除子代理失败",
+        "updated": "已更新子代理“{name}”",
+        "created": "已创建子代理“{name}”"
+      },
+      "mcp": {
+        "beforeCommand": "Codex 通过自身 CLI 管理 MCP 服务器。请使用以下命令配置：",
+        "afterCommand": "配置后即可在 Claudian 中使用。",
+        "learnMore": "了解更多"
+      },
+      "environment": {
+        "name": "Codex 环境变量",
+        "desc": "仅填写 Codex 自有的运行时变量，例如 OPENAI_* 和 CODEX_*。若 Codex 自动检测需要帮助，请将其安装目录添加到共享 PATH，而不是此提供商区域。"
+      }
     }
   }
 }

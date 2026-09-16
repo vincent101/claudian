@@ -1,4 +1,5 @@
 import type { SlashCommand } from '../core/types';
+import type { SlugNameIssue } from './frontmatter';
 import {
   extractBoolean,
   extractString,
@@ -6,9 +7,10 @@ import {
   getSlugNameIssue,
   isRecord,
   parseFrontmatter,
-  type SlugNameIssue,
   validateSlugName,
 } from './frontmatter';
+
+export type { SlugNameIssue };
 
 export interface ParsedSlashCommandContent {
   description?: string;
