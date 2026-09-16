@@ -101,6 +101,12 @@ export class HistorySearchController {
   private generation = 0;
   private openingFocus: HTMLElement | null = null;
   private locating = false;
+  /**
+   * Whether this open already rebound to a fresh snapshot. The first
+   * non-empty query of each open refreshes once; later keystrokes reuse it so
+   * typing never rebuilds the index per key.
+   */
+  private snapshotRefreshed = false;
   private readonly registry = new Map<string, MarkEntry>();
   private readonly eventDocument: Document | null;
   private readonly onDocumentKeyDown = (event: KeyboardEvent): void => {
@@ -119,6 +125,9 @@ export class HistorySearchController {
 
   open(): void {
     if (this.panel) { this.input?.focus(); this.input?.select(); return; }
+    // A new open must rebind: turns that completed while the panel was
+    // closed are invisible to the snapshot the tab acquired earlier.
+    this.snapshotRefreshed = false;
     this.openingFocus = this.eventDocument?.activeElement instanceof HTMLElement ? this.eventDocument.activeElement : null;
     if (!this.eventDocument) return;
     const panel = this.eventDocument.createElement('div'); panel.className = 'claudian-history-search';
@@ -150,6 +159,8 @@ export class HistorySearchController {
     void (async () => {
       try {
         await this.deps.refreshSearchSnapshot?.();
+        // The stream-completion refresh already rebound this open.
+        this.snapshotRefreshed = true;
         if (generation === this.generation) await this.runSearch(generation, true);
       } catch {
         if (generation === this.generation && this.panel) this.renderError(t('chat.search.error'));
@@ -173,6 +184,17 @@ export class HistorySearchController {
   private async runSearch(generation: number, preserveCurrent = false): Promise<void> {
     const conversationId = this.deps.getConversationId(); const query = this.input?.value.trim() ?? ''; this.clearHighlights();
     if (!conversationId || !query) { this.results = []; this.selectedIndex = -1; this.renderStatus(); return; }
+    // Rebind once per open before the first real query: the tab's fixed
+    // snapshot predates the panel and may miss turns that finished while the
+    // panel was closed. A failed refresh keeps the old snapshot usable; this
+    // open still stops retrying so keystrokes never rebuild the index.
+    if (!this.snapshotRefreshed) {
+      this.snapshotRefreshed = true;
+      try {
+        await this.deps.refreshSearchSnapshot?.();
+      } catch { /* stale snapshot stays searchable */ }
+      if (generation !== this.generation || !this.panel) return;
+    }
     this.setBusy(t('chat.search.indexing'));
     try {
       const previous = preserveCurrent ? this.results[this.selectedIndex] : undefined;
@@ -185,7 +207,10 @@ export class HistorySearchController {
       this.results = results;
       const retained = previous ? results.findIndex(item => item.projectionKey === previous.projectionKey && item.matchOrdinal === previous.matchOrdinal) : -1;
       this.selectedIndex = retained >= 0 ? retained : results.length - 1;
-      new Set(Array.from(this.deps.messagesEl.querySelectorAll<HTMLElement>('.claudian-message[data-message-id]')).map(el => el.dataset.messageId!)).forEach(key => this.applyMarks(key, generation));
+      // Marks exist only where the fixed results say a navigable match is;
+      // scanning every DOM message would ghost-highlight hits the snapshot
+      // does not contain.
+      new Set(results.map(item => item.projectionKey)).forEach(key => this.applyMarks(key, generation));
       this.renderStatus(); if (this.selectedIndex >= 0) await this.locateCurrent();
     } catch { if (generation === this.generation && this.panel) this.renderError(t('chat.search.error')); }
   }
@@ -216,8 +241,18 @@ export class HistorySearchController {
     const message = Array.from(this.deps.messagesEl.querySelectorAll<HTMLElement>('[data-message-id]'))
       .find(element => element.dataset.messageId === projectionKey) ?? null;
     if (!message) { this.registry.delete(projectionKey); return; }
+    // `results` is the single truth: only ordinals the fixed snapshot
+    // actually returned may carry a mark. DOM hits beyond the result set
+    // (live turns not yet in the snapshot, trimmed summary text) must not
+    // become unnavigable ghost highlights.
+    const validOrdinals = new Set(
+      this.results.filter(item => item.projectionKey === projectionKey && item.status !== 'projection_mismatch')
+        .map(item => item.matchOrdinal),
+    );
     const matches = enumerateVisibleMatches(message, this.input?.value.trim() ?? ''); const marks: HTMLElement[] = [];
-    const segments = matches.flatMap(match => match.ranges.map(range => ({ range, ordinal: match.ordinal })));
+    const segments = matches
+      .flatMap(match => match.ranges.map(range => ({ range, ordinal: match.ordinal })))
+      .filter(segment => validOrdinals.has(segment.ordinal));
     for (const { range, ordinal } of segments.reverse()) {
       const mark = this.deps.rootEl.ownerDocument.createElement('mark'); mark.className = 'claudian-search-match'; mark.dataset.ordinal = String(ordinal);
       range.surroundContents(mark); marks.push(mark);

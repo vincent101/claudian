@@ -18,6 +18,7 @@ import type {
   SubagentInfo,
   ToolCallInfo,
 } from '../../../core/types';
+import { compareChatDisplayOrder } from '../../../core/types';
 import { ClaudeTranscriptDiagnosticLog } from '../transcript/ClaudeTranscriptDiagnosticLog';
 import { type ClaudeProviderState, getClaudeState } from '../types/providerState';
 import {
@@ -452,7 +453,8 @@ export class ClaudeConversationHistoryService implements ProviderConversationHis
       ? state.forkSource!.sessionId
       : (state.providerSessionId ?? conversation.sessionId);
 
-    for (const sessionId of allSessionIds) {
+    for (let segmentOrdinal = 0; segmentOrdinal < allSessionIds.length; segmentOrdinal += 1) {
+      const sessionId = allSessionIds[segmentOrdinal];
       if (!sdkSessionExists(vaultPath, sessionId)) {
         missingSessionCount++;
         continue;
@@ -462,7 +464,7 @@ export class ClaudeConversationHistoryService implements ProviderConversationHis
       const truncateAt = isCurrentSession
         ? (isPendingFork ? state.forkSource!.resumeAt : conversation.resumeAtMessageId)
         : undefined;
-      const result = await loadSDKSessionMessages(vaultPath, sessionId, truncateAt);
+      const result = await loadSDKSessionMessages(vaultPath, sessionId, truncateAt, segmentOrdinal);
 
       if (result.status === 'oversize') {
         oversizeSegments.push({ sessionId, sizeBytes: result.sizeBytes ?? 0 });
@@ -497,7 +499,19 @@ export class ClaudeConversationHistoryService implements ProviderConversationHis
     const merged = dedupeMessages([
       ...conversation.messages,
       ...filteredSdkMessages,
-    ]).sort((a, b) => a.timestamp - b.timestamp);
+    ]);
+    // The SDK-materialized copy owns the canonical position: a cached
+    // conversation copy of the same id adopts the fresh key so dedupe (which
+    // prefers the cached copy) cannot strand it without structural order.
+    // Keyless leftovers (live turns, recovery anchors) sort stably at the tail.
+    const sdkOrderByMessageId = new Map(
+      filteredSdkMessages.filter(msg => msg.displayOrder).map(msg => [msg.id, msg.displayOrder!]),
+    );
+    for (const message of merged) {
+      const order = sdkOrderByMessageId.get(message.id);
+      if (order) message.displayOrder = order;
+    }
+    merged.sort(compareChatDisplayOrder);
 
     if (state.subagentData) {
       await enrichAsyncSubagentToolCalls(
@@ -616,6 +630,10 @@ export class ClaudeConversationHistoryService implements ProviderConversationHis
     const needle = query.trim().toLocaleLowerCase();
     if (!needle) return [];
     const results: HistorySearchResult[] = [];
+    // Parallel canonical entry index per result: within one turn the corpus
+    // entry position orders projections structurally (user before assistant),
+    // so the sort below never falls back to projectionKey string comparison.
+    const resultEntryIndexes: number[] = [];
     const ordinals = new Map<string, number>();
     let globalTurnOffset = 0;
     for (const segment of state.segments) {
@@ -631,17 +649,21 @@ export class ClaudeConversationHistoryService implements ProviderConversationHis
             matchOrdinal,
             matchedText: text.slice(matchStart, matchStart + query.trim().length),
           });
+          resultEntryIndexes.push(item.entryIndex);
           ordinals.set(item.projectionKey, matchOrdinal + 1);
           matchStart = lowerText.indexOf(needle, matchStart + needle.length);
         }
       }
       globalTurnOffset += segment.index.turns.length;
     }
-    return results.sort((a, b) =>
-      a.turnIndex - b.turnIndex
-      || a.projectionKey.localeCompare(b.projectionKey)
-      || a.matchOrdinal - b.matchOrdinal
-    );
+    return results
+      .map((result, index) => ({ result, index }))
+      .sort((a, b) =>
+        a.result.turnIndex - b.result.turnIndex
+        || resultEntryIndexes[a.index] - resultEntryIndexes[b.index]
+        || a.result.matchOrdinal - b.result.matchOrdinal
+      )
+      .map(entry => entry.result);
   }
 
   private async materializeRange(
@@ -660,11 +682,13 @@ export class ClaudeConversationHistoryService implements ProviderConversationHis
       if (indexes.length === 0) continue;
       const native = await materializeTranscriptPage(segment.index, indexes[0], indexes.length);
       const associations = await materializeTranscriptToolAssociations(segment.index, native);
-      messages.push(...await materializeSDKMessages(state.vaultPath, segment.sessionId, native, associations));
+      messages.push(...await materializeSDKMessages(
+        state.vaultPath, segment.sessionId, native, associations, state.segments.indexOf(segment),
+      ));
     }
     const current = state.segments[state.segments.length - 1];
     return {
-      messages: dedupeMessages(messages).sort((a, b) => a.timestamp - b.timestamp),
+      messages: dedupeMessages(messages).sort(compareChatDisplayOrder),
       range: { start, end },
       snapshotOffset: current.index.snapshotSize,
     };
@@ -691,7 +715,9 @@ export class ClaudeConversationHistoryService implements ProviderConversationHis
   ): Promise<ChatMessage[]> {
     const native = await materializeTranscriptPage(segment.index, turnIndex, 1);
     const associations = await materializeTranscriptToolAssociations(segment.index, native);
-    return materializeSDKMessages(state.vaultPath, segment.sessionId, native, associations);
+    return materializeSDKMessages(
+      state.vaultPath, segment.sessionId, native, associations, state.segments.indexOf(segment),
+    );
   }
 
   /**
@@ -726,15 +752,37 @@ export class ClaudeConversationHistoryService implements ProviderConversationHis
     }
     const read = entries.filter((_, i) => selected[i]);
     const skipped = entries.filter((_, i) => !selected[i]);
+    // readIndexEntries preserves the input entry order, so native aligns with
+    // the selected slots by cursor.
     const native = read.length > 0 ? await materializeTranscriptEntries(index, read) : [];
-    const synthetic: SDKNativeMessage[] = skipped
-      .map(entry => buildOversizedEntryPlaceholder(entry))
-      .filter((message): message is SDKNativeMessage => message !== null);
-    if (skipped.length > 0) {
-      synthetic.push(buildOversizedTurnMarker(turn.turnId, skipped, entries[entries.length - 1]?.timestamp));
+    const placeholderByMessageKey = new Map(
+      skipped
+        .map(entry => [entry.messageKey, buildOversizedEntryPlaceholder(entry)] as const)
+        .filter((pair): pair is readonly [string, SDKNativeMessage] => pair[1] !== null),
+    );
+    // Interleave placeholders at their original entry slots so the summary
+    // projection keeps the turn's canonical row order; a tail-appended
+    // synthetic block would detach the projection from the transcript order
+    // the search index and the detail materialization both use.
+    const combined: SDKNativeMessage[] = [];
+    let nativeCursor = 0;
+    for (let i = 0; i < entries.length; i += 1) {
+      if (selected[i]) {
+        if (nativeCursor < native.length) {
+          combined.push(native[nativeCursor]);
+          nativeCursor += 1;
+        }
+      } else {
+        const placeholder = placeholderByMessageKey.get(entries[i].messageKey);
+        if (placeholder) combined.push(placeholder);
+      }
     }
-    const combined = [...native, ...synthetic];
-    const messages = await materializeSDKMessages(state.vaultPath, segment.sessionId, combined, combined);
+    if (skipped.length > 0) {
+      combined.push(buildOversizedTurnMarker(turn.turnId, skipped, entries[entries.length - 1]?.timestamp));
+    }
+    const messages = await materializeSDKMessages(
+      state.vaultPath, segment.sessionId, combined, combined, state.segments.indexOf(segment),
+    );
     summarizeChatMessages(messages);
     return { messages, readBytes };
   }
@@ -808,7 +856,10 @@ export class ClaudeConversationHistoryService implements ProviderConversationHis
       elapsedMs: performance.now() - startedAt,
     });
     return {
-      messages: dedupeMessages(messages).sort((a, b) => a.timestamp - b.timestamp),
+      // The loop above materializes newest-first; the canonical displayOrder
+      // key restores the ascending structural order (timestamps are
+      // display-only and must not participate in structural ordering).
+      messages: dedupeMessages(messages).sort(compareChatDisplayOrder),
       range: { start: actualStart, end: plan.end },
       snapshotOffset: current.index.snapshotSize,
       sourceBytes,

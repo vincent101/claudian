@@ -1040,7 +1040,8 @@ describe('ClaudianPlugin', () => {
       expect(loadSpy).toHaveBeenCalledWith(
         expect.any(String),
         'source-session-abc',
-        'asst-uuid-cutoff'
+        'asst-uuid-cutoff',
+        0
       );
 
       // Messages should be loaded
@@ -1138,7 +1139,8 @@ describe('ClaudianPlugin', () => {
       expect(loadSpy).toHaveBeenCalledWith(
         expect.any(String),
         'session-subagent-recovery',
-        undefined
+        undefined,
+        0
       );
       expect(loaded?.messages[0].toolCalls?.find(tc => tc.id === 'task-1')).toEqual(
         expect.objectContaining({
@@ -1211,7 +1213,8 @@ describe('ClaudianPlugin', () => {
       expect(loadSpy).toHaveBeenCalledWith(
         expect.any(String),
         'session-subagent-merge',
-        undefined
+        undefined,
+        0
       );
       expect(taskTool?.result).toBe('Full SDK result from queue-operation');
       expect(taskTool?.subagent?.result).toBe('Full SDK result from queue-operation');

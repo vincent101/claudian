@@ -255,4 +255,188 @@ describe('HistorySearchController', () => {
     expect(error).not.toBeNull();
     expect(error?.textContent).toBeTruthy();
   });
+
+  describe('snapshot binding and unified results', () => {
+    let refreshSnapshot: jest.Mock;
+
+    const mountMessage = (key: string, text: string): HTMLElement => {
+      const message = document.createElement('div');
+      message.className = 'claudian-message';
+      message.dataset.messageId = key;
+      const block = document.createElement('div');
+      block.className = 'claudian-text-block';
+      block.textContent = text;
+      message.appendChild(block);
+      messages.appendChild(message);
+      return message;
+    };
+
+    const makeController = (overrides: Partial<{ searchHistoryImpl: jest.Mock }> = {}): HistorySearchController => {
+      controller.destroy();
+      controller = new HistorySearchController({
+        rootEl: root,
+        messagesEl: messages,
+        isActive,
+        getConversationId: () => 'conversation',
+        searchHistory: overrides.searchHistoryImpl ?? searchHistory,
+        locateResult: locate,
+        waitForResultRender: jest.fn().mockResolvedValue(undefined),
+        refreshSearchSnapshot: refreshSnapshot,
+      });
+      return controller;
+    };
+
+    const typeQuery = async (instance: HistorySearchController, query: string): Promise<void> => {
+      const input = root.querySelector('input') as HTMLInputElement;
+      input.value = query;
+      input.dispatchEvent(new Event('input'));
+      await jest.advanceTimersByTimeAsync(300);
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+      void instance;
+    };
+
+    beforeEach(() => {
+      refreshSnapshot = jest.fn().mockResolvedValue(undefined);
+    });
+
+    it('refreshes the snapshot once before the first non-empty query of each open', async () => {
+      const callOrder: string[] = [];
+      refreshSnapshot.mockImplementation(async () => { callOrder.push('refresh'); });
+      searchHistory.mockImplementation(async () => { callOrder.push('search'); return []; });
+      const instance = makeController();
+      instance.open();
+      await typeQuery(instance, 'needle');
+      // The panel must not search a snapshot fixed before it was opened.
+      expect(refreshSnapshot).toHaveBeenCalledTimes(1);
+      expect(callOrder).toEqual(['refresh', 'search']);
+
+      await typeQuery(instance, 'other');
+      // Subsequent keystrokes in the same open reuse the refreshed snapshot.
+      expect(refreshSnapshot).toHaveBeenCalledTimes(1);
+      expect(callOrder).toEqual(['refresh', 'search', 'search']);
+
+      instance.close({ restoreFocus: false });
+      instance.open();
+      await typeQuery(instance, 'needle');
+      // A fresh open rebinds: closing while new turns landed must not leave
+      // the next search on the pre-open snapshot.
+      expect(refreshSnapshot).toHaveBeenCalledTimes(2);
+      expect(callOrder).toEqual(['refresh', 'search', 'search', 'refresh', 'search']);
+    });
+
+    it('produces no ghost marks for DOM hits absent from the fixed results', async () => {
+      mountMessage('m1', 'needle one');
+      mountMessage('m2', 'needle two');
+      searchHistory.mockResolvedValue([
+        { projectionKey: 'm1', turnIndex: 0, matchOrdinal: 0, matchedText: 'needle' },
+      ]);
+      const instance = makeController();
+      instance.open();
+
+      await typeQuery(instance, 'needle');
+
+      // m2's DOM contains a hit the fixed snapshot does not know: it must
+      // not gain a mark (no unnavigable highlight), while m1 stays marked.
+      expect(messages.querySelector<HTMLElement>('[data-message-id="m1"] mark')).not.toBeNull();
+      expect(messages.querySelector<HTMLElement>('[data-message-id="m2"] mark')).toBeNull();
+
+      // After a stream-complete refresh re-searches, m2 enters the results
+      // (mark + total) while the current item stays on the retained m1.
+      searchHistory.mockResolvedValue([
+        { projectionKey: 'm1', turnIndex: 0, matchOrdinal: 0, matchedText: 'needle' },
+        { projectionKey: 'm2', turnIndex: 1, matchOrdinal: 0, matchedText: 'needle' },
+      ]);
+      instance.onStreamComplete();
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+      expect(messages.querySelector<HTMLElement>('[data-message-id="m2"] mark')).not.toBeNull();
+      expect(messages.querySelector<HTMLElement>('[data-message-id="m1"] mark')?.classList.contains('is-current')).toBe(true);
+      expect(messages.querySelector<HTMLElement>('[data-message-id="m2"] mark')?.classList.contains('is-current')).toBe(false);
+    });
+
+    it('keeps total, marks, and the current ordinal on the same results set', async () => {
+      mountMessage('m1', 'needle needle needle');
+      mountMessage('m2', 'needle');
+      searchHistory.mockResolvedValue([
+        { projectionKey: 'm1', turnIndex: 0, matchOrdinal: 0, matchedText: 'needle' },
+        { projectionKey: 'm1', turnIndex: 0, matchOrdinal: 1, matchedText: 'needle' },
+        { projectionKey: 'm1', turnIndex: 0, matchOrdinal: 2, matchedText: 'needle' },
+        { projectionKey: 'm2', turnIndex: 1, matchOrdinal: 0, matchedText: 'needle' },
+      ]);
+      const instance = makeController();
+      instance.open();
+
+      await typeQuery(instance, 'needle');
+
+      const m1 = messages.querySelector<HTMLElement>('[data-message-id="m1"]');
+      const m2 = messages.querySelector<HTMLElement>('[data-message-id="m2"]');
+      // N/M total (4) equals the visible mark set; default current is the
+      // newest result (m2 ordinal 0).
+      expect(m1?.querySelectorAll('mark')).toHaveLength(3);
+      expect(m2?.querySelectorAll('mark')).toHaveLength(1);
+      expect(m2?.querySelector('mark')?.classList.contains('is-current')).toBe(true);
+      expect(m1?.querySelector('mark.is-current')).toBeNull();
+
+      // Enter navigates backwards through the same set; only the navigated
+      // ordinal carries .is-current.
+      const input = root.querySelector('input') as HTMLInputElement;
+      input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', shiftKey: true, bubbles: true }));
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+      const m1Marks = Array.from(m1?.querySelectorAll('mark') ?? []);
+      expect(m1Marks.map(mark => mark.classList.contains('is-current'))).toEqual([false, false, true]);
+      expect(m2?.querySelector('mark')?.classList.contains('is-current')).toBe(false);
+    });
+
+    it('marks mixed-case matches case-insensitively from the visible projection', async () => {
+      mountMessage('m1', 'Rewind then rewind then REWIND');
+      searchHistory.mockResolvedValue([
+        { projectionKey: 'm1', turnIndex: 0, matchOrdinal: 0, matchedText: 'Rewind' },
+        { projectionKey: 'm1', turnIndex: 0, matchOrdinal: 1, matchedText: 'rewind' },
+        { projectionKey: 'm1', turnIndex: 0, matchOrdinal: 2, matchedText: 'REWIND' },
+      ]);
+      const instance = makeController();
+      instance.open();
+
+      await typeQuery(instance, 'rewIND');
+
+      expect(messages.querySelectorAll('[data-message-id="m1"] mark')).toHaveLength(3);
+    });
+
+    it('re-searches after stream completion and preserves the current item by projectionKey and matchOrdinal', async () => {
+      mountMessage('m1', 'needle one');
+      mountMessage('m2', 'needle two');
+      searchHistory.mockResolvedValueOnce([
+        { projectionKey: 'm1', turnIndex: 0, matchOrdinal: 0, matchedText: 'needle' },
+        { projectionKey: 'm2', turnIndex: 1, matchOrdinal: 0, matchedText: 'needle' },
+      ]);
+      const instance = makeController();
+      instance.open();
+      await typeQuery(instance, 'needle');
+
+      // The refresh may race a close: a rejected refresh must not break the
+      // panel; the search still runs on the old snapshot.
+      searchHistory.mockResolvedValueOnce([
+        { projectionKey: 'm1', turnIndex: 0, matchOrdinal: 0, matchedText: 'needle' },
+        { projectionKey: 'm2', turnIndex: 1, matchOrdinal: 0, matchedText: 'needle' },
+        { projectionKey: 'm3', turnIndex: 2, matchOrdinal: 0, matchedText: 'needle' },
+      ]);
+      instance.onStreamComplete();
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+      // One refresh for the first query of this open plus the stream-completion
+      // refresh; the re-search itself must not refresh again.
+      expect(refreshSnapshot).toHaveBeenCalledTimes(2);
+      // Current stays on m2 ordinal 0 even though a newer m3 hit exists.
+      expect(messages.querySelector<HTMLElement>('[data-message-id="m2"] mark')?.classList.contains('is-current')).toBe(true);
+      expect(messages.querySelector<HTMLElement>('[data-message-id="m3"] mark')).toBeNull();
+    });
+  });
 });

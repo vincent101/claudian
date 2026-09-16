@@ -12,7 +12,7 @@ import {
   type TitleGenerationService,
 } from '../../../core/providers/types';
 import type { ChatRuntime } from '../../../core/runtime/ChatRuntime';
-import type { ChatMessage, Conversation } from '../../../core/types';
+import { type ChatMessage, compareChatDisplayOrder, type Conversation } from '../../../core/types';
 import { t } from '../../../i18n/i18n';
 import type ClaudianPlugin from '../../../main';
 import { confirm } from '../../../shared/modals/ConfirmModal';
@@ -103,6 +103,12 @@ export class ConversationController {
   private callbacks: ConversationCallbacks;
   private rangeRequests = new Map<string, Promise<void>>();
   private projectionCache = new Map<string, HTMLElement>();
+  /**
+   * Candidates the provider index verified in detail text but the current
+   * (summary/loaded) projection cannot mount — recorded for diagnostics only;
+   * they never enter the navigable search results or the total.
+   */
+  private searchDiagnostics: HistorySearchResult[] = [];
 
   constructor(deps: ConversationControllerDeps, callbacks: ConversationCallbacks = {}) {
     this.deps = deps;
@@ -454,7 +460,7 @@ export class ConversationController {
         if (isStale()) return;
         const existingIds = new Set(state.messages.map(message => message.id));
         const added = page.messages.filter(message => !existingIds.has(message.id));
-        const combined = [...state.messages, ...added].sort((a, b) => a.timestamp - b.timestamp);
+        const combined = [...state.messages, ...added].sort(compareChatDisplayOrder);
         state.messages = combined;
         const addedIds = new Set(added.map(message => message.id));
         const prepend = combined.filter(message => addedIds.has(message.id));
@@ -486,8 +492,13 @@ export class ConversationController {
     query: string,
     onPhase?: (phase: 'indexing' | 'searching') => void,
   ): Promise<HistorySearchResult[]> {
+    this.searchDiagnostics = [];
     const lease = this.deps.state.historyLease;
-    if (!lease) return [];
+    // Providers without a history index (Codex/OpenCode fully-hydrated tabs)
+    // fall back to the loaded messages: only currently mounted projections
+    // can be navigated, so the fallback enumerates visible DOM matches and
+    // never triggers a window load.
+    if (!lease) return this.searchLoadedMessages(query);
     onPhase?.('indexing');
     await lease.ready;
     onPhase?.('searching');
@@ -508,7 +519,7 @@ export class ConversationController {
       } else {
         const message = await this.loadSearchCandidate(group[0].turnIndex, group[0].projectionKey);
         if (!message) {
-          results.push(...group.map(item => ({ ...item, status: 'projection_mismatch' as const })));
+          this.searchDiagnostics.push(...group.map(item => ({ ...item, status: 'projection_mismatch' as const })));
           continue;
         }
         const hash = this.contentHash(JSON.stringify(message));
@@ -521,7 +532,45 @@ export class ConversationController {
         }
         count = enumerateVisibleMatches(detached, query).length;
       }
-      results.push(...group.map(item => item.matchOrdinal < count ? item : ({ ...item, status: 'projection_mismatch' as const })));
+      // Only matches the current projection can actually mount become
+      // navigable results; detail-verified but unmountable ordinals (summary
+      // trimmed their text) stay diagnostics so the total never lies.
+      for (const item of group) {
+        if (item.matchOrdinal < count) results.push(item);
+        else this.searchDiagnostics.push({ ...item, status: 'projection_mismatch' as const });
+      }
+    }
+    return results;
+  }
+
+  /** Diagnostics from the most recent searchHistory call (never navigable). */
+  getSearchDiagnostics(): HistorySearchResult[] {
+    return this.searchDiagnostics;
+  }
+
+  /**
+   * Lease-less search over fully-hydrated state.messages. Mirrors the leased
+   * path's mountability rule: a message without a rendered DOM projection is
+   * skipped (counted nowhere) rather than force-located.
+   */
+  private async searchLoadedMessages(query: string): Promise<HistorySearchResult[]> {
+    const needle = query.trim();
+    if (!needle) return [];
+    const results: HistorySearchResult[] = [];
+    const messages = this.deps.state.messages;
+    for (let messageIndex = 0; messageIndex < messages.length; messageIndex += 1) {
+      const message = messages[messageIndex];
+      const element = this.deps.renderer.findMessageElement(message.id);
+      if (!element) continue;
+      await this.deps.renderer.waitForMessageContentRendered(message.id);
+      for (const match of enumerateVisibleMatches(element, query)) {
+        results.push({
+          projectionKey: message.id,
+          turnIndex: messageIndex,
+          matchOrdinal: match.ordinal,
+          matchedText: match.ranges.map(range => range.toString()).join(''),
+        });
+      }
     }
     return results;
   }
@@ -556,12 +605,22 @@ export class ConversationController {
     state.historyLease = next;
     try {
       await next.ready;
-      previous.release();
     } catch (error) {
       next.release();
-      if (state.historyLease === next) state.historyLease = previous;
+      if (state.historyLease === next) {
+        // Still the mounted lease: restore the still-live previous one.
+        state.historyLease = previous;
+      } else {
+        // A conversation switch (or takeover) already released and unmounted
+        // `next`; `previous` lost its last reference — release it so the
+        // exchange cannot leak a protected index.
+        previous.release();
+      }
       throw error;
     }
+    // Exchange completed (or raced with a switch): `previous` ends its
+    // reference here either way; the mounted state is never rewritten.
+    previous.release();
   }
 
   async locateHistorySearchResult(result: HistorySearchResult): Promise<HTMLElement> {
@@ -610,7 +669,7 @@ export class ConversationController {
         if (isStale()) return;
         const existingIds = new Set(state.messages.map(message => message.id));
         const added = page.messages.filter(message => !existingIds.has(message.id));
-        const combined = [...state.messages, ...added].sort((a, b) => a.timestamp - b.timestamp);
+        const combined = [...state.messages, ...added].sort(compareChatDisplayOrder);
         state.messages = combined;
         this.deps.renderer.renderMessages(combined, () => this.getGreeting());
         await this.deps.renderer.waitForRenderedMessages();
@@ -638,7 +697,7 @@ export class ConversationController {
         if (isStale()) return;
         const existingIds = new Set(state.messages.map(message => message.id));
         const added = page.messages.filter(message => !existingIds.has(message.id));
-        const combined = [...state.messages, ...added].sort((a, b) => a.timestamp - b.timestamp);
+        const combined = [...state.messages, ...added].sort(compareChatDisplayOrder);
         state.messages = combined;
         if (rerenderAll) {
           renderer.renderMessages(combined, () => this.getGreeting());

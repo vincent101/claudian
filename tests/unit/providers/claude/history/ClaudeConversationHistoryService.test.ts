@@ -131,8 +131,8 @@ describe('ClaudeConversationHistoryService M1 fuse', () => {
   it('enumerates every non-overlapping match with stable projection ordinals', async () => {
     const searchText = 'needle needle needleneedle';
     const searchCorpus = [
-      { projectionKey: 'same', turnIndex: 1, timestamp: '', textOffset: 0, textLength: 13 },
-      { projectionKey: 'same', turnIndex: 1, timestamp: '', textOffset: 14, textLength: 12 },
+      { projectionKey: 'same', turnIndex: 1, entryIndex: 0, timestamp: '', textOffset: 0, textLength: 13 },
+      { projectionKey: 'same', turnIndex: 1, entryIndex: 1, timestamp: '', textOffset: 14, textLength: 12 },
     ];
     mockBuildTranscriptIndex.mockResolvedValue({ status: 'complete', index: { filePath: '/current', dev: 1, ino: 1, snapshotSize: 1, mtimeMs: 1, entries: [], turns: [{ turnId: '0', startEntry: 0, endEntry: 0, sourceBytes: 1024 }, { turnId: '1', startEntry: 1, endEntry: 1, sourceBytes: 1024 }], searchCorpus, searchText, skippedLines: 0, buildDurationMs: 1, peakWorkerHeapBytes: 1 } });
     mockSdkSessionExists.mockImplementation((_vault, session) => session === 'current-session');
@@ -143,6 +143,55 @@ describe('ClaudeConversationHistoryService M1 fuse', () => {
       expect.objectContaining({ projectionKey: 'same', turnIndex: 1, matchOrdinal: 2 }),
       expect.objectContaining({ projectionKey: 'same', turnIndex: 1, matchOrdinal: 3 }),
     ]);
+  });
+
+  it('orders same-turn search hits by canonical corpus position, not projectionKey string', async () => {
+    const searchCorpus = [
+      { projectionKey: 'zzz-user', turnIndex: 0, entryIndex: 0, timestamp: '', textOffset: 0, textLength: 6 },
+      { projectionKey: 'aaa-assistant', turnIndex: 0, entryIndex: 1, timestamp: '', textOffset: 7, textLength: 6 },
+    ];
+    mockBuildTranscriptIndex.mockResolvedValue({ status: 'complete', index: { filePath: '/current', dev: 1, ino: 1, snapshotSize: 1, mtimeMs: 1, entries: [], turns: [{ turnId: '0', startEntry: 0, endEntry: 1, sourceBytes: 1024 }], searchCorpus, searchText: 'needle needle', skippedLines: 0, buildDurationMs: 1, peakWorkerHeapBytes: 1 } });
+    mockSdkSessionExists.mockImplementation((_vault, session) => session === 'current-session');
+    const service = new ClaudeConversationHistoryService(); const lease = service.acquireHistoryIndex(createConversation(), '/vault'); await lease.ready;
+    const results = await lease.search('needle');
+    // Same turn: the user projection (entry 0) precedes the assistant one
+    // regardless of their projectionKey strings.
+    expect(results.map(result => result.projectionKey)).toEqual(['zzz-user', 'aaa-assistant']);
+  });
+
+  it('hydrates the merged history in canonical display order with the SDK key adopted by id', async () => {
+    mockLoadSDKSessionMessages
+      .mockResolvedValueOnce({
+        status: 'complete',
+        messages: [
+          { id: 'p1', role: 'user', content: 'previous first', timestamp: 300, displayOrder: [0, 0, 0] },
+          { id: 'p2', role: 'user', content: 'previous second', timestamp: 100, displayOrder: [0, 1, 0] },
+        ],
+        skippedLines: 0,
+      })
+      .mockResolvedValueOnce({
+        status: 'complete',
+        messages: [
+          { id: 'c1', role: 'user', content: 'current', timestamp: 200, displayOrder: [1, 0, 0] },
+        ],
+        skippedLines: 0,
+      });
+    const conversation = createConversation();
+    conversation.messages = [
+      { id: 'live', role: 'assistant', content: 'live tail', timestamp: 400 },
+      { id: 'c1', role: 'user', content: 'current (cached copy)', timestamp: 200 },
+    ];
+    const service = new ClaudeConversationHistoryService();
+
+    await service.hydrateConversationHistory(conversation, '/vault');
+
+    // The cached c1 copy adopts the SDK canonical key; the keyless live
+    // message stays at the tail; timestamps (p2 newest-looking) never reorder.
+    expect(conversation.messages.map(message => message.id)).toEqual(['p1', 'p2', 'c1', 'live']);
+    expect(conversation.messages.find(message => message.id === 'c1')?.displayOrder).toEqual([1, 0, 0]);
+    // Segment ordinals are explicit: previous sessions first, current last.
+    expect(mockLoadSDKSessionMessages).toHaveBeenNthCalledWith(1, '/vault', 'previous-session', undefined, 0);
+    expect(mockLoadSDKSessionMessages).toHaveBeenNthCalledWith(2, '/vault', 'current-session', undefined, 1);
   });
 
   it('drops a failed shared build so acquire can retry', async () => {
@@ -407,6 +456,63 @@ describe('ClaudeConversationHistoryService M1 fuse', () => {
       // completed cache; the idle-cache hit itself is covered by the index
       // module tests against the real cache.
       expect(mockClearTranscriptIndexCache).not.toHaveBeenCalled();
+    });
+
+    it('restores the canonical order of a newest-first materialized window by displayOrder', async () => {
+      const turns = Array.from({ length: 3 }, (_, index) => ({ turnId: `u${index}`, startEntry: index, endEntry: index, sourceBytes: 1024 }));
+      mockBuildTranscriptIndex.mockResolvedValue(mockIndex(turns));
+      mockSdkSessionExists.mockImplementation((_vault, session) => session === 'current-session');
+      mockMaterializeTranscriptPage.mockImplementation(async (_index: any, start: number) => [{ type: 'user', uuid: `t${start}` }]);
+      const orderById = new Map([
+        ['t0', [0, 0, 0]],
+        ['t1', [0, 1, 0]],
+        ['t2', [0, 2, 0]],
+      ]);
+      mockMaterializeSDKMessages.mockImplementation(async (_vault: string, _sessionId: string, native: any[]) =>
+        native.map(message => ({
+          id: message.uuid,
+          role: 'user' as const,
+          content: `content ${message.uuid}`,
+          timestamp: 1,
+          displayOrder: orderById.get(message.uuid) as [number, number, number] | undefined,
+        })));
+      const service = new ClaudeConversationHistoryService();
+      const lease = service.acquireHistoryIndex(createConversation(), '/vault');
+      await lease.ready;
+
+      const page = await lease.loadWindow!({ anchorTurn: 3, direction: 'older', budget: budget(), projectionLevel: 'summary' });
+
+      // The window loop materializes newest-first; only the canonical
+      // displayOrder key restores the ascending structural order (identical
+      // timestamps here would otherwise keep the reversed push order).
+      expect(page.messages.map(message => message.id)).toEqual(['t0', 't1', 't2']);
+    });
+
+    it('interleaves oversized summary placeholders at their canonical entry positions', async () => {
+      const giantBytes = 12 * MiB;
+      const entries = [
+        { offset: 0, length: 100, type: 'user', messageKey: 'u2', uuid: 'u2', realUser: true, displayable: false, isMeta: false, toolUseIds: [], toolResultIds: [] },
+        { offset: 100, length: 100, type: 'assistant', messageKey: 'tu2', uuid: 'tu2', realUser: false, displayable: false, isMeta: false, toolUseIds: ['toolu_2'], toolResultIds: [] },
+        { offset: 200, length: giantBytes, type: 'user', messageKey: 'tr2', uuid: 'tr2', realUser: false, displayable: false, isMeta: false, toolUseIds: [], toolResultIds: ['toolu_2'] },
+        { offset: 200 + giantBytes, length: 80, type: 'assistant', messageKey: 'af2', uuid: 'af2', realUser: false, displayable: false, isMeta: false, toolUseIds: [], toolResultIds: [] },
+      ];
+      const turns = [{ turnId: 'u2', startEntry: 0, endEntry: 3, sourceBytes: 180 + giantBytes }];
+      mockBuildTranscriptIndex.mockResolvedValue(mockIndex(turns, entries));
+      mockSdkSessionExists.mockImplementation((_vault, session) => session === 'current-session');
+      mockMaterializeTranscriptEntries.mockImplementation(async (_index: any, readEntries: any[]) =>
+        readEntries.map(entry => ({ type: 'user', uuid: entry.messageKey })));
+      mockMaterializeSDKMessages.mockResolvedValue([]);
+      const service = new ClaudeConversationHistoryService();
+      const lease = service.acquireHistoryIndex(createConversation(), '/vault');
+      await lease.ready;
+
+      await lease.loadWindow!({ anchorTurn: 1, direction: 'older', budget: budget(), projectionLevel: 'summary' });
+
+      // The summary projection must keep the skipped entry's canonical slot:
+      // placeholder between its neighbors, turn marker last — never a
+      // tail-appended synthetic block that detaches from the original order.
+      const projected = mockMaterializeSDKMessages.mock.calls[0][2] as any[];
+      expect(projected.map(message => message.uuid)).toEqual(['u2', 'tu2', 'oversized-tr2', 'af2', 'oversized-marker-u2']);
     });
   });
 

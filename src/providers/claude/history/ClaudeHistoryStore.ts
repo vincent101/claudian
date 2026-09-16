@@ -67,6 +67,7 @@ export async function materializeSDKMessages(
   sessionId: string,
   filteredEntries: SDKNativeMessage[],
   associationEntries: SDKNativeMessage[] = filteredEntries,
+  segmentOrdinal = 0,
 ): Promise<ChatMessage[]> {
   const toolResults = collectToolResults(associationEntries);
   const toolUseResults = collectStructuredPatchResults(associationEntries);
@@ -77,13 +78,19 @@ export async function materializeSDKMessages(
   const projection = createSDKProjectionState();
 
   // Merge consecutive assistant messages until an actual user message appears
-  for (const sdkMsg of filteredEntries) {
+  for (let entryIndex = 0; entryIndex < filteredEntries.length; entryIndex += 1) {
+    const sdkMsg = filteredEntries[entryIndex];
     const projectionKind = getSDKProjectionKind(sdkMsg);
     const projectionKey = advanceSDKProjection(projection, projectionKind, sdkMsg.uuid ?? 'skipped');
     if (projectionKind === 'skip' || isSystemInjectedMessage(sdkMsg)) continue;
 
     const chatMsg = parseSDKMessageToChat(sdkMsg, toolResults);
     if (!chatMsg) continue;
+
+    // Canonical structural position: the entry index within the branch-filtered
+    // segment (skipped rows still occupy their index). A merged assistant keeps
+    // its first segment's position; timestamps stay display-only.
+    chatMsg.displayOrder = [segmentOrdinal, entryIndex, 0];
 
     if (chatMsg.role === 'assistant') {
       // context_compacted must not merge with previous assistant (it's a standalone separator)
@@ -164,7 +171,10 @@ export async function materializeSDKMessages(
     }
   }
 
-  chatMessages.sort((a, b) => a.timestamp - b.timestamp);
+  // chatMessages already follow the canonical entry order (skipped rows
+  // excluded, merged assistants at their first segment position). Re-sorting
+  // by timestamp would reorder history whenever a transcript row carries an
+  // anomalous timestamp, so the materialized order is final here.
 
   return chatMessages;
 }
@@ -172,7 +182,8 @@ export async function materializeSDKMessages(
 export async function loadSDKSessionMessages(
   vaultPath: string,
   sessionId: string,
-  resumeAtMessageId?: string
+  resumeAtMessageId?: string,
+  segmentOrdinal = 0,
 ): Promise<SDKSessionLoadResult> {
   const result = await readSDKSession(vaultPath, sessionId);
 
@@ -187,6 +198,6 @@ export async function loadSDKSessionMessages(
   }
 
   const filteredEntries = filterActiveBranch(result.messages, resumeAtMessageId);
-  const chatMessages = await materializeSDKMessages(vaultPath, sessionId, filteredEntries);
+  const chatMessages = await materializeSDKMessages(vaultPath, sessionId, filteredEntries, filteredEntries, segmentOrdinal);
   return { messages: chatMessages, skippedLines: result.skippedLines, status: 'complete' };
 }

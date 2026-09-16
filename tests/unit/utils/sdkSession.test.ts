@@ -918,7 +918,7 @@ describe('sdkSession', () => {
       expect(result.messages[2].content).toBe('Thanks');
     });
 
-    it('sorts messages by timestamp ascending', async () => {
+    it('keeps canonical JSONL order regardless of timestamps and stamps displayOrder', async () => {
       mockExistsSync.mockReturnValue(true);
       mockFsPromises.readFile.mockResolvedValue([
         '{"type":"assistant","uuid":"a1","timestamp":"2024-01-15T10:01:00Z","message":{"content":[{"type":"text","text":"Second"}]}}',
@@ -928,9 +928,42 @@ describe('sdkSession', () => {
 
       const result = await loadSDKSessionMessages('/Users/test/vault', 'session-unordered');
 
-      expect(result.messages[0].content).toBe('First');
-      expect(result.messages[1].content).toBe('Second');
-      expect(result.messages[2].content).toBe('Third');
+      // Canonical structural order follows the JSONL row order; timestamps
+      // are display-only and must never reorder materialized history.
+      expect(result.messages.map(message => message.content)).toEqual(['Second', 'First', 'Third']);
+      expect(result.messages.map(message => message.displayOrder)).toEqual([
+        [0, 0, 0],
+        [0, 1, 0],
+        [0, 2, 0],
+      ]);
+    });
+
+    it('keeps the merged assistant at its first canonical entry position when later segments carry older timestamps', async () => {
+      mockExistsSync.mockReturnValue(true);
+      mockFsPromises.readFile.mockResolvedValue([
+        '{"type":"user","uuid":"u1","timestamp":"2024-01-15T10:00:00Z","message":{"content":"Q"}}',
+        '{"type":"assistant","uuid":"a1","timestamp":"2024-01-15T10:05:00Z","message":{"content":[{"type":"text","text":"first part"}]}}',
+        '{"type":"assistant","uuid":"a2","timestamp":"2024-01-15T10:01:00Z","message":{"content":[{"type":"text","text":"second part"}]}}',
+        '{"type":"user","uuid":"u3","timestamp":"2024-01-15T10:06:00Z","message":{"content":"Next"}}',
+      ].join('\n'));
+
+      const result = await loadSDKSessionMessages('/Users/test/vault', 'session-merged-reverse-ts');
+
+      expect(result.messages.map(message => message.content)).toEqual(['Q', 'first part\n\nsecond part', 'Next']);
+      // The merged assistant keeps the first segment's entry position even
+      // though the second segment carries an older timestamp.
+      expect(result.messages[1].displayOrder).toEqual([0, 1, 0]);
+    });
+
+    it('stamps the segment ordinal onto materialized displayOrder', async () => {
+      mockExistsSync.mockReturnValue(true);
+      mockFsPromises.readFile.mockResolvedValue(
+        '{"type":"user","uuid":"u1","timestamp":"2024-01-15T10:00:00Z","message":{"content":"Hello"}}',
+      );
+
+      const result = await loadSDKSessionMessages('/Users/test/vault', 'session-segment', undefined, 3);
+
+      expect(result.messages[0].displayOrder).toEqual([3, 0, 0]);
     });
 
     it('returns empty result when session does not exist', async () => {
@@ -1037,7 +1070,8 @@ describe('sdkSession', () => {
 
     it('preserves /compact command as user message with clean displayContent', async () => {
       // File ordering mirrors real SDK JSONL: compact_boundary written BEFORE /compact command.
-      // The timestamp sort must reorder so /compact (earlier) precedes boundary (later).
+      // Canonical order keeps the boundary at its JSONL row position; its
+      // later timestamp is display-only and must not move it.
       mockExistsSync.mockReturnValue(true);
       mockFsPromises.readFile.mockResolvedValue([
         '{"type":"user","uuid":"u1","timestamp":"2024-01-15T10:00:00Z","message":{"content":"Hello"}}',
@@ -1050,17 +1084,19 @@ describe('sdkSession', () => {
 
       const result = await loadSDKSessionMessages('/Users/test/vault', 'session-compact');
 
-      // Should have: user "Hello", assistant "Hi!", user "/compact", assistant compact_boundary
-      // Meta (u2), stdout (u4) should be skipped
-      // /compact (10:02:01) sorted before compact_boundary (10:02:10) by timestamp
+      // Should have: user "Hello", assistant "Hi!", assistant compact_boundary, user "/compact"
+      // Meta (u2), stdout (u4) should be skipped; the boundary stays at its
+      // canonical row (entry 2) even though its timestamp is the latest.
       expect(result.messages).toHaveLength(4);
       expect(result.messages[0].role).toBe('user');
       expect(result.messages[0].content).toBe('Hello');
       expect(result.messages[1].role).toBe('assistant');
-      expect(result.messages[2].role).toBe('user');
-      expect(result.messages[2].displayContent).toBe('/compact');
-      expect(result.messages[3].role).toBe('assistant');
-      expect(result.messages[3].contentBlocks).toEqual([{ type: 'context_compacted' }]);
+      expect(result.messages[2].role).toBe('assistant');
+      expect(result.messages[2].contentBlocks).toEqual([{ type: 'context_compacted' }]);
+      expect(result.messages[2].displayOrder).toEqual([0, 2, 0]);
+      expect(result.messages[3].role).toBe('user');
+      expect(result.messages[3].displayContent).toBe('/compact');
+      expect(result.messages[3].displayOrder).toEqual([0, 4, 0]);
     });
 
     it('renders compact cancellation stderr as interrupt (not filtered)', async () => {

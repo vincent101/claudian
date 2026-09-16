@@ -4,6 +4,7 @@ import { Menu, Notice } from 'obsidian';
 import { ProviderRegistry } from '@/core/providers/ProviderRegistry';
 import { ConversationHistoryHydrationError } from '@/core/providers/types';
 import { ConversationController, type ConversationControllerDeps } from '@/features/chat/controllers/ConversationController';
+import * as historySearchModule from '@/features/chat/controllers/HistorySearchController';
 import { ProjectionWriteCoordinator } from '@/features/chat/rendering/ProjectionWriteCoordinator';
 import { ChatState } from '@/features/chat/state/ChatState';
 import { confirm } from '@/shared/modals/ConfirmModal';
@@ -254,13 +255,13 @@ describe('ConversationController', () => {
 
     it('reuses loaded message nodes and preserves the scroll anchor when loading earlier', async () => {
       deps.state.currentConversationId = 'large';
-      const existing = { id: 'latest', role: 'user', content: 'latest', timestamp: 100 } as any;
+      const existing = { id: 'latest', role: 'user', content: 'latest', timestamp: 100, displayOrder: [1, 0, 0] } as any;
       deps.state.messages = [existing];
       const lease = makeLease(100);
       deps.state.historyLease = lease as any;
       deps.state.loadedRanges = [{ start: 50, end: 100 }];
       deps.state.historyHasMore = true;
-      const older = { id: 'older', role: 'user', content: 'older', timestamp: 1 } as any;
+      const older = { id: 'older', role: 'user', content: 'older', timestamp: 1, displayOrder: [0, 0, 0] } as any;
       lease.loadWindow.mockResolvedValue({ messages: [older], range: { start: 0, end: 50 }, snapshotOffset: 5, sourceBytes: 1, projectedChars: 1, oversizedTurnCount: 0, pageKey: 'w:0:50', hasMoreBefore: false, hasMoreAfter: true });
 
       await controller.loadOlderHistory();
@@ -272,11 +273,11 @@ describe('ConversationController', () => {
 
     it('locates a distant search hit through the searchLocate budget window', async () => {
       deps.state.currentConversationId = 'large';
-      deps.state.messages = [{ id: 'latest', role: 'user', content: 'latest', timestamp: 100 }];
+      deps.state.messages = [{ id: 'latest', role: 'user', content: 'latest', timestamp: 100, displayOrder: [1, 0, 0] }];
       const lease = makeLease(200);
       deps.state.historyLease = lease as any;
       deps.state.loadedRanges = [{ start: 150, end: 200 }];
-      lease.loadWindow.mockResolvedValueOnce({ messages: [{ id: 'target', role: 'user', content: 'needle', timestamp: 50 }], range: { start: 25, end: 26 }, snapshotOffset: 5, sourceBytes: 1, projectedChars: 1, oversizedTurnCount: 0, pageKey: 'w:25:26', hasMoreBefore: true, hasMoreAfter: true });
+      lease.loadWindow.mockResolvedValueOnce({ messages: [{ id: 'target', role: 'user', content: 'needle', timestamp: 50, displayOrder: [0, 25, 0] }], range: { start: 25, end: 26 }, snapshotOffset: 5, sourceBytes: 1, projectedChars: 1, oversizedTurnCount: 0, pageKey: 'w:25:26', hasMoreBefore: true, hasMoreAfter: true });
       (deps.renderer.findMessageElement as jest.Mock).mockReturnValueOnce(null).mockReturnValue({} as HTMLElement);
 
       await controller.locateHistorySearchResult({ projectionKey: 'target', turnIndex: 25, matchOrdinal: 0, matchedText: 'needle' });
@@ -638,6 +639,181 @@ describe('ConversationController', () => {
 
       liveLease!.release();
       await expect(locatePromise).rejects.toThrow('projection_mismatch');
+    });
+
+    // ============================================
+    // Unified results semantics (③ + P0a fallback)
+    // ============================================
+
+    it('searches fully-hydrated loaded messages without a lease (Codex/OpenCode fallback)', async () => {
+      deps.state.currentConversationId = 'codex-conv';
+      deps.state.messages = [
+        { id: 'm1', role: 'user', content: 'needle here', timestamp: 1 },
+        { id: 'm2', role: 'assistant', content: 'not rendered', timestamp: 2 },
+      ] as any;
+      const mounted = createMockEl();
+      (deps.renderer.findMessageElement as jest.Mock).mockImplementation((key: string) => (key === 'm1' ? mounted : null));
+      const mockEnumerate = jest.spyOn(historySearchModule, 'enumerateVisibleMatches')
+        .mockReturnValue([{ ordinal: 0, ranges: [{ toString: () => 'Need' } as any, { toString: () => 'le' } as any] }, { ordinal: 1, ranges: [{ toString: () => 'needle' } as any] }]);
+
+      const results = await controller.searchHistory('needle');
+
+      // Only the mounted projection counts; locating must not trigger any
+      // window load for the unmounted message.
+      expect(results).toEqual([
+        { projectionKey: 'm1', turnIndex: 0, matchOrdinal: 0, matchedText: 'Needle' },
+        { projectionKey: 'm1', turnIndex: 0, matchOrdinal: 1, matchedText: 'needle' },
+      ]);
+      expect(deps.renderer.waitForMessageContentRendered).toHaveBeenCalledWith('m1');
+      mockEnumerate.mockRestore();
+    });
+
+    it('does not leak the previous conversation into a lease-less fallback search after switching', async () => {
+      deps.state.currentConversationId = 'codex-conv';
+      deps.state.messages = [
+        { id: 'old-1', role: 'user', content: 'needle in old conversation', timestamp: 1 },
+      ] as any;
+      const mounted = createMockEl();
+      (deps.renderer.findMessageElement as jest.Mock).mockReturnValue(mounted);
+      const mockEnumerate = jest.spyOn(historySearchModule, 'enumerateVisibleMatches')
+        .mockReturnValue([{ ordinal: 0, ranges: [{ toString: () => 'needle' } as any] }]);
+
+      await controller.searchHistory('needle');
+
+      // The conversation switched: the fallback enumerates the new state only.
+      deps.state.currentConversationId = 'codex-conv-2';
+      deps.state.messages = [
+        { id: 'new-1', role: 'user', content: 'fresh', timestamp: 1 },
+      ] as any;
+      const second = await controller.searchHistory('needle');
+
+      expect(second.map(result => result.projectionKey)).toEqual(['new-1']);
+      mockEnumerate.mockRestore();
+    });
+
+    it('keeps projection mismatches out of the navigable results and records them as diagnostics', async () => {
+      const lease = makeLease(10);
+      deps.state.historyLease = lease as any;
+      lease.search.mockResolvedValue([
+        { projectionKey: 'm1', turnIndex: 0, matchOrdinal: 0, matchedText: 'needle' },
+        { projectionKey: 'm1', turnIndex: 0, matchOrdinal: 1, matchedText: 'needle' },
+        { projectionKey: 'm1', turnIndex: 0, matchOrdinal: 2, matchedText: 'needle' },
+        { projectionKey: 'm2', turnIndex: 1, matchOrdinal: 0, matchedText: 'needle' },
+      ]);
+      const mounted = createMockEl();
+      const detached = createMockEl();
+      (deps.renderer.findMessageElement as jest.Mock).mockImplementation((key: string) => (key === 'm1' ? mounted : null));
+      lease.loadRange.mockResolvedValue({ messages: [{ id: 'm2', role: 'assistant', content: 'needle once', timestamp: 2 }], range: { start: 1, end: 2 } });
+      (deps.renderer.renderSearchCandidate as jest.Mock).mockResolvedValue(detached);
+      const mockEnumerate = jest.spyOn(historySearchModule, 'enumerateVisibleMatches')
+        .mockImplementation((root: HTMLElement) =>
+          root === mounted ? [{ ordinal: 0, ranges: [] }, { ordinal: 1, ranges: [] }] : [{ ordinal: 0, ranges: [] }]);
+
+      const results = await controller.searchHistory('needle');
+
+      // m1 has 3 detail candidates but only 2 mountable ordinals; m2 mounts 1.
+      expect(results).toEqual([
+        expect.objectContaining({ projectionKey: 'm1', matchOrdinal: 0 }),
+        expect.objectContaining({ projectionKey: 'm1', matchOrdinal: 1 }),
+        expect.objectContaining({ projectionKey: 'm2', matchOrdinal: 0 }),
+      ]);
+      expect(controller.getSearchDiagnostics()).toEqual([
+        expect.objectContaining({ projectionKey: 'm1', matchOrdinal: 2, status: 'projection_mismatch' }),
+      ]);
+      mockEnumerate.mockRestore();
+    });
+
+    it('releases the orphaned previous lease when a mid-refresh conversation switch makes the rollback impossible', async () => {
+      deps.state.currentConversationId = 'large';
+      const conversation = { id: 'large', providerId: 'claude', title: 'Large', messages: [], sessionId: 'session', createdAt: 1, updatedAt: 1 } as any;
+      (deps.plugin.getConversationSync as jest.Mock).mockReturnValue(conversation);
+      const previous = makeLease(100);
+      deps.state.historyLease = previous as any;
+      let rejectReady!: (error: Error) => void;
+      const next = makeLease(100);
+      next.ready = new Promise<void>((_resolve, reject) => { rejectReady = reject; });
+      const service = { acquireHistoryIndex: jest.fn().mockReturnValue(next) };
+      jest.spyOn(ProviderRegistry, 'getConversationHistoryService').mockReturnValue(service as any);
+
+      const refreshPromise = controller.refreshHistorySearchSnapshot();
+      await Promise.resolve();
+      // The conversation switched while the new index build failed: the
+      // switch already released and cleared the pending lease, so restoring
+      // `previous` onto the tab would pollute the new conversation.
+      deps.state.currentConversationId = 'switched';
+      deps.state.historyLease = null;
+      rejectReady(new Error('index build failed'));
+
+      await expect(refreshPromise).rejects.toThrow('index build failed');
+
+      // The previous lease is released exactly once (no leak) and the null
+      // state of the switched-to conversation stays untouched.
+      expect(previous.release).toHaveBeenCalledTimes(1);
+      expect(deps.state.historyLease).toBeNull();
+    });
+
+    // ============================================
+    // displayOrder structural merges (③ canonical order)
+    // ============================================
+
+    it('merges an older window page by displayOrder with the live tail kept last', async () => {
+      deps.state.currentConversationId = 'large';
+      deps.state.messages = [
+        { id: 'sdk', role: 'user', content: 'sdk', timestamp: 100, displayOrder: [1, 0, 0] },
+        { id: 'live', role: 'assistant', content: 'live', timestamp: 101 },
+      ] as any;
+      const lease = makeLease(100);
+      deps.state.historyLease = lease as any;
+      deps.state.loadedRanges = [{ start: 50, end: 100 }];
+      deps.state.historyHasMore = true;
+      const older = { id: 'older', role: 'user', content: 'older', timestamp: 999, displayOrder: [0, 5, 0] } as any;
+      lease.loadWindow.mockResolvedValue({ messages: [older], range: { start: 0, end: 50 }, snapshotOffset: 5, sourceBytes: 1, projectedChars: 1, oversizedTurnCount: 0, pageKey: 'w:0:50', hasMoreBefore: false, hasMoreAfter: true });
+
+      await controller.loadOlderHistory();
+
+      expect(deps.renderer.prependMessages).toHaveBeenCalledWith(
+        [older],
+        [older, expect.objectContaining({ id: 'sdk' }), expect.objectContaining({ id: 'live' })],
+      );
+    });
+
+    it('merges an around search-locate window by displayOrder', async () => {
+      deps.state.currentConversationId = 'large';
+      deps.state.messages = [
+        { id: 'sdk', role: 'user', content: 'sdk', timestamp: 100, displayOrder: [1, 0, 0] },
+        { id: 'live', role: 'assistant', content: 'live', timestamp: 101 },
+      ] as any;
+      const lease = makeLease(100);
+      deps.state.historyLease = lease as any;
+      deps.state.loadedRanges = [{ start: 50, end: 100 }];
+      const hit = { id: 'hit', role: 'user', content: 'needle', timestamp: 999, displayOrder: [0, 5, 0] } as any;
+      lease.loadWindow.mockResolvedValue({ messages: [hit], range: { start: 5, end: 6 }, snapshotOffset: 5, sourceBytes: 1, projectedChars: 1, oversizedTurnCount: 0, pageKey: 'w:5:6', hasMoreBefore: true, hasMoreAfter: true });
+      (deps.renderer.findMessageElement as jest.Mock).mockReturnValueOnce(null).mockReturnValue({} as HTMLElement);
+
+      await controller.locateHistorySearchResult({ projectionKey: 'hit', turnIndex: 5, matchOrdinal: 0, matchedText: 'needle' });
+
+      const rendered = (deps.renderer.renderMessages as jest.Mock).mock.calls[0][0] as Array<{ id: string }>;
+      expect(rendered.map(message => message.id)).toEqual(['hit', 'sdk', 'live']);
+    });
+
+    it('merges a legacy loadRange page by displayOrder', async () => {
+      deps.state.currentConversationId = 'large';
+      deps.state.messages = [
+        { id: 'sdk', role: 'user', content: 'sdk', timestamp: 100, displayOrder: [1, 0, 0] },
+        { id: 'live', role: 'assistant', content: 'live', timestamp: 101 },
+      ] as any;
+      const lease = makeLease(120);
+      delete (lease as any).loadWindow;
+      deps.state.historyLease = lease as any;
+      deps.state.loadedRanges = [{ start: 70, end: 120 }];
+      deps.state.historyHasMore = true;
+      const older = { id: 'older', role: 'user', content: 'older', timestamp: 999, displayOrder: [0, 5, 0] } as any;
+      lease.loadRange.mockResolvedValue({ messages: [older], range: { start: 20, end: 70 } });
+
+      await controller.loadOlderHistory();
+
+      const prepend = (deps.renderer.prependMessages as jest.Mock).mock.calls[0] as Array<any>;
+      expect(prepend[1].map((message: { id: string }) => message.id)).toEqual(['older', 'sdk', 'live']);
     });
   });
 

@@ -49,6 +49,8 @@ export interface TranscriptTurnIndex {
 export interface TranscriptSearchCorpusItem {
   projectionKey: string;
   turnIndex: number;
+  /** Canonical entry index of the first contributing row: structural ordering key. */
+  entryIndex: number;
   timestamp?: string;
   textOffset: number;
   textLength: number;
@@ -207,6 +209,7 @@ async function finalizeIndex(
         searchCorpus.push({
           projectionKey,
           turnIndex: currentTurnIndex,
+          entryIndex: index,
           timestamp: entry.timestamp,
           textOffset: searchTextLength,
           textLength: entry.searchText.length,

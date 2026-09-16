@@ -1,6 +1,8 @@
 // Chat types
 export {
+  type ChatDisplayOrder,
   type ChatMessage,
+  compareChatDisplayOrder,
   type ContentBlock,
   type Conversation,
   type ConversationMeta,

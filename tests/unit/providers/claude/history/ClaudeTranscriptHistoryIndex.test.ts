@@ -114,6 +114,33 @@ describe('ClaudeTranscriptHistoryIndex', () => {
     expect(result.index.searchText).toContain('first\n\nneedle');
   });
 
+  it('stamps each corpus item with its canonical entry index for structural ordering', async () => {
+    const path = join(process.env.TMPDIR ?? '/tmp', `claudian-corpus-order-${process.pid}.jsonl`);
+    const lines = [
+      JSON.stringify({ type: 'user', uuid: 'u1', message: { content: 'question' } }),
+      JSON.stringify({ type: 'assistant', uuid: 'a1', parentUuid: 'u1', message: { content: 'first' } }),
+      JSON.stringify({ type: 'assistant', uuid: 'synthetic', parentUuid: 'a1', message: { model: '<synthetic>', content: 'skip' } }),
+      JSON.stringify({ type: 'assistant', uuid: 'a2', parentUuid: 'synthetic', message: { content: 'needle' } }),
+      JSON.stringify({ type: 'system', subtype: 'compact_boundary', uuid: 'compact', parentUuid: 'a2', timestamp: '2026-01-01T00:00:00Z' }),
+      JSON.stringify({ type: 'assistant', uuid: 'a3', parentUuid: 'compact', message: { content: 'after compact' } }),
+    ];
+    await writeFile(path, `${lines.join('\n')}\n`);
+
+    const result = await buildTranscriptIndex(path, { useWorker: false });
+
+    expect(result.status).toBe('complete');
+    if (result.status !== 'complete') return;
+    // Corpus items carry the canonical entry index of their first contributing
+    // row (skipped rows occupy their index; merged assistants keep the first
+    // row's position) so search results order structurally, never by
+    // projectionKey string comparison.
+    expect(result.index.searchCorpus.map(item => [item.projectionKey, item.entryIndex])).toEqual([
+      ['u1', 0],
+      ['a1', 1],
+      ['a3', 5],
+    ]);
+  });
+
   it('indexes an external meta row and materializes byte-exact pages across chunks', async () => {
     const path = join(process.env.TMPDIR ?? '/tmp', `claudian-index-${process.pid}.jsonl`);
     const lines = [

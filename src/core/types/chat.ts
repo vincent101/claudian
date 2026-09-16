@@ -59,6 +59,35 @@ export interface ChatMessage {
   userMessageId?: string;
   /** Provider-native assistant message identifier used for rewind/fork checkpoints. */
   assistantMessageId?: string;
+  /**
+   * Opaque structural order key (canonical position of the materialized
+   * projection). Read-only for consumers: only the owning provider assigns it
+   * while materializing history; merges and renders sort by it and must never
+   * fall back to timestamps. Live/unmaterialized messages carry no key and
+   * sort stably after keyed ones (live tail).
+   */
+  displayOrder?: ChatDisplayOrder;
+}
+
+/** [segmentOrdinal, entryOrdinal, projectionOrdinal] — see ChatMessage.displayOrder. */
+export type ChatDisplayOrder = readonly [number, number, number];
+
+/**
+ * Canonical structural order for materialized history merges. Keyed messages
+ * (provider-materialized) order by their display key; keyless ones (live
+ * turns, provider-less fallbacks) keep their incoming relative order behind
+ * every keyed message. Returns 0 only for two keyless messages so the stable
+ * sort preserves the live tail.
+ */
+export function compareChatDisplayOrder(a: ChatMessage, b: ChatMessage): number {
+  const left = a.displayOrder;
+  const right = b.displayOrder;
+  if (left && right) {
+    return left[0] - right[0] || left[1] - right[1] || left[2] - right[2];
+  }
+  if (left) return -1;
+  if (right) return 1;
+  return 0;
 }
 
 /** Persisted conversation with messages and session state. */
