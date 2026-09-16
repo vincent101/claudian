@@ -100,7 +100,9 @@
       "timestamp": "보낸 시간: {time}",
       "expandFullContent": "전체 내용 보기",
       "contentTruncatedNote": "미리보기 — 총 {count}자",
-      "tooLargeToRender": "내용이 너무 커서 인라인 렌더링할 수 없습니다({count}자)."
+      "tooLargeToRender": "내용이 너무 커서 인라인 렌더링할 수 없습니다({count}자).",
+      "copyAriaLabel": "메시지 복사",
+      "copied": "복사됨"
     },
     "tabs": {
       "moveLeft": "왼쪽으로 이동",

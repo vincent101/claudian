@@ -100,7 +100,9 @@
       "timestamp": "Enviado: {time}",
       "expandFullContent": "Mostrar contenido completo",
       "contentTruncatedNote": "Vista previa — {count} caracteres en total",
-      "tooLargeToRender": "El contenido es demasiado grande para mostrarlo en línea ({count} caracteres)."
+      "tooLargeToRender": "El contenido es demasiado grande para mostrarlo en línea ({count} caracteres).",
+      "copyAriaLabel": "Copy message",
+      "copied": "copied!"
     },
     "tabs": {
       "moveLeft": "Move left",

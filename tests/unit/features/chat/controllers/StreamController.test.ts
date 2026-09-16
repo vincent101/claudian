@@ -103,7 +103,7 @@ function createMockDeps(): StreamControllerDeps {
     state,
     renderer: {
       renderContent: jest.fn(),
-      addTextCopyButton: jest.fn(),
+      syncLiveMessageActions: jest.fn(),
       domEpoch: 0,
       isMounted: () => true,
     } as any,
@@ -271,10 +271,7 @@ describe("StreamController - Text Content", () => {
         expect.anything(),
         'Hello'
       );
-      expect(deps.renderer.addTextCopyButton).toHaveBeenCalledWith(
-        expect.anything(),
-        'Hello'
-      );
+      expect(deps.renderer.syncLiveMessageActions).toHaveBeenCalledWith(msg);
       expect(msg.contentBlocks).toContainEqual({
         type: 'text',
         content: 'Hello',
@@ -298,54 +295,49 @@ describe("StreamController - Text Content", () => {
         expect.anything(),
         'Final $x^2$'
       );
-      expect(deps.renderer.addTextCopyButton).toHaveBeenCalledWith(
-        expect.anything(),
-        'Final $x^2$'
-      );
+      expect(deps.renderer.syncLiveMessageActions).toHaveBeenCalledWith(msg);
     });
   });
 
   describe('Text block finalization', () => {
-    it('should add copy button when finalizing text block with content', async () => {
+    it('should sync the message-level copy action when finalizing text with content', async () => {
       const msg = createTestMessage();
       deps.state.currentTextEl = createMockEl();
       deps.state.currentTextContent = 'Hello World';
 
       await controller.finalizeCurrentTextBlock(msg);
 
-      expect(deps.renderer.addTextCopyButton).toHaveBeenCalledWith(
-        expect.anything(),
-        'Hello World'
-      );
+      expect(deps.renderer.syncLiveMessageActions).toHaveBeenCalledWith(msg);
       expect(msg.contentBlocks).toContainEqual({
         type: 'text',
         content: 'Hello World',
       });
     });
 
-    it('should not add copy button when no text element exists', async () => {
+    it('should still request the toolbar sync on detached turns (renderer no-ops)', async () => {
       const msg = createTestMessage();
       deps.state.currentTextEl = null;
       deps.state.currentTextContent = 'Hello World';
 
       await controller.finalizeCurrentTextBlock(msg);
 
-      expect(deps.renderer.addTextCopyButton).not.toHaveBeenCalled();
-      // Content block should still be added
+      // Element resolution moved into the renderer: a detached turn still
+      // lands the domain block and asks for a sync that safely no-ops.
+      expect(deps.renderer.syncLiveMessageActions).toHaveBeenCalledWith(msg);
       expect(msg.contentBlocks).toContainEqual({
         type: 'text',
         content: 'Hello World',
       });
     });
 
-    it('should not add copy button when no text content exists', async () => {
+    it('should not request a toolbar sync when no text content exists', async () => {
       const msg = createTestMessage();
       deps.state.currentTextEl = createMockEl();
       deps.state.currentTextContent = '';
 
       await controller.finalizeCurrentTextBlock(msg);
 
-      expect(deps.renderer.addTextCopyButton).not.toHaveBeenCalled();
+      expect(deps.renderer.syncLiveMessageActions).not.toHaveBeenCalled();
       expect(msg.contentBlocks).toEqual([]);
     });
 
@@ -1613,10 +1605,7 @@ describe("StreamController - Text Content", () => {
       expect(msg.contentBlocks).toContainEqual(
         expect.objectContaining({ type: 'text', content: 'Some text' })
       );
-      expect(deps.renderer.addTextCopyButton).toHaveBeenCalledWith(
-        expect.anything(),
-        'Some text'
-      );
+      expect(deps.renderer.syncLiveMessageActions).toHaveBeenCalledWith(msg);
     });
 
     it('tool_use arrives while thinking state → finalizeCurrentThinkingBlock is called', async () => {

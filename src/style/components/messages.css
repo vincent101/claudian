@@ -200,40 +200,6 @@
   margin: 0;
 }
 
-.claudian-text-copy-btn {
-  position: absolute;
-  bottom: 0;
-  inset-inline-end: 0;
-  border: none;
-  color: var(--text-faint);
-  cursor: pointer;
-  opacity: 0;
-  transition: opacity 0.15s ease, color 0.15s ease;
-  z-index: 2;
-  display: flex;
-  align-items: center;
-  gap: 4px;
-}
-
-.claudian-text-copy-btn svg {
-  width: 16px;
-  height: 16px;
-}
-
-.claudian-text-block:hover .claudian-text-copy-btn {
-  opacity: 1;
-}
-
-.claudian-text-copy-btn:hover {
-  color: var(--text-normal);
-}
-
-.claudian-text-copy-btn.copied {
-  color: var(--text-accent);
-  font-size: 11px;
-  font-family: var(--font-monospace);
-}
-
 .claudian-text-block+.claudian-tool-call {
   margin-top: 8px;
 }
@@ -308,7 +274,8 @@
   font-style: italic;
 }
 
-/* Action buttons toolbar below user messages */
+/* Message-level action toolbar (copy, rewind, fork, timestamp) shared by
+   user and assistant messages; shown on message hover/focus-within. */
 .claudian-message-actions {
   position: absolute;
   bottom: -20px;
@@ -325,11 +292,12 @@
   opacity: 1;
 }
 
-/* Assistant messages carry only the non-interactive timestamp. The -20px hang
-   below the box (user-button toolbar design) drops it onto the next message,
-   and a collapsed subagent block ends ~18px (subagent-list margin + box
-   padding) above the box edge, pushing the stamp well into the following user
-   bubble. Anchor it inside the box's bottom strip instead. */
+/* Assistant toolbars anchor inside the box's bottom strip: the -20px hang
+   below the box (user-button toolbar design) drops the toolbar onto the next
+   message, and a collapsed subagent block ends ~18px (subagent-list margin +
+   box padding) above the box edge, pushing it well into the following user
+   bubble. The 0b461e03 fix stays until the reserved-space acceptance pass
+   proves a below-box hang cannot overlap the next message again. */
 .claudian-message-assistant .claudian-message-actions {
   bottom: 0;
 }

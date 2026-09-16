@@ -18,6 +18,7 @@ import { renderStoredAsyncSubagent, renderStoredSubagent } from '@/features/chat
 import { renderStoredThinkingBlock } from '@/features/chat/rendering/ThinkingBlockRenderer';
 import { renderStoredToolCall } from '@/features/chat/rendering/ToolCallRenderer';
 import { renderStoredWriteEdit } from '@/features/chat/rendering/WriteEditRenderer';
+import { t } from '@/i18n/i18n';
 
 jest.mock('@/features/chat/rendering/SubagentRenderer', () => ({
   renderStoredAsyncSubagent: jest.fn().mockReturnValue({ wrapperEl: {}, cleanup: jest.fn() }),
@@ -413,6 +414,255 @@ describe('MessageRenderer', () => {
     expect(rewindCallback).toHaveBeenCalledWith('u1');
   });
 
+  describe('message-level toolbar sync (assistant/user alignment)', () => {
+    const timestamp = new Date(2026, 8, 14, 20, 35, 3).getTime();
+
+    function findToolbarChildren(messagesEl: any, messageIndex = 0) {
+      const msgEl = (messagesEl.children as any[])[messageIndex];
+      const toolbar = (msgEl.children as any[]).find((child: any) => child.hasClass?.('claudian-message-actions'));
+      return { msgEl, toolbar };
+    }
+
+    it('places the assistant copy action in the message toolbar before the timestamp', () => {
+      const messagesEl = createMockEl();
+      const { renderer } = createRenderer(messagesEl);
+      jest.spyOn(renderer, 'renderContent').mockResolvedValue(undefined);
+
+      renderer.renderStoredMessage({
+        id: 'a-copy',
+        role: 'assistant',
+        content: '',
+        contentBlocks: [{ type: 'text', content: 'Answer body' } as any],
+        timestamp,
+      });
+
+      const { msgEl, toolbar } = findToolbarChildren(messagesEl);
+      expect(toolbar).toBeDefined();
+      // Toolbar is a direct child of the message element, never nested in content.
+      expect((msgEl.children as any[]).includes(toolbar)).toBe(true);
+      const toolbarClasses = (toolbar.children as any[]).map((child: any) => child.className);
+      expect(toolbarClasses).toEqual(['claudian-message-copy-btn', 'claudian-message-timestamp']);
+    });
+
+    it('keeps one copy button for multi-block assistant messages and joins all text blocks', async () => {
+      const messagesEl = createMockEl();
+      const { renderer } = createRenderer(messagesEl);
+      jest.spyOn(renderer, 'renderContent').mockResolvedValue(undefined);
+      const writeTextMock = jest.fn().mockResolvedValue(undefined);
+      Object.defineProperty(globalThis, 'navigator', {
+        value: { clipboard: { writeText: writeTextMock } },
+        writable: true,
+        configurable: true,
+      });
+
+      renderer.renderStoredMessage({
+        id: 'a-multi',
+        role: 'assistant',
+        content: '',
+        contentBlocks: [
+          { type: 'text', content: 'First part' } as any,
+          { type: 'thinking', content: 'hidden reasoning' } as any,
+          { type: 'text', content: 'Second part' } as any,
+        ],
+        timestamp,
+      });
+
+      const { toolbar } = findToolbarChildren(messagesEl);
+      const copyButtons = (toolbar.children as any[]).filter((child: any) => child.hasClass('claudian-message-copy-btn'));
+      expect(copyButtons).toHaveLength(1);
+
+      const clickHandlers = copyButtons[0]._eventListeners.get('click');
+      await clickHandlers[0]({ stopPropagation: jest.fn() });
+
+      // Thinking blocks are excluded; text blocks join in display order.
+      expect(writeTextMock).toHaveBeenCalledWith('First part\n\nSecond part');
+    });
+
+    it('falls back to msg.content for old assistant messages without contentBlocks', async () => {
+      const messagesEl = createMockEl();
+      const { renderer } = createRenderer(messagesEl);
+      jest.spyOn(renderer, 'renderContent').mockResolvedValue(undefined);
+      const writeTextMock = jest.fn().mockResolvedValue(undefined);
+      Object.defineProperty(globalThis, 'navigator', {
+        value: { clipboard: { writeText: writeTextMock } },
+        writable: true,
+        configurable: true,
+      });
+
+      renderer.renderStoredMessage({
+        id: 'a-legacy',
+        role: 'assistant',
+        content: 'Legacy answer',
+        toolCalls: [{ id: 't1', name: 'Read', input: {}, status: 'completed' } as any],
+        timestamp,
+      });
+
+      const { toolbar } = findToolbarChildren(messagesEl);
+      const copyBtn = (toolbar.children as any[]).find((child: any) => child.hasClass('claudian-message-copy-btn'));
+      expect(copyBtn).toBeDefined();
+
+      await copyBtn._eventListeners.get('click')[0]({ stopPropagation: jest.fn() });
+      expect(writeTextMock).toHaveBeenCalledWith('Legacy answer');
+    });
+
+    it('renders no copy action for tool-only assistant messages', () => {
+      const messagesEl = createMockEl();
+      const { renderer } = createRenderer(messagesEl);
+      jest.spyOn(renderer, 'renderContent').mockResolvedValue(undefined);
+
+      renderer.renderStoredMessage({
+        id: 'a-tools',
+        role: 'assistant',
+        content: '',
+        contentBlocks: [{ type: 'tool_use', toolId: 't1' } as any],
+        toolCalls: [{ id: 't1', name: 'Read', input: {}, status: 'completed' } as any],
+        timestamp,
+      });
+
+      const { toolbar } = findToolbarChildren(messagesEl);
+      expect(toolbar).toBeDefined();
+      expect(toolbar.querySelector('.claudian-message-copy-btn')).toBeNull();
+      expect(toolbar.querySelector('.claudian-message-timestamp')).not.toBeNull();
+    });
+
+    it('syncs the live assistant toolbar as text blocks finalize without adding buttons', async () => {
+      const messagesEl = createMockEl();
+      const { renderer } = createRenderer(messagesEl);
+      jest.spyOn(renderer, 'renderContent').mockResolvedValue(undefined);
+      const writeTextMock = jest.fn().mockResolvedValue(undefined);
+      Object.defineProperty(globalThis, 'navigator', {
+        value: { clipboard: { writeText: writeTextMock } },
+        writable: true,
+        configurable: true,
+      });
+
+      const liveMsg: ChatMessage = { id: 'a-live', role: 'assistant', content: '', timestamp };
+      renderer.addMessage(liveMsg);
+
+      // Live creation: timestamp only, no copy yet (nothing to copy).
+      let { toolbar } = findToolbarChildren(messagesEl);
+      expect(toolbar.querySelector('.claudian-message-timestamp')).not.toBeNull();
+      expect(toolbar.querySelector('.claudian-message-copy-btn')).toBeNull();
+
+      // First finalize lands the first text block in contentBlocks.
+      liveMsg.contentBlocks = [{ type: 'text', content: 'Streamed part' } as any];
+      renderer.syncLiveMessageActions(liveMsg);
+
+      ({ toolbar } = findToolbarChildren(messagesEl));
+      const copyButtons = (toolbar.children as any[]).filter((child: any) => child.hasClass('claudian-message-copy-btn'));
+      expect(copyButtons).toHaveLength(1);
+      expect(toolbar.querySelector('.claudian-message-timestamp')).not.toBeNull();
+
+      // A later finalize only extends the payload — still one button.
+      liveMsg.contentBlocks = [
+        { type: 'text', content: 'Streamed part' } as any,
+        { type: 'text', content: 'Follow-up part' } as any,
+      ];
+      renderer.syncLiveMessageActions(liveMsg);
+
+      ({ toolbar } = findToolbarChildren(messagesEl));
+      const updatedButtons = (toolbar.children as any[]).filter((child: any) => child.hasClass('claudian-message-copy-btn'));
+      expect(updatedButtons).toHaveLength(1);
+      await updatedButtons[0]._eventListeners.get('click')[0]({ stopPropagation: jest.fn() });
+      expect(writeTextMock).toHaveBeenCalledWith('Streamed part\n\nFollow-up part');
+    });
+
+    it('keeps the user toolbar order fork → rewind → copy → timestamp', () => {
+      const messagesEl = createMockEl();
+      const rewindCallback = jest.fn().mockResolvedValue(undefined);
+      const forkCallback = jest.fn().mockResolvedValue(undefined);
+      const renderer = new MessageRenderer(
+        { app: {}, settings: { mediaFolder: '' } } as any,
+        createMockComponent() as any,
+        messagesEl,
+        rewindCallback,
+        forkCallback,
+        mockCapabilities(),
+      );
+      jest.spyOn(renderer, 'renderContent').mockResolvedValue(undefined);
+
+      const userMsg: ChatMessage = {
+        id: 'u-order',
+        role: 'user',
+        content: 'Question',
+        timestamp,
+        userMessageId: 'user-u',
+      };
+      const allMessages: ChatMessage[] = [
+        { id: 'a1', role: 'assistant', content: '', timestamp: 1, assistantMessageId: 'prev-a' },
+        userMsg,
+        { id: 'a2', role: 'assistant', content: '', timestamp: 3, assistantMessageId: 'resp-a' },
+      ];
+      renderer.renderStoredMessage(userMsg, allMessages, 1);
+
+      const { toolbar } = findToolbarChildren(messagesEl);
+      const toolbarClasses = (toolbar.children as any[]).map((child: any) => child.className);
+      expect(toolbarClasses).toEqual([
+        'claudian-message-fork-btn',
+        'claudian-message-rewind-btn',
+        'claudian-message-copy-btn',
+        'claudian-message-timestamp',
+      ]);
+    });
+
+    it('re-syncs the live user toolbar payload on updateLiveUserMessage', async () => {
+      const messagesEl = createMockEl();
+      // A rewind callback makes addMessage track the element in liveMessageEls,
+      // which is how the live-user path resolves the mounted message.
+      const renderer = new MessageRenderer(
+        { app: {}, settings: { mediaFolder: '' } } as any,
+        createMockComponent() as any,
+        messagesEl,
+        jest.fn().mockResolvedValue(undefined),
+      );
+      jest.spyOn(renderer, 'renderContent').mockResolvedValue(undefined);
+      const writeTextMock = jest.fn().mockResolvedValue(undefined);
+      Object.defineProperty(globalThis, 'navigator', {
+        value: { clipboard: { writeText: writeTextMock } },
+        writable: true,
+        configurable: true,
+      });
+
+      const userMsg: ChatMessage = { id: 'u-live', role: 'user', content: 'draft', timestamp };
+      renderer.addMessage(userMsg);
+
+      userMsg.content = 'edited prompt';
+      renderer.updateLiveUserMessage(userMsg);
+
+      const { toolbar } = findToolbarChildren(messagesEl);
+      const copyButtons = (toolbar.children as any[]).filter((child: any) => child.hasClass('claudian-message-copy-btn'));
+      expect(copyButtons).toHaveLength(1);
+      await copyButtons[0]._eventListeners.get('click')[0]({ stopPropagation: jest.fn() });
+      expect(writeTextMock).toHaveBeenCalledWith('edited prompt');
+    });
+
+    it('shows translated copied feedback after a successful copy', async () => {
+      const messagesEl = createMockEl();
+      const { renderer } = createRenderer(messagesEl);
+      jest.spyOn(renderer, 'renderContent').mockResolvedValue(undefined);
+      Object.defineProperty(globalThis, 'navigator', {
+        value: { clipboard: { writeText: jest.fn().mockResolvedValue(undefined) } },
+        writable: true,
+        configurable: true,
+      });
+
+      renderer.renderStoredMessage({
+        id: 'a-feedback',
+        role: 'assistant',
+        content: 'Answer',
+        timestamp,
+      });
+
+      const { toolbar } = findToolbarChildren(messagesEl);
+      const copyBtn = (toolbar.children as any[]).find((child: any) => child.hasClass('claudian-message-copy-btn'));
+      expect(copyBtn.getAttribute('aria-label')).toBe(t('chat.message.copyAriaLabel'));
+
+      await copyBtn._eventListeners.get('click')[0]({ stopPropagation: jest.fn() });
+      expect(copyBtn.textContent).toBe(t('chat.message.copied'));
+      expect(copyBtn.classList.contains('copied')).toBe(true);
+    });
+  });
+
   describe('message-level timestamp toolbar', () => {
     const timestamp = new Date(2026, 8, 14, 20, 35, 3).getTime();
 
@@ -675,7 +925,6 @@ describe('MessageRenderer', () => {
     const messagesEl = createMockEl();
     const { renderer } = createRenderer(messagesEl);
     const renderContentSpy = jest.spyOn(renderer, 'renderContent').mockResolvedValue(undefined);
-    const addCopySpy = jest.spyOn(renderer, 'addTextCopyButton').mockImplementation(() => {});
 
     const msg: ChatMessage = {
       id: 'm1',
@@ -691,8 +940,9 @@ describe('MessageRenderer', () => {
 
     // Should render content text
     expect(renderContentSpy).toHaveBeenCalledWith(expect.anything(), 'Legacy response text');
-    // Should add copy button for fallback text
-    expect(addCopySpy).toHaveBeenCalledWith(expect.anything(), 'Legacy response text');
+    // Message-level toolbar carries the copy action for the fallback text
+    const toolbar = messagesEl.querySelector('.claudian-message-actions');
+    expect(toolbar?.querySelector('.claudian-message-copy-btn')).not.toBeNull();
     // Should render tool call
     expect(renderStoredToolCall).toHaveBeenCalled();
   });
@@ -1123,21 +1373,6 @@ describe('MessageRenderer', () => {
   });
 
   // ============================================
-  // Copy button
-  // ============================================
-
-  it('addTextCopyButton adds a copy button element', () => {
-    const textEl = createMockEl();
-    const { renderer } = createRenderer();
-
-    renderer.addTextCopyButton(textEl, 'some markdown');
-
-    expect(textEl.children.length).toBe(1);
-    const copyBtn = textEl.children[0];
-    expect(copyBtn.hasClass('claudian-text-copy-btn')).toBe(true);
-  });
-
-  // ============================================
   // Scroll utilities
   // ============================================
 
@@ -1239,10 +1474,10 @@ describe('MessageRenderer', () => {
   });
 
   // ============================================
-  // addTextCopyButton - click behavior
+  // message-level copy - click behavior
   // ============================================
 
-  describe('addTextCopyButton - click behavior', () => {
+  describe('message copy button - click behavior', () => {
     let originalNavigator: Navigator;
 
     beforeEach(() => {
@@ -1259,10 +1494,24 @@ describe('MessageRenderer', () => {
       });
     });
 
-    it('click should copy and show feedback', async () => {
-      const { renderer } = createRenderer();
-      const textEl = createMockEl();
+    function mountCopyButton() {
+      const messagesEl = createMockEl();
+      const { renderer } = createRenderer(messagesEl);
+      jest.spyOn(renderer, 'renderContent').mockResolvedValue(undefined);
 
+      renderer.renderStoredMessage({
+        id: 'a-copy-click',
+        role: 'assistant',
+        content: 'markdown content',
+        timestamp: 1,
+      });
+
+      const msgEl = (messagesEl.children as any[])[0];
+      const toolbar = (msgEl.children as any[]).find((child: any) => child.hasClass('claudian-message-actions'));
+      return (toolbar.children as any[]).find((child: any) => child.hasClass('claudian-message-copy-btn'));
+    }
+
+    it('click should copy and show feedback', async () => {
       const writeTextMock = jest.fn().mockResolvedValue(undefined);
       Object.defineProperty(globalThis, 'navigator', {
         value: { clipboard: { writeText: writeTextMock } },
@@ -1270,26 +1519,18 @@ describe('MessageRenderer', () => {
         configurable: true,
       });
 
-      renderer.addTextCopyButton(textEl, 'markdown content');
-
-      const copyBtn = textEl.children[0];
-      expect(copyBtn.hasClass('claudian-text-copy-btn')).toBe(true);
-
-      // Simulate click
+      const copyBtn = mountCopyButton();
       const clickHandlers = copyBtn._eventListeners.get('click');
       expect(clickHandlers).toBeDefined();
 
-      await clickHandlers![0]({ stopPropagation: jest.fn() });
+      await clickHandlers[0]({ stopPropagation: jest.fn() });
 
       expect(writeTextMock).toHaveBeenCalledWith('markdown content');
-      expect(copyBtn.textContent).toBe('copied!');
+      expect(copyBtn.textContent).toBe(t('chat.message.copied'));
       expect(copyBtn.classList.contains('copied')).toBe(true);
     });
 
     it('should handle clipboard API failure gracefully', async () => {
-      const { renderer } = createRenderer();
-      const textEl = createMockEl();
-
       const writeTextMock = jest.fn().mockRejectedValue(new Error('not allowed'));
       Object.defineProperty(globalThis, 'navigator', {
         value: { clipboard: { writeText: writeTextMock } },
@@ -1297,16 +1538,14 @@ describe('MessageRenderer', () => {
         configurable: true,
       });
 
-      renderer.addTextCopyButton(textEl, 'content');
-
-      const copyBtn = textEl.children[0];
+      const copyBtn = mountCopyButton();
       const clickHandlers = copyBtn._eventListeners.get('click');
 
       // Should not throw
-      await clickHandlers![0]({ stopPropagation: jest.fn() });
+      await clickHandlers[0]({ stopPropagation: jest.fn() });
 
       // Should not show feedback on error
-      expect(copyBtn.textContent).not.toBe('copied!');
+      expect(copyBtn.textContent).not.toBe(t('chat.message.copied'));
     });
   });
 
@@ -1652,10 +1891,10 @@ describe('MessageRenderer', () => {
   });
 
   // ============================================
-  // addTextCopyButton - rapid click handling
+  // message-level copy - rapid click handling
   // ============================================
 
-  describe('addTextCopyButton - rapid click handling', () => {
+  describe('message copy button - rapid click handling', () => {
     let originalNavigator: Navigator;
 
     beforeEach(() => {
@@ -1677,44 +1916,52 @@ describe('MessageRenderer', () => {
       });
     });
 
+    function mountCopyButton() {
+      const messagesEl = createMockEl();
+      const { renderer } = createRenderer(messagesEl);
+      jest.spyOn(renderer, 'renderContent').mockResolvedValue(undefined);
+
+      renderer.renderStoredMessage({
+        id: 'a-copy-rapid',
+        role: 'assistant',
+        content: 'content to copy',
+        timestamp: 1,
+      });
+
+      const msgEl = (messagesEl.children as any[])[0];
+      const toolbar = (msgEl.children as any[]).find((child: any) => child.hasClass('claudian-message-actions'));
+      return (toolbar.children as any[]).find((child: any) => child.hasClass('claudian-message-copy-btn'));
+    }
+
     it('rapid clicks clear previous timeout', async () => {
-      const { renderer } = createRenderer();
-      const textEl = createMockEl();
       const clearTimeoutSpy = jest.spyOn(globalThis, 'clearTimeout');
 
-      renderer.addTextCopyButton(textEl, 'content to copy');
-
-      const copyBtn = textEl.children[0];
+      const copyBtn = mountCopyButton();
       const clickHandlers = copyBtn._eventListeners.get('click');
       expect(clickHandlers).toBeDefined();
 
       // First click
       await clickHandlers![0]({ stopPropagation: jest.fn() });
-      expect(copyBtn.textContent).toBe('copied!');
+      expect(copyBtn.textContent).toBe(t('chat.message.copied'));
 
       // Second rapid click before timeout expires
       await clickHandlers![0]({ stopPropagation: jest.fn() });
 
       // clearTimeout should have been called for the first pending timeout
       expect(clearTimeoutSpy).toHaveBeenCalled();
-      expect(copyBtn.textContent).toBe('copied!');
+      expect(copyBtn.textContent).toBe(t('chat.message.copied'));
 
       clearTimeoutSpy.mockRestore();
     });
 
     it('feedback timeout restores icon after delay', async () => {
-      const { renderer } = createRenderer();
-      const textEl = createMockEl();
-
-      renderer.addTextCopyButton(textEl, 'content to copy');
-
-      const copyBtn = textEl.children[0];
+      const copyBtn = mountCopyButton();
       const originalInnerHTML = copyBtn.innerHTML;
       const clickHandlers = copyBtn._eventListeners.get('click');
 
       // Click to copy
       await clickHandlers![0]({ stopPropagation: jest.fn() });
-      expect(copyBtn.textContent).toBe('copied!');
+      expect(copyBtn.textContent).toBe(t('chat.message.copied'));
       expect(copyBtn.classList.contains('copied')).toBe(true);
 
       // Advance timers by 1500ms (the feedback duration)

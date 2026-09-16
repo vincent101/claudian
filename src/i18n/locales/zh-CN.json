@@ -100,7 +100,9 @@
       "timestamp": "发送于 {time}",
       "expandFullContent": "显示完整内容",
       "contentTruncatedNote": "预览 — 共 {count} 字符",
-      "tooLargeToRender": "内容过大，无法内联渲染（{count} 字符）。"
+      "tooLargeToRender": "内容过大，无法内联渲染（{count} 字符）。",
+      "copyAriaLabel": "复制消息",
+      "copied": "已复制"
     },
     "tabs": {
       "moveLeft": "向左移动",

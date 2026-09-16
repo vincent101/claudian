@@ -78,6 +78,8 @@ export type TranslationKey =
   | 'chat.message.expandFullContent'
   | 'chat.message.contentTruncatedNote'
   | 'chat.message.tooLargeToRender'
+  | 'chat.message.copyAriaLabel'
+  | 'chat.message.copied'
 
   // Chat - Tab bar
   | 'chat.tabs.moveLeft'

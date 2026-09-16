@@ -100,7 +100,9 @@
       "timestamp": "傳送於 {time}",
       "expandFullContent": "顯示完整內容",
       "contentTruncatedNote": "預覽 — 共 {count} 字元",
-      "tooLargeToRender": "內容過大，無法內聯渲染（{count} 字元）。"
+      "tooLargeToRender": "內容過大，無法內聯渲染（{count} 字元）。",
+      "copyAriaLabel": "複製訊息",
+      "copied": "已複製"
     },
     "tabs": {
       "moveLeft": "向左移動",

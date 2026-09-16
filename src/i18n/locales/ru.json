@@ -100,7 +100,9 @@
       "timestamp": "Отправлено: {time}",
       "expandFullContent": "Показать полное содержимое",
       "contentTruncatedNote": "Предпросмотр — всего {count} символов",
-      "tooLargeToRender": "Содержимое слишком велико для отображения inline ({count} символов)."
+      "tooLargeToRender": "Содержимое слишком велико для отображения inline ({count} символов).",
+      "copyAriaLabel": "Copy message",
+      "copied": "copied!"
     },
     "tabs": {
       "moveLeft": "Move left",

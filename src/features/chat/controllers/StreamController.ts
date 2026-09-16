@@ -891,10 +891,10 @@ export class StreamController {
       }
       msg.contentBlocks = msg.contentBlocks || [];
       msg.contentBlocks.push({ type: 'text', content: textContent });
-      // Copy button added here (not during streaming) to match history-loaded messages
-      if (state.currentTextEl) {
-        renderer.addTextCopyButton(state.currentTextEl, textContent);
-      }
+      // Message-level toolbar sync (not during streaming) to match
+      // history-loaded messages: the whole-message copy action picks up the
+      // finalized block, keeping a single button per message.
+      renderer.syncLiveMessageActions(msg);
     }
     state.currentTextEl = null;
     state.currentTextContent = '';

@@ -131,7 +131,18 @@ export function createMockEl(tag = 'div'): any {
     },
 
     appendChild(child: any) { children.push(child); return child; },
-    insertBefore(el: MockElement, _ref: MockElement | null) { children.unshift(el); },
+    insertBefore(el: MockElement, ref: MockElement | null) {
+      // Real DOM semantics: an existing child is moved, not duplicated.
+      const existingIndex = children.indexOf(el);
+      if (existingIndex !== -1) children.splice(existingIndex, 1);
+      if (ref) {
+        const refIndex = children.indexOf(ref);
+        if (refIndex !== -1) children.splice(refIndex, 0, el);
+        else children.push(el);
+      } else {
+        children.push(el);
+      }
+    },
     get firstChild() { return children[0] || null; },
     remove() {},
     empty() {

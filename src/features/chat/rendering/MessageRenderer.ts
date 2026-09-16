@@ -194,13 +194,16 @@ export class MessageRenderer {
       if (textToShow) {
         const textEl = contentEl.createDiv({ cls: 'claudian-text-block' });
         void this.renderMessageContent(msg.id, [this.renderContent(textEl, textToShow)]);
-        this.addUserCopyButton(msgEl, textToShow);
       }
       if (this.rewindCallback || this.forkCallback) {
         this.liveMessageEls.set(msg.id, msgEl);
       }
+    } else {
+      // Assistant messages resolve their toolbar sync by id later, when
+      // StreamController finalizes text blocks into contentBlocks.
+      this.liveMessageEls.set(msg.id, msgEl);
     }
-    this.addMessageTimestamp(msgEl, msg.timestamp);
+    this.syncMessageActions(msgEl, msg);
 
     this.scrollToBottom();
     return msgEl;
@@ -230,14 +233,7 @@ export class MessageRenderer {
       void this.renderMessageContent(msg.id, [this.renderContent(textEl, textToShow)]);
     }
 
-    const toolbar = msgEl.querySelector('.claudian-message-actions') as HTMLElement | null;
-    if (toolbar) {
-      toolbar.querySelectorAll('.claudian-user-msg-copy-btn').forEach((el) => el.remove());
-    }
-
-    if (textToShow) {
-      this.addUserCopyButton(msgEl, textToShow);
-    }
+    this.syncMessageActions(msgEl, msg);
   }
 
   removeMessage(messageId: string): void {
@@ -529,8 +525,8 @@ export class MessageRenderer {
         let deferred = false;
         if (textToShow) {
           deferred = this.renderTextContent(contentEl, textToShow, []);
-          this.addUserCopyButton(msgEl, textToShow);
         }
+        this.syncMessageActions(msgEl, msg);
         // Summary completion must not masquerade as detail completion (B1
         // rule): a message with deferred shells notifies at summary level.
         void this.renderMessageContent(msg.id, [], deferred ? 'summary' : 'detail');
@@ -546,6 +542,7 @@ export class MessageRenderer {
         const jobs: Array<Promise<void>> = [];
         const deferred = this.renderAssistantContent(msg, contentEl, jobs);
         void this.renderMessageContent(msg.id, jobs, deferred ? 'summary' : 'detail');
+        this.syncMessageActions(msgEl, msg);
         if (msg.isInterrupt) {
           this.appendInterruptIndicator(contentEl);
         }
@@ -676,7 +673,6 @@ export class MessageRenderer {
     if (text.length <= HISTORY_RENDER_LIMITS.lazyTextChars) {
       const textEl = contentEl.createDiv({ cls: 'claudian-text-block' });
       jobs.push(this.renderContent(textEl, text));
-      this.addTextCopyButton(textEl, text);
       return false;
     }
     this.addLazyTextShell(contentEl, text);
@@ -715,7 +711,6 @@ export class MessageRenderer {
     }
     shell.removeClass('claudian-text-lazy');
     await this.renderContent(shell, text);
-    this.addTextCopyButton(shell, text);
   }
 
   /**
@@ -1005,21 +1000,86 @@ export class MessageRenderer {
   }
 
   // ============================================
-  // Copy Button
+  // Message Actions Toolbar
   // ============================================
 
   /** Clipboard icon SVG for copy button. */
   private static readonly COPY_ICON = `<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>`;
 
   /**
-   * Adds a copy button to a text block.
-   * Button shows clipboard icon on hover, changes to "copied!" on click.
-   * @param textEl The rendered text element
-   * @param markdown The original markdown content to copy
+   * Live copy payload per button element. The payload grows as streaming
+   * finalizes more text blocks, so the click handler reads it at click time
+   * instead of closing over one block's text.
    */
-  addTextCopyButton(textEl: HTMLElement, markdown: string): void {
-    const copyBtn = textEl.createSpan({ cls: 'claudian-text-copy-btn' });
+  private static readonly copyPayloads = new WeakMap<HTMLElement, string>();
+
+  /**
+   * Whole-message copy text: the current projection's text blocks joined in
+   * display order (assistant), or the full prompt (user). Thinking, tool,
+   * subagent and duration data never enter the payload; summary projections
+   * copy exactly the summary they render — full text requires the detail API
+   * and stays out of scope.
+   */
+  private collectMessageCopyText(msg: ChatMessage): string {
+    if (msg.role === 'user') {
+      return msg.displayContent ?? msg.content;
+    }
+    if (!msg.contentBlocks || msg.contentBlocks.length === 0) {
+      // Old conversations without contentBlocks fall back to raw content.
+      return msg.content;
+    }
+    const texts: string[] = [];
+    for (const block of msg.contentBlocks) {
+      if (block.type === 'text' && block.content && block.content.trim()) {
+        texts.push(block.content);
+      }
+    }
+    return texts.join('\n\n');
+  }
+
+  /**
+   * Idempotent toolbar sync shared by every mount path (stored, prepend, live
+   * user/assistant, projection rebuild): exactly one copy action reflecting
+   * the current projection, plus the timestamp.
+   */
+  syncMessageActions(msgEl: HTMLElement, msg: ChatMessage): void {
+    const toolbar = this.getOrCreateActionsToolbar(msgEl);
+    this.syncCopyAction(toolbar, msg);
+    this.addMessageTimestamp(msgEl, msg.timestamp);
+  }
+
+  /** Resolves the mounted element for a live message and syncs its toolbar. */
+  syncLiveMessageActions(msg: ChatMessage): void {
+    const msgEl = this.liveMessageEls.get(msg.id)
+      ?? this.messagesEl.querySelector(`[data-message-id="${msg.id}"]`) as HTMLElement | null;
+    if (!msgEl) {
+      return;
+    }
+    this.syncMessageActions(msgEl, msg);
+  }
+
+  private syncCopyAction(toolbar: HTMLElement, msg: ChatMessage): void {
+    const payload = this.collectMessageCopyText(msg);
+    const existing = toolbar.querySelector('.claudian-message-copy-btn') as HTMLElement | null;
+    if (!payload) {
+      existing?.remove();
+      return;
+    }
+    if (existing) {
+      // Multi-block finalize: update the payload, never add a second button.
+      MessageRenderer.copyPayloads.set(existing, payload);
+      return;
+    }
+
+    const copyBtn = toolbar.createSpan({ cls: 'claudian-message-copy-btn' });
     copyBtn.innerHTML = MessageRenderer.COPY_ICON;
+    copyBtn.setAttribute('aria-label', t('chat.message.copyAriaLabel'));
+    MessageRenderer.copyPayloads.set(copyBtn, payload);
+    // Buttons read before the timestamp on both roles.
+    const timestamp = toolbar.querySelector('.claudian-message-timestamp');
+    if (timestamp) {
+      toolbar.insertBefore(copyBtn, timestamp);
+    }
 
     let feedbackTimeout: ReturnType<typeof setTimeout> | null = null;
 
@@ -1027,7 +1087,7 @@ export class MessageRenderer {
       e.stopPropagation();
 
       try {
-        await navigator.clipboard.writeText(markdown);
+        await navigator.clipboard.writeText(MessageRenderer.copyPayloads.get(copyBtn) ?? '');
       } catch {
         // Clipboard API may fail in non-secure contexts
         return;
@@ -1038,9 +1098,9 @@ export class MessageRenderer {
         clearTimeout(feedbackTimeout);
       }
 
-      // Show "copied!" feedback
+      // Show copied feedback
       copyBtn.innerHTML = '';
-      copyBtn.setText('copied!');
+      copyBtn.setText(t('chat.message.copied'));
       copyBtn.classList.add('copied');
 
       feedbackTimeout = setTimeout(() => {
@@ -1098,33 +1158,6 @@ export class MessageRenderer {
       text: formatted,
     });
     timeEl.setAttribute('aria-label', t('chat.message.timestamp', { time: formatted }));
-  }
-
-  private addUserCopyButton(msgEl: HTMLElement, content: string): void {
-    const toolbar = this.getOrCreateActionsToolbar(msgEl);
-    const copyBtn = toolbar.createSpan({ cls: 'claudian-user-msg-copy-btn' });
-    copyBtn.innerHTML = MessageRenderer.COPY_ICON;
-    copyBtn.setAttribute('aria-label', 'Copy message');
-
-    let feedbackTimeout: ReturnType<typeof setTimeout> | null = null;
-
-    copyBtn.addEventListener('click', async (e) => {
-      e.stopPropagation();
-      try {
-        await navigator.clipboard.writeText(content);
-      } catch {
-        return;
-      }
-      if (feedbackTimeout) clearTimeout(feedbackTimeout);
-      copyBtn.innerHTML = '';
-      copyBtn.setText('copied!');
-      copyBtn.classList.add('copied');
-      feedbackTimeout = setTimeout(() => {
-        copyBtn.innerHTML = MessageRenderer.COPY_ICON;
-        copyBtn.classList.remove('copied');
-        feedbackTimeout = null;
-      }, 1500);
-    });
   }
 
   private addRewindButton(msgEl: HTMLElement, messageId: string): void {
