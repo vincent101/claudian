@@ -457,3 +457,31 @@ npm run typecheck && npm run lint && npm run test && npm run build
 - [v2] 阻断 2：amnesia 增加 recovery generation、下一个 `session_init` 连续性确认、最多 2 次重试与 `tripped` 熔断/用户提示。
 - [v2] 阻断 3：spacer 增加 page-local render generation + content-settled 屏障；3 秒超时用 estimated 高度并在回访后校正。
 - [v2] 补充：chunk 增加投影字符边界；剪贴板设硬上限、文件流式导出；回滚固定 C→B→A；订正 `exportFullHistory` 为 `ClaudeConversationHistoryService.ts:823-833`；性能数字改为实测门槛。
+
+## v2 终审记录（2026-09-16）
+
+### 硬伤清单
+
+- **阻断｜§2.1**：`session_init` 非逐 turn 事件，持久 query 注入后可能不再触发，`awaiting_init` 会悬空。改为 init 判跳变、成功 `result` 且 session 等于 dispatch 快照才确认；注入最多两次；`tripped` 提供原子重置入口。
+- **阻断｜§4.2-4.3**：stored render 对 content promise 是 fire-and-forget，lazy expand 不再通知。改 page-scoped render ticket；分帧、展开、图片全登记，settle 后才记 measured。
+- **高｜§2.2**：双计属实；须按 request 建快照：`message_start` 重置，delta 只 patch 已出现字段，非空主-agent assistant snapshot 替换；全零不覆盖正值，过滤 subagent。保留 turn model 快照；resolved model 仅匹配 result 并持久化。
+- **高｜§3.1.1**：registry 须 token/CAS；reserve 新 id，提交时原子 old→new，仅 owner token 可释放；恢复去重正确。
+- **中｜§3.3**：`save/restore/hydrateTab` 须显式传 page，禁用 `Conversation.messages` 过桥。
+
+### 场景推演
+
+| 场景 | 结论 |
+|---|---|
+| 1.59GB/2.9MB 打开 | 有界尾窗；小会话须实测 300/500ms 门 |
+| 翻20页/250+ turns | ticket 修后 DOM≤200；搜索可重建高亮 |
+| 流式导出/amnesia | snapshot 可并行；恢复按 result 确认 |
+| 双tab/Codex | registry 封堵；per-tab 必要；Codex 回归 |
+| usage | 约520k；result 仅校正窗口 |
+
+### 总结论
+
+**需修订后实施。** 双开基本闭合；amnesia、spacer 未闭合；usage 需 request 状态机。粗估 A 8–12、B 10–15、C 12–18 人日，联测 5–8 人日。
+
+### 批次 A 落地切分
+
+A0a rewind-runtime；A0b usage-snapshot；A1 iterator/导出/amnesia；A2 detail/search/LRU。A0a/A0b 独立部署回滚；A→B→C，回滚 C→B→A。
