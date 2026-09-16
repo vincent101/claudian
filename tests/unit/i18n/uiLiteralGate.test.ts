@@ -45,16 +45,47 @@ const ALLOWLIST: AllowlistEntry[] = [
     literal: 'codex mcp',
     reason: 'CLI command rendered inside a <code> element',
   },
+  {
+    file: 'src/providers/codex/ui/CodexSettingsTab.ts',
+    sink: 'renderEnvironmentSettingsSection.placeholder',
+    literal: 'OPENAI_API_KEY=your-key\nOPENAI_BASE_URL=https://api.openai.com/v1\nOPENAI_MODEL=',
+    reason: 'technical env var example list shown as placeholder',
+  },
+  {
+    file: 'src/providers/codex/ui/CodexSettingsTab.ts',
+    sink: 'renderEnvironmentSettingsSection.placeholder',
+    literal: '\nCODEX_SANDBOX=workspace-write',
+    reason: 'technical env var example list shown as placeholder',
+  },
+  {
+    file: 'src/providers/opencode/ui/OpencodeSettingsTab.ts',
+    sink: 'renderEnvironmentSettingsSection.placeholder',
+    literal: '\nOPENCODE_DB=/path/to/opencode.db',
+    reason: 'technical env var example list shown as placeholder',
+  },
 ];
 
 // Sinks whose first call argument is user-visible text.
 const FIRST_ARG_TEXT_METHODS = new Set(['setText', 'setName', 'setDesc', 'setTitle', 'setPlaceholder', 'appendText']);
 
-// Settings-object factories whose name/desc options are user-visible.
-const SETTINGS_FACTORY_FUNCTIONS = new Set(['renderHiddenProviderCommandSetting', 'renderEnvironmentSettingsSection']);
+// Call targets whose options object carries user-visible text, mapped to the
+// argument index where that options object actually sits: createEl(tag,
+// options) versus createDiv(options)/createSpan(options);
+// renderHiddenProviderCommandSetting(container, providerId, copy), reached via
+// context.renderHiddenProviderCommandSetting(...) in the scanned files;
+// renderEnvironmentSettingsSection(options).
+const OPTIONS_OBJECT_SINKS = new Map<string, number>([
+  ['createEl', 1],
+  ['createDiv', 0],
+  ['createSpan', 0],
+  ['renderHiddenProviderCommandSetting', 2],
+  ['renderEnvironmentSettingsSection', 0],
+]);
 
-// DOM creation helpers whose options object carries visible text.
-const DOM_CREATE_METHODS = new Set(['createEl', 'createDiv', 'createSpan']);
+// Top-level properties of those options objects whose values are user-visible
+// text: DOM creation options (text/title) and settings factory copy
+// (name/desc/placeholder/heading).
+const VISIBLE_OPTION_PROPERTIES = new Set(['text', 'title', 'name', 'desc', 'placeholder', 'heading']);
 
 // Property assignments whose right-hand side is user-visible text.
 const TEXT_PROPERTIES = new Set(['textContent', 'innerText', 'title', 'placeholder']);
@@ -155,8 +186,8 @@ function collectSinkFindings(relFile: string, source: ts.SourceFile): Finding[] 
         continue;
       }
       const name = property.name.getText(source);
-      if (name === 'text') {
-        check(property.initializer, `${prefix}.text`);
+      if (VISIBLE_OPTION_PROPERTIES.has(name)) {
+        check(property.initializer, `${prefix}.${name}`);
       } else if (name === 'attr' && ts.isObjectLiteralExpression(property.initializer)) {
         for (const attrProperty of property.initializer.properties) {
           if (!ts.isPropertyAssignment(attrProperty)) {
@@ -168,6 +199,13 @@ function collectSinkFindings(relFile: string, source: ts.SourceFile): Finding[] 
           }
         }
       }
+    }
+  };
+
+  const checkOptionsSink = (callNode: ts.CallExpression, name: string): void => {
+    const optionsIndex = OPTIONS_OBJECT_SINKS.get(name);
+    if (optionsIndex !== undefined) {
+      checkOptionsObject(callNode.arguments[optionsIndex], name);
     }
   };
 
@@ -186,13 +224,13 @@ function collectSinkFindings(relFile: string, source: ts.SourceFile): Finding[] 
           if (attrName && VISIBLE_ATTR_NAMES.has(attrName)) {
             check(node.arguments[1], `${methodName}(${attrName})`);
           }
-        } else if (DOM_CREATE_METHODS.has(methodName)) {
-          checkOptionsObject(node.arguments[1], methodName);
+        } else {
+          checkOptionsSink(node, methodName);
         }
       } else if (ts.isIdentifier(expression)) {
         const functionName = expression.text;
-        if (SETTINGS_FACTORY_FUNCTIONS.has(functionName)) {
-          checkOptionsObject(node.arguments[1], functionName);
+        if (OPTIONS_OBJECT_SINKS.has(functionName)) {
+          checkOptionsSink(node, functionName);
         } else if (functionName === 'confirmDelete') {
           check(node.arguments[1], functionName);
         }
