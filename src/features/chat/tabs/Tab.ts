@@ -51,7 +51,7 @@ import { NavigationSidebar } from '../ui/NavigationSidebar';
 import { StatusPanel } from '../ui/StatusPanel';
 import { recalculateUsageForModel } from '../utils/usageInfo';
 import { getTabProviderId } from './providerResolution';
-import type { TabData, TabDOMElements, TabHydrationHooks, TabId, TabProviderContext } from './types';
+import type { CompletedTurnEvent, TabData, TabDOMElements, TabHydrationHooks, TabId, TabProviderContext } from './types';
 import { generateTabId, TEXTAREA_MAX_HEIGHT_PERCENT, TEXTAREA_MIN_MAX_HEIGHT } from './types';
 
 type TabProviderSettings = Record<string, unknown> & {
@@ -113,6 +113,7 @@ export interface TabCreateOptions {
   /** Provider to inherit for blank tabs (e.g. from the active tab). */
   defaultProviderId?: ProviderId;
   onStreamingChanged?: (isStreaming: boolean) => void;
+  onTurnCompleted?: (event: CompletedTurnEvent) => void;
   onTitleChanged?: (title: string) => void;
   onAttentionChanged?: (needsAttention: boolean) => void;
   onConversationIdChanged?: (conversationId: string | null) => void;
@@ -355,6 +356,7 @@ export function createTab(options: TabCreateOptions): TabData {
     conversation,
     tabId,
     onStreamingChanged,
+    onTurnCompleted,
     onAttentionChanged,
     onConversationIdChanged,
   } = options;
@@ -441,6 +443,8 @@ export function createTab(options: TabCreateOptions): TabData {
     },
     dom,
     renderer: null,
+    lastNotifiedCompletedTurnId: null,
+    onTurnCompleted,
   };
 
   return tab;
@@ -1408,6 +1412,7 @@ export function initializeTabControllers(
     recordDiagnostic: event => tab.service?.recordAutoTurnDiagnostic?.(event),
     getProjectionCoordinator: () => tab.controllers.projectionWriteCoordinator,
     setWelcomeEl: (el) => { dom.welcomeEl = el; },
+    onTurnCompleted: event => tab.onTurnCompleted?.(event),
   });
 
   tab.controllers.inputController = new InputController({
@@ -1442,6 +1447,7 @@ export function initializeTabControllers(
     getAgentService: () => tab.service,
     getSubagentManager: () => services.subagentManager,
     getTabProviderId: () => getTabProviderId(tab, plugin),
+    onTurnCompleted: event => tab.onTurnCompleted?.(event),
     ensureServiceInitialized: async () => {
       if (tab.serviceInitialized && tab.lifecycleState === 'bound_active') {
         return true;

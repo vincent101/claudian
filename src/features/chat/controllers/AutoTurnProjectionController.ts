@@ -10,6 +10,7 @@ import type { MessageRenderer } from '../rendering/MessageRenderer';
 import type { ProjectionWriteLease } from '../rendering/ProjectionWriteCoordinator';
 import type { SubagentManager } from '../services/SubagentManager';
 import type { ChatState } from '../state/ChatState';
+import type { CompletedTurnEvent } from '../tabs/types';
 import type { ConversationController } from './ConversationController';
 import {
   createTurnProjectionContext,
@@ -46,6 +47,12 @@ interface AutoTurnProjectionControllerDeps {
   } | null;
   /** Updates the tab's welcome element reference after a full re-projection. */
   setWelcomeEl?: (el: HTMLElement | null) => void;
+  /**
+   * Successful auto-turn completion signal: fired once per turn, only after
+   * finalization and the final projection settled. Notification policy reads
+   * this, never the UI busy state.
+   */
+  onTurnCompleted?: (event: CompletedTurnEvent) => void;
 }
 
 interface AutoProjection {
@@ -323,6 +330,9 @@ export class AutoTurnProjectionController {
 
     let completionError: unknown = null;
     let timedOut = false;
+    // Completion gate: only turns whose finalization actually succeeded may
+    // emit the completion event (save failures do not affect this flag).
+    let finalizedCleanly = false;
     this.deps.recordDiagnostic?.({ phase: 'render_start', turnId: event.turnId, generation: event.generation, leaseKind: 'auto' });
     try {
       // A deferred mount (queued behind a stored transaction) must land and
@@ -343,6 +353,7 @@ export class AutoTurnProjectionController {
         CALLBACK_FINALIZE_TIMEOUT_MS,
         'finalize_timeout',
       );
+      finalizedCleanly = true;
       this.deps.recordDiagnostic?.({ phase: 'render_end', turnId: event.turnId, generation: event.generation, leaseKind: 'auto' });
       this.deps.state.hasPendingConversationSave = true;
       this.deps.recordDiagnostic?.({ phase: 'save_start', turnId: event.turnId, generation: event.generation, leaseKind: 'auto' });
@@ -389,10 +400,17 @@ export class AutoTurnProjectionController {
         // P5: the live lease releases BEFORE the stored reprojection is
         // queued — holding live while acquiring stored self-deadlocks the FIFO.
         this.releaseLiveLease(active);
-        await this.reprojectIfDirty(active, event.turnId, event.generation);
+        const reprojectionSettled = await this.reprojectIfDirty(active, event.turnId, event.generation);
         this.active = null;
         this.deps.turnCoordinator.finish(event.turnId);
         this.deps.recordDiagnostic?.({ phase: 'lease_finish', turnId: event.turnId, generation: event.generation, leaseKind: 'auto' });
+        if (finalizedCleanly && reprojectionSettled) {
+          // Emitted only after the final projection settled: save failures
+          // still notify (the reply is visible), finalize failures never do.
+          // Never emitted from TurnCoordinator.finish — that path also serves
+          // cancellation and invalidation.
+          this.deps.onTurnCompleted?.({ turnId: event.turnId, kind: 'auto', outcome: 'completed' });
+        }
       }
     }
     if (completionError) {
@@ -410,10 +428,15 @@ export class AutoTurnProjectionController {
    * stays invisible until a full render. Rebuild from the latest ChatState
    * under a stored transaction, mirroring the user-turn path
    * (InputController.sendMessage).
+   *
+   * Returns whether the final projection settled: nothing dirty to
+   * re-project counts as success; stale, cancelled or failed re-projections
+   * return false so the completion event is suppressed — the previous void
+   * swallow could not distinguish these outcomes.
    */
-  private async reprojectIfDirty(active: AutoProjection, turnId: string, generation: number): Promise<void> {
-    if (!active.context.projectionDirty) return;
-    if (this.active !== active || !this.isCurrent(active, turnId, generation)) return;
+  private async reprojectIfDirty(active: AutoProjection, turnId: string, generation: number): Promise<boolean> {
+    if (!active.context.projectionDirty) return true;
+    if (this.active !== active || !this.isCurrent(active, turnId, generation)) return false;
     const coordinator = this.deps.getProjectionCoordinator?.() ?? null;
     const reproject = async (): Promise<void> => {
       const welcomeEl = this.deps.renderer.renderMessages(
@@ -425,12 +448,13 @@ export class AutoTurnProjectionController {
     };
     try {
       if (coordinator) {
-        await coordinator.runStored(() => !this.isCurrent(active, turnId, generation), reproject);
-      } else {
-        await reproject();
+        return (await coordinator.runStored(() => !this.isCurrent(active, turnId, generation), reproject)) !== null;
       }
+      await reproject();
+      return true;
     } catch {
       // Reprojection is a DOM repair; a failure must not break lease settlement.
+      return false;
     }
   }
 

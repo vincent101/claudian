@@ -39,6 +39,7 @@ import { setToolIcon, updateToolCallResult } from '../rendering/ToolCallRenderer
 import type { SubagentManager } from '../services/SubagentManager';
 import type { ChatState } from '../state/ChatState';
 import type { QueuedMessage } from '../state/types';
+import type { CompletedTurnEvent } from '../tabs/types';
 import type { FileContextManager } from '../ui/FileContext';
 import type { ImageContextManager } from '../ui/ImageContext';
 import type { AddExternalContextResult, McpServerSelector } from '../ui/InputToolbar';
@@ -106,6 +107,12 @@ export interface InputControllerDeps {
   } | null;
   /** Tab-level provider fallback for blank tabs (derived from draft model). */
   getTabProviderId?: () => ProviderId;
+  /**
+   * Successful user-turn completion signal: fired once per turn, only after
+   * the provider stream exhausted naturally and the final visible projection
+   * settled. Notification policy reads this, never the UI busy state.
+   */
+  onTurnCompleted?: (event: CompletedTurnEvent) => void;
   /** Returns true if ready. */
   ensureServiceInitialized?: () => Promise<boolean>;
   openConversation?: (conversationId: string) => Promise<void>;
@@ -362,6 +369,11 @@ export class InputController {
     let deferredAutoSendContent: string | null = null;
     let deferredNewSessionPlan: string | null = null;
     let wasInvalidated = false;
+    // Turn-completion gates: the event may only fire when the provider
+    // stream exhausted naturally (break/throw leave this false) and the
+    // final visible projection settled — see the outer finally.
+    let providerCompletedNaturally = false;
+    let turnCompletionNotified = false;
 
     try {
     // Hide welcome message when sending first message
@@ -511,6 +523,9 @@ export class InputController {
         turnContext.renderTarget = state.currentContentEl;
         await streamController.handleStreamChunk(chunk, turnContext);
       }
+      // Natural exhaustion only: break paths set wasInvalidated/wasInterrupted
+      // beforehand and a thrown query skips this line entirely.
+      providerCompletedNaturally = !wasInvalidated && !wasInterrupted;
     } catch (error) {
       const errorMsg = error instanceof Error ? error.message : 'Unknown error';
       // Null guard: a turn projection that was never created has no DOM to
@@ -710,6 +725,11 @@ export class InputController {
       // stored transaction is queued; holding live while queueing stored
       // would self-deadlock the FIFO.
       projectionLease?.release();
+      // Whether the final visible projection settled — the completion event
+      // may only fire after this is true. A dirty turn must re-project
+      // cleanly first; a cancelled stored wait resolves null and a failing
+      // re-projection throws, both leaving this false.
+      let finalProjectionSettled: boolean;
       if (
         turnContext?.projectionDirty
         && !wasInvalidated
@@ -721,13 +741,36 @@ export class InputController {
           await renderer.waitForRenderedMessages();
         };
         if (projectionCoordinator) {
-          await projectionCoordinator.runStored(
+          finalProjectionSettled = (await projectionCoordinator.runStored(
             () => state.streamGeneration !== streamGeneration,
             reproject,
-          );
+          )) !== null;
         } else {
           await reproject();
+          finalProjectionSettled = true;
         }
+      } else {
+        // Not dirty: the live streaming mount is the final projection; stale
+        // or invalidated turns are excluded by the same gates here.
+        finalProjectionSettled = !wasInvalidated && state.streamGeneration === streamGeneration;
+      }
+
+      // Once-guard: additional emission sites in this finally (deferred
+      // follow-up sends, future re-entry) must not double-report the turn.
+      const notifyTurnCompletedOnce = (): void => {
+        if (turnCompletionNotified) return;
+        turnCompletionNotified = true;
+        this.deps.onTurnCompleted?.({ turnId, kind: 'user', outcome: 'completed' });
+      };
+
+      if (
+        finalProjectionSettled
+        && providerCompletedNaturally
+        && !state.cancelRequested
+      ) {
+        // Save is deliberately not a gate — a visible reply still completes
+        // the turn even when persistence failed.
+        notifyTurnCompletedOnce();
       }
 
       if (shouldReleaseUserTurn) {

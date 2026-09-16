@@ -95,6 +95,18 @@ export interface TabManagerInterface {
 /** Tab identifier type. */
 export type TabId = string;
 
+/**
+ * Provider-neutral successful turn completion. Emitted only after the
+ * provider stream exhausted naturally AND the final visible projection
+ * landed; cancels, failures, lease losses and invalidations never emit.
+ * Notification policy must read this instead of UI busy state.
+ */
+export type CompletedTurnEvent = {
+  turnId: string;
+  kind: 'user' | 'auto';
+  outcome: 'completed';
+};
+
 export type TabHydrationState =
   | 'SHELL'
   | 'SCHEDULED'
@@ -272,6 +284,16 @@ export interface TabData {
 
   /** Per-tab renderer. */
   renderer: MessageRenderer | null;
+
+  /**
+   * Last turn id already consumed by the completion-notification policy.
+   * Turn ids are monotonic per tab, so a single slot deduplicates replays
+   * (observer restarts, repeated finished callbacks) without a Set.
+   */
+  lastNotifiedCompletedTurnId: string | null;
+
+  /** Successful-turn-completion callback wired into the turn controllers. */
+  onTurnCompleted?: (event: CompletedTurnEvent) => void;
 }
 
 export type TabProviderContext = Pick<TabData, 'conversationId' | 'service' | 'providerId' | 'lifecycleState' | 'draftModel'>;
@@ -308,6 +330,9 @@ export interface TabManagerCallbacks {
 
   /** Called when tab streaming state changes. */
   onTabStreamingChanged?: (tabId: TabId, isStreaming: boolean) => void;
+
+  /** Called when a background tab's needsReview flips on (completed turn unseen). */
+  onTabReviewChanged?: (tabId: TabId, needsReview: boolean) => void;
 
   /** Called when tab title changes. */
   onTabTitleChanged?: (tabId: TabId, title: string) => void;

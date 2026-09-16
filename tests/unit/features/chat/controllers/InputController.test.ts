@@ -3746,4 +3746,163 @@ describe('InputController - Message Queue', () => {
       expect(deps.renderer.renderMessages).not.toHaveBeenCalled();
     });
   });
+
+  describe('Turn completion notification', () => {
+    function prepare(
+      overrides: Partial<InputControllerDeps> = {},
+      options: { coordinator?: ProjectionWriteCoordinatorForTest } = {},
+    ) {
+      const onTurnCompleted = jest.fn();
+      const sendableDeps = createSendableDeps({
+        onTurnCompleted,
+        ...(options.coordinator ? { getProjectionCoordinator: () => options.coordinator! } : {}),
+        ...overrides,
+      });
+      sendableDeps.renderer.renderMessages = jest.fn().mockReturnValue(createMockEl());
+      sendableDeps.renderer.waitForRenderedMessages = jest.fn().mockResolvedValue(undefined);
+      (sendableDeps as any).setWelcomeEl = jest.fn();
+      ((sendableDeps as any).mockAgentService.query as jest.Mock).mockImplementation(() =>
+        createMockStream([{ type: 'text', content: 'streamed' }]));
+      const sendableInputEl = sendableDeps.getInputEl() as ReturnType<typeof createMockInputEl>;
+      const turnController = new InputController(sendableDeps);
+      return { deps: sendableDeps, controller: turnController, inputEl: sendableInputEl, onTurnCompleted };
+    }
+
+    function markProjectionDirty(deps: InputControllerDeps): void {
+      (deps.streamController.handleStreamChunk as jest.Mock).mockImplementation(
+        async (_chunk: unknown, context: { projectionDirty: boolean }) => {
+          context.projectionDirty = true;
+        },
+      );
+    }
+
+    it('emits exactly one completion event after a natural stream with a clean projection', async () => {
+      const { controller, inputEl, onTurnCompleted } = prepare();
+      inputEl.value = 'hello';
+      await controller.sendMessage();
+
+      expect(onTurnCompleted).toHaveBeenCalledTimes(1);
+      expect(onTurnCompleted).toHaveBeenCalledWith({
+        turnId: expect.stringMatching(/^msg-/),
+        kind: 'user',
+        outcome: 'completed',
+      });
+    });
+
+    it('emits once when a dirty turn re-projects successfully at the boundary', async () => {
+      const coordinator = new ProjectionWriteCoordinatorForTest();
+      const { controller, inputEl, onTurnCompleted, deps } = prepare({}, { coordinator });
+      markProjectionDirty(deps);
+      inputEl.value = 'dirty turn';
+      await controller.sendMessage();
+
+      expect(deps.renderer.renderMessages).toHaveBeenCalledTimes(1);
+      expect(onTurnCompleted).toHaveBeenCalledTimes(1);
+    });
+
+    it('never emits when the query throws even though cleanup and finalize still run', async () => {
+      const { controller, inputEl, onTurnCompleted, deps } = prepare();
+      ((deps as any).mockAgentService.query as jest.Mock).mockImplementation(() => {
+        throw new Error('Network timeout');
+      });
+      inputEl.value = 'boom';
+      await controller.sendMessage();
+
+      expect(deps.streamController.finalizeCurrentTextBlock).toHaveBeenCalled();
+      expect(onTurnCompleted).not.toHaveBeenCalled();
+    });
+
+    it('never emits when the live projection lease wait is cancelled', async () => {
+      const coordinator = new ProjectionWriteCoordinatorForTest();
+      let releaseStored!: () => void;
+      const storedDone = coordinator.runStored(
+        () => false,
+        () => new Promise<void>(resolve => { releaseStored = resolve; }),
+      );
+      await Promise.resolve();
+
+      const { controller, inputEl, onTurnCompleted, deps } = prepare({}, { coordinator });
+      inputEl.value = 'cancelled wait';
+      const sendPromise = controller.sendMessage();
+      await Promise.resolve();
+      await Promise.resolve();
+
+      deps.state.bumpStreamGeneration();
+      releaseStored();
+      await storedDone;
+      await sendPromise;
+
+      expect(onTurnCompleted).not.toHaveBeenCalled();
+    });
+
+    it('never emits when service initialization reports not ready', async () => {
+      const { controller, inputEl, onTurnCompleted } = prepare({
+        ensureServiceInitialized: async () => false,
+      });
+      inputEl.value = 'cold start fail';
+      await controller.sendMessage();
+
+      expect(onTurnCompleted).not.toHaveBeenCalled();
+    });
+
+    it('never emits when service initialization throws', async () => {
+      const { controller, inputEl, onTurnCompleted } = prepare({
+        ensureServiceInitialized: async () => {
+          throw new Error('init crashed');
+        },
+      });
+      inputEl.value = 'cold start crash';
+      await expect(controller.sendMessage()).rejects.toThrow('init crashed');
+
+      expect(onTurnCompleted).not.toHaveBeenCalled();
+    });
+
+    it('never emits when the user cancels mid-stream', async () => {
+      const { controller, inputEl, onTurnCompleted, deps } = prepare();
+      ((deps as any).mockAgentService.query as jest.Mock).mockImplementation(() => (async function* () {
+        deps.state.cancelRequested = true;
+        yield { type: 'text', content: 'partial' };
+      })());
+      inputEl.value = 'cancel me';
+      await controller.sendMessage();
+
+      expect(onTurnCompleted).not.toHaveBeenCalled();
+    });
+
+    it('never emits when a newer generation invalidates the stream', async () => {
+      const { controller, inputEl, onTurnCompleted, deps } = prepare();
+      (deps.streamController.handleStreamChunk as jest.Mock).mockImplementation(async () => {
+        deps.state.bumpStreamGeneration();
+      });
+      inputEl.value = 'invalidated';
+      await controller.sendMessage();
+
+      expect(onTurnCompleted).not.toHaveBeenCalled();
+    });
+
+    it('never emits when the final dirty re-projection fails', async () => {
+      const coordinator = new ProjectionWriteCoordinatorForTest();
+      const { controller, inputEl, onTurnCompleted, deps } = prepare({}, { coordinator });
+      markProjectionDirty(deps);
+      (deps.renderer.waitForRenderedMessages as jest.Mock).mockRejectedValue(new Error('render failed'));
+      inputEl.value = 'dirty fail';
+      await expect(controller.sendMessage()).rejects.toThrow('render failed');
+
+      expect(onTurnCompleted).not.toHaveBeenCalled();
+    });
+
+    it('still emits once when the conversation save fails after a successful projection', async () => {
+      const coordinator = new ProjectionWriteCoordinatorForTest();
+      const { controller, inputEl, onTurnCompleted, deps } = prepare({}, { coordinator });
+      markProjectionDirty(deps);
+      (deps.conversationController.save as jest.Mock).mockRejectedValue(new Error('disk full'));
+      inputEl.value = 'save fails';
+      await expect(controller.sendMessage()).rejects.toThrow('disk full');
+
+      // Save is not a completion gate: the reply is already visible, so the
+      // event fires exactly once and the re-projection is not repeated.
+      expect(deps.renderer.renderMessages).toHaveBeenCalledTimes(1);
+      expect(onTurnCompleted).toHaveBeenCalledTimes(1);
+    });
+  });
 });

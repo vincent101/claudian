@@ -191,6 +191,7 @@ export class ClaudianView extends ItemView {
           this.persistTabState();
         },
         onTabStreamingChanged: () => this.updateTabBar(),
+        onTabReviewChanged: () => this.updateTabBar(),
         onTabTitleChanged: () => this.updateTabBar(),
         onTabAttentionChanged: () => this.updateTabBar(),
         onTabConversationChanged: () => {

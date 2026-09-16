@@ -42,6 +42,7 @@ describe('AutoTurnProjectionController', () => {
     });
     const save = jest.fn().mockResolvedValue(undefined);
     const notify = jest.fn();
+    const onTurnCompleted = jest.fn();
     const streamController = {
       beginRenderFlushScope: jest.fn(),
       handleStreamChunk,
@@ -65,12 +66,13 @@ describe('AutoTurnProjectionController', () => {
       notify,
       ...(options.coordinator ? { getProjectionCoordinator: () => options.coordinator! } : {}),
       setWelcomeEl,
+      onTurnCompleted,
     });
     Object.defineProperty(contentEl, 'isConnected', { value: true, configurable: true });
     return {
       controller, state, turnCoordinator, processQueuedMessage, finishSpy,
       addMessage, removeMessage, renderMessages, waitForRenderedMessages, setWelcomeEl,
-      streamController, handleStreamChunk, save, notify, contentEl,
+      streamController, handleStreamChunk, save, notify, onTurnCompleted, contentEl,
     };
   }
 
@@ -507,5 +509,134 @@ describe('AutoTurnProjectionController', () => {
     expect(handleStreamChunk).not.toHaveBeenCalled();
     expect(turnCoordinator.isBusy()).toBe(false);
     expect(state.messages.map(message => message.role)).toEqual(['user']);
+  });
+
+  // ============================================
+  // Turn completion notification
+  // ============================================
+
+  it('emits one completion event when finish settles cleanly without a re-projection', async () => {
+    const { controller, onTurnCompleted } = setup();
+    controller.started({ turnId: 'auto-1', generation: 0, source: { kind: 'assistant-continuation' } });
+    await controller.chunk({ turnId: 'auto-1', generation: 0, chunk: { type: 'text', content: 'work' } });
+
+    await controller.finished({ turnId: 'auto-1', generation: 0, metadata: {} });
+
+    expect(onTurnCompleted).toHaveBeenCalledTimes(1);
+    expect(onTurnCompleted).toHaveBeenCalledWith({ turnId: 'auto-1', kind: 'auto', outcome: 'completed' });
+  });
+
+  it('emits one completion event when a dirty turn re-projects successfully', async () => {
+    const coordinator = new ProjectionWriteCoordinator();
+    const { controller, onTurnCompleted } = setup({ coordinator });
+    controller.started({ turnId: 'auto-1', generation: 0, source: { kind: 'peer', label: 'researcher' }, displayContent: 'inspect' });
+    await (controller as any).active.mountTask;
+    await controller.chunk({ turnId: 'auto-1', generation: 0, chunk: { type: 'text', content: 'work' } });
+    (controller as any).active.context.projectionDirty = true;
+
+    await controller.finished({ turnId: 'auto-1', generation: 0, metadata: {} });
+
+    expect(onTurnCompleted).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not emit when the re-projection fails', async () => {
+    const { controller, onTurnCompleted, renderMessages } = setup();
+    controller.started({ turnId: 'auto-1', generation: 0, source: { kind: 'assistant-continuation' } });
+    await controller.chunk({ turnId: 'auto-1', generation: 0, chunk: { type: 'text', content: 'work' } });
+    (controller as any).active.context.projectionDirty = true;
+    renderMessages.mockImplementation(() => { throw new Error('render failed'); });
+
+    await controller.finished({ turnId: 'auto-1', generation: 0, metadata: {} });
+
+    expect(onTurnCompleted).not.toHaveBeenCalled();
+  });
+
+  it('does not emit when the turn went stale before the re-projection', async () => {
+    const { controller, onTurnCompleted, state, save } = setup();
+    let releaseSave!: () => void;
+    save.mockImplementationOnce(() => new Promise<void>(resolve => { releaseSave = resolve; }));
+    controller.started({ turnId: 'auto-1', generation: 0, source: { kind: 'assistant-continuation' } });
+    await controller.chunk({ turnId: 'auto-1', generation: 0, chunk: { type: 'text', content: 'work' } });
+    (controller as any).active.context.projectionDirty = true;
+
+    const finished = controller.finished({ turnId: 'auto-1', generation: 0, metadata: {} });
+    for (let i = 0; i < 10; i++) {
+      await Promise.resolve();
+    }
+    // A conversation switch mid-save stales the turn before the boundary
+    // re-projection runs.
+    state.currentConversationId = 'conv-2';
+    releaseSave();
+    await finished;
+
+    expect(onTurnCompleted).not.toHaveBeenCalled();
+  });
+
+  it('does not emit for cancelled turns', () => {
+    const { controller, onTurnCompleted } = setup();
+    controller.started({ turnId: 'auto-1', generation: 0, source: { kind: 'assistant-continuation' } });
+
+    controller.cancelled({ turnId: 'auto-1', generation: 1, reason: 'shutdown' });
+
+    expect(onTurnCompleted).not.toHaveBeenCalled();
+  });
+
+  it('does not emit when finalization rejects', async () => {
+    const { controller, onTurnCompleted, streamController } = setup();
+    streamController.finalizeCurrentThinkingBlock.mockRejectedValueOnce(new Error('render failed'));
+    controller.started({ turnId: 'auto-1', generation: 0, source: { kind: 'assistant-continuation' } });
+
+    await controller.finished({ turnId: 'auto-1', generation: 0, metadata: {} });
+
+    expect(onTurnCompleted).not.toHaveBeenCalled();
+  });
+
+  it('does not emit when finalization times out', async () => {
+    jest.useFakeTimers();
+    const { controller, onTurnCompleted, streamController } = setup();
+    streamController.finalizeCurrentThinkingBlock.mockImplementationOnce(() => new Promise(() => {}));
+    controller.started({ turnId: 'auto-finalize-timeout', generation: 0, source: { kind: 'assistant-continuation' } });
+    const finished = controller.finished({ turnId: 'auto-finalize-timeout', generation: 0, metadata: {} });
+    await jest.advanceTimersByTimeAsync(3_000);
+    await finished;
+
+    expect(onTurnCompleted).not.toHaveBeenCalled();
+    jest.useRealTimers();
+  });
+
+  it('does not emit when a chunk timeout aborts the turn', async () => {
+    jest.useFakeTimers();
+    const { controller, onTurnCompleted, handleStreamChunk } = setup();
+    handleStreamChunk.mockImplementationOnce(() => new Promise(() => {}));
+    controller.started({ turnId: 'auto-chunk-timeout', generation: 0, source: { kind: 'assistant-continuation' } });
+    const chunk = controller.chunk({ turnId: 'auto-chunk-timeout', generation: 0, chunk: { type: 'text', content: 'stuck' } });
+    const rejected = expect(chunk).rejects.toThrow('chunk_timeout'); // eslint-disable-line jest/valid-expect
+    await jest.advanceTimersByTimeAsync(1_000);
+    await rejected;
+
+    expect(onTurnCompleted).not.toHaveBeenCalled();
+    jest.useRealTimers();
+  });
+
+  it('emits at most once for duplicate finished callbacks of the same turn', async () => {
+    const { controller, onTurnCompleted } = setup();
+    controller.started({ turnId: 'auto-1', generation: 0, source: { kind: 'assistant-continuation' } });
+
+    await controller.finished({ turnId: 'auto-1', generation: 0, metadata: {} });
+    await controller.finished({ turnId: 'auto-1', generation: 0, metadata: {} });
+
+    expect(onTurnCompleted).toHaveBeenCalledTimes(1);
+  });
+
+  it('still emits when the save fails after a successful projection', async () => {
+    const { controller, onTurnCompleted, save } = setup();
+    save.mockRejectedValueOnce(new Error('disk full'));
+    controller.started({ turnId: 'auto-1', generation: 0, source: { kind: 'assistant-continuation' } });
+
+    await controller.finished({ turnId: 'auto-1', generation: 0, metadata: {} });
+
+    // Save failure leaves the reply visible — the existing "visible but not
+    // saved" Notice stays independent of the completion event.
+    expect(onTurnCompleted).toHaveBeenCalledTimes(1);
   });
 });

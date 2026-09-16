@@ -5,6 +5,7 @@ import { Notice } from 'obsidian';
 
 import { ProviderRegistry } from '@/core/providers/ProviderRegistry';
 import { ProviderWorkspaceRegistry } from '@/core/providers/ProviderWorkspaceRegistry';
+import { InputController } from '@/features/chat/controllers/InputController';
 import { TurnCoordinator } from '@/features/chat/controllers/TurnCoordinator';
 import { ChatState } from '@/features/chat/state/ChatState';
 import {
@@ -1923,6 +1924,22 @@ describe('Tab - Controller Initialization', () => {
       initializeTabControllers(tab, options.plugin, mockComponent, options.mcpManager);
 
       expect(tab.controllers.inputController).toBeDefined();
+    });
+
+    it('injects the tab-level onTurnCompleted callback into the InputController deps', () => {
+      const options = createMockOptions();
+      const onTurnCompleted = jest.fn();
+      const tab = createTab({ ...options, onTurnCompleted });
+      const mockComponent = {} as any;
+
+      initializeTabUI(tab, options.plugin);
+      initializeTabControllers(tab, options.plugin, mockComponent, options.mcpManager);
+
+      const constructorMock = InputController as unknown as jest.Mock;
+      const injectedDeps = constructorMock.mock.calls[constructorMock.mock.calls.length - 1][0];
+      injectedDeps.onTurnCompleted({ turnId: 'turn-1', kind: 'user', outcome: 'completed' });
+
+      expect(onTurnCompleted).toHaveBeenCalledWith({ turnId: 'turn-1', kind: 'user', outcome: 'completed' });
     });
 
     it('should create and initialize NavigationController', () => {

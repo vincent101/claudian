@@ -3845,11 +3845,22 @@ describe('TabManager - Desktop Notifications', () => {
     expect(createdNotifications).toHaveLength(0);
   });
 
-  it('notifies when a background tab finishes streaming without cancel', async () => {
+  it('does not notify or mark review when a background tab leaves the streaming state', async () => {
+    // isStreaming=false is UI busy state: it also fires on cancel,
+    // invalidation and startup failures, so it must not imply completion.
     const { callbacksByTab, tabs } = await setupWithTabs(2);
     tabs[1].state.cancelRequested = false;
 
     callbacksByTab.get(tabs[1].id)!.onStreamingChanged(false);
+
+    expect(createdNotifications).toHaveLength(0);
+    expect(tabs[1].state.needsReview).toBe(false);
+  });
+
+  it('notifies exactly once and marks review on a successful background turn completion', async () => {
+    const { callbacksByTab, tabs } = await setupWithTabs(2);
+
+    callbacksByTab.get(tabs[1].id)!.onTurnCompleted({ turnId: 'turn-1', kind: 'user', outcome: 'completed' });
 
     expect(createdNotifications).toHaveLength(1);
     expect(createdNotifications[0]).toEqual({
@@ -3858,6 +3869,109 @@ describe('TabManager - Desktop Notifications', () => {
       silent: true,
     });
     expect(tabs[1].state.needsReview).toBe(true);
+  });
+
+  it('deduplicates a replayed completion for the same turn id', async () => {
+    const { callbacksByTab, tabs } = await setupWithTabs(2);
+
+    callbacksByTab.get(tabs[1].id)!.onTurnCompleted({ turnId: 'turn-1', kind: 'auto', outcome: 'completed' });
+    callbacksByTab.get(tabs[1].id)!.onTurnCompleted({ turnId: 'turn-1', kind: 'auto', outcome: 'completed' });
+
+    expect(createdNotifications).toHaveLength(1);
+  });
+
+  it('notifies again for a different turn on the same background tab', async () => {
+    const { callbacksByTab, tabs } = await setupWithTabs(2);
+
+    callbacksByTab.get(tabs[1].id)!.onTurnCompleted({ turnId: 'turn-1', kind: 'user', outcome: 'completed' });
+    callbacksByTab.get(tabs[1].id)!.onTurnCompleted({ turnId: 'turn-2', kind: 'user', outcome: 'completed' });
+
+    expect(createdNotifications).toHaveLength(2);
+  });
+
+  it('does not notify for a foreground completion and never back-fills after switching away', async () => {
+    const { callbacksByTab, tabs, manager } = await setupWithTabs(2);
+
+    callbacksByTab.get(tabs[0].id)!.onTurnCompleted({ turnId: 'turn-1', kind: 'user', outcome: 'completed' });
+    expect(createdNotifications).toHaveLength(0);
+    expect(tabs[0].state.needsReview).toBe(false);
+
+    // The already-consumed completion must not resurface as a belated
+    // notification once the tab has moved to the background.
+    await manager.switchToTab(tabs[1].id);
+    callbacksByTab.get(tabs[0].id)!.onTurnCompleted({ turnId: 'turn-1', kind: 'user', outcome: 'completed' });
+    expect(createdNotifications).toHaveLength(0);
+    expect(tabs[0].state.needsReview).toBe(false);
+  });
+
+  it('does not notify on streaming edges, tab switches or switch-backs alone', async () => {
+    const { callbacksByTab, tabs, manager } = await setupWithTabs(2);
+
+    callbacksByTab.get(tabs[1].id)!.onStreamingChanged(true);
+    await manager.switchToTab(tabs[1].id);
+    callbacksByTab.get(tabs[0].id)!.onStreamingChanged(false);
+    await manager.switchToTab(tabs[0].id);
+
+    expect(createdNotifications).toHaveLength(0);
+  });
+
+  it('never notifies across the hydration lifecycle of restored tabs', async () => {
+    // SHELL→LOADING→READY hydration, a mid-flight switch that stales the
+    // in-progress restore, and re-hydration never imply a turn completion.
+    jest.clearAllMocks();
+    const tabs: any[] = [];
+    mockCreateTab.mockImplementation(() => {
+      const tab = createMockTabData({
+        id: `notify-tab-${tabs.length + 1}`,
+        conversationId: `conv-${tabs.length + 1}`,
+        hydrationState: 'SHELL',
+        controllers: {
+          conversationController: {
+            save: jest.fn().mockResolvedValue(undefined),
+            loadActive: jest.fn().mockResolvedValue(undefined),
+            initializeWelcome: jest.fn(),
+          },
+        },
+      });
+      tabs.push(tab);
+      return tab;
+    });
+    const plugin = createMockPlugin({
+      getConversationSync: jest.fn((id: string) => ({
+        id,
+        providerId: 'claude',
+        title: `Title ${id}`,
+        messages: [],
+      })),
+    });
+    const manager = new TabManager(plugin, createMockMcpManager(), createMockEl(), createMockView());
+
+    jest.useFakeTimers();
+    try {
+      const tab1 = await manager.createTab('conv-1');
+      jest.runAllTimers();
+      await flushMicrotasks();
+      expect(tab1?.hydrationState).toBe('READY');
+      expect(createdNotifications).toHaveLength(0);
+
+      // The background tab's pending hydration goes stale on the switch-away
+      // and falls back to SHELL — still without notifying.
+      const tab2 = await manager.createTab('conv-2', undefined, { activate: false });
+      await manager.switchToTab(tab2!.id);
+      await manager.switchToTab(tab1!.id);
+      jest.runAllTimers();
+      await flushMicrotasks();
+      expect(tab2?.hydrationState).toBe('SHELL');
+      expect(createdNotifications).toHaveLength(0);
+
+      await manager.switchToTab(tab2!.id);
+      jest.runAllTimers();
+      await flushMicrotasks();
+      expect(tab2?.hydrationState).toBe('READY');
+      expect(createdNotifications).toHaveLength(0);
+    } finally {
+      jest.useRealTimers();
+    }
   });
 
   it('does not notify when a background tab finishes via user cancel', async () => {

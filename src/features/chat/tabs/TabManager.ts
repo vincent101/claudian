@@ -205,11 +205,26 @@ export class TabManager implements TabManagerInterface {
       ...(typeof draftModel === 'string' ? { draftModel } : {}),
       defaultProviderId,
       onStreamingChanged: (isStreaming) => {
-        if (!isStreaming && tab.id !== this.activeTabId && !tab.state.cancelRequested) {
-          tab.state.needsReview = true;
-          this.notifyBackgroundTab(tab, 'streamComplete');
-        }
+        // UI busy-state sync only: false also fires on cancel, invalidation
+        // and startup failures, so it must not be read as turn completion.
         this.callbacks.onTabStreamingChanged?.(tab.id, isStreaming);
+      },
+      onTurnCompleted: (event) => {
+        // Completion-notification policy: only a successfully finished turn
+        // that ran while the tab was in the background marks it for review
+        // and notifies. The per-tab last-notified id deduplicates replays
+        // (observer restarts, repeated finished callbacks); switching tabs
+        // clears needsReview but never this id.
+        if (tab.lastNotifiedCompletedTurnId === event.turnId) {
+          return;
+        }
+        tab.lastNotifiedCompletedTurnId = event.turnId;
+        if (tab.id === this.activeTabId) {
+          return;
+        }
+        tab.state.needsReview = true;
+        this.callbacks.onTabReviewChanged?.(tab.id, true);
+        this.notifyBackgroundTab(tab, 'streamComplete');
       },
       onTitleChanged: (title) => {
         this.callbacks.onTabTitleChanged?.(tab.id, title);
