@@ -25,31 +25,65 @@ const MAX_NAME_LENGTH = 64;
 const CODEX_AGENT_NAME_PATTERN = /^[a-z0-9_-]+$/;
 const CODEX_NICKNAME_PATTERN = /^[A-Za-z0-9 _-]+$/;
 
-export function validateCodexSubagentName(name: string): string | null {
-  if (!name) return 'Subagent name is required';
-  if (name.length > MAX_NAME_LENGTH) return `Subagent name must be ${MAX_NAME_LENGTH} characters or fewer`;
-  if (!CODEX_AGENT_NAME_PATTERN.test(name)) return 'Subagent name can only contain lowercase letters, numbers, hyphens, and underscores';
+export type CodexSubagentNameIssueCode = 'required' | 'tooLong' | 'invalidChars';
+export type CodexNicknameIssueCode = 'invalidChars' | 'duplicate';
+
+export interface CodexSubagentNameIssue {
+  code: CodexSubagentNameIssueCode;
+  /** Present when code === 'tooLong'. */
+  max: number;
+}
+
+export interface CodexNicknameIssue {
+  code: CodexNicknameIssueCode;
+}
+
+/** Locale-free validation outcome so the modal can map to i18n keys. */
+export function getCodexSubagentNameIssue(name: string): CodexSubagentNameIssue | null {
+  if (!name) return { code: 'required', max: MAX_NAME_LENGTH };
+  if (name.length > MAX_NAME_LENGTH) return { code: 'tooLong', max: MAX_NAME_LENGTH };
+  if (!CODEX_AGENT_NAME_PATTERN.test(name)) return { code: 'invalidChars', max: MAX_NAME_LENGTH };
   return null;
 }
 
-export function validateCodexNicknameCandidates(candidates: string[]): string | null {
+export function getCodexNicknameCandidatesIssue(candidates: string[]): CodexNicknameIssue | null {
   const normalized = candidates.map(candidate => candidate.trim()).filter(Boolean);
   if (normalized.length === 0) return null;
 
   const seen = new Set<string>();
   for (const candidate of normalized) {
     if (!CODEX_NICKNAME_PATTERN.test(candidate)) {
-      return 'Nickname candidates can only contain ASCII letters, numbers, spaces, hyphens, and underscores';
+      return { code: 'invalidChars' };
     }
 
     const dedupeKey = candidate.toLowerCase();
     if (seen.has(dedupeKey)) {
-      return 'Nickname candidates must be unique';
+      return { code: 'duplicate' };
     }
     seen.add(dedupeKey);
   }
 
   return null;
+}
+
+// Legacy English-string wrappers kept for existing callers and tests.
+export function validateCodexSubagentName(name: string): string | null {
+  const issue = getCodexSubagentNameIssue(name);
+  if (!issue) return null;
+  switch (issue.code) {
+    case 'required': return 'Subagent name is required';
+    case 'tooLong': return `Subagent name must be ${issue.max} characters or fewer`;
+    case 'invalidChars': return 'Subagent name can only contain lowercase letters, numbers, hyphens, and underscores';
+  }
+}
+
+export function validateCodexNicknameCandidates(candidates: string[]): string | null {
+  const issue = getCodexNicknameCandidatesIssue(candidates);
+  if (!issue) return null;
+  switch (issue.code) {
+    case 'invalidChars': return 'Nickname candidates can only contain ASCII letters, numbers, spaces, hyphens, and underscores';
+    case 'duplicate': return 'Nickname candidates must be unique';
+  }
 }
 
 class CodexSubagentModal extends Modal {

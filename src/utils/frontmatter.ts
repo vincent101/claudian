@@ -173,22 +173,50 @@ export function isRecord(value: unknown): value is Record<string, unknown> {
   return value != null && typeof value === 'object' && !Array.isArray(value);
 }
 
-const MAX_SLUG_LENGTH = 64;
+export const MAX_SLUG_LENGTH = 64;
 const SLUG_PATTERN = /^[a-z0-9-]+$/;
 const YAML_RESERVED_WORDS = new Set(['true', 'false', 'null', 'yes', 'no', 'on', 'off']);
 
-export function validateSlugName(name: string, label: string): string | null {
+/**
+ * Stable, locale-free validation outcome so UI layers can map to i18n keys.
+ */
+export type SlugNameIssueCode = 'required' | 'tooLong' | 'invalidChars' | 'reserved';
+
+export interface SlugNameIssue {
+  code: SlugNameIssueCode;
+  /** Present when code === 'tooLong'. */
+  max: number;
+}
+
+export function getSlugNameIssue(name: string): SlugNameIssue | null {
   if (!name) {
-    return `${label} name is required`;
+    return { code: 'required', max: MAX_SLUG_LENGTH };
   }
   if (name.length > MAX_SLUG_LENGTH) {
-    return `${label} name must be ${MAX_SLUG_LENGTH} characters or fewer`;
+    return { code: 'tooLong', max: MAX_SLUG_LENGTH };
   }
   if (!SLUG_PATTERN.test(name)) {
-    return `${label} name can only contain lowercase letters, numbers, and hyphens`;
+    return { code: 'invalidChars', max: MAX_SLUG_LENGTH };
   }
   if (YAML_RESERVED_WORDS.has(name)) {
-    return `${label} name cannot be a YAML reserved word (true, false, null, yes, no, on, off)`;
+    return { code: 'reserved', max: MAX_SLUG_LENGTH };
   }
   return null;
+}
+
+export function validateSlugName(name: string, label: string): string | null {
+  const issue = getSlugNameIssue(name);
+  if (!issue) {
+    return null;
+  }
+  switch (issue.code) {
+    case 'required':
+      return `${label} name is required`;
+    case 'tooLong':
+      return `${label} name must be ${issue.max} characters or fewer`;
+    case 'invalidChars':
+      return `${label} name can only contain lowercase letters, numbers, and hyphens`;
+    case 'reserved':
+      return `${label} name cannot be a YAML reserved word (true, false, null, yes, no, on, off)`;
+  }
 }

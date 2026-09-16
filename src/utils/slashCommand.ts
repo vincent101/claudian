@@ -3,8 +3,10 @@ import {
   extractBoolean,
   extractString,
   extractStringArray,
+  getSlugNameIssue,
   isRecord,
   parseFrontmatter,
+  type SlugNameIssue,
   validateSlugName,
 } from './frontmatter';
 
@@ -30,6 +32,11 @@ export function extractFirstParagraph(content: string): string | undefined {
 
 export function validateCommandName(name: string): string | null {
   return validateSlugName(name, 'Command');
+}
+
+/** Locale-free variant so callers can map the issue to their own i18n keys. */
+export function getCommandNameIssue(name: string): SlugNameIssue | null {
+  return getSlugNameIssue(name);
 }
 
 export function isSkill(cmd: SlashCommand): boolean {

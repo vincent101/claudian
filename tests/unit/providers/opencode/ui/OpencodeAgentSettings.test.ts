@@ -13,6 +13,7 @@ import { createOpencodeAgentPersistenceKey } from '@/providers/opencode/storage/
 import type { OpencodeAgentDefinition } from '@/providers/opencode/types/agent';
 import {
   findOpencodeAgentNameConflict,
+  getOpencodeAgentNameIssue,
   validateOpencodeAgentName,
 } from '@/providers/opencode/ui/OpencodeAgentSettings';
 
@@ -54,6 +55,26 @@ describe('validateOpencodeAgentName', () => {
   it('rejects leading or trailing whitespace inside a segment', () => {
     expect(validateOpencodeAgentName('review /builder')).toBe(
       'Agent name path segments cannot start or end with whitespace',
+    );
+  });
+});
+
+describe('getOpencodeAgentNameIssue', () => {
+  it('returns stable issue codes', () => {
+    expect(getOpencodeAgentNameIssue('')).toEqual({ code: 'required' });
+    expect(getOpencodeAgentNameIssue('/review')).toEqual({ code: 'pathSegments' });
+    expect(getOpencodeAgentNameIssue('review/ /builder')).toEqual({ code: 'segmentEmpty' });
+    expect(getOpencodeAgentNameIssue('review /builder')).toEqual({ code: 'segmentWhitespace' });
+    expect(getOpencodeAgentNameIssue('review/../builder')).toEqual({ code: 'dotSegment' });
+    expect(getOpencodeAgentNameIssue('review:builder')).toEqual({ code: 'reservedCharacter' });
+    expect(getOpencodeAgentNameIssue('Security Review/Builder')).toBeNull();
+  });
+
+  it('mirrors the legacy string wrapper', () => {
+    const issue = getOpencodeAgentNameIssue('/review');
+    expect(issue?.code).toBe('pathSegments');
+    expect(validateOpencodeAgentName('/review')).toBe(
+      'Agent name must use slash-separated path segments without leading or trailing slashes',
     );
   });
 });

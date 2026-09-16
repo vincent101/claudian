@@ -7,33 +7,60 @@ import type { OpencodeAgentDefinition } from '../types/agent';
 
 const OPENCODE_AGENT_INVALID_SEGMENT_PATTERN = /[<>:"\\|?*]/;
 
-export function validateOpencodeAgentName(name: string): string | null {
-  if (!name) return 'Agent name is required';
+export type OpencodeAgentNameIssueCode =
+  | 'required'
+  | 'pathSegments'
+  | 'segmentEmpty'
+  | 'segmentWhitespace'
+  | 'dotSegment'
+  | 'reservedCharacter';
+
+export interface OpencodeAgentNameIssue {
+  code: OpencodeAgentNameIssueCode;
+}
+
+/** Locale-free validation outcome so the modal can map to i18n keys. */
+export function getOpencodeAgentNameIssue(name: string): OpencodeAgentNameIssue | null {
+  if (!name) return { code: 'required' };
 
   const segments = name.split('/');
   if (segments.length === 0 || segments.some((segment) => segment.length === 0)) {
-    return 'Agent name must use slash-separated path segments without leading or trailing slashes';
+    return { code: 'pathSegments' };
   }
 
   for (const segment of segments) {
     if (!segment.trim()) {
-      return 'Agent name path segments cannot be empty or whitespace-only';
+      return { code: 'segmentEmpty' };
     }
 
     if (segment !== segment.trim()) {
-      return 'Agent name path segments cannot start or end with whitespace';
+      return { code: 'segmentWhitespace' };
     }
 
     if (segment === '.' || segment === '..') {
-      return 'Agent name cannot include "." or ".." path segments';
+      return { code: 'dotSegment' };
     }
 
     if (segment.includes('\0') || OPENCODE_AGENT_INVALID_SEGMENT_PATTERN.test(segment)) {
-      return 'Agent name path segments cannot contain Windows-reserved filename characters';
+      return { code: 'reservedCharacter' };
     }
   }
 
   return null;
+}
+
+// Legacy English-string wrapper kept for existing callers and tests.
+export function validateOpencodeAgentName(name: string): string | null {
+  const issue = getOpencodeAgentNameIssue(name);
+  if (!issue) return null;
+  switch (issue.code) {
+    case 'required': return 'Agent name is required';
+    case 'pathSegments': return 'Agent name must use slash-separated path segments without leading or trailing slashes';
+    case 'segmentEmpty': return 'Agent name path segments cannot be empty or whitespace-only';
+    case 'segmentWhitespace': return 'Agent name path segments cannot start or end with whitespace';
+    case 'dotSegment': return 'Agent name cannot include "." or ".." path segments';
+    case 'reservedCharacter': return 'Agent name path segments cannot contain Windows-reserved filename characters';
+  }
 }
 
 export function findOpencodeAgentNameConflict(
@@ -278,39 +305,39 @@ class OpencodeAgentModal extends Modal {
         return;
       }
 
-      const temperature = parseOptionalNumber(temperatureInput.value, 'Temperature');
-      if (temperature.error) {
-        new Notice(temperature.error);
+      const temperature = parseOptionalNumber(temperatureInput.value);
+      if (temperature.issue) {
+        new Notice(formatAgentFieldIssue(temperature.issue, 'Temperature'));
         return;
       }
 
-      const topP = parseOptionalNumber(topPInput.value, 'Top P');
-      if (topP.error) {
-        new Notice(topP.error);
+      const topP = parseOptionalNumber(topPInput.value);
+      if (topP.issue) {
+        new Notice(formatAgentFieldIssue(topP.issue, 'Top P'));
         return;
       }
 
-      const steps = parseOptionalPositiveInteger(stepsInput.value, 'Steps');
-      if (steps.error) {
-        new Notice(steps.error);
+      const steps = parseOptionalPositiveInteger(stepsInput.value);
+      if (steps.issue) {
+        new Notice(formatAgentFieldIssue(steps.issue, 'Steps'));
         return;
       }
 
-      const tools = parseOptionalJsonObjectOfBooleans(toolsInput.value, 'Enabled Tools');
-      if (tools.error) {
-        new Notice(tools.error);
+      const tools = parseOptionalJsonObjectOfBooleans(toolsInput.value);
+      if (tools.issue) {
+        new Notice(formatAgentFieldIssue(tools.issue, 'Enabled Tools'));
         return;
       }
 
-      const permission = parseOptionalJson(permissionInput.value, 'Permission');
-      if (permission.error) {
-        new Notice(permission.error);
+      const permission = parseOptionalJson(permissionInput.value);
+      if (permission.issue) {
+        new Notice(formatAgentFieldIssue(permission.issue, 'Permission'));
         return;
       }
 
-      const options = parseOptionalJsonObject(optionsInput.value, 'Options');
-      if (options.error) {
-        new Notice(options.error);
+      const options = parseOptionalJsonObject(optionsInput.value);
+      if (options.issue) {
+        new Notice(formatAgentFieldIssue(options.issue, 'Options'));
         return;
       }
 
@@ -488,10 +515,28 @@ export class OpencodeAgentSettings {
   }
 }
 
+/** Stable issue categories so the modal can format with its own field label / locale. */
+export type OpencodeFieldIssueCode =
+  | 'validNumber'
+  | 'positiveInteger'
+  | 'validJson'
+  | 'jsonObject'
+  | 'booleanMap';
+
+// Temporary English formatting; switched to t() keys together with the i18n migration.
+function formatAgentFieldIssue(issue: OpencodeFieldIssueCode, label: string): string {
+  switch (issue) {
+    case 'validNumber': return `${label} must be a valid number`;
+    case 'positiveInteger': return `${label} must be a positive integer`;
+    case 'validJson': return `${label} must be valid JSON`;
+    case 'jsonObject': return `${label} must be a JSON object`;
+    case 'booleanMap': return `${label} must map tool names to boolean values`;
+  }
+}
+
 function parseOptionalNumber(
   value: string,
-  label: string,
-): { error?: string; value?: number } {
+): { issue?: OpencodeFieldIssueCode; value?: number } {
   const trimmed = value.trim();
   if (!trimmed) {
     return {};
@@ -499,7 +544,7 @@ function parseOptionalNumber(
 
   const parsed = Number(trimmed);
   if (!Number.isFinite(parsed)) {
-    return { error: `${label} must be a valid number` };
+    return { issue: 'validNumber' };
   }
 
   return { value: parsed };
@@ -507,8 +552,7 @@ function parseOptionalNumber(
 
 function parseOptionalPositiveInteger(
   value: string,
-  label: string,
-): { error?: string; value?: number } {
+): { issue?: OpencodeFieldIssueCode; value?: number } {
   const trimmed = value.trim();
   if (!trimmed) {
     return {};
@@ -516,7 +560,7 @@ function parseOptionalPositiveInteger(
 
   const parsed = Number(trimmed);
   if (!Number.isInteger(parsed) || parsed <= 0) {
-    return { error: `${label} must be a positive integer` };
+    return { issue: 'positiveInteger' };
   }
 
   return { value: parsed };
@@ -524,8 +568,7 @@ function parseOptionalPositiveInteger(
 
 function parseOptionalJson(
   value: string,
-  label: string,
-): { error?: string; value?: unknown } {
+): { issue?: OpencodeFieldIssueCode; value?: unknown } {
   const trimmed = value.trim();
   if (!trimmed) {
     return {};
@@ -534,21 +577,20 @@ function parseOptionalJson(
   try {
     return { value: JSON.parse(trimmed) };
   } catch {
-    return { error: `${label} must be valid JSON` };
+    return { issue: 'validJson' };
   }
 }
 
 function parseOptionalJsonObject(
   value: string,
-  label: string,
-): { error?: string; value?: Record<string, unknown> } {
-  const parsed = parseOptionalJson(value, label);
-  if (parsed.error || parsed.value === undefined) {
-    return parsed.error ? { error: parsed.error } : {};
+): { issue?: OpencodeFieldIssueCode; value?: Record<string, unknown> } {
+  const parsed = parseOptionalJson(value);
+  if (parsed.issue || parsed.value === undefined) {
+    return parsed.issue ? { issue: parsed.issue } : {};
   }
 
   if (!isJsonObject(parsed.value)) {
-    return { error: `${label} must be a JSON object` };
+    return { issue: 'jsonObject' };
   }
 
   return { value: parsed.value };
@@ -556,15 +598,14 @@ function parseOptionalJsonObject(
 
 function parseOptionalJsonObjectOfBooleans(
   value: string,
-  label: string,
-): { error?: string; value?: Record<string, boolean> } {
-  const parsed = parseOptionalJsonObject(value, label);
-  if (parsed.error || parsed.value === undefined) {
-    return parsed.error ? { error: parsed.error } : {};
+): { issue?: OpencodeFieldIssueCode; value?: Record<string, boolean> } {
+  const parsed = parseOptionalJsonObject(value);
+  if (parsed.issue || parsed.value === undefined) {
+    return parsed.issue ? { issue: parsed.issue } : {};
   }
 
   if (!Object.values(parsed.value).every((entry) => typeof entry === 'boolean')) {
-    return { error: `${label} must map tool names to boolean values` };
+    return { issue: 'booleanMap' };
   }
 
   return { value: parsed.value as Record<string, boolean> };

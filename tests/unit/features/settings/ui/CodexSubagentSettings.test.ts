@@ -3,6 +3,8 @@ import { createCodexSubagentPersistenceKey } from '@/providers/codex/storage/Cod
 import type { CodexSubagentDefinition } from '@/providers/codex/types/subagent';
 import {
   CodexSubagentSettings,
+  getCodexNicknameCandidatesIssue,
+  getCodexSubagentNameIssue,
   validateCodexNicknameCandidates,
   validateCodexSubagentName,
 } from '@/providers/codex/ui/CodexSubagentSettings';
@@ -134,6 +136,31 @@ describe('validateCodexSubagentName', () => {
 
   it('rejects names over 64 characters', () => {
     expect(validateCodexSubagentName('a'.repeat(65))).not.toBeNull();
+  });
+});
+
+describe('getCodexSubagentNameIssue', () => {
+  it('returns stable issue codes with max length', () => {
+    expect(getCodexSubagentNameIssue('')).toEqual({ code: 'required', max: 64 });
+    expect(getCodexSubagentNameIssue('a'.repeat(65))).toEqual({ code: 'tooLong', max: 64 });
+    expect(getCodexSubagentNameIssue('Bad Name')).toEqual({ code: 'invalidChars', max: 64 });
+    expect(getCodexSubagentNameIssue('code_reviewer')).toBeNull();
+  });
+
+  it('mirrors the legacy string wrapper', () => {
+    expect(getCodexSubagentNameIssue('a'.repeat(65))?.code).toBe('tooLong');
+    expect(validateCodexSubagentName('a'.repeat(65))).toBe(
+      'Subagent name must be 64 characters or fewer'
+    );
+  });
+});
+
+describe('getCodexNicknameCandidatesIssue', () => {
+  it('returns stable issue codes', () => {
+    expect(getCodexNicknameCandidatesIssue(['Atlas', 'atlas'])).toEqual({ code: 'duplicate' });
+    expect(getCodexNicknameCandidatesIssue(['Delta!'])).toEqual({ code: 'invalidChars' });
+    expect(getCodexNicknameCandidatesIssue(['Atlas', 'Delta-1', 'Echo_2', 'Scout 3'])).toBeNull();
+    expect(getCodexNicknameCandidatesIssue([])).toBeNull();
   });
 });
 

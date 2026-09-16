@@ -1,4 +1,4 @@
-import { extractFirstParagraph, parseSlashCommandContent, serializeCommand, serializeSlashCommandMarkdown, validateCommandName, yamlString } from '@/utils/slashCommand';
+import { extractFirstParagraph, getCommandNameIssue, parseSlashCommandContent, serializeCommand, serializeSlashCommandMarkdown, validateCommandName, yamlString } from '@/utils/slashCommand';
 
 describe('parseSlashCommandContent', () => {
   describe('basic parsing', () => {
@@ -746,6 +746,29 @@ describe('validateCommandName', () => {
       expect(validateCommandName(word)).not.toBeNull();
     }
   );
+});
+
+describe('getCommandNameIssue', () => {
+  it('returns null for valid names', () => {
+    expect(getCommandNameIssue('my-command')).toBeNull();
+    expect(getCommandNameIssue('a'.repeat(64))).toBeNull();
+  });
+
+  it('returns stable issue codes with max length', () => {
+    expect(getCommandNameIssue('')).toEqual({ code: 'required', max: 64 });
+    expect(getCommandNameIssue('a'.repeat(65))).toEqual({ code: 'tooLong', max: 64 });
+    expect(getCommandNameIssue('My_Command')).toEqual({ code: 'invalidChars', max: 64 });
+    expect(getCommandNameIssue('true')).toEqual({ code: 'reserved', max: 64 });
+  });
+
+  it('stays consistent with the legacy string API', () => {
+    expect(getCommandNameIssue('my-command')).toBeNull();
+    expect(validateCommandName('my-command')).toBeNull();
+    expect(getCommandNameIssue('a'.repeat(65))?.code).toBe('tooLong');
+    expect(validateCommandName('a'.repeat(65))).toBe(
+      'Command name must be 64 characters or fewer'
+    );
+  });
 });
 
 describe('extractFirstParagraph', () => {
