@@ -1,7 +1,9 @@
 import { createMockEl } from '@test/helpers/mockElement';
+import { Menu } from 'obsidian';
 
 import { TabBar, type TabBarCallbacks } from '@/features/chat/tabs/TabBar';
 import type { TabBarItem } from '@/features/chat/tabs/types';
+import { t } from '@/i18n/i18n';
 
 // Helper to create mock callbacks
 function createMockCallbacks(): TabBarCallbacks {
@@ -9,6 +11,7 @@ function createMockCallbacks(): TabBarCallbacks {
     onTabClick: jest.fn(),
     onTabClose: jest.fn(),
     onNewTab: jest.fn(),
+    onTabReorder: jest.fn(),
   };
 }
 
@@ -202,30 +205,294 @@ describe('TabBar', () => {
 
       expect(callbacks.onTabClick).toHaveBeenCalledWith('clicked-tab');
     });
+  });
 
-    it('should call onTabClose on right-click when canClose is true', () => {
+  describe('drag and drop reorder', () => {
+    function setupThreeTabs() {
       const containerEl = createMockEl();
       const callbacks = createMockCallbacks();
       const tabBar = new TabBar(containerEl, callbacks);
+      const items = [
+        createTabBarItem({ id: 't1', index: 1 }),
+        createTabBarItem({ id: 't2', index: 2 }),
+        createTabBarItem({ id: 't3', index: 3 }),
+      ];
+      tabBar.update(items);
+      return { containerEl, callbacks, tabBar, items };
+    }
 
-      tabBar.update([createTabBarItem({ id: 'closeable-tab', canClose: true })]);
+    function startDrag(badge: any, id: string) {
+      badge.dispatchEvent('dragstart', {
+        preventDefault: jest.fn(),
+        dataTransfer: { setData: jest.fn(), effectAllowed: '' },
+      });
+      return id;
+    }
 
-      // Simulate right-click (contextmenu)
-      const mockEvent = { preventDefault: jest.fn() };
-      containerEl._children[0].dispatchEvent('contextmenu', mockEvent);
+    it('marks badges as draggable', () => {
+      const { containerEl } = setupThreeTabs();
 
-      expect(mockEvent.preventDefault).toHaveBeenCalled();
-      expect(callbacks.onTabClose).toHaveBeenCalledWith('closeable-tab');
+      for (const badge of containerEl._children) {
+        expect(badge.draggable).toBe(true);
+      }
     });
 
-    it('should not register contextmenu handler when canClose is false', () => {
+    it('computes a drop-after index in remove-then-insert space', () => {
+      const { containerEl, callbacks } = setupThreeTabs();
+
+      startDrag(containerEl._children[0], 't1');
+      const overBadge = containerEl._children[1];
+      overBadge.dispatchEvent('dragover', {
+        preventDefault: jest.fn(),
+        clientX: 100,
+        dataTransfer: { dropEffect: '' },
+      });
+      overBadge.dispatchEvent('drop', {
+        preventDefault: jest.fn(),
+        clientX: 100,
+        dataTransfer: { dropEffect: '' },
+      });
+
+      // Dragging t1 after t2: removing t1 first leaves [t2, t3]; inserting
+      // after t2 is index 1.
+      expect(callbacks.onTabReorder).toHaveBeenCalledWith('t1', 1);
+    });
+
+    it('computes a drop-before index in remove-then-insert space', () => {
+      const { containerEl, callbacks } = setupThreeTabs();
+
+      startDrag(containerEl._children[2], 't3');
+      const overBadge = containerEl._children[0];
+      overBadge.getBoundingClientRect = () => ({ left: 50, width: 20 } as DOMRect);
+      overBadge.dispatchEvent('dragover', {
+        preventDefault: jest.fn(),
+        clientX: 55,
+        dataTransfer: { dropEffect: '' },
+      });
+      overBadge.dispatchEvent('drop', {
+        preventDefault: jest.fn(),
+        clientX: 55,
+        dataTransfer: { dropEffect: '' },
+      });
+
+      // Dragging t3 before t1: target index 0 in the [t1, t2] remainder.
+      expect(callbacks.onTabReorder).toHaveBeenCalledWith('t3', 0);
+    });
+
+    it('shows exactly one insertion indicator during dragover and clears it on drop', () => {
+      const { containerEl } = setupThreeTabs();
+
+      startDrag(containerEl._children[0], 't1');
+      const target = containerEl._children[1];
+      target.getBoundingClientRect = () => ({ left: 50, width: 20 } as DOMRect);
+      target.dispatchEvent('dragover', {
+        preventDefault: jest.fn(),
+        clientX: 70,
+        dataTransfer: { dropEffect: '' },
+      });
+
+      expect(target.hasClass('claudian-tab-drop-after')).toBe(true);
+      expect(target.hasClass('claudian-tab-drop-before')).toBe(false);
+      expect(containerEl._children[2].hasClass('claudian-tab-drop-after')).toBe(false);
+      expect(containerEl._children[2].hasClass('claudian-tab-drop-before')).toBe(false);
+
+      target.dispatchEvent('drop', {
+        preventDefault: jest.fn(),
+        clientX: 70,
+        dataTransfer: { dropEffect: '' },
+      });
+
+      expect(target.hasClass('claudian-tab-drop-after')).toBe(false);
+      expect(target.hasClass('claudian-tab-drop-before')).toBe(false);
+    });
+
+    it('swaps the indicator edge when dragging across the midpoint', () => {
+      const { containerEl } = setupThreeTabs();
+
+      startDrag(containerEl._children[0], 't1');
+      const target = containerEl._children[1];
+      target.getBoundingClientRect = () => ({ left: 50, width: 20 } as DOMRect);
+
+      target.dispatchEvent('dragover', {
+        preventDefault: jest.fn(),
+        clientX: 51,
+        dataTransfer: { dropEffect: '' },
+      });
+      expect(target.hasClass('claudian-tab-drop-before')).toBe(true);
+
+      target.dispatchEvent('dragover', {
+        preventDefault: jest.fn(),
+        clientX: 69,
+        dataTransfer: { dropEffect: '' },
+      });
+      expect(target.hasClass('claudian-tab-drop-after')).toBe(true);
+      expect(target.hasClass('claudian-tab-drop-before')).toBe(false);
+    });
+
+    it('ignores dragover from an unknown source tab', () => {
+      const { containerEl, callbacks } = setupThreeTabs();
+
+      // A drag started in another TabBar never registered a source here.
+      containerEl._children[1].dispatchEvent('dragover', {
+        preventDefault: jest.fn(),
+        clientX: 70,
+        dataTransfer: { dropEffect: '' },
+      });
+      containerEl._children[1].dispatchEvent('drop', {
+        preventDefault: jest.fn(),
+        clientX: 70,
+        dataTransfer: { dropEffect: '' },
+      });
+
+      expect(callbacks.onTabReorder).not.toHaveBeenCalled();
+      expect(containerEl._children[1].hasClass('claudian-tab-drop-after')).toBe(false);
+    });
+
+    it('does not switch tabs on the click following a drag', () => {
+      const { containerEl, callbacks } = setupThreeTabs();
+
+      startDrag(containerEl._children[0], 't1');
+      containerEl._children[1].dispatchEvent('dragover', {
+        preventDefault: jest.fn(),
+        clientX: 70,
+        dataTransfer: { dropEffect: '' },
+      });
+      containerEl._children[1].dispatchEvent('drop', {
+        preventDefault: jest.fn(),
+        clientX: 70,
+        dataTransfer: { dropEffect: '' },
+      });
+
+      // Chromium can still deliver a click after dragend; it must not switch.
+      containerEl._children[0].dispatchEvent('click');
+
+      expect(callbacks.onTabClick).not.toHaveBeenCalled();
+    });
+
+    it('clears drag state unconditionally on dragend', () => {
+      const { containerEl } = setupThreeTabs();
+
+      const source = containerEl._children[0];
+      startDrag(source, 't1');
+      const target = containerEl._children[1];
+      target.dispatchEvent('dragover', {
+        preventDefault: jest.fn(),
+        clientX: 70,
+        dataTransfer: { dropEffect: '' },
+      });
+
+      source.dispatchEvent('dragend', { preventDefault: jest.fn() });
+
+      expect(source.hasClass('claudian-tab-badge-dragging')).toBe(false);
+      expect(target.hasClass('claudian-tab-drop-after')).toBe(false);
+
+      // A later plain click switches normally again.
+      target.dispatchEvent('click');
+      expect(target._eventListeners.has('click')).toBe(true);
+    });
+
+    it('clears stale drag state when update() replaces the badges', () => {
+      const { containerEl, tabBar, callbacks } = setupThreeTabs();
+
+      const source = containerEl._children[0];
+      startDrag(source, 't1');
+      source.dispatchEvent('dragend', { preventDefault: jest.fn() });
+
+      // The post-drag click arrives after update() already rebuilt the DOM:
+      // the rebuilt badge must switch tabs normally.
+      tabBar.update([
+        createTabBarItem({ id: 't2', index: 1 }),
+        createTabBarItem({ id: 't1', index: 2 }),
+        createTabBarItem({ id: 't3', index: 3 }),
+      ]);
+      containerEl._children[1].dispatchEvent('click');
+
+      // The rebuilt badge behaves like a fresh gesture: the click switches.
+      expect(callbacks.onTabClick).toHaveBeenCalledWith('t1');
+    });
+  });
+
+  describe('context menu', () => {
+    it('shows a menu with translated move/close items instead of closing directly', () => {
+      const containerEl = createMockEl();
+      const callbacks = createMockCallbacks();
+      const tabBar = new TabBar(containerEl, callbacks);
+      tabBar.update([
+        createTabBarItem({ id: 't1', index: 1 }),
+        createTabBarItem({ id: 't2', index: 2 }),
+        createTabBarItem({ id: 't3', index: 3 }),
+      ]);
+
+      const mockEvent = { preventDefault: jest.fn(), clientX: 10, clientY: 10 };
+      containerEl._children[1].dispatchEvent('contextmenu', mockEvent);
+
+      expect(mockEvent.preventDefault).toHaveBeenCalled();
+      expect(callbacks.onTabClose).not.toHaveBeenCalled();
+
+      const menu = (Menu as any).instances.at(-1);
+      expect(menu).toBeDefined();
+      expect(menu.showAtMouseEvent).toHaveBeenCalledWith(mockEvent);
+      expect(menu.items.map((item: any) => item.title)).toEqual([
+        t('chat.tabs.moveLeft'),
+        t('chat.tabs.moveRight'),
+        t('chat.tabs.close'),
+      ]);
+    });
+
+    it('reorders through the shared callback from the menu items', () => {
+      const containerEl = createMockEl();
+      const callbacks = createMockCallbacks();
+      const tabBar = new TabBar(containerEl, callbacks);
+      tabBar.update([
+        createTabBarItem({ id: 't1', index: 1 }),
+        createTabBarItem({ id: 't2', index: 2 }),
+        createTabBarItem({ id: 't3', index: 3 }),
+      ]);
+
+      containerEl._children[1].dispatchEvent('contextmenu', { preventDefault: jest.fn() });
+      const menu = (Menu as any).instances.at(-1);
+
+      // Middle tab moves left → insertion index 0 in remove-then-insert space.
+      menu.items[0].clickHandler?.();
+      expect(callbacks.onTabReorder).toHaveBeenCalledWith('t2', 0);
+
+      // Middle tab moves right → insertion index 2.
+      menu.items[1].clickHandler?.();
+      expect(callbacks.onTabReorder).toHaveBeenCalledWith('t2', 2);
+
+      menu.items[2].clickHandler?.();
+      expect(callbacks.onTabClose).toHaveBeenCalledWith('t2');
+    });
+
+    it('disables boundary move items but keeps positions stable', () => {
+      const containerEl = createMockEl();
+      const callbacks = createMockCallbacks();
+      const tabBar = new TabBar(containerEl, callbacks);
+      tabBar.update([
+        createTabBarItem({ id: 't1', index: 1 }),
+        createTabBarItem({ id: 't2', index: 2 }),
+        createTabBarItem({ id: 't3', index: 3 }),
+      ]);
+
+      containerEl._children[0].dispatchEvent('contextmenu', { preventDefault: jest.fn() });
+      let menu = (Menu as any).instances.at(-1);
+      expect(menu.items[0].disabled).toBe(true);
+      expect(menu.items[1].disabled).toBe(false);
+      expect(menu.items[2].disabled).toBe(false);
+
+      containerEl._children[2].dispatchEvent('contextmenu', { preventDefault: jest.fn() });
+      menu = (Menu as any).instances.at(-1);
+      expect(menu.items[0].disabled).toBe(false);
+      expect(menu.items[1].disabled).toBe(true);
+    });
+
+    it('does not open a menu when the tab cannot close (single streaming tab)', () => {
       const containerEl = createMockEl();
       const callbacks = createMockCallbacks();
       const tabBar = new TabBar(containerEl, callbacks);
 
       tabBar.update([createTabBarItem({ id: 'uncloseable-tab', canClose: false })]);
 
-      // Check that contextmenu handler was not registered
       expect(containerEl._children[0]._eventListeners.has('contextmenu')).toBe(false);
     });
   });

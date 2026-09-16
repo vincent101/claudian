@@ -101,6 +101,11 @@
       "expandFullContent": "Vollständigen Inhalt anzeigen",
       "contentTruncatedNote": "Vorschau — insgesamt {count} Zeichen",
       "tooLargeToRender": "Inhalt ist zu groß für die Inline-Darstellung ({count} Zeichen)."
+    },
+    "tabs": {
+      "moveLeft": "Move left",
+      "moveRight": "Move right",
+      "close": "Close"
     }
   },
   "settings": {

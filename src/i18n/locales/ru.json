@@ -101,6 +101,11 @@
       "expandFullContent": "Показать полное содержимое",
       "contentTruncatedNote": "Предпросмотр — всего {count} символов",
       "tooLargeToRender": "Содержимое слишком велико для отображения inline ({count} символов)."
+    },
+    "tabs": {
+      "moveLeft": "Move left",
+      "moveRight": "Move right",
+      "close": "Close"
     }
   },
   "settings": {

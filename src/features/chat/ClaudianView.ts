@@ -203,6 +203,13 @@ export class ClaudianView extends ItemView {
           this.updateTabBar();
           this.syncProviderBrandColor();
         },
+        onTabOrderChanged: () => {
+          // Badge numbers and close-fallback neighbours derive from Map order,
+          // so a reorder must repaint the bar and persist the new openTabs
+          // sequence in the same pass.
+          this.updateTabBar();
+          this.persistTabState();
+        },
       }
     );
 
@@ -270,6 +277,7 @@ export class ClaudianView extends ItemView {
       onTabClick: (tabId) => this.handleTabClick(tabId),
       onTabClose: (tabId) => this.handleTabClose(tabId),
       onNewTab: () => this.createNewTab(),
+      onTabReorder: (tabId, targetIndex) => this.handleTabReorder(tabId, targetIndex),
     });
     fragment.appendChild(this.tabBarContainerEl);
 
@@ -384,6 +392,15 @@ export class ClaudianView extends ItemView {
     const force = tab?.state.isStreaming ?? false;
     await this.tabManager?.closeTab(tabId, force);
     this.updateTabBarVisibility();
+  }
+
+  /**
+   * Reorders a tab (drag-drop or context-menu move). UI refresh and
+   * persistence hang off the manager's onTabOrderChanged so every moveTab
+   * caller — not just the tab bar — stays consistent.
+   */
+  private handleTabReorder(tabId: TabId, targetIndex: number): void {
+    this.tabManager?.moveTab(tabId, targetIndex);
   }
 
   async createNewTab(): Promise<void> {

@@ -566,6 +566,50 @@ export class TabManager implements TabManagerInterface {
     return true;
   }
 
+  /**
+   * Moves a tab to a new position in the tab bar.
+   *
+   * `targetIndex` is the insertion index in the order that remains after the
+   * source tab is removed first ("remove-then-insert"), which is exactly the
+   * index a drop gesture computes. The Map is rebuilt in the new order so every
+   * order-derived behavior (badge numbering, close fallback, notification
+   * index, persisted openTabs) follows the visual order; TabData instances,
+   * the active tab, runtimes and hydration state are never touched.
+   *
+   * @returns True when the order actually changed.
+   */
+  moveTab(tabId: TabId, targetIndex: number): boolean {
+    const currentIds = Array.from(this.tabs.keys());
+    const sourceIndex = currentIds.indexOf(tabId);
+    if (sourceIndex === -1) {
+      return false;
+    }
+    if (targetIndex < 0 || targetIndex > currentIds.length - 1) {
+      return false;
+    }
+
+    // Remove-then-insert: indices after the source shift down by one before
+    // the target index applies.
+    const removed = currentIds.splice(sourceIndex, 1);
+    currentIds.splice(targetIndex, 0, removed[0]);
+
+    const previousIds = Array.from(this.tabs.keys());
+    if (currentIds.every((id, i) => id === previousIds[i])) {
+      return false;
+    }
+
+    // Map iteration order follows insertion order, so rebuilding with the same
+    // TabData references re-keys the order without recreating tab state.
+    const reordered = currentIds.map((id) => this.tabs.get(id)!);
+    this.tabs.clear();
+    for (const tab of reordered) {
+      this.tabs.set(tab.id, tab);
+    }
+
+    this.callbacks.onTabOrderChanged?.();
+    return true;
+  }
+
   // ============================================
   // Tab Queries
   // ============================================

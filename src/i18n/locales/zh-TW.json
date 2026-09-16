@@ -101,6 +101,11 @@
       "expandFullContent": "顯示完整內容",
       "contentTruncatedNote": "預覽 — 共 {count} 字元",
       "tooLargeToRender": "內容過大，無法內聯渲染（{count} 字元）。"
+    },
+    "tabs": {
+      "moveLeft": "向左移動",
+      "moveRight": "向右移動",
+      "close": "關閉分頁"
     }
   },
   "settings": {

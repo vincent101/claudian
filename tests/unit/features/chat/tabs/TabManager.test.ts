@@ -1448,6 +1448,116 @@ describe('TabManager - Tab Bar Data', () => {
   });
 });
 
+describe('TabManager - moveTab (reorder)', () => {
+  let callbacks: TabManagerCallbacks;
+  let manager: TabManager;
+  let tabs: any[];
+
+  beforeEach(async () => {
+    callbacks = { onTabOrderChanged: jest.fn() };
+    manager = createManager({ callbacks });
+    tabs = [];
+    mockCreateTab.mockImplementation(() => {
+      const tab = createMockTabData({ id: `tab-${tabs.length + 1}` });
+      tabs.push(tab);
+      return tab;
+    });
+    for (let i = 0; i < 3; i++) {
+      await manager.createTab();
+    }
+  });
+
+  it('moves the first tab to the end and reports success', () => {
+    const moved = manager.moveTab('tab-1', 2);
+
+    expect(moved).toBe(true);
+    expect(manager.getAllTabs().map((tab) => tab.id)).toEqual(['tab-2', 'tab-3', 'tab-1']);
+    expect(callbacks.onTabOrderChanged).toHaveBeenCalledTimes(1);
+  });
+
+  it('moves the middle tab left', () => {
+    const moved = manager.moveTab('tab-2', 0);
+
+    expect(moved).toBe(true);
+    expect(manager.getAllTabs().map((tab) => tab.id)).toEqual(['tab-2', 'tab-1', 'tab-3']);
+  });
+
+  it('moves the last tab to the front', () => {
+    const moved = manager.moveTab('tab-3', 0);
+
+    expect(moved).toBe(true);
+    expect(manager.getAllTabs().map((tab) => tab.id)).toEqual(['tab-3', 'tab-1', 'tab-2']);
+  });
+
+  it('rejects a same-position move without firing callbacks', () => {
+    expect(manager.moveTab('tab-2', 1)).toBe(false);
+    expect(manager.moveTab('tab-1', 0)).toBe(false);
+    expect(manager.moveTab('tab-3', 2)).toBe(false);
+    expect(callbacks.onTabOrderChanged).not.toHaveBeenCalled();
+    expect(manager.getAllTabs().map((tab) => tab.id)).toEqual(['tab-1', 'tab-2', 'tab-3']);
+  });
+
+  it('rejects unknown tab ids and out-of-bounds target indices', () => {
+    expect(manager.moveTab('nope', 0)).toBe(false);
+    expect(manager.moveTab('tab-1', -1)).toBe(false);
+    expect(manager.moveTab('tab-1', 3)).toBe(false);
+    expect(callbacks.onTabOrderChanged).not.toHaveBeenCalled();
+  });
+
+  it('keeps the active tab id and TabData references intact', async () => {
+    await manager.switchToTab('tab-2');
+    jest.clearAllMocks();
+    const before = manager.getAllTabs();
+
+    manager.moveTab('tab-3', 0);
+
+    expect(manager.getActiveTabId()).toBe('tab-2');
+    // Reorder rebuilds the Map ordering only — never the TabData instances
+    // (runtimes, DOM and hydration stay owned by their original tab objects).
+    expect(manager.getAllTabs().every((tab, i) => tab === before.find((b) => b.id === tab.id))).toBe(true);
+    expect(mockDeactivateTab).not.toHaveBeenCalled();
+    expect(mockDestroyTab).not.toHaveBeenCalled();
+  });
+
+  it('renumbers getTabBarItems in the new order', () => {
+    manager.moveTab('tab-3', 0);
+
+    const items = manager.getTabBarItems();
+
+    expect(items.map((item) => item.id)).toEqual(['tab-3', 'tab-1', 'tab-2']);
+    expect(items.map((item) => item.index)).toEqual([1, 2, 3]);
+  });
+
+  it('uses the new order for the close-fallback neighbour selection', async () => {
+    manager.moveTab('tab-3', 0);
+    // Active tab is the first created one; switch to the (now) middle tab so
+    // closing it must fall back to its new visual predecessor.
+    await manager.switchToTab('tab-1');
+
+    await manager.closeTab('tab-1');
+
+    expect(manager.getActiveTabId()).toBe('tab-3');
+  });
+
+  it('persists openTabs in the new order and restores the same order', async () => {
+    manager.moveTab('tab-2', 2);
+
+    const persisted = manager.getPersistedState();
+    expect(persisted.openTabs.map((state) => state.tabId)).toEqual(['tab-1', 'tab-3', 'tab-2']);
+
+    const restored = createManager();
+    const restoredIds: string[] = [];
+    mockCreateTab.mockImplementation((opts: any) => {
+      const tab = createMockTabData({ id: opts.tabId });
+      restoredIds.push(opts.tabId);
+      return tab;
+    });
+    await restored.restoreState(persisted);
+
+    expect(restored.getAllTabs().map((tab) => tab.id)).toEqual(['tab-1', 'tab-3', 'tab-2']);
+  });
+});
+
 describe('TabManager - Conversation Management', () => {
   let manager: TabManager;
   let plugin: any;
@@ -3827,6 +3937,20 @@ describe('TabManager - Desktop Notifications', () => {
       body: 'Tab 2 "Test Tab" needs your response',
       silent: true,
     });
+  });
+
+  it('uses the reordered position for the notification index', async () => {
+    const { callbacksByTab, manager, tabs } = await setupWithTabs(3);
+
+    // Move the last tab to the front: its notification must announce the new
+    // badge number (1), not its creation-order position (3).
+    manager.moveTab(tabs[2].id, 0);
+    createdNotifications.length = 0;
+
+    callbacksByTab.get(tabs[2].id)!.onAttentionChanged(true);
+
+    expect(createdNotifications).toHaveLength(1);
+    expect(createdNotifications[0].body).toBe('Tab 1 "Test Tab" needs your response');
   });
 
   it('does not notify when the active tab needs attention', async () => {

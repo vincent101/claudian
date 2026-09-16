@@ -345,6 +345,13 @@ export interface TabManagerCallbacks {
 
   /** Called when the active provider changes within a tab (blank tab model selection). */
   onTabProviderChanged?: (tabId: TabId, providerId: ProviderId) => void;
+
+  /**
+   * Called after a successful moveTab reorder. Map ordering is behavior data
+   * (badge numbering, close fallback, notification index), so listeners must
+   * re-derive anything cached from the old order.
+   */
+  onTabOrderChanged?: () => void;
 }
 
 /**

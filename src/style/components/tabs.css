@@ -20,10 +20,25 @@
   border: 2px solid var(--background-modifier-border);
   font-size: 12px;
   font-weight: 500;
-  cursor: pointer;
+  cursor: grab;
   color: var(--text-muted);
   background: var(--background-primary);
   transition: border-color 0.15s ease, color 0.15s ease, background 0.15s ease;
+}
+
+/* Drag-reorder states: the source badge dims while a drop edge highlights
+   the insertion point on the target badge. */
+.claudian-tab-badge-dragging {
+  opacity: 0.45;
+  cursor: grabbing;
+}
+
+.claudian-tab-drop-before {
+  box-shadow: -2px 0 0 0 var(--interactive-accent);
+}
+
+.claudian-tab-drop-after {
+  box-shadow: 2px 0 0 0 var(--interactive-accent);
 }
 
 .claudian-tab-badge:hover {

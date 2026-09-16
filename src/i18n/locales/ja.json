@@ -101,6 +101,11 @@
       "expandFullContent": "全文を表示",
       "contentTruncatedNote": "プレビュー — 全 {count} 文字",
       "tooLargeToRender": "内容が大きすぎてインライン表示できません（{count} 文字）。"
+    },
+    "tabs": {
+      "moveLeft": "左へ移動",
+      "moveRight": "右へ移動",
+      "close": "タブを閉じる"
     }
   },
   "settings": {

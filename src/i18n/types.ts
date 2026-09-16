@@ -79,6 +79,11 @@ export type TranslationKey =
   | 'chat.message.contentTruncatedNote'
   | 'chat.message.tooLargeToRender'
 
+  // Chat - Tab bar
+  | 'chat.tabs.moveLeft'
+  | 'chat.tabs.moveRight'
+  | 'chat.tabs.close'
+
   // Chat - Fork
   | 'chat.fork.ariaLabel'
   | 'chat.fork.chooseTarget'
