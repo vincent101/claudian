@@ -3636,6 +3636,62 @@ describe('Tab - Cross-Provider Model Rejection', () => {
     expect(Notice).not.toHaveBeenCalled();
     expect(plugin.saveSettings).toHaveBeenCalled();
   });
+
+  it('re-denominates the tab usage with the explicitly selected model on same-provider switch', async () => {
+    jest.spyOn(ProviderRegistry, 'createInstructionRefineService').mockReturnValue({ cancel: jest.fn(), resetConversation: jest.fn() } as any);
+    jest.spyOn(ProviderRegistry, 'createTitleGenerationService').mockReturnValue({ cancel: jest.fn() } as any);
+    jest.spyOn(ProviderRegistry, 'getTaskResultInterpreter').mockReturnValue({} as any);
+    jest.spyOn(ProviderRegistry, 'getChatUIConfig').mockReturnValue({
+      getModelOptions: jest.fn().mockReturnValue([]),
+      ownsModel: jest.fn((model: string) => model.startsWith('gpt-') || /^o\d/.test(model)),
+      isAdaptiveReasoningModel: jest.fn().mockReturnValue(false),
+      getReasoningOptions: jest.fn().mockReturnValue([]),
+      getDefaultReasoningValue: jest.fn().mockReturnValue('off'),
+      getContextWindowSize: jest.fn().mockReturnValue(500000),
+      isDefaultModel: jest.fn().mockReturnValue(false),
+      applyModelDefaults: jest.fn(),
+      normalizeModelVariant: jest.fn((model: string) => model),
+      getCustomModelIds: jest.fn().mockReturnValue(new Set()),
+    } as any);
+
+    const plugin = createMockPlugin();
+    const tab = createTab(createMockOptions({ plugin }));
+    initializeTabUI(tab, plugin);
+
+    tab.lifecycleState = 'bound_cold';
+    tab.providerId = 'claude';
+    tab.conversationId = 'conv-1';
+    tab.state.usage = {
+      model: 'sonnet',
+      inputTokens: 400_000,
+      cacheCreationInputTokens: 30_000,
+      cacheReadInputTokens: 20_000,
+      contextWindow: 800_000,
+      contextWindowIsAuthoritative: true,
+      contextTokens: 450_000,
+      percentage: 57,
+    };
+
+    const toolbarModule = jest.requireMock('@/features/chat/ui/InputToolbar') as {
+      createInputToolbar: jest.Mock;
+    };
+    const toolbarCallbacks = toolbarModule.createInputToolbar.mock.calls.at(-1)?.[1];
+
+    await toolbarCallbacks.onModelChange('opus');
+
+    // Explicit switch semantics: the newly selected model wins over both the
+    // stored fallback window and the previous model's authoritative window.
+    expect(tab.state.usage).toEqual({
+      model: 'opus',
+      inputTokens: 400_000,
+      cacheCreationInputTokens: 30_000,
+      cacheReadInputTokens: 20_000,
+      contextWindow: 500000,
+      contextWindowIsAuthoritative: false,
+      contextTokens: 450_000,
+      percentage: 90,
+    });
+  });
 });
 
 describe('Tab - Blank Tab Draft Model Change', () => {

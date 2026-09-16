@@ -62,8 +62,18 @@ function normalizeModelId(model: string): string {
   return model.trim().toLowerCase();
 }
 
-function has1MContextSuffix(model: string): boolean {
-  return normalizeModelId(model).endsWith(ONE_M_SUFFIX);
+/**
+ * Key-matching normalization for custom context limits: a runtime-resolved
+ * model id may carry the `[1m]` variant suffix (e.g. persisted usage.model
+ * "sonnet[1m]") while the configured preset key is the bare family alias, or
+ * vice versa. Stripping the suffix lets a configured window hit both alias
+ * forms. Lookup normalization only — the suffix itself implies no window.
+ */
+function normalizeContextLimitKey(model: string): string {
+  const normalized = normalizeModelId(model);
+  return normalized.endsWith(ONE_M_SUFFIX)
+    ? normalized.slice(0, -ONE_M_SUFFIX.length)
+    : normalized;
 }
 
 function isBuiltInFamilyVariant(model: string, family: 'sonnet' | 'opus'): boolean {
@@ -93,9 +103,9 @@ function resolveCustomContextLimit(
     return exactLimit;
   }
 
-  const normalizedModel = normalizeModelId(model);
+  const normalizedModel = normalizeContextLimitKey(model);
   const matchingLimits = Object.entries(customLimits)
-    .filter(([key, limit]) => key !== model && normalizeModelId(key) === normalizedModel && isValidContextLimit(limit))
+    .filter(([key, limit]) => key !== model && normalizeContextLimitKey(key) === normalizedModel && isValidContextLimit(limit))
     .map(([, limit]) => limit);
 
   return matchingLimits.length === 1 ? matchingLimits[0] : null;
@@ -168,7 +178,6 @@ export function resolveAdaptiveEffortLevel(
 }
 
 export const CONTEXT_WINDOW_STANDARD = 200_000;
-export const CONTEXT_WINDOW_1M = 1_000_000;
 
 /**
  * Maps a stored built-in family variant onto the variant actually offered by
@@ -202,6 +211,14 @@ export function normalizeVisibleModelVariantForPresets(
   return model;
 }
 
+/**
+ * Presets are the single source of truth for context-window denominators:
+ * a configured window (exact key or alias-normalized match) wins, and
+ * anything unconfigured falls back to the conservative standard window.
+ * The historical `[1m]`/fable hard-coded 1M rules were removed because they
+ * formed a second truth source that could override user configuration
+ * (2026-09-16 design decision).
+ */
 export function getContextWindowSize(
   model: string,
   customLimits?: Record<string, number>
@@ -209,14 +226,6 @@ export function getContextWindowSize(
   const customLimit = resolveCustomContextLimit(model, customLimits);
   if (customLimit !== null) {
     return customLimit;
-  }
-
-  if (has1MContextSuffix(model)) {
-    return CONTEXT_WINDOW_1M;
-  }
-
-  if (isFableFamilyModel(model)) {
-    return CONTEXT_WINDOW_1M;
   }
 
   return CONTEXT_WINDOW_STANDARD;

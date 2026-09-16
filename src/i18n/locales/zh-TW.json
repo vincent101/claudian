@@ -357,7 +357,7 @@
       "desc": "定義 Claude 模型選擇器中顯示的檔位。模型 ID 原樣發送給 Claude Code；上下文視窗可選，填寫後覆蓋內建預設值。",
       "labelPlaceholder": "名稱",
       "modelPlaceholder": "模型 ID（如 sonnet、fable）",
-      "windowPlaceholder": "上下文視窗（如 200k、1m）",
+      "windowPlaceholder": "上下文視窗（預設 200000）",
       "add": "新增檔位",
       "reset": "恢復預設四檔",
       "remove": "刪除",

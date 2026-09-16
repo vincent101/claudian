@@ -357,7 +357,7 @@
       "desc": "Define the model tiers shown in the Claude model selector. The model id is sent to Claude Code as-is; the context window is optional and overrides the built-in default.",
       "labelPlaceholder": "Label",
       "modelPlaceholder": "Model id (e.g. sonnet, fable)",
-      "windowPlaceholder": "Context window (e.g. 200k, 1m)",
+      "windowPlaceholder": "Context window (default 200000)",
       "add": "Add preset",
       "reset": "Restore defaults",
       "remove": "Remove",

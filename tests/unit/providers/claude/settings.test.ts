@@ -4,6 +4,7 @@ import {
   updateClaudeProviderSettings,
   validateClaudeModelPresetDrafts,
 } from '@/providers/claude/settings';
+import { getContextWindowSize } from '@/providers/claude/types/models';
 
 describe('Claude model presets', () => {
   describe('DEFAULT_CLAUDE_MODEL_PRESETS', () => {
@@ -170,6 +171,20 @@ describe('Claude model presets', () => {
   });
 
   describe('updateClaudeProviderSettings preset projection', () => {
+    it('keeps factory out-of-box windows non-regressed after rule removal (storage.load chain)', () => {
+      // storage.load() merges defaults then runs updateClaudeProviderSettings
+      // with the resolved presets, so the factory fable 1M window reaches
+      // customContextLimits before any user interaction. With the [1m]/fable
+      // hard-coded rules gone, that projection is what keeps fable at 1M.
+      const bag: Record<string, unknown> = {};
+      updateClaudeProviderSettings(bag, getClaudeProviderSettings(bag));
+      const limits = bag.customContextLimits as Record<string, number>;
+      expect(getContextWindowSize('haiku', limits)).toBe(200_000);
+      expect(getContextWindowSize('sonnet', limits)).toBe(200_000);
+      expect(getContextWindowSize('opus', limits)).toBe(200_000);
+      expect(getContextWindowSize('fable', limits)).toBe(1_000_000);
+    });
+
     it('projects preset windows into customContextLimits for existing readers', () => {
       const bag: Record<string, unknown> = {
         providerConfigs: { claude: {} },

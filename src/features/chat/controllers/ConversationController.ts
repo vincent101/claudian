@@ -28,6 +28,7 @@ import type { FileContextManager } from '../ui/FileContext';
 import type { ImageContextManager } from '../ui/ImageContext';
 import type { ExternalContextSelector, McpServerSelector } from '../ui/InputToolbar';
 import type { StatusPanel } from '../ui/StatusPanel';
+import { refreshUsageContextWindow } from '../utils/usageInfo';
 import { enumerateVisibleMatches } from './HistorySearchController';
 
 export interface ConversationCallbacks {
@@ -1061,6 +1062,7 @@ export class ConversationController {
     state.currentConversationId = conversation.id;
     state.messages = [...conversation.messages];
     state.usage = conversation.usage ?? null;
+    this.refreshRestoredUsageWindow(conversation);
     state.autoScrollEnabled = plugin.settings.enableAutoScroll ?? true;
     state.hasPendingConversationSave = false;
 
@@ -1100,6 +1102,29 @@ export class ConversationController {
       () => this.getGreeting()
     );
     this.deps.setWelcomeEl(welcomeEl);
+  }
+
+  /**
+   * Re-derives the restored usage denominator through the provider preset
+   * chain. A persisted non-authoritative window may be a stale local fallback
+   * (idle sessions never receive a runtime-corrected one) and settings may
+   * have changed since the snapshot was written, so hydration must not trust
+   * the stored denominator. Candidate order: the usage's own recorded model,
+   * then the provider's current-model projection; same-model authoritative
+   * runtime windows survive inside refreshUsageContextWindow.
+   */
+  private refreshRestoredUsageWindow(conversation: Conversation): void {
+    const usage = this.deps.state.usage;
+    if (!usage || !conversation.providerId) {
+      return;
+    }
+
+    const fallbackModel = this.deps.plugin.settings.savedProviderModel?.[conversation.providerId];
+    this.deps.state.usage = refreshUsageContextWindow(usage, {
+      uiConfig: ProviderRegistry.getChatUIConfig(conversation.providerId),
+      settings: this.deps.plugin.settings as unknown as Record<string, unknown>,
+      fallbackModel,
+    });
   }
 
   /**

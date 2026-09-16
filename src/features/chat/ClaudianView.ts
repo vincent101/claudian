@@ -19,7 +19,7 @@ import {
 import { TabBar } from './tabs/TabBar';
 import { TabManager } from './tabs/TabManager';
 import type { TabData, TabId } from './tabs/types';
-import { recalculateUsageForModel } from './utils/usageInfo';
+import { refreshUsageContextWindow } from './utils/usageInfo';
 
 export class ClaudianView extends ItemView {
   private plugin: ClaudianPlugin;
@@ -102,13 +102,17 @@ export class ClaudianView extends ItemView {
       const model = providerSettings.model as string;
       const uiConfig = ProviderRegistry.getChatUIConfig(providerId);
       const capabilities = ProviderRegistry.getCapabilities(providerId);
-      const contextWindow = uiConfig.getContextWindowSize(
-        model,
-        providerSettings.customContextLimits as Record<string, number> | undefined,
-      );
 
       if (tab.state.usage) {
-        tab.state.usage = recalculateUsageForModel(tab.state.usage, model, contextWindow);
+        // Re-derive each tab's denominator from its own recorded model so a
+        // preset-window change applies to every open conversation without
+        // re-labeling them all with the provider's current model. The current
+        // model is only the fallback candidate for usages that carry none.
+        tab.state.usage = refreshUsageContextWindow(tab.state.usage, {
+          uiConfig,
+          settings: providerSettings,
+          fallbackModel: model,
+        });
       }
 
       tab.ui.modelSelector?.updateDisplay();

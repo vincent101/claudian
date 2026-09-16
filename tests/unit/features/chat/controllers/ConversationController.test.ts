@@ -7,7 +7,17 @@ import { ConversationController, type ConversationControllerDeps } from '@/featu
 import * as historySearchModule from '@/features/chat/controllers/HistorySearchController';
 import { ProjectionWriteCoordinator } from '@/features/chat/rendering/ProjectionWriteCoordinator';
 import { ChatState } from '@/features/chat/state/ChatState';
+import { claudeChatUIConfig } from '@/providers/claude/ui/ClaudeChatUIConfig';
 import { confirm } from '@/shared/modals/ConfirmModal';
+
+// Hydration usage re-derivation needs a real chat UI config behind the
+// provider registry; only the config seam is registered. The empty
+// historyService keeps bindHistoryLease on its legacy reset path instead of
+// throwing on a missing registration.
+ProviderRegistry.register('claude', {
+  chatUIConfig: claudeChatUIConfig,
+  historyService: {},
+} as never);
 
 jest.mock('@/shared/modals/ConfirmModal', () => ({
   confirm: jest.fn().mockResolvedValue(true),
@@ -1506,6 +1516,140 @@ describe('ConversationController', () => {
 
       const greetingFn = (deps.renderer.renderMessages as jest.Mock).mock.calls[0][1];
       expect(greetingFn().length).toBeGreaterThan(0);
+    });
+  });
+
+  describe('loadActive usage denominator re-derivation (idle-session fix)', () => {
+    const usagePresets = [
+      { label: 'Haiku', model: 'haiku' },
+      { label: 'Sonnet', model: 'sonnet' },
+      { label: 'Opus', model: 'opus' },
+    ];
+
+    function seedClaudeSettings(
+      customContextLimits: Record<string, number>,
+      savedProviderModel?: Record<string, string>,
+    ): void {
+      deps.plugin.settings = {
+        userName: '',
+        enableAutoTitleGeneration: true,
+        permissionConfigs: {},
+        providerConfigs: {
+          claude: { modelPresets: usagePresets },
+        },
+        customContextLimits,
+        ...(savedProviderModel ? { savedProviderModel } : {}),
+      } as unknown as typeof deps.plugin.settings;
+    }
+
+    function storedUsage(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+      return {
+        model: 'sonnet',
+        inputTokens: 400_000,
+        cacheCreationInputTokens: 30_000,
+        cacheReadInputTokens: 20_000,
+        contextWindow: 200_000,
+        contextWindowIsAuthoritative: false,
+        contextTokens: 450_000,
+        percentage: 100,
+        ...overrides,
+      };
+    }
+
+    function storedConversation(usage?: Record<string, unknown>): Record<string, unknown> {
+      return {
+        id: 'conv-usage',
+        providerId: 'claude',
+        title: 'Old session',
+        sessionId: 'session-1',
+        messages: [{ id: '1', role: 'user', content: 'hello', timestamp: 1 }],
+        createdAt: 1,
+        updatedAt: 1,
+        ...(usage !== undefined ? { usage } : {}),
+      };
+    }
+
+    it('re-derives a stored non-authoritative fallback window on hydration without any send', async () => {
+      seedClaudeSettings({ 'sonnet': 1_000_000 });
+      deps.state.currentConversationId = 'conv-usage';
+      (deps.plugin.getConversationById as jest.Mock).mockResolvedValue(
+        storedConversation(storedUsage()),
+      );
+
+      await controller.loadActive();
+
+      expect(deps.state.usage).toEqual({
+        ...storedUsage(),
+        contextWindow: 1_000_000,
+        contextWindowIsAuthoritative: false,
+        percentage: 45,
+      });
+    });
+
+    it('matches the configured preset through a [1m] alias usage.model on hydration', async () => {
+      seedClaudeSettings({ 'sonnet': 1_000_000 });
+      deps.state.currentConversationId = 'conv-usage';
+      (deps.plugin.getConversationById as jest.Mock).mockResolvedValue(
+        storedConversation(storedUsage({ model: 'sonnet[1m]' })),
+      );
+
+      await controller.loadActive();
+
+      expect(deps.state.usage?.contextWindow).toBe(1_000_000);
+      expect(deps.state.usage?.model).toBe('sonnet[1m]');
+    });
+
+    it('keeps an authoritative same-model runtime window on hydration', async () => {
+      seedClaudeSettings({ 'sonnet': 1_000_000 });
+      deps.state.currentConversationId = 'conv-usage';
+      (deps.plugin.getConversationById as jest.Mock).mockResolvedValue(
+        storedConversation(storedUsage({
+          contextWindow: 800_000,
+          contextWindowIsAuthoritative: true,
+          percentage: 57,
+        })),
+      );
+
+      await controller.loadActive();
+
+      expect(deps.state.usage?.contextWindow).toBe(800_000);
+      expect(deps.state.usage?.contextWindowIsAuthoritative).toBe(true);
+    });
+
+    it('falls back to the provider current-model projection when the stored usage has no model', async () => {
+      seedClaudeSettings({ 'sonnet': 1_000_000 }, { claude: 'sonnet' });
+      deps.state.currentConversationId = 'conv-usage';
+      (deps.plugin.getConversationById as jest.Mock).mockResolvedValue(
+        storedConversation(storedUsage({ model: undefined })),
+      );
+
+      await controller.loadActive();
+
+      expect(deps.state.usage?.model).toBe('sonnet');
+      expect(deps.state.usage?.contextWindow).toBe(1_000_000);
+      expect(deps.state.usage?.percentage).toBe(45);
+    });
+
+    it('keeps sessions without usage untouched (gauge stays hidden)', async () => {
+      seedClaudeSettings({ 'sonnet': 1_000_000 });
+      deps.state.currentConversationId = 'conv-usage';
+      (deps.plugin.getConversationById as jest.Mock).mockResolvedValue(storedConversation());
+
+      await controller.loadActive();
+
+      expect(deps.state.usage).toBeNull();
+    });
+
+    it('restores the stored usage as-is when the conversation carries no provider id', async () => {
+      seedClaudeSettings({ 'sonnet': 1_000_000 });
+      deps.state.currentConversationId = 'conv-usage';
+      const legacyConversation = storedConversation(storedUsage());
+      delete legacyConversation.providerId;
+      (deps.plugin.getConversationById as jest.Mock).mockResolvedValue(legacyConversation);
+
+      await controller.loadActive();
+
+      expect(deps.state.usage).toEqual(storedUsage());
     });
   });
 

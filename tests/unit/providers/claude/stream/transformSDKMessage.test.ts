@@ -1521,7 +1521,11 @@ describe('transformSDKMessage', () => {
         expect(results).toEqual([]);
       });
 
-      it('keeps the 1M family default as the stream-phase denominator for fable', () => {
+      it('falls back to the standard window as the stream-phase denominator for unconfigured fable', () => {
+        // Preset-only resolution (2026-09-16): the fable hard-coded 1M rule is
+        // gone, so an unconfigured fable keeps the conservative stream-phase
+        // denominator until the authoritative result window arrives (covered
+        // above) or a preset window is projected (covered below).
         const usageState = createTransformUsageState();
         const message = msg({
           type: 'assistant',
@@ -1540,7 +1544,7 @@ describe('transformSDKMessage', () => {
         const results = [...transformSDKMessage(message, { intendedModel: 'fable', usageState })];
         const usage = (results.find(r => r.type === 'usage') as { usage: { contextWindow: number } }).usage;
 
-        expect(usage.contextWindow).toBe(1000000);
+        expect(usage.contextWindow).toBe(200000);
       });
 
       it('prefers a preset context window projected into customContextLimits', () => {

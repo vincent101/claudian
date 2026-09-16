@@ -12,7 +12,6 @@ import {
 import type { ClaudianSettings } from '@/core/types/settings';
 import { getClaudeProviderSettings } from '@/providers/claude/settings';
 import {
-  CONTEXT_WINDOW_1M,
   CONTEXT_WINDOW_STANDARD,
   getContextWindowSize,
   isAdaptiveThinkingModel,
@@ -603,50 +602,47 @@ describe('types.ts', () => {
       });
     });
 
-    describe('[1m] suffix detection', () => {
-      it('should return 1M context window for models with [1m] suffix', () => {
-        expect(getContextWindowSize('opus[1m]')).toBe(CONTEXT_WINDOW_1M);
-        expect(getContextWindowSize('sonnet[1m]')).toBe(CONTEXT_WINDOW_1M);
+    describe('preset-only resolution (2026-09-16 simplification)', () => {
+      it('returns the standard window for [1m] alias forms without a matching preset', () => {
+        expect(getContextWindowSize('sonnet[1m]')).toBe(CONTEXT_WINDOW_STANDARD);
+        expect(getContextWindowSize('opus[1m]')).toBe(CONTEXT_WINDOW_STANDARD);
+        expect(getContextWindowSize('claude-opus-4-6[1m]')).toBe(CONTEXT_WINDOW_STANDARD);
       });
 
-      it('should treat [1M] and [1m] suffixes equivalently', () => {
-        expect(getContextWindowSize('opus[1M]')).toBe(CONTEXT_WINDOW_1M);
-        expect(getContextWindowSize('claude-opus-4-6[1M]')).toBe(CONTEXT_WINDOW_1M);
-        expect(getContextWindowSize('claude-sonnet-4-6[1M]')).toBe(CONTEXT_WINDOW_1M);
+      it('returns the standard window for fable forms without a matching preset', () => {
+        expect(getContextWindowSize('fable')).toBe(CONTEXT_WINDOW_STANDARD);
+        expect(getContextWindowSize('claude-fable-5')).toBe(CONTEXT_WINDOW_STANDARD);
       });
 
-      it('should return 1M for full model IDs with [1m] suffix', () => {
-        expect(getContextWindowSize('claude-opus-4-6[1m]')).toBe(CONTEXT_WINDOW_1M);
-        expect(getContextWindowSize('claude-sonnet-4-6[1m]')).toBe(CONTEXT_WINDOW_1M);
+      it('lets a configured window override the [1m] alias suffix (non-fallback value)', () => {
+        const customLimits = { 'sonnet': 500000 };
+        expect(getContextWindowSize('sonnet[1m]', customLimits)).toBe(500000);
       });
 
-      it('should prefer custom limits over [1m] suffix', () => {
-        const customLimits = { 'opus[1m]': 500000 };
-        expect(getContextWindowSize('opus[1m]', customLimits)).toBe(500000);
+      it('matches a configured preset through the [1m] alias form (control for fallback masking)', () => {
+        const customLimits = { 'sonnet': 1_000_000 };
+        expect(getContextWindowSize('sonnet[1m]', customLimits)).toBe(1_000_000);
       });
 
-      it('should match custom limits case-insensitively for [1M] suffixes', () => {
+      it('matches the bare-family key when the preset is configured under the [1m] form', () => {
+        const customLimits = { 'sonnet[1m]': 800000 };
+        expect(getContextWindowSize('sonnet', customLimits)).toBe(800000);
+      });
+
+      it('keeps exact-key hits winning over alias normalization', () => {
+        const customLimits = { 'sonnet': 200000, 'sonnet[1m]': 500000 };
+        expect(getContextWindowSize('sonnet[1m]', customLimits)).toBe(500000);
+        expect(getContextWindowSize('sonnet', customLimits)).toBe(200000);
+      });
+
+      it('still matches custom limits case-insensitively', () => {
         const customLimits = { 'claude-opus-4-6[1m]': 500000 };
         expect(getContextWindowSize('claude-opus-4-6[1M]', customLimits)).toBe(500000);
       });
 
-      it('should return standard for models without [1m] suffix', () => {
+      it('returns the standard window for models without [1m] suffix', () => {
         expect(getContextWindowSize('opus')).toBe(CONTEXT_WINDOW_STANDARD);
         expect(getContextWindowSize('sonnet')).toBe(CONTEXT_WINDOW_STANDARD);
-      });
-    });
-
-    describe('fable family defaults', () => {
-      it('should default the fable alias to a 1M context window', () => {
-        expect(getContextWindowSize('fable')).toBe(CONTEXT_WINDOW_1M);
-      });
-
-      it('should default concrete fable model ids to a 1M context window', () => {
-        expect(getContextWindowSize('claude-fable-5')).toBe(CONTEXT_WINDOW_1M);
-      });
-
-      it('should still prefer custom limits for fable models', () => {
-        expect(getContextWindowSize('fable', { 'fable': 500_000 })).toBe(500_000);
       });
     });
 
