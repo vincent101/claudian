@@ -1,3 +1,4 @@
+import { recalculateUsageForModel } from '@/features/chat/utils/usageInfo';
 import { CODEX_SPARK_MODEL, DEFAULT_CODEX_PRIMARY_MODEL } from '@/providers/codex/types/models';
 import { codexChatUIConfig } from '@/providers/codex/ui/CodexChatUIConfig';
 
@@ -100,8 +101,79 @@ describe('CodexChatUIConfig', () => {
   });
 
   describe('getContextWindowSize', () => {
-    it('should return 200000 for all models', () => {
+    it('should return 200000 for all models without custom limits', () => {
       expect(codexChatUIConfig.getContextWindowSize(DEFAULT_CODEX_PRIMARY_MODEL)).toBe(200_000);
+      expect(codexChatUIConfig.getContextWindowSize('my-custom-model', {})).toBe(200_000);
+      expect(codexChatUIConfig.getContextWindowSize('my-custom-model', undefined)).toBe(200_000);
+    });
+
+    it('applies the provider-scoped custom limit when no authoritative window exists', () => {
+      expect(
+        codexChatUIConfig.getContextWindowSize('my-custom-model', { 'my-custom-model': 256_000 }),
+      ).toBe(256_000);
+      // Limits for other models must not leak into this model's denominator.
+      expect(
+        codexChatUIConfig.getContextWindowSize('my-custom-model', { 'other-model': 128_000 }),
+      ).toBe(200_000);
+    });
+  });
+
+  describe('context window denominator with authoritative runtime windows', () => {
+    it('keeps the authoritative window when the model is unchanged', () => {
+      // App-server reports 200000 as authoritative for gpt-5.5; a stale custom
+      // limit of 256000 for the same model must not override it.
+      const usage = recalculateUsageForModel(
+        {
+          contextTokens: 10_000,
+          contextWindow: 200_000,
+          contextWindowIsAuthoritative: true,
+          model: DEFAULT_CODEX_PRIMARY_MODEL,
+        },
+        DEFAULT_CODEX_PRIMARY_MODEL,
+        codexChatUIConfig.getContextWindowSize(
+          DEFAULT_CODEX_PRIMARY_MODEL,
+          { [DEFAULT_CODEX_PRIMARY_MODEL]: 256_000 },
+        ),
+      );
+
+      expect(usage.contextWindow).toBe(200_000);
+      expect(usage.contextWindowIsAuthoritative).toBe(true);
+    });
+
+    it('falls back to the custom limit for the newly selected model', () => {
+      const usage = recalculateUsageForModel(
+        {
+          contextTokens: 10_000,
+          contextWindow: 200_000,
+          contextWindowIsAuthoritative: true,
+          model: DEFAULT_CODEX_PRIMARY_MODEL,
+        },
+        'my-custom-model',
+        codexChatUIConfig.getContextWindowSize(
+          'my-custom-model',
+          { 'my-custom-model': 128_000 },
+        ),
+      );
+
+      expect(usage.contextWindow).toBe(128_000);
+      expect(usage.contextWindowIsAuthoritative).toBe(false);
+      expect(usage.percentage).toBe(8);
+    });
+
+    it('falls back to the 200k default when the new model has no custom limit', () => {
+      const usage = recalculateUsageForModel(
+        {
+          contextTokens: 10_000,
+          contextWindow: 200_000,
+          contextWindowIsAuthoritative: true,
+          model: DEFAULT_CODEX_PRIMARY_MODEL,
+        },
+        'another-model',
+        codexChatUIConfig.getContextWindowSize('another-model', { 'my-custom-model': 128_000 }),
+      );
+
+      expect(usage.contextWindow).toBe(200_000);
+      expect(usage.contextWindowIsAuthoritative).toBe(false);
     });
   });
 

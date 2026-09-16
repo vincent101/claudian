@@ -70,8 +70,10 @@ export const codexChatUIConfig: ProviderChatUIConfig = {
     return 'medium';
   },
 
-  getContextWindowSize(): number {
-    return DEFAULT_CONTEXT_WINDOW;
+  getContextWindowSize(model: string, customLimits?: Record<string, number>): number {
+    // Local fallback only: an authoritative app-server window (via
+    // recalculateUsageForModel) still outranks this value for the same model.
+    return customLimits?.[model] ?? DEFAULT_CONTEXT_WINDOW;
   },
 
   isDefaultModel(model: string): boolean {
