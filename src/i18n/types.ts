@@ -61,6 +61,7 @@ export type TranslationKey =
   | 'chat.history.errorDescription'
   | 'chat.history.retry'
   | 'chat.history.switchFailed'
+  | 'chat.history.oversizeSegmentDetail'
   | 'chat.search.placeholder'
   | 'chat.search.noResults'
   | 'chat.search.error'
@@ -80,11 +81,15 @@ export type TranslationKey =
   | 'chat.message.tooLargeToRender'
   | 'chat.message.copyAriaLabel'
   | 'chat.message.copied'
+  | 'chat.message.renderFailed'
+  | 'chat.message.renderFailedContent'
+  | 'chat.message.compactBoundary'
 
   // Chat - Tab bar
   | 'chat.tabs.moveLeft'
   | 'chat.tabs.moveRight'
   | 'chat.tabs.close'
+  | 'chat.tabs.boundProviderSwitch'
 
   // Chat - Fork
   | 'chat.fork.ariaLabel'
@@ -103,6 +108,51 @@ export type TranslationKey =
   | 'chat.fork.errorNoActiveTab'
   | 'chat.fork.commandNoMessages'
   | 'chat.fork.commandNoAssistantUuid'
+  | 'chat.fork.unsupportedProvider'
+  | 'chat.fork.unavailable'
+
+  // Chat - Input and instruction flow
+  | 'chat.input.placeholder'
+  | 'chat.input.serviceInitFailed'
+  | 'chat.input.serviceUnavailable'
+  | 'chat.input.steerQueuedFailed'
+  | 'chat.input.errorNotice'
+  | 'chat.instruction.added'
+  | 'chat.instruction.noneReceived'
+  | 'chat.instruction.processFailed'
+  | 'chat.instruction.refineFailed'
+
+  // Chat - Inline approval
+  | 'chat.approval.agentLabel'
+  | 'chat.approval.unexpectedSelection'
+
+  // Chat - Built-in commands and resume
+  | 'chat.commands.unsupportedProvider'
+  | 'chat.commands.externalContextUnavailable'
+  | 'chat.commands.externalContextAdded'
+  | 'chat.commands.unknown'
+  | 'chat.resume.noConversations'
+  | 'chat.resume.openFailed'
+
+  // Chat - Codex chat UI config copy
+  | 'chat.codex.effort.low'
+  | 'chat.codex.effort.medium'
+  | 'chat.codex.effort.high'
+  | 'chat.codex.effort.xhigh'
+  | 'chat.codex.permission.safe'
+  | 'chat.codex.permission.yolo'
+  | 'chat.codex.permission.plan'
+  | 'chat.codex.serviceTier.standard'
+  | 'chat.codex.serviceTier.fast'
+
+  // Chat - OpenCode chat UI config copy
+  | 'chat.opencode.model.acpRuntime'
+  | 'chat.opencode.model.configured'
+  | 'chat.opencode.model.selectedInSession'
+  | 'chat.opencode.thinking.default'
+  | 'chat.opencode.permission.safe'
+  | 'chat.opencode.permission.yolo'
+  | 'chat.opencode.permission.plan'
 
   // Settings - Section Headings
   | 'settings.title'

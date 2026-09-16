@@ -5,6 +5,7 @@ import { InputController, type InputControllerDeps } from '@/features/chat/contr
 import { TurnCoordinator } from '@/features/chat/controllers/TurnCoordinator';
 import { ProjectionWriteCoordinator as ProjectionWriteCoordinatorForTest } from '@/features/chat/rendering/ProjectionWriteCoordinator';
 import { ChatState } from '@/features/chat/state/ChatState';
+import { t } from '@/i18n/i18n';
 import { encodeClaudeTurn } from '@/providers/claude/prompt/ClaudeTurnEncoder';
 import { ResumeSessionDropdown } from '@/shared/components/ResumeSessionDropdown';
 
@@ -1843,7 +1844,7 @@ describe('InputController - Message Queue', () => {
 
       await controller.sendMessage();
 
-      expect(mockNotice).toHaveBeenCalledWith('Fork not available.');
+      expect(mockNotice).toHaveBeenCalledWith(t('chat.fork.unavailable'));
       expect(inputEl.value).toBe('');
     });
   });

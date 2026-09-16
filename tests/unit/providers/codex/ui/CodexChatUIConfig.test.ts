@@ -1,4 +1,5 @@
 import { recalculateUsageForModel } from '@/features/chat/utils/usageInfo';
+import { setLocale } from '@/i18n/i18n';
 import { CODEX_SPARK_MODEL, DEFAULT_CODEX_PRIMARY_MODEL } from '@/providers/codex/types/models';
 import { codexChatUIConfig } from '@/providers/codex/ui/CodexChatUIConfig';
 
@@ -124,10 +125,12 @@ describe('CodexChatUIConfig', () => {
       // limit of 256000 for the same model must not override it.
       const usage = recalculateUsageForModel(
         {
+          inputTokens: 10_000,
           contextTokens: 10_000,
           contextWindow: 200_000,
           contextWindowIsAuthoritative: true,
           model: DEFAULT_CODEX_PRIMARY_MODEL,
+          percentage: 5,
         },
         DEFAULT_CODEX_PRIMARY_MODEL,
         codexChatUIConfig.getContextWindowSize(
@@ -143,10 +146,12 @@ describe('CodexChatUIConfig', () => {
     it('falls back to the custom limit for the newly selected model', () => {
       const usage = recalculateUsageForModel(
         {
+          inputTokens: 10_000,
           contextTokens: 10_000,
           contextWindow: 200_000,
           contextWindowIsAuthoritative: true,
           model: DEFAULT_CODEX_PRIMARY_MODEL,
+          percentage: 5,
         },
         'my-custom-model',
         codexChatUIConfig.getContextWindowSize(
@@ -163,10 +168,12 @@ describe('CodexChatUIConfig', () => {
     it('falls back to the 200k default when the new model has no custom limit', () => {
       const usage = recalculateUsageForModel(
         {
+          inputTokens: 10_000,
           contextTokens: 10_000,
           contextWindow: 200_000,
           contextWindowIsAuthoritative: true,
           model: DEFAULT_CODEX_PRIMARY_MODEL,
+          percentage: 5,
         },
         'another-model',
         codexChatUIConfig.getContextWindowSize('another-model', { 'my-custom-model': 128_000 }),
@@ -278,6 +285,16 @@ describe('CodexChatUIConfig', () => {
         planValue: 'plan',
         planLabel: 'Plan',
       });
+    });
+
+    it('resolves labels at call time so a locale switch is reflected immediately', () => {
+      try {
+        expect(setLocale('zh-CN')).toBe(true);
+        expect(codexChatUIConfig.getPermissionModeToggle!()?.inactiveLabel).toBe('安全');
+        expect(codexChatUIConfig.getReasoningOptions(DEFAULT_CODEX_PRIMARY_MODEL, {})[0].label).toBe('低');
+      } finally {
+        setLocale('en');
+      }
     });
   });
 });

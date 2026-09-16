@@ -50,7 +50,9 @@
       "errorNoSession": "Nenhum ID de sessão disponível",
       "errorNoActiveTab": "Nenhuma aba ativa",
       "commandNoMessages": "Não é possível bifurcar: não há mensagens na conversa",
-      "commandNoAssistantUuid": "Não é possível bifurcar: não há resposta do assistente com identificadores"
+      "commandNoAssistantUuid": "Não é possível bifurcar: não há resposta do assistente com identificadores",
+      "unsupportedProvider": "Fork is not supported by this provider.",
+      "unavailable": "Fork not available."
     },
     "bangBash": {
       "placeholder": "> Executar um comando bash...",
@@ -79,7 +81,8 @@
       "errorTitle": "Conversation failed to load",
       "errorDescription": "The conversation history could not be loaded.",
       "retry": "Retry",
-      "switchFailed": "Failed to switch conversation: {error}"
+      "switchFailed": "Failed to switch conversation: {error}",
+      "oversizeSegmentDetail": "{id} ({size} MiB)"
     },
     "search": {
       "placeholder": "Pesquisar no histórico ({shortcut})",
@@ -102,12 +105,75 @@
       "contentTruncatedNote": "Prévia — {count} caracteres no total",
       "tooLargeToRender": "Conteúdo grande demais para renderizar inline ({count} caracteres).",
       "copyAriaLabel": "Copy message",
-      "copied": "copied!"
+      "copied": "copied!",
+      "renderFailed": "Failed to render this message.",
+      "renderFailedContent": "Failed to render message content.",
+      "compactBoundary": "Conversation compacted"
     },
     "tabs": {
       "moveLeft": "Move left",
       "moveRight": "Move right",
-      "close": "Close"
+      "close": "Close",
+      "boundProviderSwitch": "Cannot switch provider on a bound session. Start a new tab instead."
+    },
+    "input": {
+      "placeholder": "How can I help you today?",
+      "serviceInitFailed": "Failed to initialize agent service. Please try again.",
+      "serviceUnavailable": "Agent service not available. Please reload the plugin.",
+      "steerQueuedFailed": "Failed to steer the queued Codex message. It is still available.",
+      "errorNotice": "Error: {error}"
+    },
+    "instruction": {
+      "added": "Instruction added to custom system prompt",
+      "noneReceived": "No instruction received",
+      "processFailed": "Failed to process response",
+      "refineFailed": "Failed to refine instruction"
+    },
+    "approval": {
+      "agentLabel": "Agent: {id}",
+      "unexpectedSelection": "Unexpected approval selection: \"{value}\""
+    },
+    "commands": {
+      "unsupportedProvider": "/{command} is not supported by this provider.",
+      "externalContextUnavailable": "External context selector not available.",
+      "externalContextAdded": "Added external context: {path}",
+      "unknown": "Unknown command: {action}"
+    },
+    "resume": {
+      "noConversations": "No conversations to resume",
+      "openFailed": "Failed to open conversation: {error}"
+    },
+    "codex": {
+      "effort": {
+        "low": "Low",
+        "medium": "Medium",
+        "high": "High",
+        "xhigh": "XHigh"
+      },
+      "permission": {
+        "safe": "Safe",
+        "yolo": "YOLO",
+        "plan": "Plan"
+      },
+      "serviceTier": {
+        "standard": "Standard",
+        "fast": "Fast"
+      }
+    },
+    "opencode": {
+      "model": {
+        "acpRuntime": "ACP runtime",
+        "configured": "Configured model",
+        "selectedInSession": "Selected in an existing session"
+      },
+      "thinking": {
+        "default": "Default"
+      },
+      "permission": {
+        "safe": "Safe",
+        "yolo": "YOLO",
+        "plan": "Plan"
+      }
     }
   },
   "settings": {

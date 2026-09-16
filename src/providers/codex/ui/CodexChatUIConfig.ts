@@ -5,6 +5,7 @@ import type {
   ProviderServiceTierToggleConfig,
   ProviderUIOption,
 } from '../../../core/providers/types';
+import { t } from '../../../i18n/i18n';
 import { OPENAI_PROVIDER_ICON } from '../../../shared/icons';
 import { getCodexModelOptions } from '../modelOptions';
 import { applyCodexModelDefaults } from '../settings';
@@ -15,29 +16,39 @@ import {
   FAST_TIER_CODEX_MODEL,
 } from '../types/models';
 
-const EFFORT_LEVELS: ProviderReasoningOption[] = [
-  { value: 'low', label: 'Low' },
-  { value: 'medium', label: 'Medium' },
-  { value: 'high', label: 'High' },
-  { value: 'xhigh', label: 'XHigh' },
-];
+// Render-time factories instead of module-level constants: labels must be
+// resolved through t() at call time so a locale switch is reflected without
+// reloading the plugin.
 
-const CODEX_PERMISSION_MODE_TOGGLE: ProviderPermissionModeToggleConfig = {
-  inactiveValue: 'normal',
-  inactiveLabel: 'Safe',
-  activeValue: 'yolo',
-  activeLabel: 'YOLO',
-  planValue: 'plan',
-  planLabel: 'Plan',
-};
+function getEffortLevels(): ProviderReasoningOption[] {
+  return [
+    { value: 'low', label: t('chat.codex.effort.low') },
+    { value: 'medium', label: t('chat.codex.effort.medium') },
+    { value: 'high', label: t('chat.codex.effort.high') },
+    { value: 'xhigh', label: t('chat.codex.effort.xhigh') },
+  ];
+}
 
-const CODEX_SERVICE_TIER_TOGGLE: ProviderServiceTierToggleConfig = {
-  inactiveValue: 'default',
-  inactiveLabel: 'Standard',
-  activeValue: 'fast',
-  activeLabel: 'Fast',
-  description: FAST_TIER_CODEX_DESCRIPTION,
-};
+function getCodexPermissionModeToggle(): ProviderPermissionModeToggleConfig {
+  return {
+    inactiveValue: 'normal',
+    inactiveLabel: t('chat.codex.permission.safe'),
+    activeValue: 'yolo',
+    activeLabel: t('chat.codex.permission.yolo'),
+    planValue: 'plan',
+    planLabel: t('chat.codex.permission.plan'),
+  };
+}
+
+function getCodexServiceTierToggle(): ProviderServiceTierToggleConfig {
+  return {
+    inactiveValue: 'default',
+    inactiveLabel: t('chat.codex.serviceTier.standard'),
+    activeValue: 'fast',
+    activeLabel: t('chat.codex.serviceTier.fast'),
+    description: FAST_TIER_CODEX_DESCRIPTION,
+  };
+}
 
 const DEFAULT_CONTEXT_WINDOW = 200_000;
 
@@ -63,7 +74,7 @@ export const codexChatUIConfig: ProviderChatUIConfig = {
   },
 
   getReasoningOptions(_model: string, _settings: Record<string, unknown>): ProviderReasoningOption[] {
-    return [...EFFORT_LEVELS];
+    return getEffortLevels();
   },
 
   getDefaultReasoningValue(_model: string, _settings: Record<string, unknown>): string {
@@ -105,11 +116,11 @@ export const codexChatUIConfig: ProviderChatUIConfig = {
   },
 
   getPermissionModeToggle(): ProviderPermissionModeToggleConfig {
-    return CODEX_PERMISSION_MODE_TOGGLE;
+    return getCodexPermissionModeToggle();
   },
 
   getServiceTierToggle(settings): ProviderServiceTierToggleConfig | null {
-    return settings.model === FAST_TIER_CODEX_MODEL ? CODEX_SERVICE_TIER_TOGGLE : null;
+    return settings.model === FAST_TIER_CODEX_MODEL ? getCodexServiceTierToggle() : null;
   },
 
   getProviderIcon() {

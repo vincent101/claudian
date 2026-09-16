@@ -50,7 +50,9 @@
       "errorNoSession": "沒有可用的工作階段 ID",
       "errorNoActiveTab": "沒有使用中的分頁",
       "commandNoMessages": "無法分叉：對話中沒有訊息",
-      "commandNoAssistantUuid": "無法分叉：沒有帶識別碼的助手回覆"
+      "commandNoAssistantUuid": "無法分叉：沒有帶識別碼的助手回覆",
+      "unsupportedProvider": "當前提供商不支援分叉。",
+      "unavailable": "分叉不可用。"
     },
     "bangBash": {
       "placeholder": "> 執行 bash 指令...",
@@ -79,7 +81,8 @@
       "errorTitle": "對話載入失敗",
       "errorDescription": "無法載入對話歷史。",
       "retry": "重試",
-      "switchFailed": "切換會話失敗：{error}"
+      "switchFailed": "切換會話失敗：{error}",
+      "oversizeSegmentDetail": "{id}（{size} MiB）"
     },
     "search": {
       "placeholder": "搜尋對話歷史（{shortcut}）",
@@ -102,12 +105,75 @@
       "contentTruncatedNote": "預覽 — 共 {count} 字元",
       "tooLargeToRender": "內容過大，無法內聯渲染（{count} 字元）。",
       "copyAriaLabel": "複製訊息",
-      "copied": "已複製"
+      "copied": "已複製",
+      "renderFailed": "渲染此訊息失敗。",
+      "renderFailedContent": "渲染訊息內容失敗。",
+      "compactBoundary": "對話已壓縮"
     },
     "tabs": {
       "moveLeft": "向左移動",
       "moveRight": "向右移動",
-      "close": "關閉分頁"
+      "close": "關閉分頁",
+      "boundProviderSwitch": "已綁定的會話無法切換提供商，請改開新分頁。"
+    },
+    "input": {
+      "placeholder": "今天我能幫你做什麼？",
+      "serviceInitFailed": "初始化代理服務失敗，請重試。",
+      "serviceUnavailable": "代理服務不可用，請重新載入外掛。",
+      "steerQueuedFailed": "轉向排隊的 Codex 訊息失敗，該訊息仍然可用。",
+      "errorNotice": "錯誤：{error}"
+    },
+    "instruction": {
+      "added": "指令已加入自訂系統提示詞",
+      "noneReceived": "未收到指令",
+      "processFailed": "處理回應失敗",
+      "refineFailed": "細化指令失敗"
+    },
+    "approval": {
+      "agentLabel": "代理：{id}",
+      "unexpectedSelection": "意外的審批選擇：\"{value}\""
+    },
+    "commands": {
+      "unsupportedProvider": "當前提供商不支援 /{command}。",
+      "externalContextUnavailable": "外部上下文選擇器不可用。",
+      "externalContextAdded": "已新增外部上下文：{path}",
+      "unknown": "未知命令：{action}"
+    },
+    "resume": {
+      "noConversations": "沒有可恢復的對話",
+      "openFailed": "開啟對話失敗：{error}"
+    },
+    "codex": {
+      "effort": {
+        "low": "低",
+        "medium": "中",
+        "high": "高",
+        "xhigh": "超高"
+      },
+      "permission": {
+        "safe": "安全",
+        "yolo": "YOLO",
+        "plan": "計劃"
+      },
+      "serviceTier": {
+        "standard": "標準",
+        "fast": "快速"
+      }
+    },
+    "opencode": {
+      "model": {
+        "acpRuntime": "ACP 執行時",
+        "configured": "已設定的模型",
+        "selectedInSession": "在既有會話中選擇的模型"
+      },
+      "thinking": {
+        "default": "預設"
+      },
+      "permission": {
+        "safe": "安全",
+        "yolo": "YOLO",
+        "plan": "計劃"
+      }
     }
   },
   "settings": {

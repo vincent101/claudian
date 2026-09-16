@@ -477,7 +477,7 @@ export class MessageRenderer {
         attr: { 'data-message-id': msg.id, 'data-role': msg.role },
       });
       const contentEl = msgEl.createDiv({ cls: 'claudian-message-content' });
-      contentEl.createDiv({ cls: 'claudian-render-error', text: 'Failed to render this message.' });
+      contentEl.createDiv({ cls: 'claudian-render-error', text: t('chat.message.renderFailed') });
     }
   }
 
@@ -551,7 +551,7 @@ export class MessageRenderer {
       // Replace partial content with an error card instead of leaving a
       // half-built message or appending a duplicate bubble.
       contentEl.empty();
-      contentEl.createDiv({ cls: 'claudian-render-error', text: 'Failed to render this message.' });
+      contentEl.createDiv({ cls: 'claudian-render-error', text: t('chat.message.renderFailed') });
     }
     this.addMessageTimestamp(msgEl, msg.timestamp);
   }
@@ -614,7 +614,7 @@ export class MessageRenderer {
           }
         } else if (block.type === 'context_compacted') {
           const boundaryEl = contentEl.createDiv({ cls: 'claudian-compact-boundary' });
-          boundaryEl.createSpan({ cls: 'claudian-compact-boundary-label', text: 'Conversation compacted' });
+          boundaryEl.createSpan({ cls: 'claudian-compact-boundary-label', text: t('chat.message.compactBoundary') });
         } else if (block.type === 'subagent') {
           const taskToolCall = msg.toolCalls?.find(
             tc => tc.id === block.subagentId && isSubagentToolName(tc.name)
@@ -971,7 +971,7 @@ export class MessageRenderer {
             label.addEventListener('click', async () => {
               try {
                 await navigator.clipboard.writeText(code.textContent || '');
-                label.setText('copied!');
+                label.setText(t('chat.message.copied'));
                 setTimeout(() => label.setText(match[1]), 1500);
               } catch {
                 // Clipboard API may fail in non-secure contexts
@@ -994,7 +994,7 @@ export class MessageRenderer {
     } catch {
       el.createDiv({
         cls: 'claudian-render-error',
-        text: 'Failed to render message content.',
+        text: t('chat.message.renderFailedContent'),
       });
     }
   }

@@ -1,3 +1,5 @@
+import { setLocale } from '@/i18n/i18n';
+
 import {
   getEffectiveOpencodeModes,
   getManagedOpencodeModes,
@@ -87,6 +89,30 @@ describe('opencodeChatUIConfig permission mode wiring', () => {
       planLabel: 'Plan',
       planValue: 'plan',
     });
+  });
+
+  it('resolves model option and toggle copy at call time for locale switches', () => {
+    try {
+      expect(setLocale('zh-CN')).toBe(true);
+      expect(opencodeChatUIConfig.getPermissionModeToggle?.()?.inactiveLabel).toBe('安全');
+      const fallback = opencodeChatUIConfig.getModelOptions({});
+      expect(fallback[0].description).toBe('ACP 运行时');
+      expect(opencodeChatUIConfig.getReasoningOptions(
+        'opencode:anthropic/claude-sonnet-4',
+        {
+          providerConfigs: {
+            opencode: {
+              discoveredModels: [
+                { label: 'Anthropic/Claude Sonnet 4', rawId: 'anthropic/claude-sonnet-4' },
+                { label: 'Anthropic/Claude Sonnet 4 (high)', rawId: 'anthropic/claude-sonnet-4/high' },
+              ],
+            },
+          },
+        },
+      )[0].label).toBe('默认');
+    } finally {
+      setLocale('en');
+    }
   });
 
   it('derives shared permission mode from the saved managed OpenCode mode', () => {

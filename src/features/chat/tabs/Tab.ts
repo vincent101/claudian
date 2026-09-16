@@ -499,7 +499,7 @@ function buildTabDOM(contentEl: HTMLElement): TabDOMElements {
   const inputEl = inputWrapper.createEl('textarea', {
     cls: 'claudian-input',
     attr: {
-      placeholder: 'How can I help you today?',
+      placeholder: t('chat.input.placeholder'),
       rows: '3',
       dir: 'auto',
     },
@@ -830,7 +830,7 @@ function initializeInputToolbar(
       const boundProvider = tab.providerId;
       const modelProvider = getProviderForModel(model, plugin.settings as unknown as Record<string, unknown>);
       if (modelProvider !== boundProvider) {
-        new Notice('Cannot switch provider on a bound session. Start a new tab instead.');
+        new Notice(t('chat.tabs.boundProviderSwitch'));
         tab.ui.modelSelector?.updateDisplay();
         return;
       }
@@ -1072,7 +1072,7 @@ async function handleForkRequest(
   const { state } = tab;
 
   if (!getTabCapabilities(tab, plugin).supportsFork) {
-    new Notice('Fork is not supported by this provider.');
+    new Notice(t('chat.fork.unsupportedProvider'));
     return;
   }
 
@@ -1122,7 +1122,7 @@ async function handleForkAll(
   const { state } = tab;
 
   if (!getTabCapabilities(tab, plugin).supportsFork) {
-    new Notice('Fork is not supported by this provider.');
+    new Notice(t('chat.fork.unsupportedProvider'));
     return;
   }
 
@@ -1655,7 +1655,10 @@ export function renderTabHydrationPlaceholder(
     for (const segment of tab.hydrationDiagnostic?.segments ?? []) {
       placeholder.createDiv({
         cls: 'claudian-history-placeholder-detail',
-        text: `${segment.sessionId} (${(segment.sizeBytes / 1024 / 1024).toFixed(1)} MiB)`,
+        text: t('chat.history.oversizeSegmentDetail', {
+          id: segment.sessionId,
+          size: (segment.sizeBytes / 1024 / 1024).toFixed(1),
+        }),
       });
     }
     return;

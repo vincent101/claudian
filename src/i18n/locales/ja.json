@@ -50,7 +50,9 @@
       "errorNoSession": "セッション ID がありません",
       "errorNoActiveTab": "アクティブなタブがありません",
       "commandNoMessages": "フォークできません: 会話にメッセージがありません",
-      "commandNoAssistantUuid": "フォークできません: 識別子付きのアシスタント応答がありません"
+      "commandNoAssistantUuid": "フォークできません: 識別子付きのアシスタント応答がありません",
+      "unsupportedProvider": "このプロバイダはフォークをサポートしていません。",
+      "unavailable": "フォークは利用できません。"
     },
     "bangBash": {
       "placeholder": "> bash コマンドを実行...",
@@ -79,7 +81,8 @@
       "errorTitle": "Conversation failed to load",
       "errorDescription": "The conversation history could not be loaded.",
       "retry": "Retry",
-      "switchFailed": "Failed to switch conversation: {error}"
+      "switchFailed": "Failed to switch conversation: {error}",
+      "oversizeSegmentDetail": "{id}（{size} MiB）"
     },
     "search": {
       "placeholder": "会話履歴を検索（{shortcut}）",
@@ -102,12 +105,75 @@
       "contentTruncatedNote": "プレビュー — 全 {count} 文字",
       "tooLargeToRender": "内容が大きすぎてインライン表示できません（{count} 文字）。",
       "copyAriaLabel": "メッセージをコピー",
-      "copied": "コピーしました"
+      "copied": "コピーしました",
+      "renderFailed": "このメッセージの描画に失敗しました。",
+      "renderFailedContent": "メッセージ内容の描画に失敗しました。",
+      "compactBoundary": "会話を圧縮しました"
     },
     "tabs": {
       "moveLeft": "左へ移動",
       "moveRight": "右へ移動",
-      "close": "タブを閉じる"
+      "close": "タブを閉じる",
+      "boundProviderSwitch": "バインド済みセッションではプロバイダを切り替えられません。新しいタブを開いてください。"
+    },
+    "input": {
+      "placeholder": "今日は何をお手伝いしましょうか？",
+      "serviceInitFailed": "エージェントサービスの初期化に失敗しました。再試行してください。",
+      "serviceUnavailable": "エージェントサービスが利用できません。プラグインを再読み込みしてください。",
+      "steerQueuedFailed": "キュー内の Codex メッセージのステアに失敗しました。メッセージは引き続き利用できます。",
+      "errorNotice": "エラー：{error}"
+    },
+    "instruction": {
+      "added": "指示をカスタムシステムプロンプトに追加しました",
+      "noneReceived": "指示が受信されませんでした",
+      "processFailed": "応答の処理に失敗しました",
+      "refineFailed": "指示の洗練に失敗しました"
+    },
+    "approval": {
+      "agentLabel": "エージェント：{id}",
+      "unexpectedSelection": "予期しない承認選択です：\"{value}\""
+    },
+    "commands": {
+      "unsupportedProvider": "このプロバイダは /{command} をサポートしていません。",
+      "externalContextUnavailable": "外部コンテキストセレクターが利用できません。",
+      "externalContextAdded": "外部コンテキストを追加しました：{path}",
+      "unknown": "不明なコマンドです：{action}"
+    },
+    "resume": {
+      "noConversations": "再開する会話がありません",
+      "openFailed": "会話を開けませんでした：{error}"
+    },
+    "codex": {
+      "effort": {
+        "low": "低",
+        "medium": "中",
+        "high": "高",
+        "xhigh": "超高"
+      },
+      "permission": {
+        "safe": "セーフ",
+        "yolo": "YOLO",
+        "plan": "プラン"
+      },
+      "serviceTier": {
+        "standard": "標準",
+        "fast": "高速"
+      }
+    },
+    "opencode": {
+      "model": {
+        "acpRuntime": "ACP ランタイム",
+        "configured": "設定済みモデル",
+        "selectedInSession": "既存セッションで選択されたモデル"
+      },
+      "thinking": {
+        "default": "デフォルト"
+      },
+      "permission": {
+        "safe": "セーフ",
+        "yolo": "YOLO",
+        "plan": "プラン"
+      }
     }
   },
   "settings": {

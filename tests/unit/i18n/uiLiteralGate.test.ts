@@ -3,15 +3,16 @@ import * as path from 'path';
 import * as ts from 'typescript';
 
 /**
- * AST-level regression gate for the Codex/OpenCode settings i18n migration.
+ * AST-level regression gate for the Codex/OpenCode settings and chat-layer
+ * i18n migrations.
  *
- * Walks the six migrated files and fails when a user-visible UI sink
+ * Walks the migrated files and fails when a user-visible UI sink
  * (settings component name/desc/title/placeholder, DOM text, aria-label/title
- * attributes, Notice, confirm dialogs) receives a hardcoded string or template
- * fragment instead of t(). Technical literals (paths, model IDs, protocol
- * values, JSON examples) are recognized structurally; the narrow allowlist
- * below covers the remaining legitimate literals and every entry must actually
- * occur in the scanned sources.
+ * attributes, Notice, confirm dialogs, option label/description config copy)
+ * receives a hardcoded string or template fragment instead of t(). Technical
+ * literals (paths, model IDs, protocol values, JSON examples) are recognized
+ * structurally; the narrow allowlist below covers the remaining legitimate
+ * literals and every entry must actually occur in the scanned sources.
  */
 
 const REPO_ROOT = path.resolve(__dirname, '..', '..', '..');
@@ -23,6 +24,11 @@ const TARGET_FILES = [
   'src/providers/opencode/ui/OpencodeSettingsTab.ts',
   'src/providers/opencode/ui/OpencodeAgentSettings.ts',
   'src/features/settings/ui/EnvironmentSettingsSection.ts',
+  'src/providers/codex/ui/CodexChatUIConfig.ts',
+  'src/providers/opencode/ui/OpencodeChatUIConfig.ts',
+  'src/features/chat/rendering/MessageRenderer.ts',
+  'src/features/chat/tabs/Tab.ts',
+  'src/features/chat/controllers/InputController.ts',
 ];
 
 interface AllowlistEntry {
@@ -63,6 +69,12 @@ const ALLOWLIST: AllowlistEntry[] = [
     literal: '\nOPENCODE_DB=/path/to/opencode.db',
     reason: 'technical env var example list shown as placeholder',
   },
+  {
+    file: 'src/providers/opencode/ui/OpencodeChatUIConfig.ts',
+    sink: 'obj.label',
+    literal: 'OpenCode',
+    reason: 'provider product name shown as the synthetic model label; identical in every locale',
+  },
 ];
 
 // Sinks whose first call argument is user-visible text.
@@ -89,6 +101,16 @@ const VISIBLE_OPTION_PROPERTIES = new Set(['text', 'title', 'name', 'desc', 'pla
 
 // Property assignments whose right-hand side is user-visible text.
 const TEXT_PROPERTIES = new Set(['textContent', 'innerText', 'title', 'placeholder']);
+
+// Object-literal properties that carry user-visible copy in option/config
+// literals (ProviderUIOption, ProviderReasoningOption, toggle configs).
+const CONFIG_COPY_PROPERTIES = new Set([
+  'label',
+  'description',
+  'inactiveLabel',
+  'activeLabel',
+  'planLabel',
+]);
 
 // Attribute names inside attr objects / setAttr calls that are user-visible.
 const VISIBLE_ATTR_NAMES = new Set(['aria-label', 'title', 'placeholder']);
@@ -237,6 +259,11 @@ function collectSinkFindings(relFile: string, source: ts.SourceFile): Finding[] 
       }
     } else if (ts.isNewExpression(node) && ts.isIdentifier(node.expression) && node.expression.text === 'Notice') {
       check(node.arguments?.[0], 'Notice');
+    } else if (ts.isPropertyAssignment(node)) {
+      const propertyName = node.name.getText(source).replace(/^['"]|['"]$/g, '');
+      if (CONFIG_COPY_PROPERTIES.has(propertyName)) {
+        check(node.initializer, `obj.${propertyName}`);
+      }
     } else if (ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.EqualsToken && ts.isPropertyAccessExpression(node.left)) {
       if (TEXT_PROPERTIES.has(node.left.name.text)) {
         check(node.right, `=.${node.left.name.text}`);

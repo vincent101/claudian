@@ -4,6 +4,7 @@ import type {
   ProviderReasoningOption,
   ProviderUIOption,
 } from '../../../core/providers/types';
+import { t } from '../../../i18n/i18n';
 import { OPENCODE_PROVIDER_ICON } from '../../../shared/icons';
 import {
   buildOpencodeBaseModels,
@@ -21,18 +22,29 @@ import {
 } from '../modes';
 import { getOpencodeProviderSettings, updateOpencodeProviderSettings } from '../settings';
 
-const OPENCODE_MODELS: ProviderUIOption[] = [
-  { value: OPENCODE_SYNTHETIC_MODEL_ID, label: 'OpenCode', description: 'ACP runtime' },
-];
+// Render-time factories instead of module-level constants: descriptions and
+// toggle labels must resolve through t() at call time so a locale switch is
+// reflected without reloading the plugin.
+
+function getOpencodeFallbackModels(): ProviderUIOption[] {
+  return [
+    // 'OpenCode' is the provider product name and stays untranslated.
+    { value: OPENCODE_SYNTHETIC_MODEL_ID, label: 'OpenCode', description: t('chat.opencode.model.acpRuntime') },
+  ];
+}
+
+function getOpencodePermissionModeToggle(): ProviderPermissionModeToggleConfig {
+  return {
+    inactiveValue: 'normal',
+    inactiveLabel: t('chat.opencode.permission.safe'),
+    activeValue: 'yolo',
+    activeLabel: t('chat.opencode.permission.yolo'),
+    planValue: 'plan',
+    planLabel: t('chat.opencode.permission.plan'),
+  };
+}
+
 const DEFAULT_CONTEXT_WINDOW = 200_000;
-const OPENCODE_PERMISSION_MODE_TOGGLE: ProviderPermissionModeToggleConfig = {
-  inactiveValue: 'normal',
-  inactiveLabel: 'Safe',
-  activeValue: 'yolo',
-  activeLabel: 'YOLO',
-  planValue: 'plan',
-  planLabel: 'Plan',
-};
 
 export const opencodeChatUIConfig: ProviderChatUIConfig = {
   getModelOptions(settings): ProviderUIOption[] {
@@ -44,7 +56,7 @@ export const opencodeChatUIConfig: ProviderChatUIConfig = {
     const discoveredModels = new Map(buildOpencodeBaseModels(opencodeSettings.discoveredModels).map((model) => [
       encodeOpencodeModelId(model.rawId),
       applyAlias(model.rawId, {
-        description: model.description ?? 'ACP runtime',
+        description: model.description ?? t('chat.opencode.model.acpRuntime'),
         label: model.label,
         value: encodeOpencodeModelId(model.rawId),
       }),
@@ -67,7 +79,7 @@ export const opencodeChatUIConfig: ProviderChatUIConfig = {
         encodedModelId,
         discoveredModels.get(encodedModelId)
           ?? applyAlias(rawModelId, {
-            description: 'Configured model',
+            description: t('chat.opencode.model.configured'),
             label: rawModelId,
             value: encodedModelId,
           }),
@@ -100,14 +112,14 @@ export const opencodeChatUIConfig: ProviderChatUIConfig = {
         baseModelId,
         discoveredModels.get(baseModelId)
           ?? applyAlias(baseRawId, {
-            description: 'Selected in an existing session',
+            description: t('chat.opencode.model.selectedInSession'),
             label: baseRawId,
             value: baseModelId,
           }),
       );
     }
 
-    return options.length > 0 ? options : [...OPENCODE_MODELS];
+    return options.length > 0 ? options : getOpencodeFallbackModels();
   },
 
   ownsModel(model: string): boolean {
@@ -132,7 +144,7 @@ export const opencodeChatUIConfig: ProviderChatUIConfig = {
     }
 
     return [
-      { value: OPENCODE_DEFAULT_THINKING_LEVEL, label: 'Default' },
+      { value: OPENCODE_DEFAULT_THINKING_LEVEL, label: t('chat.opencode.thinking.default') },
       ...variants.map((variant) => ({
         description: variant.description,
         label: variant.label,
@@ -229,7 +241,7 @@ export const opencodeChatUIConfig: ProviderChatUIConfig = {
   },
 
   getPermissionModeToggle(): ProviderPermissionModeToggleConfig {
-    return OPENCODE_PERMISSION_MODE_TOGGLE;
+    return getOpencodePermissionModeToggle();
   },
 
   resolvePermissionMode(settings: Record<string, unknown>): string | null {
