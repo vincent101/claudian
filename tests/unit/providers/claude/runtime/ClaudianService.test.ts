@@ -14,7 +14,13 @@ import * as sessionUtils from '@/utils/session';
 const sdkMock = sdkModule as unknown as {
   setMockMessages: (messages: any[], options?: { appendResult?: boolean }) => void;
   resetMockMessages: () => void;
+  setMockRewindFiles: (
+    impl: ((userMessageId: string, options?: { dryRun?: boolean }) => Promise<any>) | null
+  ) => void;
   simulateCrash: (afterChunks?: number) => void;
+  getQueryCallCount: () => number;
+  getLastOptions: () => any;
+  getLastResponse: () => any;
   query: typeof sdkModule.query;
 };
 
@@ -3443,11 +3449,6 @@ describe('ClaudianService', () => {
   });
 
   describe('rewindFiles', () => {
-    it('throws when no persistentQuery', async () => {
-      (service as any).persistentQuery = null;
-      await expect(service.rewindFiles('uuid')).rejects.toThrow('No active query');
-    });
-
     it('throws when shuttingDown', async () => {
       (service as any).persistentQuery = { rewindFiles: jest.fn() };
       (service as any).shuttingDown = true;
@@ -3468,6 +3469,44 @@ describe('ClaudianService', () => {
   });
 
   describe('rewind', () => {
+    it('starts the persistent query on demand when no message was sent yet (lazy runtime contract)', async () => {
+      // A hydrated tab that never sent a message: session id known via passive
+      // sync, but no persistent query was ever started.
+      service.setSessionId('lazy-rewind-session');
+      sdkMock.resetMockMessages();
+      const rewindFilesMock = jest.fn()
+        .mockResolvedValueOnce({ canRewind: true, filesChanged: ['a.txt'], insertions: 5, deletions: 3 })
+        .mockResolvedValueOnce({ canRewind: true });
+      sdkMock.setMockRewindFiles(rewindFilesMock);
+
+      const result = await service.rewind('user-uuid', 'assistant-uuid');
+
+      // The query was started lazily, resuming the conversation's session
+      expect(sdkMock.getLastOptions()?.resume).toBe('lazy-rewind-session');
+      // rewind_files ran: dry-run first, then the actual rewind
+      expect(rewindFilesMock).toHaveBeenNthCalledWith(1, 'user-uuid', { dryRun: true });
+      expect(rewindFilesMock).toHaveBeenNthCalledWith(2, 'user-uuid', { dryRun: undefined });
+      expect(result.canRewind).toBe(true);
+      expect(result.filesChanged).toEqual(['a.txt']);
+      expect((service as any).pendingResumeAt).toBe('assistant-uuid');
+      // Successful rewind closes the query
+      expect((service as any).persistentQuery).toBeNull();
+    });
+
+    it('throws a semantic error without side effects when the CLI is unavailable', async () => {
+      service.setSessionId('lazy-rewind-session');
+      sdkMock.resetMockMessages();
+      (mockPlugin.getResolvedProviderCliPath as jest.Mock).mockReturnValue(null);
+
+      await expect(service.rewind('user-uuid', 'assistant-uuid'))
+        .rejects.toThrow('Claude CLI not found. Please install Claude Code CLI.');
+
+      // No query started, no rewind side effects
+      expect(sdkMock.getQueryCallCount()).toBe(0);
+      expect((service as any).persistentQuery).toBeNull();
+      expect((service as any).pendingResumeAt).toBeUndefined();
+    });
+
     it('dry-runs first to capture filesChanged, then performs actual rewind', async () => {
       // SDK only returns filesChanged on dry run, not on actual rewind
       const mockRewindFiles = jest.fn()

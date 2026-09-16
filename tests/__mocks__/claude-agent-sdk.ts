@@ -119,6 +119,7 @@ let customMockMessages: any[] | null = null;
 let appendResultMessage = true;
 let lastOptions: Options | undefined;
 let mockSupportedCommands: Array<{ name: string; description: string; argumentHint?: string }> = [];
+let mockRewindFilesImpl: ((userMessageId: string, options?: { dryRun?: boolean }) => Promise<any>) | null = null;
 let lastResponse: (AsyncGenerator<any> & {
   interrupt: jest.Mock;
   setModel: jest.Mock;
@@ -127,6 +128,7 @@ let lastResponse: (AsyncGenerator<any> & {
   applyFlagSettings: jest.Mock;
   setMcpServers: jest.Mock;
   supportedCommands: jest.Mock;
+  rewindFiles: jest.Mock | ((userMessageId: string, options?: { dryRun?: boolean }) => Promise<any>);
 }) | null = null;
 
 // Crash simulation control
@@ -145,10 +147,21 @@ export function resetMockMessages() {
   appendResultMessage = true;
   lastOptions = undefined;
   mockSupportedCommands = [];
+  mockRewindFilesImpl = null;
   lastResponse = null;
   shouldThrowOnIteration = false;
   throwAfterChunks = 0;
   queryCallCount = 0;
+}
+
+/**
+ * Configure the rewindFiles implementation returned by mocked persistent queries.
+ * Unset by default so tests exercising rewind must opt in explicitly.
+ */
+export function setMockRewindFiles(
+  impl: ((userMessageId: string, options?: { dryRun?: boolean }) => Promise<any>) | null
+) {
+  mockRewindFilesImpl = impl;
 }
 
 export function setMockSupportedCommands(
@@ -302,6 +315,7 @@ export function query({ prompt, options }: { prompt: any; options: Options }): A
     applyFlagSettings: jest.Mock;
     setMcpServers: jest.Mock;
     supportedCommands: jest.Mock;
+    rewindFiles: jest.Mock | ((userMessageId: string, options?: { dryRun?: boolean }) => Promise<any>);
   };
   gen.interrupt = jest.fn().mockResolvedValue(undefined);
   // Dynamic update methods for persistent queries
@@ -311,6 +325,8 @@ export function query({ prompt, options }: { prompt: any; options: Options }): A
   gen.applyFlagSettings = jest.fn().mockResolvedValue(undefined);
   gen.setMcpServers = jest.fn().mockResolvedValue({ added: [], removed: [], errors: {} });
   gen.supportedCommands = jest.fn().mockResolvedValue(mockSupportedCommands);
+  gen.rewindFiles = mockRewindFilesImpl
+    ?? jest.fn().mockRejectedValue(new Error('rewindFiles not configured in SDK mock'));
   lastResponse = gen;
 
   return gen;

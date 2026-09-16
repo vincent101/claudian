@@ -2496,6 +2496,37 @@ export class ClaudianService implements ChatRuntime {
   }
 
   async rewind(userMessageId: string, assistantMessageId: string): Promise<ChatRewindResult> {
+    // Lazy runtime contract: a hydrated tab that has never sent a message has
+    // no persistent query. Start it on demand with the same lazy startup the
+    // send path uses in query() (startPersistentQuery with the current
+    // session), so rewind doesn't fail with a bare "No active query".
+    // All failure paths below throw before any file or message state is
+    // touched — the rewind service only runs once a query exists.
+    if (!this.persistentQuery && !this.shuttingDown) {
+      const vaultPath = getVaultPath(this.plugin.app);
+      if (!vaultPath) {
+        throw new Error('Could not determine vault path');
+      }
+      const cliPath = this.plugin.getResolvedProviderCliPath('claude');
+      if (!cliPath) {
+        throw new Error('Claude CLI not found. Please install Claude Code CLI.');
+      }
+      try {
+        await this.startPersistentQuery(
+          vaultPath,
+          cliPath,
+          this.sessionManager.getSessionId() ?? undefined
+        );
+      } catch (error) {
+        throw new Error(
+          `Rewind could not start the Claude session: ${error instanceof Error ? error.message : 'Unknown error'}`,
+          { cause: error },
+        );
+      }
+    }
+    if (!this.persistentQuery) {
+      throw new Error('Rewind could not start the Claude session');
+    }
     return executeClaudeRewind(userMessageId, {
       assistantMessageId,
       rewindFiles: this.rewindFiles.bind(this),
