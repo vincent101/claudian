@@ -241,7 +241,15 @@ export class ClaudianSettingsStorage {
   async load(): Promise<StoredClaudianSettings> {
     const settingsPath = await this.getLoadPath();
     if (!settingsPath) {
-      return this.getDefaults();
+      // First launch: project factory presets into customContextLimits the
+      // same way the file-backed branch does, so out-of-box windows (fable 1M)
+      // match before the settings file is ever written.
+      const defaults = { ...this.getDefaults() } as StoredClaudianSettings;
+      updateClaudeProviderSettings(
+        defaults as unknown as Record<string, unknown>,
+        getClaudeProviderSettings({}),
+      );
+      return defaults;
     }
 
     const content = await this.adapter.read(settingsPath);

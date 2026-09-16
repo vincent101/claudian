@@ -271,7 +271,11 @@ describe('ClaudianPlugin', () => {
 
       await plugin.loadSettings();
 
-      expect(plugin.settings).toEqual(DEFAULT_SETTINGS);
+      // load() projects factory presets into customContextLimits on first launch.
+      expect(plugin.settings).toEqual({
+        ...DEFAULT_SETTINGS,
+        customContextLimits: { ...DEFAULT_SETTINGS.customContextLimits, fable: 1_000_000 },
+      });
     });
 
     it('should use defaults when loadData returns empty object', async () => {
@@ -281,7 +285,10 @@ describe('ClaudianPlugin', () => {
 
       await plugin.loadSettings();
 
-      expect(plugin.settings).toEqual(DEFAULT_SETTINGS);
+      expect(plugin.settings).toEqual({
+        ...DEFAULT_SETTINGS,
+        customContextLimits: { ...DEFAULT_SETTINGS.customContextLimits, fable: 1_000_000 },
+      });
     });
 
     it('should migrate legacy openInMainTab true to main-tab placement', async () => {

@@ -1,9 +1,11 @@
+import type { VaultFileAdapter } from '@/core/storage/VaultFileAdapter';
 import {
   DEFAULT_CLAUDE_MODEL_PRESETS,
   getClaudeProviderSettings,
   updateClaudeProviderSettings,
   validateClaudeModelPresetDrafts,
 } from '@/providers/claude/settings';
+import { ClaudianSettingsStorage } from '@/providers/claude/storage/ClaudianSettingsStorage';
 import { getContextWindowSize } from '@/providers/claude/types/models';
 
 describe('Claude model presets', () => {
@@ -171,14 +173,28 @@ describe('Claude model presets', () => {
   });
 
   describe('updateClaudeProviderSettings preset projection', () => {
-    it('keeps factory out-of-box windows non-regressed after rule removal (storage.load chain)', () => {
-      // storage.load() merges defaults then runs updateClaudeProviderSettings
-      // with the resolved presets, so the factory fable 1M window reaches
-      // customContextLimits before any user interaction. With the [1m]/fable
-      // hard-coded rules gone, that projection is what keeps fable at 1M.
-      const bag: Record<string, unknown> = {};
-      updateClaudeProviderSettings(bag, getClaudeProviderSettings(bag));
-      const limits = bag.customContextLimits as Record<string, number>;
+    async function loadFromAdapter(exists: boolean): Promise<Record<string, number>> {
+      const adapter = {
+        exists: jest.fn().mockResolvedValue(exists),
+        read: jest.fn().mockResolvedValue('{}'),
+        write: jest.fn().mockResolvedValue(undefined),
+        delete: jest.fn().mockResolvedValue(undefined),
+      } as unknown as jest.Mocked<VaultFileAdapter>;
+      const storage = new ClaudianSettingsStorage(adapter);
+      const settings = await storage.load();
+      return settings.customContextLimits ?? {};
+    }
+
+    it('keeps factory out-of-box windows non-regressed on first launch (no settings file)', async () => {
+      const limits = await loadFromAdapter(false);
+      expect(getContextWindowSize('haiku', limits)).toBe(200_000);
+      expect(getContextWindowSize('sonnet', limits)).toBe(200_000);
+      expect(getContextWindowSize('opus', limits)).toBe(200_000);
+      expect(getContextWindowSize('fable', limits)).toBe(1_000_000);
+    });
+
+    it('keeps factory out-of-box windows non-regressed with an existing settings file', async () => {
+      const limits = await loadFromAdapter(true);
       expect(getContextWindowSize('haiku', limits)).toBe(200_000);
       expect(getContextWindowSize('sonnet', limits)).toBe(200_000);
       expect(getContextWindowSize('opus', limits)).toBe(200_000);
