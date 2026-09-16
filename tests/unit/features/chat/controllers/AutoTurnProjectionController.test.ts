@@ -572,11 +572,57 @@ describe('AutoTurnProjectionController', () => {
     expect(onTurnCompleted).not.toHaveBeenCalled();
   });
 
+  it('does not emit when the dirty re-projection stored wait resolves null', async () => {
+    const coordinator = new ProjectionWriteCoordinator();
+    const { controller, onTurnCompleted, state, renderMessages } = setup({ coordinator });
+    controller.started({ turnId: 'auto-1', generation: 0, source: { kind: 'assistant-continuation' } });
+    await (controller as any).active.mountTask;
+    await controller.chunk({ turnId: 'auto-1', generation: 0, chunk: { type: 'text', content: 'work' } });
+    (controller as any).active.context.projectionDirty = true;
+
+    // Hold a stored transaction so the boundary re-projection queues behind
+    // it in the coordinator FIFO instead of running immediately.
+    let releaseStored!: () => void;
+    const stored = coordinator.runStored(
+      () => false,
+      () => new Promise<void>(resolve => { releaseStored = resolve; }),
+    );
+    await Promise.resolve();
+
+    const finished = controller.finished({ turnId: 'auto-1', generation: 0, metadata: {} });
+    for (let i = 0; i < 20; i++) {
+      await Promise.resolve();
+    }
+    // The turn goes stale only after the re-projection queued its stored
+    // wait: the wait resolves null (cancelled at grant time) — the
+    // re-projection must not run and the turn must not be reported.
+    state.currentConversationId = 'conv-2';
+    releaseStored();
+    await stored;
+    await finished;
+
+    expect(renderMessages).not.toHaveBeenCalled();
+    expect(onTurnCompleted).not.toHaveBeenCalled();
+  });
+
   it('does not emit for cancelled turns', () => {
     const { controller, onTurnCompleted } = setup();
     controller.started({ turnId: 'auto-1', generation: 0, source: { kind: 'assistant-continuation' } });
 
     controller.cancelled({ turnId: 'auto-1', generation: 1, reason: 'shutdown' });
+
+    expect(onTurnCompleted).not.toHaveBeenCalled();
+  });
+
+  it('does not emit when the observer cancels the turn as interrupted', async () => {
+    const { controller, onTurnCompleted } = setup();
+    controller.started({ turnId: 'auto-1', generation: 0, source: { kind: 'peer', label: 'researcher' }, displayContent: 'work' });
+    await controller.chunk({ turnId: 'auto-1', generation: 0, chunk: { type: 'text', content: 'partial' } });
+
+    // Observer stop / transcript replacement: the runtime bumps the turn
+    // generation and flags the cancel as interrupted — no end marker will
+    // ever follow, so the turn must never be reported as completed.
+    controller.cancelled({ turnId: 'auto-1', generation: 1, reason: 'observer_stopped', interrupted: true });
 
     expect(onTurnCompleted).not.toHaveBeenCalled();
   });

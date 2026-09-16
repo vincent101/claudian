@@ -3905,5 +3905,23 @@ describe('InputController - Message Queue', () => {
       expect(deps.renderer.renderMessages).toHaveBeenCalledTimes(1);
       expect(onTurnCompleted).toHaveBeenCalledTimes(1);
     });
+
+    it('never emits when a cancel lands after the last stream chunk', async () => {
+      const { controller, inputEl, onTurnCompleted, deps } = prepare();
+      // The user cancels while the final chunk is still projecting: the loop
+      // then exhausts naturally, but the turn was cancelled — the shared
+      // flag is reset during cleanup, so the gate must not re-read it.
+      (deps.streamController.handleStreamChunk as jest.Mock).mockImplementation(async () => {
+        deps.state.cancelRequested = true;
+      });
+      inputEl.value = 'late cancel';
+      await controller.sendMessage();
+
+      expect(deps.streamController.appendTurnText).toHaveBeenCalledWith(
+        expect.stringContaining('Interrupted'),
+        expect.anything(),
+      );
+      expect(onTurnCompleted).not.toHaveBeenCalled();
+    });
   });
 });

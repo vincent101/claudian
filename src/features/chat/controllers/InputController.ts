@@ -375,6 +375,11 @@ export class InputController {
     // final visible projection settled — see the outer finally.
     let providerCompletedNaturally = false;
     let turnCompletionNotified = false;
+    // Turn-local cancellation latch: state.cancelRequested is reset during
+    // cleanup, so the emission gate in the outer finally must not re-read the
+    // shared flag — a cancel landing between natural exhaustion and the reset
+    // would otherwise be forgotten and misreported as completed.
+    let didCancelThisTurn = false;
 
     try {
     // Hide welcome message when sending first message
@@ -554,7 +559,7 @@ export class InputController {
 
       // Skip remaining cleanup if stream was invalidated (tab closed or conversation switched)
       if (!wasInvalidated && state.streamGeneration === streamGeneration) {
-        const didCancelThisTurn = wasInterrupted || state.cancelRequested;
+        didCancelThisTurn = wasInterrupted || state.cancelRequested;
         if (didCancelThisTurn && !state.pendingNewSessionPlan && turnContext) {
           await streamController.appendTurnText('\n\n<span class="claudian-interrupted">Interrupted</span> <span class="claudian-interrupted-hint">· What should Claudian do instead?</span>', turnContext);
         }
@@ -767,7 +772,7 @@ export class InputController {
       if (
         finalProjectionSettled
         && providerCompletedNaturally
-        && !state.cancelRequested
+        && !didCancelThisTurn
       ) {
         // Save is deliberately not a gate — a visible reply still completes
         // the turn even when persistence failed.
