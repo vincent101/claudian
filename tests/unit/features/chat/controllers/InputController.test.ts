@@ -1554,6 +1554,18 @@ describe('InputController - Message Queue', () => {
       expect((askController as any).pendingAskInline).toBeNull();
     });
 
+    it('F1b: the cancel path also destroys a pending exit-plan-mode inline (same family as F1)', () => {
+      const askDeps = createAskDeps();
+      const askController = new InputController(askDeps);
+      const mockPlanInline = { destroy: jest.fn() };
+      (askController as any).pendingExitPlanModeInline = mockPlanInline;
+
+      askController.dismissPendingApprovalPrompt();
+
+      expect(mockPlanInline.destroy).toHaveBeenCalled();
+      expect((askController as any).pendingExitPlanModeInline).toBeNull();
+    });
+
     it('F2: an auto (background) turn denies the ask without rendering any UI', async () => {
       const askDeps = createAskDeps();
       const turnCoordinator = new TurnCoordinator({

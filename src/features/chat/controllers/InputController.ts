@@ -1619,8 +1619,9 @@ export class InputController {
     // no user attending the tab — an ask card there can never be answered and
     // its pending canUseTool promise would block the auto turn forever. Deny
     // immediately: null flows through ClaudeApprovalHandler as deny+interrupt,
-    // the model wraps up on its own and the lease settles on the result line.
-    // The feature lease is exclusive, so its kind attributes the ask reliably.
+    // which aborts the turn; the interrupted result line then settles the auto
+    // lease. The feature lease is exclusive, so its kind attributes the ask
+    // reliably.
     if (this.getTurnCoordinator()?.getActiveTurn()?.kind === 'auto') {
       return null;
     }
@@ -1735,14 +1736,17 @@ export class InputController {
       this.pendingAskInline.destroy();
       this.pendingAskInline = null;
     }
-  }
-
-  dismissPendingApproval(): void {
-    this.dismissPendingApprovalPrompt();
+    // 2.5.1 F1b (same family): an exit-plan-mode card left pending here keeps
+    // canUseTool blocked the same way — destroy() resolves the decision with
+    // null → deny+interrupt ('User cancelled.') → CLI unblocks.
     if (this.pendingExitPlanModeInline) {
       this.pendingExitPlanModeInline.destroy();
       this.pendingExitPlanModeInline = null;
     }
+  }
+
+  dismissPendingApproval(): void {
+    this.dismissPendingApprovalPrompt();
     this.dismissPendingPlanApproval(true);
     this.resetInputContainerVisibility();
   }

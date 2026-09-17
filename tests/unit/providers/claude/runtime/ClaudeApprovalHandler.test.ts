@@ -28,6 +28,19 @@ function createAskControllerDeps(): InputControllerDeps {
   } as unknown as InputControllerDeps;
 }
 
+/** handleExitPlanMode additionally resolves provider capabilities through the
+ * agent service (planPathPrefix) and needs the content renderer hook. */
+function createExitPlanControllerDeps(): InputControllerDeps {
+  return {
+    ...createAskControllerDeps(),
+    renderer: { renderContent: jest.fn() } as any,
+    getAgentService: () => ({
+      providerId: 'claude',
+      getCapabilities: () => ({ planPathPrefix: '/plans' }),
+    }) as any,
+  } as unknown as InputControllerDeps;
+}
+
 function createCanUseTool(controller: InputController) {
   return createClaudeApprovalCallback({
     getAllowedTools: () => null,
@@ -85,5 +98,45 @@ describe('createClaudeApprovalCallback - AskUserQuestion cancel path (2.5.1 F1)'
       interrupt: true,
     });
     expect((controller as any).pendingAskInline).toBeNull();
+  });
+
+  it('settles a pending exit-plan-mode prompt as deny+interrupt when the cancel path dismisses it (2.5.1 F1b)', async () => {
+    // Same family as F1: an exit-plan-mode card left pending by the cancel
+    // path keeps the SDK's canUseTool blocked forever.
+    const controller = new InputController(createExitPlanControllerDeps());
+    const canUseTool = createClaudeApprovalCallback({
+      getAllowedTools: () => null,
+      getApprovalCallback: () => jest.fn(),
+      getAskUserQuestionCallback: () => null,
+      getExitPlanModeCallback: () => (input, signal) => controller.handleExitPlanMode(input, signal),
+      getPermissionMode: () => 'normal' as PermissionMode,
+      resolveSDKPermissionMode: (mode) => mode as unknown as SDKPermissionMode,
+      syncPermissionMode: () => {},
+    });
+
+    const permissionPromise = canUseTool(
+      'ExitPlanMode',
+      { plan: 'do the thing' },
+      { signal: new AbortController().signal } as any,
+    );
+    expect((controller as any).pendingExitPlanModeInline).not.toBeNull();
+
+    controller.dismissPendingApprovalPrompt();
+
+    const result = await Promise.race([
+      permissionPromise,
+      new Promise<never>((_, reject) => setTimeout(
+        () => reject(new Error('canUseTool never settled: the cancelled exit-plan-mode promise leaked')),
+        500,
+      )),
+    ]);
+
+    // Existing deny semantics (handler): null decision → deny + interrupt.
+    expect(result).toEqual({
+      behavior: 'deny',
+      message: 'User cancelled.',
+      interrupt: true,
+    });
+    expect((controller as any).pendingExitPlanModeInline).toBeNull();
   });
 });
