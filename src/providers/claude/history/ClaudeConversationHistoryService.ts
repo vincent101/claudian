@@ -6,7 +6,7 @@ import {
   type HistoryIndexLease,
   type HistoryLoadBudget,
   type HistoryLoadProgress,
-  type HistoryRangePage,
+  type HistoryMessageDetailResult,
   type HistorySearchResult,
   HistorySourceUnavailableError,
   type HistoryWindowPage,
@@ -571,7 +571,8 @@ export class ClaudeConversationHistoryService implements ProviderConversationHis
       get totalTurns() { return fixed.state?.flattenedTurns.length ?? 0; },
       ready,
       search: async query => this.searchIndex(await fixed.ready, query),
-      loadRange: async (start, end) => this.materializeRange(await fixed.ready, start, end),
+      loadMessageDetail: async (projectionKey, options) =>
+        this.materializeMessageDetail(await fixed.ready, projectionKey, options),
       loadWindow: async request => this.materializeWindow(await fixed.ready, request),
       planWindow: request => {
         if (!fixed.state) throw new Error('History index is not ready for window planning');
@@ -672,35 +673,47 @@ export class ClaudeConversationHistoryService implements ProviderConversationHis
       .map(entry => entry.result);
   }
 
-  private async materializeRange(
+  private async materializeMessageDetail(
     state: ConversationIndexState,
-    start: number,
-    end: number,
-  ): Promise<HistoryRangePage> {
-    const total = state.flattenedTurns.length;
-    if (!Number.isInteger(start) || !Number.isInteger(end) || start < 0 || start >= end || end > total) {
-      throw new RangeError(`Invalid history range [${start}, ${end}) for ${total} turns`);
-    }
-    const selected = state.flattenedTurns.slice(start, end);
-    const messages: ChatMessage[] = [];
+    projectionKey: string,
+    options: { maxSourceBytes: number; signal?: AbortSignal },
+  ): Promise<HistoryMessageDetailResult> {
+    if (options.signal?.aborted) throw new Error('History detail load aborted');
     for (const segment of state.segments) {
-      const indexes = selected.filter(item => item.segment === segment).map(item => item.turnIndex);
-      if (indexes.length === 0) continue;
-      const native = await materializeTranscriptPage(segment.index, indexes[0], indexes.length);
-      const associations = await materializeTranscriptToolAssociations(segment.index, native);
-      // materializeTranscriptPage reads entries[firstTurn.startEntry..], so the
-      // page slice starts at that segment-global entry index.
-      messages.push(...await materializeSDKMessages(
-        state.vaultPath, segment.sessionId, native, associations, segment.segmentOrdinal,
-        segment.index.turns[indexes[0]].startEntry,
-      ));
+      const descriptor = segment.index.projectionDescriptors?.find(item => item.projectionKey === projectionKey);
+      if (!descriptor) continue;
+      const entries = segment.index.entries.slice(descriptor.startEntry, descriptor.endEntry + 1);
+      const wantedToolIds = new Set(entries.flatMap(entry => [...entry.toolUseIds, ...entry.toolResultIds]));
+      const associationEntries = wantedToolIds.size > 0
+        ? segment.index.entries.filter(entry =>
+          entry.toolUseIds.some(id => wantedToolIds.has(id))
+          || entry.toolResultIds.some(id => wantedToolIds.has(id)))
+        : entries;
+      const uniqueEntries = [...new Map([...entries, ...associationEntries].map(entry => [entry.offset, entry])).values()];
+      const sourceBytes = uniqueEntries.reduce((sum, entry) => sum + entry.length, 0);
+      if (sourceBytes > options.maxSourceBytes) return { status: 'too_large' };
+      const native = await materializeTranscriptEntries(segment.index, entries);
+      if (options.signal?.aborted) throw new Error('History detail load aborted');
+      const associations = associationEntries.length === entries.length
+        ? native
+        : await materializeTranscriptEntries(segment.index, associationEntries);
+      const messages = await materializeSDKMessages(
+        state.vaultPath,
+        segment.sessionId,
+        native,
+        associations,
+        segment.segmentOrdinal,
+        descriptor.startEntry,
+      );
+      const message = messages.find(candidate => candidate.id === projectionKey);
+      if (!message) return { status: 'not_found' };
+      message.projectionLevel = 'detail';
+      message.historyTurnOrdinal = state.segments
+        .slice(0, state.segments.indexOf(segment))
+        .reduce((sum, item) => sum + item.index.turns.length, 0) + descriptor.turnIndex;
+      return { status: 'exact', message };
     }
-    const current = state.segments[state.segments.length - 1];
-    return {
-      messages: dedupeMessages(messages).sort(compareChatDisplayOrder),
-      range: { start, end },
-      snapshotOffset: current.index.snapshotSize,
-    };
+    return { status: 'not_found' };
   }
 
   private turnSourceBytes(state: ConversationIndexState): number[] {
@@ -823,15 +836,17 @@ export class ClaudeConversationHistoryService implements ProviderConversationHis
       turnCount: plan.end - plan.start,
       sourceBytes: plan.plannedSourceBytes,
     });
-    const messages: ChatMessage[] = [];
-    let actualStart = plan.end;
-    let sourceBytes = 0;
-    let projectedChars = 0;
-    let oversizedTurnCount = 0;
-    // Materialize newest-first so budget overruns drop older turns and the
-    // anchor-adjacent turn always survives (giant turn -> summary, not empty;
-    // the planner already guarantees a non-empty plan includes that turn).
-    for (let index = plan.end - 1; index >= plan.start; index -= 1) {
+    const turns: Array<{
+      index: number;
+      messages: ChatMessage[];
+      sourceBytes: number;
+      projectedChars: number;
+      shrunk: boolean;
+    }> = [];
+    // Preserve the planner's contiguous interval and canonical direction. If
+    // projected chars force a second shrink, endpoints are removed by distance
+    // from the anchor rather than always sacrificing the older side.
+    for (let index = plan.start; index < plan.end; index += 1) {
       const item = state.flattenedTurns[index];
       const turnBytes = item.segment.index.turns[item.turnIndex].sourceBytes ?? 0;
       const oversized = turnBytes > request.budget.maxSourceBytes;
@@ -846,10 +861,6 @@ export class ClaudeConversationHistoryService implements ProviderConversationHis
         produced = await this.materializeTurn(state, item.segment, item.turnIndex);
         readBytes = turnBytes;
       }
-      // Per-turn hard ceiling: `isNewest` only exempts the cumulative window
-      // admission below, never this cap — an anchor turn whose summary
-      // projection alone exceeds the char budget is hard-capped to the real
-      // measured value (identity and order survive, payloads shrink).
       let chars = measureChatProjectionChars(produced);
       if (chars > request.budget.maxProjectedChars) {
         const capped = hardCapChatProjection(produced, request.budget.maxProjectedChars);
@@ -857,41 +868,49 @@ export class ClaudeConversationHistoryService implements ProviderConversationHis
         chars = capped.projectedChars;
         shrunk = true;
       }
-      const isNewest = index === plan.end - 1;
-      if (!isNewest && (
-        projectedChars + chars > request.budget.maxProjectedChars
-        || sourceBytes + readBytes > request.budget.maxSourceBytes
-      )) {
-        break;
-      }
-      messages.push(...produced);
-      sourceBytes += readBytes;
-      projectedChars += chars;
-      if (shrunk) oversizedTurnCount += 1;
-      actualStart = index;
+      for (const message of produced) message.projectionLevel = shrunk ? 'summary' : 'detail';
+      turns.push({ index, messages: produced, sourceBytes: readBytes, projectedChars: chars, shrunk });
     }
+    const anchorIndex = request.direction === 'older'
+      ? Math.max(plan.start, plan.end - 1)
+      : request.direction === 'newer'
+        ? plan.start
+        : Math.max(plan.start, Math.min(request.anchorTurn, plan.end - 1));
+    let sourceBytes = turns.reduce((sum, turn) => sum + turn.sourceBytes, 0);
+    let projectedChars = turns.reduce((sum, turn) => sum + turn.projectedChars, 0);
+    while (turns.length > 1 && (
+      sourceBytes > request.budget.maxSourceBytes
+      || projectedChars > request.budget.maxProjectedChars
+    )) {
+      const firstDistance = Math.abs(turns[0].index - anchorIndex);
+      const lastDistance = Math.abs(turns[turns.length - 1].index - anchorIndex);
+      const removed = firstDistance >= lastDistance ? turns.shift()! : turns.pop()!;
+      sourceBytes -= removed.sourceBytes;
+      projectedChars -= removed.projectedChars;
+    }
+    const actualStart = turns[0]?.index ?? plan.end;
+    const actualEnd = turns[turns.length - 1]?.index + 1 || plan.end;
+    const messages = turns.flatMap(turn => turn.messages);
+    const oversizedTurnCount = turns.filter(turn => turn.shrunk).length;
     const current = state.segments[state.segments.length - 1];
     this.windowDiagnostics?.record({
       phase: 'window_complete',
-      turnCount: actualStart < plan.end ? plan.end - actualStart : 0,
+      turnCount: turns.length,
       sourceBytes,
       projectedChars,
       oversizedTurns: oversizedTurnCount,
       elapsedMs: performance.now() - startedAt,
     });
     return {
-      // The loop above materializes newest-first; the canonical displayOrder
-      // key restores the ascending structural order (timestamps are
-      // display-only and must not participate in structural ordering).
       messages: dedupeMessages(messages).sort(compareChatDisplayOrder),
-      range: { start: actualStart, end: plan.end },
+      range: { start: actualStart, end: actualEnd },
       snapshotOffset: current.index.snapshotSize,
       sourceBytes,
       projectedChars,
       oversizedTurnCount,
-      pageKey: `w:${actualStart}:${plan.end}`,
+      pageKey: `w:${actualStart}:${actualEnd}`,
       hasMoreBefore: actualStart > 0,
-      hasMoreAfter: plan.end < total,
+      hasMoreAfter: actualEnd < total,
     };
   }
 

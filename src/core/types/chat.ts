@@ -67,6 +67,10 @@ export interface ChatMessage {
    * sort stably after keyed ones (live tail).
    */
   displayOrder?: ChatDisplayOrder;
+  /** Materialization fidelity; absent means callers must verify detail before destructive use. */
+  projectionLevel?: 'summary' | 'detail';
+  /** Zero-based user-turn ordinal from the fixed history snapshot. */
+  historyTurnOrdinal?: number;
 }
 
 /** [segmentOrdinal, entryOrdinal, projectionOrdinal] — see ChatMessage.displayOrder. */

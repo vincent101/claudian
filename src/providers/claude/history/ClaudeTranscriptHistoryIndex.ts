@@ -56,6 +56,14 @@ export interface TranscriptSearchCorpusItem {
   textLength: number;
 }
 
+export interface TranscriptProjectionDescriptor {
+  projectionKey: string;
+  turnIndex: number;
+  startEntry: number;
+  endEntry: number;
+  sourceBytes: number;
+}
+
 export interface TranscriptHistoryIndex {
   filePath: string;
   dev: number;
@@ -66,6 +74,7 @@ export interface TranscriptHistoryIndex {
   turns: TranscriptTurnIndex[];
   searchCorpus: TranscriptSearchCorpusItem[];
   searchText: string;
+  projectionDescriptors?: TranscriptProjectionDescriptor[];
   skippedLines: number;
   buildDurationMs: number;
   peakWorkerHeapBytes: number;
@@ -175,6 +184,8 @@ async function finalizeIndex(
   const turns: TranscriptTurnIndex[] = [];
   const searchCorpus: TranscriptSearchCorpusItem[] = [];
   const searchTextParts: string[] = [];
+  const projectionDescriptors: TranscriptProjectionDescriptor[] = [];
+  const descriptorByKey = new Map<string, TranscriptProjectionDescriptor>();
   let searchTextLength = 0;
   for (let index = 0; index < canonical.length; index += 1) {
     const entry = canonical[index];
@@ -198,6 +209,23 @@ async function finalizeIndex(
       currentTurnBytes += entry.length;
     }
     entry.turnId = currentTurn?.turnId;
+    if (projectionKey && currentTurnIndex >= 0) {
+      const existingDescriptor = descriptorByKey.get(projectionKey);
+      if (existingDescriptor) {
+        existingDescriptor.endEntry = index;
+        existingDescriptor.sourceBytes += entry.length;
+      } else {
+        const descriptor = {
+          projectionKey,
+          turnIndex: currentTurnIndex,
+          startEntry: index,
+          endEntry: index,
+          sourceBytes: entry.length,
+        };
+        descriptorByKey.set(projectionKey, descriptor);
+        projectionDescriptors.push(descriptor);
+      }
+    }
     if (entry.searchText && currentTurnIndex >= 0 && projectionKey) {
       const existing = searchCorpus[searchCorpus.length - 1];
       const separator = entry.type === 'assistant' && existing?.projectionKey === projectionKey ? '\n\n' : '';
@@ -233,6 +261,7 @@ async function finalizeIndex(
     turns,
     searchCorpus,
     searchText: searchTextParts.join(''),
+    projectionDescriptors,
     skippedLines,
     buildDurationMs: 0,
     peakWorkerHeapBytes: 0,
@@ -331,7 +360,8 @@ async function buildDirect(filePath: string, options: BuildOptions): Promise<Tra
   }
 }
 
-const MAX_COMPLETED_INDEXES = 2;
+const MAX_COMPLETED_INDEXES = 8;
+const MAX_COMPLETED_INDEX_METADATA_BYTES = 128 * 1024 * 1024;
 const completed = new Map<string, TranscriptIndexResult>();
 const inFlight = new Map<string, Promise<TranscriptIndexResult>>();
 const protectedPaths = new Map<string, number>();
@@ -349,14 +379,31 @@ function isProtectedCompletedKey(key: string, result: TranscriptIndexResult): bo
   return keys[keys.length - 1] === key;
 }
 
+function estimateIndexMetadataBytes(result: TranscriptIndexResult): number {
+  if (result.status === 'failed') return 0;
+  const index = result.index;
+  return index.searchText.length * 2
+    + index.entries.length * 192
+    + index.turns.length * 64
+    + index.searchCorpus.length * 80
+    + (index.projectionDescriptors?.length ?? 0) * 80;
+}
+
+function completedMetadataBytes(): number {
+  let total = 0;
+  for (const result of completed.values()) total += estimateIndexMetadataBytes(result);
+  return total;
+}
+
 function evictCompleted(): void {
-  while (completed.size > MAX_COMPLETED_INDEXES) {
-    const candidate = [...completed.keys()].find(key => {
-      const result = completed.get(key);
-      return !result || !isProtectedCompletedKey(key, result);
-    }) ?? completed.keys().next().value;
-    if (!candidate) return;
-    completed.delete(candidate);
+  while (completed.size > MAX_COMPLETED_INDEXES || completedMetadataBytes() > MAX_COMPLETED_INDEX_METADATA_BYTES) {
+    const candidate = [...completed.entries()].find(([key, result]) =>
+      !inFlight.has(key) && !isProtectedCompletedKey(key, result));
+    if (!candidate) {
+      diagnosticSink?.({ phase: 'cache_overcommit', bytes: completedMetadataBytes(), entries: completed.size });
+      return;
+    }
+    completed.delete(candidate[0]);
     diagnosticSink?.({ phase: 'cache_evict' });
   }
 }
@@ -468,7 +515,7 @@ function buildInWorker(filePath: string, options: BuildOptions): Promise<Transcr
 const requests = new Map<string, Promise<TranscriptIndexResult>>();
 
 export interface TranscriptIndexDiagnosticEvent {
-  phase: 'index_worker_fallback' | 'queued' | 'start' | 'progress' | 'finalize' | 'complete' | 'failed' | 'aborted' | 'stalled' | 'cache_hit' | 'cache_evict';
+  phase: 'index_worker_fallback' | 'queued' | 'start' | 'progress' | 'finalize' | 'complete' | 'failed' | 'aborted' | 'stalled' | 'cache_hit' | 'cache_evict' | 'cache_overcommit';
   errorName?: string;
   buildId?: string;
   mode?: 'worker' | 'direct';

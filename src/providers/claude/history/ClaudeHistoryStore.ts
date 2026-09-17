@@ -95,6 +95,7 @@ export async function materializeSDKMessages(
     // across turns and pages. A merged assistant keeps its first segment's
     // position; timestamps stay display-only.
     chatMsg.displayOrder = [segmentOrdinal, entryIndexBase + entryIndex, 0];
+    chatMsg.projectionLevel = 'detail';
 
     if (chatMsg.role === 'assistant') {
       // context_compacted must not merge with previous assistant (it's a standalone separator)

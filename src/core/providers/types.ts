@@ -458,22 +458,25 @@ export class HistorySourceUnavailableError extends Error {
   }
 }
 
+export type HistoryMessageDetailResult =
+  | { status: 'exact'; message: ChatMessage }
+  | { status: 'not_found' }
+  | { status: 'too_large' };
+
 export interface HistoryIndexLease {
   conversationId: string;
   /** Fixed total from the index snapshot acquired for this lease. */
   totalTurns: number;
   ready: Promise<void>;
   search(query: string): Promise<HistorySearchResult[]>;
-  /** @deprecated A2 removes this UI-bypass API after legacy callers migrate. */
-  loadRange(startInclusive: number, endExclusive: number): Promise<HistoryRangePage>;
-  /**
-   * Budget-bounded window materialization for interactive UI. `loadRange` stays
-   * for full-export style internal paths and must not be used by first-screen
-   * or paging flows.
-   */
-  loadWindow?(request: HistoryWindowRequest): Promise<HistoryWindowPage>;
+  loadMessageDetail(
+    projectionKey: string,
+    options: { maxSourceBytes: number; signal?: AbortSignal },
+  ): Promise<HistoryMessageDetailResult>;
+  /** Budget-bounded window materialization for interactive UI. */
+  loadWindow(request: HistoryWindowRequest): Promise<HistoryWindowPage>;
   /** Metadata-only window plan (no reads); used for progress reporting. */
-  planWindow?(request: HistoryWindowRequest): { start: number; end: number };
+  planWindow(request: HistoryWindowRequest): { start: number; end: number };
   release(): void;
 }
 
