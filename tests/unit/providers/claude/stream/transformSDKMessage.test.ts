@@ -1081,11 +1081,14 @@ describe('transformSDKMessage', () => {
   });
 
   describe('result messages', () => {
-    it('yields context_window for successful result messages with modelUsage', () => {
+    it('emits no context_window for result messages: modelUsage no longer denominates (2.3.2 ②)', () => {
+      // User ruling 2026-09-17: the denominator follows the model selector's
+      // preset configuration only. The SDK-reported contextWindow (200k here
+      // while the preset configures 1M) must never override it.
       const message = msg({
         type: 'result',
         modelUsage: {
-          'claude-sonnet-4-5-20250514': {
+          'claude-sonnet[1m]': {
             inputTokens: 1000,
             cacheCreationInputTokens: 500,
             cacheReadInputTokens: 200,
@@ -1100,12 +1103,10 @@ describe('transformSDKMessage', () => {
 
       const results = [...transformSDKMessage(message)];
 
-      expect(results).toEqual([
-        { type: 'context_window', contextWindow: 200000 },
-      ]);
+      expect(results).toEqual([]);
     });
 
-    it('yields error and context_window for failed result messages', () => {
+    it('yields error for failed result messages without a context_window', () => {
       const message = msg({
         type: 'result',
         subtype: 'error_max_turns',
@@ -1116,416 +1117,51 @@ describe('transformSDKMessage', () => {
 
       expect(results).toEqual([
         { type: 'error', content: 'Hit maximum turn limit' },
-        { type: 'context_window', contextWindow: 200000 },
       ]);
     });
 
-    it('yields context_window with 1M for [1m] models', () => {
-      const message = msg({
-        type: 'result',
-        modelUsage: {
-          'claude-opus-4-6[1m]': {
-            inputTokens: 1000,
-            outputTokens: 300,
-            cacheReadInputTokens: 0,
-            cacheCreationInputTokens: 0,
-            webSearchRequests: 0,
-            costUSD: 0.01,
-            contextWindow: 1000000,
-            maxOutputTokens: 32000,
-          },
-        },
-      });
-
-      const results = [...transformSDKMessage(message)];
-
-      expect(results).toEqual([
-        { type: 'context_window', contextWindow: 1000000 },
-      ]);
-    });
-
-    it('prefers the exact intended model when modelUsage includes multiple entries', () => {
-      const message = msg({
-        type: 'result',
-        modelUsage: {
-          'custom-subagent-model': {
-            inputTokens: 1000,
-            outputTokens: 300,
-            cacheReadInputTokens: 0,
-            cacheCreationInputTokens: 0,
-            webSearchRequests: 0,
-            costUSD: 0.01,
-            contextWindow: 1000000,
-            maxOutputTokens: 32000,
-          },
-          'custom-main-model': {
-            inputTokens: 1000,
-            outputTokens: 300,
-            cacheReadInputTokens: 0,
-            cacheCreationInputTokens: 0,
-            webSearchRequests: 0,
-            costUSD: 0.01,
-            contextWindow: 200000,
-            maxOutputTokens: 32000,
-          },
-        },
-      });
-
-      const results = [...transformSDKMessage(message, { intendedModel: 'custom-main-model' })];
-
-      expect(results).toEqual([
-        { type: 'context_window', contextWindow: 200000 },
-      ]);
-    });
-
-    it('matches built-in aliases against SDK modelUsage keys when unambiguous', () => {
-      const message = msg({
-        type: 'result',
-        modelUsage: {
-          'claude-sonnet-4-5-20250514': {
-            inputTokens: 1000,
-            outputTokens: 300,
-            cacheReadInputTokens: 0,
-            cacheCreationInputTokens: 0,
-            webSearchRequests: 0,
-            costUSD: 0.01,
-            contextWindow: 200000,
-            maxOutputTokens: 32000,
-          },
-          'claude-opus-4-6[1m]': {
-            inputTokens: 1000,
-            outputTokens: 300,
-            cacheReadInputTokens: 0,
-            cacheCreationInputTokens: 0,
-            webSearchRequests: 0,
-            costUSD: 0.01,
-            contextWindow: 1000000,
-            maxOutputTokens: 32000,
-          },
-        },
-      });
-
-      const results = [...transformSDKMessage(message, { intendedModel: 'opus[1m]' })];
-
-      expect(results).toEqual([
-        { type: 'context_window', contextWindow: 1000000 },
-      ]);
-    });
-
-    it('matches the built-in [1m] alias against the SDK unversioned family key when subagents add entries', () => {
-      // Real SDK shape: a sonnet[1m] turn with a background subagent reports
-      // "claude-sonnet[1m]" (no version digits) plus the subagent model.
-      const message = msg({
-        type: 'result',
-        modelUsage: {
-          'claude-sonnet[1m]': {
-            inputTokens: 1000,
-            outputTokens: 300,
-            cacheReadInputTokens: 0,
-            cacheCreationInputTokens: 0,
-            webSearchRequests: 0,
-            costUSD: 0.01,
-            contextWindow: 1000000,
-            maxOutputTokens: 32000,
-          },
-          'claude-haiku-4-5': {
-            inputTokens: 500,
-            outputTokens: 100,
-            cacheReadInputTokens: 0,
-            cacheCreationInputTokens: 0,
-            webSearchRequests: 0,
-            costUSD: 0.005,
-            contextWindow: 200000,
-            maxOutputTokens: 32000,
-          },
-        },
-      });
-
-      const results = [...transformSDKMessage(message, { intendedModel: 'sonnet[1m]' })];
-
-      expect(results).toEqual([
-        { type: 'context_window', contextWindow: 1000000 },
-      ]);
-    });
-
-    it('matches provider-qualified custom model ids against SDK modelUsage keys', () => {
-      const message = msg({
-        type: 'result',
-        modelUsage: {
-          'claude-haiku-4-5-20251001': {
-            inputTokens: 1000,
-            outputTokens: 300,
-            cacheReadInputTokens: 0,
-            cacheCreationInputTokens: 0,
-            webSearchRequests: 0,
-            costUSD: 0.01,
-            contextWindow: 200000,
-            maxOutputTokens: 32000,
-          },
-          'claude-opus-4-6[1m]': {
-            inputTokens: 1000,
-            outputTokens: 300,
-            cacheReadInputTokens: 0,
-            cacheCreationInputTokens: 0,
-            webSearchRequests: 0,
-            costUSD: 0.01,
-            contextWindow: 1000000,
-            maxOutputTokens: 32000,
-          },
-        },
-      });
-
-      const results = [...transformSDKMessage(message, { intendedModel: 'anthropic/claude-opus-4-6[1m]' })];
-
-      expect(results).toEqual([
-        { type: 'context_window', contextWindow: 1000000 },
-      ]);
-    });
-
-    it('preserves literal exact matches when provider-qualified entries normalize to the same Claude id', () => {
-      const message = msg({
-        type: 'result',
-        modelUsage: {
-          'eu.anthropic.claude-opus-4-6[1m]': {
-            inputTokens: 1000,
-            outputTokens: 300,
-            cacheReadInputTokens: 0,
-            cacheCreationInputTokens: 0,
-            webSearchRequests: 0,
-            costUSD: 0.01,
-            contextWindow: 1000000,
-            maxOutputTokens: 32000,
-          },
-          'us.anthropic.claude-opus-4-6[1m]': {
-            inputTokens: 1000,
-            outputTokens: 300,
-            cacheReadInputTokens: 0,
-            cacheCreationInputTokens: 0,
-            webSearchRequests: 0,
-            costUSD: 0.01,
-            contextWindow: 500000,
-            maxOutputTokens: 32000,
-          },
-        },
-      });
-
-      const results = [...transformSDKMessage(message, { intendedModel: 'eu.anthropic.claude-opus-4-6[1m]' })];
-
-      expect(results).toEqual([
-        { type: 'context_window', contextWindow: 1000000 },
-      ]);
-    });
-
-    it('matches provider-qualified custom model ids with uppercase 1M suffixes', () => {
-      const message = msg({
-        type: 'result',
-        modelUsage: {
-          'claude-haiku-4-5-20251001': {
-            inputTokens: 1000,
-            outputTokens: 300,
-            cacheReadInputTokens: 0,
-            cacheCreationInputTokens: 0,
-            webSearchRequests: 0,
-            costUSD: 0.01,
-            contextWindow: 200000,
-            maxOutputTokens: 32000,
-          },
-          'claude-opus-4-6[1m]': {
-            inputTokens: 1000,
-            outputTokens: 300,
-            cacheReadInputTokens: 0,
-            cacheCreationInputTokens: 0,
-            webSearchRequests: 0,
-            costUSD: 0.01,
-            contextWindow: 1000000,
-            maxOutputTokens: 32000,
-          },
-        },
-      });
-
-      const results = [...transformSDKMessage(message, { intendedModel: 'anthropic/claude-opus-4-6[1M]' })];
-
-      expect(results).toEqual([
-        { type: 'context_window', contextWindow: 1000000 },
-      ]);
-    });
-
-    it('does not heuristically match different custom model ids', () => {
-      const message = msg({
-        type: 'result',
-        modelUsage: {
-          'claude-haiku-4-5-20251001': {
-            inputTokens: 1000,
-            outputTokens: 300,
-            cacheReadInputTokens: 0,
-            cacheCreationInputTokens: 0,
-            webSearchRequests: 0,
-            costUSD: 0.01,
-            contextWindow: 200000,
-            maxOutputTokens: 32000,
-          },
-          'claude-opus-4-6[1m]': {
-            inputTokens: 1000,
-            outputTokens: 300,
-            cacheReadInputTokens: 0,
-            cacheCreationInputTokens: 0,
-            webSearchRequests: 0,
-            costUSD: 0.01,
-            contextWindow: 1000000,
-            maxOutputTokens: 32000,
-          },
-        },
-      });
-
-      const results = [...transformSDKMessage(message, { intendedModel: 'anthropic/claude-opus-4-6' })];
-
-      expect(results).toEqual([]);
-    });
-
-    it('does not override the heuristic when multi-model result usage is ambiguous', () => {
-      const message = msg({
-        type: 'result',
-        modelUsage: {
-          'claude-sonnet-4-5-20250514': {
-            inputTokens: 1000,
-            outputTokens: 300,
-            cacheReadInputTokens: 0,
-            cacheCreationInputTokens: 0,
-            webSearchRequests: 0,
-            costUSD: 0.01,
-            contextWindow: 200000,
-            maxOutputTokens: 32000,
-          },
-          'claude-sonnet-4-6-20260101': {
-            inputTokens: 1000,
-            outputTokens: 300,
-            cacheReadInputTokens: 0,
-            cacheCreationInputTokens: 0,
-            webSearchRequests: 0,
-            costUSD: 0.01,
-            contextWindow: 500000,
-            maxOutputTokens: 32000,
-          },
-        },
-      });
-
-      const results = [...transformSDKMessage(message, { intendedModel: 'sonnet' })];
-
-      expect(results).toEqual([]);
-    });
-
-    describe('fable alias resolution via session init', () => {
-      const multiEntryUsage = {
-        'claude-haiku-4-5-20251001': {
-          inputTokens: 1000,
-          outputTokens: 300,
-          cacheReadInputTokens: 0,
-          cacheCreationInputTokens: 0,
-          webSearchRequests: 0,
-          costUSD: 0.01,
-          contextWindow: 200000,
-          maxOutputTokens: 32000,
-        },
-        'claude-opus[1m]': {
-          inputTokens: 1000,
-          outputTokens: 300,
-          cacheReadInputTokens: 0,
-          cacheCreationInputTokens: 0,
-          webSearchRequests: 0,
-          costUSD: 0.01,
-          contextWindow: 1000000,
-          maxOutputTokens: 32000,
-        },
+    it('keeps the configured preset window as the settled denominator when the result reports a smaller one', () => {
+      // 2.3.2 ② acceptance: a result carrying a 200k window over a
+      // sonnet[1m] turn configured for 1M must leave the denominator at 1M —
+      // stream phase and post-result stay on the same single source.
+      const usageState = createTransformUsageState();
+      const options = {
+        intendedModel: 'sonnet[1m]',
+        customContextLimits: { 'sonnet': 1_000_000 },
+        usageState,
       };
 
-      it('matches the SDK-resolved model from system/init over the intended alias', () => {
-        const usageState = createTransformUsageState();
-        const initMessage = msg({
-          type: 'system',
-          subtype: 'init',
-          session_id: 'test-session',
-          model: 'claude-opus[1m]',
-        });
-        const initEvents = [...transformSDKMessage(initMessage, { intendedModel: 'fable', usageState })];
-        expect(initEvents).toHaveLength(1);
-
-        const resultMessage = msg({
-          type: 'result',
-          modelUsage: multiEntryUsage,
-        });
-        const results = [...transformSDKMessage(resultMessage, { intendedModel: 'fable', usageState })];
-
-        expect(results).toEqual([{ type: 'context_window', contextWindow: 1000000 }]);
-      });
-
-      it('matches the resolved model through normalization when only casing differs', () => {
-        const usageState = createTransformUsageState();
-        const initMessage = msg({
-          type: 'system',
-          subtype: 'init',
-          session_id: 'test-session',
-          model: 'claude-opus[1M]',
-        });
-        const initEvents = [...transformSDKMessage(initMessage, { intendedModel: 'fable', usageState })];
-        expect(initEvents).toHaveLength(1);
-
-        const resultMessage = msg({
-          type: 'result',
-          modelUsage: multiEntryUsage,
-        });
-        const results = [...transformSDKMessage(resultMessage, { intendedModel: 'fable', usageState })];
-
-        expect(results).toEqual([{ type: 'context_window', contextWindow: 1000000 }]);
-      });
-
-      it('falls back to fable family matching without init', () => {
-        const resultMessage = msg({
-          type: 'result',
-          modelUsage: {
-            'claude-haiku-4-5-20251001': {
-              inputTokens: 1000,
-              outputTokens: 300,
-              cacheReadInputTokens: 0,
-              cacheCreationInputTokens: 0,
-              webSearchRequests: 0,
-              costUSD: 0.01,
-              contextWindow: 200000,
-              maxOutputTokens: 32000,
-            },
-            'claude-fable-5': {
-              inputTokens: 1000,
-              outputTokens: 300,
-              cacheReadInputTokens: 0,
-              cacheCreationInputTokens: 0,
-              webSearchRequests: 0,
-              costUSD: 0.01,
-              contextWindow: 1000000,
-              maxOutputTokens: 32000,
-            },
+      const chunks = [
+        ...transformSDKMessage(msg({
+          type: 'assistant',
+          parent_tool_use_id: null,
+          message: {
+            content: [{ type: 'text', text: 'Hello' }],
+            usage: { input_tokens: 1000, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 },
           },
-        });
-
-        const results = [...transformSDKMessage(resultMessage, { intendedModel: 'fable' })];
-
-        expect(results).toEqual([{ type: 'context_window', contextWindow: 1000000 }]);
-      });
-
-      it('emits no context_window when fable cannot be matched in a multi-entry result', () => {
-        const resultMessage = msg({
+        }), options),
+        ...transformSDKMessage(msg({
           type: 'result',
-          modelUsage: multiEntryUsage,
-        });
+          subtype: 'success',
+          modelUsage: {
+            'claude-sonnet[1m]': { contextWindow: 200_000 },
+          },
+        }), options),
+      ];
+      const usageChunks = chunks.filter((chunk): chunk is Extract<typeof chunk, { type: 'usage' }> => chunk.type === 'usage');
 
-        const results = [...transformSDKMessage(resultMessage, { intendedModel: 'fable' })];
+      expect(usageChunks.length).toBeGreaterThan(0);
+      for (const chunk of usageChunks) {
+        expect(chunk.usage.contextWindow).toBe(1_000_000);
+      }
+    });
 
-        expect(results).toEqual([]);
-      });
-
+    describe('fable stream-phase denominator (2.3.2 ②: result modelUsage no longer denominates)', () => {
       it('falls back to the standard window as the stream-phase denominator for unconfigured fable', () => {
-        // Preset-only resolution (2026-09-16): the fable hard-coded 1M rule is
-        // gone, so an unconfigured fable keeps the conservative stream-phase
-        // denominator until the authoritative result window arrives (covered
-        // above) or a preset window is projected (covered below).
+        // Preset-only resolution (2026-09-16); result windows stopped
+        // denominating entirely (2.3.2 ②, 2026-09-17): an unconfigured fable
+        // keeps the conservative 200k denominator stream-phase and settled,
+        // until a preset window is projected (covered below).
         const usageState = createTransformUsageState();
         const message = msg({
           type: 'assistant',
@@ -2056,39 +1692,6 @@ describe('transformSDKMessage', () => {
       ], options);
 
       expect(chunks[chunks.length - 1].model).toBe('sonnet[1m]');
-    });
-
-    it('matches result modelUsage against the session-resolved model captured in an earlier turn', () => {
-      const usageState = createTransformUsageState();
-      const options = { intendedModel: 'fable', sessionResolvedModel: 'claude-opus[1m]', usageState };
-
-      const results = [...transformSDKMessage(msg({
-        type: 'result',
-        modelUsage: {
-          'claude-haiku-4-5-20251001': {
-            inputTokens: 1000,
-            outputTokens: 300,
-            cacheReadInputTokens: 0,
-            cacheCreationInputTokens: 0,
-            webSearchRequests: 0,
-            costUSD: 0.01,
-            contextWindow: 200000,
-            maxOutputTokens: 32000,
-          },
-          'claude-opus[1m]': {
-            inputTokens: 1000,
-            outputTokens: 300,
-            cacheReadInputTokens: 0,
-            cacheCreationInputTokens: 0,
-            webSearchRequests: 0,
-            costUSD: 0.01,
-            contextWindow: 1000000,
-            maxOutputTokens: 32000,
-          },
-        },
-      }), options)];
-
-      expect(results).toEqual([{ type: 'context_window', contextWindow: 1000000 }]);
     });
   });
 

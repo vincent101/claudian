@@ -1105,13 +1105,12 @@ export class ConversationController {
   }
 
   /**
-   * Re-derives the restored usage denominator through the provider preset
-   * chain. A persisted non-authoritative window may be a stale local fallback
-   * (idle sessions never receive a runtime-corrected one) and settings may
-   * have changed since the snapshot was written, so hydration must not trust
-   * the stored denominator. Candidate order: the usage's own recorded model,
-   * then the provider's current-model projection; same-model authoritative
-   * runtime windows survive inside refreshUsageContextWindow.
+   * Re-derives the restored usage denominator from the tab's restored selector
+   * model (the provider-model projection) through the provider preset chain.
+   * The persisted usage.model is a runtime label, never a denominator source
+   * (2.3.2 ②, user ruling 2026-09-17), and settings may have changed since
+   * the snapshot was written, so hydration must not trust the stored
+   * denominator either.
    */
   private refreshRestoredUsageWindow(conversation: Conversation): void {
     const usage = this.deps.state.usage;
@@ -1119,11 +1118,11 @@ export class ConversationController {
       return;
     }
 
-    const fallbackModel = this.deps.plugin.settings.savedProviderModel?.[conversation.providerId];
+    const selectorModel = this.deps.plugin.settings.savedProviderModel?.[conversation.providerId];
     this.deps.state.usage = refreshUsageContextWindow(usage, {
       uiConfig: ProviderRegistry.getChatUIConfig(conversation.providerId),
       settings: this.deps.plugin.settings as unknown as Record<string, unknown>,
-      fallbackModel,
+      selectorModel,
     });
   }
 

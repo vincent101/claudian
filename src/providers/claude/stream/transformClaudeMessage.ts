@@ -4,7 +4,7 @@ import type { SDKToolUseResult, StreamChunk, UsageInfo } from '../../../core/typ
 import { isBlockedMessage } from '../sdk/messages';
 import { extractToolResultContent } from '../sdk/toolResultContent';
 import type { TransformEvent } from '../sdk/types';
-import { getContextWindowSize, isDefaultClaudeModel } from '../types/models';
+import { getContextWindowSize } from '../types/models';
 import { createTransformStreamState, type TransformStreamState } from './toolInputStreamState';
 
 type ToolUseFields = { id: string; name: string; input: Record<string, unknown> };
@@ -80,176 +80,8 @@ export interface TransformUsageState {
   getResolvedModel(): string | null;
 }
 
-interface ContextWindowEntry {
-  model: string;
-  contextWindow: number;
-}
-
-interface ClaudeModelSignature {
-  normalizedModel: string;
-  family: 'haiku' | 'sonnet' | 'opus' | 'fable';
-  is1M: boolean;
-  major?: string;
-  minor?: string;
-  date?: string;
-}
-
 function isResultError(message: { type: 'result'; subtype: string }): message is SDKResultError {
   return !!message.subtype && message.subtype !== 'success';
-}
-
-function normalizeClaudeModelId(model: string): string {
-  const normalized = model.trim().toLowerCase();
-  const claudeIndex = normalized.indexOf('claude-');
-  // Strip everything up to AND including the "claude-" prefix: the SDK reports
-  // unversioned family keys like "claude-sonnet[1m]" while the intended model
-  // is the bare alias "sonnet[1m]" — both must normalize to the same string or
-  // multi-entry modelUsage (main + subagent) can never exact-match them.
-  return claudeIndex >= 0 ? normalized.slice(claudeIndex + 'claude-'.length) : normalized;
-}
-
-function parseClaudeModelSignature(model: string): ClaudeModelSignature | null {
-  const normalized = normalizeClaudeModelId(model);
-  if (normalized === 'haiku') {
-    return { normalizedModel: normalized, family: 'haiku', is1M: false };
-  }
-  if (normalized === 'sonnet' || normalized === 'sonnet[1m]') {
-    return { normalizedModel: normalized, family: 'sonnet', is1M: normalized.endsWith('[1m]') };
-  }
-  if (normalized === 'opus' || normalized === 'opus[1m]') {
-    return { normalizedModel: normalized, family: 'opus', is1M: normalized.endsWith('[1m]') };
-  }
-  // Fable ships with a 1M window across its family.
-  if (normalized === 'fable' || normalized === 'fable[1m]') {
-    return { normalizedModel: normalized, family: 'fable', is1M: true };
-  }
-
-  const versionedMatch = normalized.match(
-    /^(?:claude-)?(haiku|sonnet|opus|fable)-(\d+)(?:-(\d+))?(?:-(\d{8}))?(?:-v\d+:\d+)?(\[1m\])?$/,
-  );
-  if (versionedMatch) {
-    const [, familyMatch, major, minor, date, oneMillionSuffix] = versionedMatch;
-    const family = familyMatch as ClaudeModelSignature['family'];
-    return {
-      normalizedModel: normalized,
-      family,
-      is1M: family === 'fable' || oneMillionSuffix === '[1m]',
-      major,
-      minor,
-      date,
-    };
-  }
-
-  return null;
-}
-
-function findUniqueEntry(
-  entries: ContextWindowEntry[],
-  predicate: (entry: ContextWindowEntry) => boolean,
-): ContextWindowEntry | null {
-  const matches = entries.filter(predicate);
-  return matches.length === 1 ? matches[0] : null;
-}
-
-function matchClaudeModelSignature(
-  entrySignature: ClaudeModelSignature | null,
-  intendedSignature: ClaudeModelSignature,
-  options?: { ignoreIs1M?: boolean },
-): boolean {
-  if (!entrySignature || entrySignature.family !== intendedSignature.family) {
-    return false;
-  }
-  if (!options?.ignoreIs1M && entrySignature.is1M !== intendedSignature.is1M) {
-    return false;
-  }
-  if (intendedSignature.major && entrySignature.major !== intendedSignature.major) {
-    return false;
-  }
-  if (intendedSignature.minor && entrySignature.minor !== intendedSignature.minor) {
-    return false;
-  }
-  if (intendedSignature.date && entrySignature.date !== intendedSignature.date) {
-    return false;
-  }
-  return true;
-}
-
-function selectContextWindowEntry(
-  modelUsage: Record<string, { contextWindow?: number }>,
-  intendedModel?: string,
-  resolvedModel?: string
-): ContextWindowEntry | null {
-  const entries: ContextWindowEntry[] = Object.entries(modelUsage)
-    .flatMap(([model, usage]) =>
-      typeof usage?.contextWindow === 'number' && usage.contextWindow > 0
-        ? [{ model, contextWindow: usage.contextWindow }]
-        : []
-    );
-
-  if (entries.length === 0) {
-    return null;
-  }
-
-  if (entries.length === 1) {
-    return entries[0];
-  }
-
-  // The SDK-resolved model (system/init) is authoritative for alias presets
-  // like fable: the CLI reports the concrete id it actually mapped to.
-  if (resolvedModel) {
-    const resolvedLiteralMatch = entries.find((entry) => entry.model === resolvedModel);
-    if (resolvedLiteralMatch) {
-      return resolvedLiteralMatch;
-    }
-
-    const normalizedResolvedModel = normalizeClaudeModelId(resolvedModel);
-    const resolvedNormalizedMatch = findUniqueEntry(entries, (entry) =>
-      normalizeClaudeModelId(entry.model) === normalizedResolvedModel
-    );
-    if (resolvedNormalizedMatch) {
-      return resolvedNormalizedMatch;
-    }
-  }
-
-  if (!intendedModel) {
-    return null;
-  }
-
-  const literalExactMatch = entries.find((entry) => entry.model === intendedModel);
-  if (literalExactMatch) {
-    return literalExactMatch;
-  }
-
-  const normalizedIntendedModel = normalizeClaudeModelId(intendedModel);
-  const exactMatch = findUniqueEntry(entries, (entry) => normalizeClaudeModelId(entry.model) === normalizedIntendedModel);
-  if (exactMatch) {
-    return exactMatch;
-  }
-
-  if (!isDefaultClaudeModel(intendedModel)) {
-    return null;
-  }
-
-  const intendedSignature = parseClaudeModelSignature(intendedModel);
-  if (!intendedSignature) {
-    return null;
-  }
-
-  const strictSignatureMatch = findUniqueEntry(entries, (entry) =>
-    matchClaudeModelSignature(parseClaudeModelSignature(entry.model), intendedSignature),
-  );
-  if (strictSignatureMatch) {
-    return strictSignatureMatch;
-  }
-
-  const hasVersionedTarget = Boolean(intendedSignature.major || intendedSignature.date);
-  if (!hasVersionedTarget) {
-    return null;
-  }
-
-  return findUniqueEntry(entries, (entry) =>
-    matchClaudeModelSignature(parseClaudeModelSignature(entry.model), intendedSignature, { ignoreIs1M: true }),
-  );
 }
 
 const EMPTY_PROMPT_USAGE: PromptUsageSnapshot = {
@@ -633,22 +465,14 @@ export function* transformSDKMessage(
         };
       }
 
-      // Usage is now extracted from assistant messages for accuracy (excludes subagent tokens)
-      // Result message usage is aggregated across main + subagents, causing inaccurate spikes
+      // Usage is extracted from assistant messages for accuracy (excludes
+      // subagent tokens); result-message usage is aggregated across main +
+      // subagents and would cause inaccurate spikes.
 
-      if ('modelUsage' in message && message.modelUsage) {
-        const modelUsage = message.modelUsage as Record<string, { contextWindow?: number }>;
-        const selectedEntry = selectContextWindowEntry(
-          modelUsage,
-          options?.intendedModel,
-          options?.usageState?.getResolvedModel()
-            ?? options?.sessionResolvedModel
-            ?? undefined,
-        );
-        if (selectedEntry) {
-          yield { type: 'context_window', contextWindow: selectedEntry.contextWindow };
-        }
-      }
+      // modelUsage / contextWindow is deliberately ignored (2.3.2 ②, user
+      // ruling 2026-09-17): the denominator follows the model selector's
+      // preset configuration only. Stream-phase and settled denominators stay
+      // on this single source; the SDK-reported window never overrides it.
       break;
 
     default:

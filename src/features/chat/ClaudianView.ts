@@ -104,14 +104,14 @@ export class ClaudianView extends ItemView {
       const capabilities = ProviderRegistry.getCapabilities(providerId);
 
       if (tab.state.usage) {
-        // Re-derive each tab's denominator from its own recorded model so a
-        // preset-window change applies to every open conversation without
-        // re-labeling them all with the provider's current model. The current
-        // model is only the fallback candidate for usages that carry none.
+        // Re-derive each tab's denominator from the model its selector shows
+        // (the provider's current model here): the selector is the single
+        // denominator source (2.3.2 ②, user ruling 2026-09-17), and a
+        // preset-window change applies to every open conversation.
         tab.state.usage = refreshUsageContextWindow(tab.state.usage, {
           uiConfig,
           settings: providerSettings,
-          fallbackModel: model,
+          selectorModel: model,
         });
       }
 

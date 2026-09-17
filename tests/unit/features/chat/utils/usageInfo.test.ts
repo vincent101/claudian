@@ -87,87 +87,65 @@ describe('usageInfo', () => {
       { label: 'Opus', model: 'opus' },
     ];
 
-    it('re-derives a non-authoritative stored window from the usage.model preset', () => {
-      const usage = createClaudeUsage();
+    it('denominates from the selector model only: a prefixed usage.model never participates (2.3.2 ②)', () => {
+      // User ruling 2026-09-17: the denominator follows the model selector's
+      // preset configuration. The persisted usage.model ("claude-sonnet[1m]",
+      // the CLI-reported form) is a label, not a denominator source.
+      const usage = createClaudeUsage({ model: 'claude-sonnet[1m]' });
       const refreshed = refreshUsageContextWindow(usage, {
         uiConfig: claudeChatUIConfig,
         settings: createClaudeSettings(presets, { 'sonnet': 1_000_000 }),
-      });
-
-      expect(refreshed).toEqual({
-        ...usage,
-        contextWindow: 1_000_000,
-        contextWindowIsAuthoritative: false,
-        percentage: 45,
-      });
-    });
-
-    it('matches a configured preset through a [1m] alias usage.model (control: non-fallback value)', () => {
-      const usage = createClaudeUsage({ model: 'sonnet[1m]' });
-      const refreshed = refreshUsageContextWindow(usage, {
-        uiConfig: claudeChatUIConfig,
-        settings: createClaudeSettings(presets, { 'sonnet': 1_000_000 }),
+        selectorModel: 'sonnet[1m]',
       });
 
       expect(refreshed.contextWindow).toBe(1_000_000);
       expect(refreshed.model).toBe('sonnet[1m]');
+      expect(refreshed.percentage).toBe(45);
     });
 
-    it('normalizes casing of the stored usage.model before preset lookup', () => {
-      const usage = createClaudeUsage({ model: 'Sonnet' });
+    it('follows the selector model when it differs from the usage label', () => {
+      // 「我选什么模型，显示什么模型的上下文长度才对」: the selector wins over
+      // whatever model the persisted usage recorded.
+      const usage = createClaudeUsage({ model: 'opus' });
       const refreshed = refreshUsageContextWindow(usage, {
         uiConfig: claudeChatUIConfig,
         settings: createClaudeSettings(presets, { 'sonnet': 500_000 }),
+        selectorModel: 'sonnet',
       });
 
+      expect(refreshed.model).toBe('sonnet');
       expect(refreshed.contextWindow).toBe(500_000);
     });
 
-    it('remaps the usage.model variant onto the offered preset without rewriting the stored label', () => {
-      // Presets only offer the 1M variant: the family variant must be remapped
-      // so the configured window resolves, but the persisted usage.model keeps
-      // recording what the runtime actually reported.
-      const usage = createClaudeUsage({ model: 'sonnet' });
+    it('remaps the selector model variant onto the offered preset', () => {
+      // Presets only offer the 1M variant: the selector's family variant is
+      // remapped so the configured window resolves.
+      const usage = createClaudeUsage();
       const refreshed = refreshUsageContextWindow(usage, {
         uiConfig: claudeChatUIConfig,
         settings: createClaudeSettings(
           [{ label: 'Sonnet 1M', model: 'sonnet[1m]' }],
           { 'sonnet[1m]': 700_000 },
         ),
+        selectorModel: 'sonnet',
       });
 
       expect(refreshed.contextWindow).toBe(700_000);
-      expect(refreshed.model).toBe('sonnet');
     });
 
-    it('keeps an authoritative same-model runtime window untouched', () => {
-      const usage = createClaudeUsage({
-        contextWindow: 800_000,
-        contextWindowIsAuthoritative: true,
-        percentage: 57,
-      });
-      const refreshed = refreshUsageContextWindow(usage, {
-        uiConfig: claudeChatUIConfig,
-        settings: createClaudeSettings(presets, { 'sonnet': 1_000_000 }),
-      });
-
-      expect(refreshed.contextWindow).toBe(800_000);
-      expect(refreshed.contextWindowIsAuthoritative).toBe(true);
-    });
-
-    it('drops a stale authoritative window when the stored model differs from the candidate', () => {
+    it('drops a stale authoritative window when the selector model differs from the usage model', () => {
       // An authoritative window is only valid for the model that produced it;
-      // when the candidate model comes from the caller (no stored model), the
-      // runtime window must not survive the model change.
+      // the runtime window must not survive the model change (Codex still
+      // produces authoritative windows; Claude no longer does — 2.3.2 ②).
       const usage = createClaudeUsage({
-        model: undefined,
+        model: 'other-model',
         contextWindow: 800_000,
         contextWindowIsAuthoritative: true,
       });
       const refreshed = refreshUsageContextWindow(usage, {
         uiConfig: claudeChatUIConfig,
         settings: createClaudeSettings(presets, { 'sonnet': 1_000_000 }),
-        fallbackModel: 'sonnet',
+        selectorModel: 'sonnet',
       });
 
       expect(refreshed.model).toBe('sonnet');
@@ -175,20 +153,7 @@ describe('usageInfo', () => {
       expect(refreshed.contextWindowIsAuthoritative).toBe(false);
     });
 
-    it('falls back to the caller-provided current model when usage carries none', () => {
-      const usage = createClaudeUsage({ model: undefined });
-      const refreshed = refreshUsageContextWindow(usage, {
-        uiConfig: claudeChatUIConfig,
-        settings: createClaudeSettings(presets, { 'sonnet': 1_000_000 }),
-        fallbackModel: 'sonnet',
-      });
-
-      expect(refreshed.model).toBe('sonnet');
-      expect(refreshed.contextWindow).toBe(1_000_000);
-      expect(refreshed.percentage).toBe(45);
-    });
-
-    it('returns the usage unchanged when no candidate model exists', () => {
+    it('returns the usage unchanged when no selector model exists', () => {
       const usage = createClaudeUsage({ model: undefined });
       const refreshed = refreshUsageContextWindow(usage, {
         uiConfig: claudeChatUIConfig,
@@ -199,10 +164,11 @@ describe('usageInfo', () => {
     });
 
     it('falls back to the conservative standard window for unconfigured models', () => {
-      const usage = createClaudeUsage({ model: 'sonnet[1m]' });
+      const usage = createClaudeUsage();
       const refreshed = refreshUsageContextWindow(usage, {
         uiConfig: claudeChatUIConfig,
         settings: createClaudeSettings(presets, {}),
+        selectorModel: 'sonnet[1m]',
       });
 
       expect(refreshed.contextWindow).toBe(200_000);

@@ -67,9 +67,9 @@ function createTab(usage: UsageInfo | null): unknown {
 describe('ClaudianView.refreshModelSelector usage refresh', () => {
   beforeEach(() => {
     jest.clearAllMocks();
-    // The provider's current (global) model differs from the historical tab's
-    // usage.model on purpose: the refresh must re-denominate by each tab's
-    // own recorded model, not re-label everything with the current one.
+    // The provider's current (global) model is the selector model every tab
+    // re-denominates by (2.3.2 ②): the persisted usage.model is a runtime
+    // label, never a denominator source.
     mockGetProviderSettingsSnapshot.mockReturnValue({
       model: 'haiku',
       permissionMode: 'normal',
@@ -77,8 +77,14 @@ describe('ClaudianView.refreshModelSelector usage refresh', () => {
     });
   });
 
-  it('refreshes a historical tab by its own usage.model after preset windows change', () => {
-    const usage = createUsage();
+  it('re-denominates a tab by the selector model after preset windows change', () => {
+    mockGetProviderSettingsSnapshot.mockReturnValue({
+      model: 'sonnet',
+      permissionMode: 'normal',
+      customContextLimits: { 'sonnet': 1_000_000 },
+    });
+    // CLI-reported label form: must resolve through the selector anyway.
+    const usage = createUsage({ model: 'claude-sonnet[1m]' });
     const tab = createTab(usage);
     const { view } = createView([tab]);
 
@@ -90,23 +96,21 @@ describe('ClaudianView.refreshModelSelector usage refresh', () => {
     expect(refreshed.percentage).toBe(45);
   });
 
-  it('keeps an authoritative same-model runtime window through the refresh', () => {
-    const usage = createUsage({
-      contextWindow: 800_000,
-      contextWindowIsAuthoritative: true,
-      percentage: 57,
-    });
+  it('re-labels and re-denominates when the selector model differs from the usage label', () => {
+    // User ruling 2026-09-17: 我选什么模型，显示什么模型的上下文长度才对.
+    const usage = createUsage({ model: 'sonnet' });
     const tab = createTab(usage);
     const { view } = createView([tab]);
 
     view.refreshModelSelector();
 
     const refreshed = (tab as { state: { usage: UsageInfo } }).state.usage;
-    expect(refreshed.contextWindow).toBe(800_000);
-    expect(refreshed.contextWindowIsAuthoritative).toBe(true);
+    expect(refreshed.model).toBe('haiku');
+    expect(refreshed.contextWindow).toBe(200_000);
+    expect(refreshed.percentage).toBe(100);
   });
 
-  it('falls back to the provider current model when a tab usage carries no model', () => {
+  it('denominates by the provider current model when a tab usage carries no model', () => {
     const usage = createUsage({ model: undefined });
     const tab = createTab(usage);
     const { view } = createView([tab]);

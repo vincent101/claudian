@@ -4666,11 +4666,12 @@ describe('ClaudianService', () => {
       }
     });
 
-    it('keeps the 1M context window for a sonnet[1m] turn when the global model drifts mid-turn', async () => {
+    it('keeps the configured preset denominator when the result reports a different window (2.3.2 ②)', async () => {
       await startPersistentQueryWithChannel();
 
-      // A turn dispatched while the provider ran sonnet[1m]; usage transforms
-      // must keep denominating against the dispatch model, not live settings.
+      // A sonnet[1m] turn with a configured 1M preset window; the result's
+      // modelUsage (200k, plus a subagent entry) must not override the
+      // denominator — the model selector's preset is the single source.
       const turn = createRuntimeTurn({ id: 'turn-drift', kind: 'user' });
       turn.model = 'sonnet[1m]';
       (service as any).runtimeTurns.set('turn-drift', turn);
@@ -4680,6 +4681,7 @@ describe('ClaudianService', () => {
 
       (mockPlugin.settings as any).enableSonnet1M = true;
       (mockPlugin.settings as any).model = 'sonnet';
+      (mockPlugin.settings as any).customContextLimits = { 'sonnet': 1_000_000 };
 
       await (service as any).routeMessage({
         type: 'assistant',
@@ -4688,23 +4690,22 @@ describe('ClaudianService', () => {
           usage: { input_tokens: 1200, cache_creation_input_tokens: 0, cache_read_input_tokens: 300000 },
         },
       });
-      // Result with main [1m] model + a subagent entry: multi-entry modelUsage
-      // is where intended-model matching decides the authoritative window.
       await (service as any).routeMessage({
         type: 'result',
         subtype: 'success',
         result: 'done',
         modelUsage: {
-          'claude-sonnet[1m]': { contextWindow: 1_000_000 },
+          'claude-sonnet[1m]': { contextWindow: 200_000 },
           'claude-haiku-4-5': { contextWindow: 200_000 },
         },
       });
 
       const finalUsage = turn.bufferedUsage?.usage;
       expect(finalUsage).toBeDefined();
-      expect(finalUsage!.model).toBe('sonnet[1m]');
       expect(finalUsage!.contextWindow).toBe(1_000_000);
-      expect(finalUsage!.contextWindowIsAuthoritative).toBe(true);
+      // No runtime-authoritative window exists anymore: the result never
+      // marks the denominator authoritative (2.3.2 ②).
+      expect(finalUsage!.contextWindowIsAuthoritative).not.toBe(true);
     });
   });
 });

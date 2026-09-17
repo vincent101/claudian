@@ -81,7 +81,7 @@ import {
   type SubagentHookState,
 } from '../hooks/SubagentHooks';
 import { encodeClaudeTurn } from '../prompt/ClaudeTurnEncoder';
-import { isContextWindowEvent, isSessionInitEvent, isStreamChunk } from '../sdk/typeGuards';
+import { isSessionInitEvent, isStreamChunk } from '../sdk/typeGuards';
 import type { SessionInitEvent, TransformEvent } from '../sdk/types';
 import { getClaudeProviderSettings } from '../settings';
 import {
@@ -340,32 +340,6 @@ export class ClaudianService implements ChatRuntime {
   ): Extract<StreamChunk, { type: 'usage' }> {
     turn.bufferedUsage = chunk;
     return chunk;
-  }
-
-  private updateBufferedUsageContextWindow(
-    turn: RuntimeTurn,
-    contextWindow: number,
-  ): Extract<StreamChunk, { type: 'usage' }> | null {
-    if (!turn.bufferedUsage || contextWindow <= 0) {
-      return null;
-    }
-
-    const usage = turn.bufferedUsage.usage;
-    const percentage = Math.min(
-      100,
-      Math.max(0, Math.round((usage.contextTokens / contextWindow) * 100)),
-    );
-    const nextChunk: Extract<StreamChunk, { type: 'usage' }> = {
-      ...turn.bufferedUsage,
-      usage: {
-        ...usage,
-        contextWindow,
-        contextWindowIsAuthoritative: true,
-        percentage,
-      },
-    };
-    turn.bufferedUsage = nextChunk;
-    return nextChunk;
   }
 
   setPendingResumeAt(uuid: string | undefined): void {
@@ -1020,12 +994,6 @@ export class ClaudianService implements ChatRuntime {
 
       if (isSessionInitEvent(event)) {
         this.applySessionInitSideEffects(event);
-      } else if (isContextWindowEvent(event)) {
-        const usageChunk = this.updateBufferedUsageContextWindow(activeTurn, event.contextWindow);
-        if (!usageChunk) {
-          continue;
-        }
-        await this.deliverChunkToTurn(activeTurn, usageChunk);
       } else if (isStreamChunk(event)) {
         // Dedup: SDK delivers text via stream_events (incremental) AND the assistant message
         // (complete). Skip the assistant message text if stream text was already seen.
@@ -2276,11 +2244,6 @@ export class ClaudianService implements ChatRuntime {
           if (isSessionInitEvent(event)) {
             this.sessionManager.captureSession(event.sessionId);
             streamSessionId = event.sessionId;
-          } else if (isContextWindowEvent(event)) {
-            const usageChunk = this.updateBufferedUsageContextWindow(turn, event.contextWindow);
-            if (usageChunk) {
-              yield usageChunk;
-            }
           } else if (isStreamChunk(event)) {
             if (message.type === 'assistant' && turn.sawStreamText && event.type === 'text') {
               continue;

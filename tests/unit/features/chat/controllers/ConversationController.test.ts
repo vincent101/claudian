@@ -1569,7 +1569,24 @@ describe('ConversationController', () => {
       };
     }
 
-    it('re-derives a stored non-authoritative fallback window on hydration without any send', async () => {
+    it('denominates from the restored selector model on hydration, ignoring the CLI-reported usage label (2.3.2 ②)', async () => {
+      seedClaudeSettings({ 'sonnet': 1_000_000 }, { claude: 'sonnet' });
+      deps.state.currentConversationId = 'conv-usage';
+      (deps.plugin.getConversationById as jest.Mock).mockResolvedValue(
+        storedConversation(storedUsage({
+          // CLI-reported form: a label, never a denominator source.
+          model: 'claude-sonnet[1m]',
+        })),
+      );
+
+      await controller.loadActive();
+
+      expect(deps.state.usage?.model).toBe('sonnet');
+      expect(deps.state.usage?.contextWindow).toBe(1_000_000);
+      expect(deps.state.usage?.percentage).toBe(45);
+    });
+
+    it('keeps the stored usage as-is when no selector model projection exists', async () => {
       seedClaudeSettings({ 'sonnet': 1_000_000 });
       deps.state.currentConversationId = 'conv-usage';
       (deps.plugin.getConversationById as jest.Mock).mockResolvedValue(
@@ -1578,56 +1595,26 @@ describe('ConversationController', () => {
 
       await controller.loadActive();
 
-      expect(deps.state.usage).toEqual({
-        ...storedUsage(),
-        contextWindow: 1_000_000,
-        contextWindowIsAuthoritative: false,
-        percentage: 45,
-      });
+      // No selector model to denominate from: the stored snapshot survives.
+      expect(deps.state.usage).toEqual(storedUsage());
     });
 
-    it('matches the configured preset through a [1m] alias usage.model on hydration', async () => {
-      seedClaudeSettings({ 'sonnet': 1_000_000 });
-      deps.state.currentConversationId = 'conv-usage';
-      (deps.plugin.getConversationById as jest.Mock).mockResolvedValue(
-        storedConversation(storedUsage({ model: 'sonnet[1m]' })),
-      );
-
-      await controller.loadActive();
-
-      expect(deps.state.usage?.contextWindow).toBe(1_000_000);
-      expect(deps.state.usage?.model).toBe('sonnet[1m]');
-    });
-
-    it('keeps an authoritative same-model runtime window on hydration', async () => {
-      seedClaudeSettings({ 'sonnet': 1_000_000 });
-      deps.state.currentConversationId = 'conv-usage';
-      (deps.plugin.getConversationById as jest.Mock).mockResolvedValue(
-        storedConversation(storedUsage({
-          contextWindow: 800_000,
-          contextWindowIsAuthoritative: true,
-          percentage: 57,
-        })),
-      );
-
-      await controller.loadActive();
-
-      expect(deps.state.usage?.contextWindow).toBe(800_000);
-      expect(deps.state.usage?.contextWindowIsAuthoritative).toBe(true);
-    });
-
-    it('falls back to the provider current-model projection when the stored usage has no model', async () => {
+    it('drops a stale authoritative window when the selector model differs from the usage model', async () => {
       seedClaudeSettings({ 'sonnet': 1_000_000 }, { claude: 'sonnet' });
       deps.state.currentConversationId = 'conv-usage';
       (deps.plugin.getConversationById as jest.Mock).mockResolvedValue(
-        storedConversation(storedUsage({ model: undefined })),
+        storedConversation(storedUsage({
+          model: 'other-model',
+          contextWindow: 800_000,
+          contextWindowIsAuthoritative: true,
+        })),
       );
 
       await controller.loadActive();
 
       expect(deps.state.usage?.model).toBe('sonnet');
       expect(deps.state.usage?.contextWindow).toBe(1_000_000);
-      expect(deps.state.usage?.percentage).toBe(45);
+      expect(deps.state.usage?.contextWindowIsAuthoritative).toBe(false);
     });
 
     it('keeps sessions without usage untouched (gauge stays hidden)', async () => {

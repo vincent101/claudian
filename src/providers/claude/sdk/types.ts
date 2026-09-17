@@ -9,9 +9,7 @@ export interface SessionInitEvent {
   permissionMode?: string;
 }
 
-export interface ContextWindowEvent {
-  type: 'context_window';
-  contextWindow: number;
-}
-
-export type TransformEvent = StreamChunk | SessionInitEvent | ContextWindowEvent;
+// No ContextWindowEvent anymore (2.3.2 ②, 2026-09-17): the SDK-reported
+// context window stopped denominating usage — the preset configuration behind
+// the model selector is the single denominator source.
+export type TransformEvent = StreamChunk | SessionInitEvent;

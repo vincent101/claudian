@@ -31,26 +31,31 @@ export interface UsageContextWindowDeps {
   uiConfig: Pick<ProviderChatUIConfig, 'normalizeModelVariant' | 'getContextWindowSize'>;
   /** Raw settings bag; providers extract their config (incl. customContextLimits) from it. */
   settings: Record<string, unknown>;
-  /** Current/draft model used only when the usage carries no model of its own. */
-  fallbackModel?: string;
+  /**
+   * The model the tab's model selector shows (hydration: the restored
+   * provider-model projection; settings refresh: the provider's current
+   * model). The single denominator source (2.3.2 ②, user ruling 2026-09-17):
+   * "我选什么模型，显示什么模型的上下文长度才对".
+   */
+  selectorModel?: string;
 }
 
 /**
  * Re-derives the usage denominator through the provider preset chain for
  * every entry point where already-existing usage reaches the UI (conversation
- * hydration, settings refresh). Persisted usage snapshots may carry a locally
- * fallback window that was never authoritative, and settings may have changed
- * since the snapshot was written, so the denominator is recomputed from the
- * candidate model — the usage's own recorded model first, the caller's
- * current model otherwise. A same-model authoritative runtime window survives
- * (recalculateUsageForModel); the stored model label is never rewritten by
- * variant normalization so later re-derivations stay stable.
+ * hydration, settings refresh). The selector model is the only candidate
+ * (2.3.2 ②, user ruling 2026-09-17): the persisted usage.model is a runtime
+ * label (CLI-reported form like "claude-sonnet[1m]") and never denominates —
+ * the earlier usage.model-first chain (2.3.1) could not resolve such labels
+ * against configured presets and silently fell to 200k. A same-model
+ * authoritative runtime window survives (recalculateUsageForModel; only
+ * non-Claude providers still produce those).
  */
 export function refreshUsageContextWindow(
   usage: UsageInfo,
   deps: UsageContextWindowDeps,
 ): UsageInfo {
-  const candidate = usage.model?.trim() || deps.fallbackModel?.trim() || '';
+  const candidate = deps.selectorModel?.trim() || '';
   if (!candidate) {
     return usage;
   }
