@@ -88,6 +88,37 @@ type FullHistoryIterable = AsyncIterable<FullHistoryChunk>;
 
 这解决了两个不同问题：导出遍历全部历史且流式落地；模型恢复不可能容纳无限历史，因此只注入未摘要、未拆断 turn 的有界后缀。`buildContextFromHistory(ChatMessage[])` 保留给普通小数组调用；新增 `HistoryContextAccumulator.appendChunk()`，禁止 amnesia 再调用旧全量函数。
 
+#### [v4.1 补遗 2026-09-16] 导出入口、writer 与格式
+
+实证：生产代码中 `exportFullHistory` 只有 `TabManager.ts:408-412` 一处调用，且用途是给 runtime 做 amnesia 恢复；现有命令只覆盖 open/new tab/new session 等，`TabBar` 右键仅 move/close；会话列表已在 `ConversationController.ts:1264-1382` 提供按 `conversationId` 定位的右键菜单。故推荐在**会话列表项右键菜单**增加“导出完整会话到文件”“复制完整会话文本”，它能导出未打开会话且目标无歧义。命令面板只能操作 active tab，可作为后续快捷入口；tab 右键空间窄且当前只对 `canClose` tab 注册，不作为首版入口。
+
+文件默认写入 vault 内 `.claudian/exports/<安全化标题>-<本地时间>.md`，重名递增后缀；完成后 Notice 显示 vault 相对路径。首版不弹路径选择器：仓库没有 `FallbackSuggester`/通用 save-file 组件，唯一文件系统选择模式是 `InputToolbar.ts:705-738` 的 Electron `showOpenDialog` 目录选择器，移动端不可复用。若后续要自选位置，另建跨平台 vault-path suggester，不把 Electron API带入本批。
+
+在 `/Users/vincentwang/Documents/NoteVault/tools/claudian/src/core/providers/types.ts` 增加 provider-neutral `WritableLike`（`write(text): Promise<void>`，可选 `close/abort`）；`consumeHistoryText` 每格式化一条即 `await writer.write`，保留背压。Obsidian 装配留在 feature/app 层：`adapter.write(partialPath, '')` 建临时文件，writer 的每次 `write` 顺序调用 `adapter.append(partialPath, text)`，成功后 rename，失败/abort 删除 partial。`obsidian.d.ts` 的 `DataAdapter` 明确提供 `write`、`append`、`appendBinary`；仓库现有 storage 只用全量 `write`，故不能复用其全量 buffer，但可复用 `VaultFileAdapter` 的目录创建/路径规范化方式。这里的“流式”是 bounded chunk 顺序 append，不承诺底层 OS stream handle。
+
+导出文本不另创格式：从 `/Users/vincentwang/Documents/NoteVault/tools/claudian/src/utils/session.ts` 的 `buildContextFromHistory` 抽出单消息 formatter，保持现有 `User/Assistant`、current-note、thinking 摘要与 tool 状态格式；数组函数、iterator 文件导出和 draft 导出共用它。剪贴板硬上限固定为 **4 MiB UTF-8**：先用 index/page 的 `projectedChars` 做保守预估闸（明显超限直接拒绝），再在逐条格式化时以 `TextEncoder` 累计实际 UTF-8 bytes；实际值一旦超过立即停止、释放 iterator 且不调用 `navigator.clipboard.writeText`。仅双闸都通过才允许拼接这个有界字符串。新增 TranslationKey 覆盖入口、成功/失败、`chat.history.export.clipboardTooLarge`（文案：“会话超过 4 MiB，无法复制到剪贴板。请改用‘导出完整会话到文件’。”）与 source unavailable；十个 locale 同步补键，不留英文直写。
+
+#### [v4.1 补遗 2026-09-16] draft 导出契约
+
+实证：现实现 `vaultPath` 为空即复制 `conversation.messages`，而 §3.1 已确定 Claude 的 `conversation.messages` 以后不再代表完整视图；新建未落盘消息的事实只在当前 tab `ChatState.messages`。因此 `iterateFullHistory` 只表示 transcript snapshot：无法解析 vault/session/transcript 时抛结构化 `HistorySourceUnavailableError`（含 `reason: 'vault_unavailable' | 'session_unavailable' | 'transcript_unavailable'`），绝不回退数组。
+
+显式 draft export 在 feature 层分流，不进入 iterator：仅当用户对**当前 tab**执行导出、provider history service 确认不存在 transcript 身份，且该 tab 的 `ChatState.messages` 非空时，允许以 `source: 'draft'` 将该小数组一次性送入同一单消息 formatter。只要 conversation 有 transcript 身份，即使文件暂时不可读也必须报 source unavailable，禁止拿当前 materialized window 冒充完整历史。这与 §3.3 的 “`exportFullHistory` fallback” 一致：该旧方法不再承担 fallback；首版文件/剪贴板入口显式选择 `transcript` 或满足上述判定的 `draft`。
+
+#### [v4.1 补遗 2026-09-16] recovery 状态暴露与动作接线
+
+实证：共享 `ChatRuntime` 已有 `onReadyStateChange(listener) → disposer` 的 provider-neutral订阅模式，feature 的 `setupServiceCallbacks`/tab cleanup 已负责装配与解绑；`onStreamingChanged`/`onTurnCompleted` 则是 runtime→tab 的回调接缝。采用同类订阅而非让 feature 读取 Claude `SessionManager`：在 `/Users/vincentwang/Documents/NoteVault/tools/claudian/src/core/runtime/ChatRuntime.ts` 增加可选 `onHistoryRecoveryStateChange(listener)`、`retryHistoryRecovery(generation)`，事件仅暴露中性 `{status: 'idle'|'recovering'|'tripped', generation, reason?}`。Claude runtime 把 `SessionManager` 状态映射后同步首发并在每次迁移通知；其他 provider 不实现。
+
+提示使用 messages viewport 与 input 之间的**持久可交互 recovery banner/card**，不写入 `ChatMessage`、不伪装系统消息。原因：Notice 虽可接 `DocumentFragment`，但仓库实际用法均是短暂通知且无动作生命周期；`InlineAskUserQuestion`/`InlinePlanApproval` 已证明 inline card + 按钮/键盘交互模式可行，但二者是一锤子 promise，不直接复用类，只复用视觉和销毁模式。banner 只在当前 generation 为 `tripped` 时存在，包含 i18n 文案和两个按钮：
+
+- “新建会话”调用既有 `TabManager.createNewConversation()`；成功切换后由 runtime/session reset 建新 generation，banner 随 `idle` 事件销毁。
+- “重试恢复”调用当前 tab runtime 的 `retryHistoryRecovery(capturedGeneration)`；返回 false 表示 stale generation，保持/刷新当前状态而不误清新熔断；返回 true 后显示 `recovering`，防重复点击。
+
+切 tab、runtime cleanup 必须取消订阅并销毁旧 banner；新 runtime 装配时订阅会同步发当前状态，故后台发生的 tripped 不丢失。新增 TranslationKey：标题、原因、两动作、stale/重试失败；不得把 provider 错误字符串直接作为 UI 文案。
+
+#### [v4.1 补遗 2026-09-16] `setFullHistoryExporter` 过渡
+
+全仓实证确认生产唯一调用方是 `TabManager.ts:408-412`（另有对应单测），A1 同批将其改装为 `setHistoryRecoverySource(() => historyService.iterateFullHistory(...))`。`ChatRuntime.setFullHistoryExporter` 与 Claude 实现标 `@deprecated` 保留一个发布版：内部仅登记 legacy source，并适配为单 chunk iterable；新 source 优先，二者都存在时不得双读。它只保障外部/旧测试装配不崩，不再有生产调用，也不用于用户导出；下一批按 grep 零调用删除。回归测试锁定旧 setter 仍可装配、TabManager 只调用新 setter、runtime 恢复只消费一个 source。
+
 [v4 修订] A1 范围新增并入残项：统一 hydrate 段序与 index 侧段序口径——`ClaudeConversationHistoryService.ts:456-461` 按文件链下标保留 missing-session 空洞，而 `:606-621` 段压缩在中间 session 文件缺失时两路径会对同一消息赋不同段序；统一口径后补多段缺失场景测试（来源：1c 复核复验留档）。
 
 改动文件：
