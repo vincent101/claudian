@@ -38,8 +38,11 @@ export class SessionManager {
     // refresh via syncConversationState) is not a session change: clearing
     // recovery state here would wipe pending injection between turns and
     // silently dismiss a tripped banner. Only a real id change (incl.
-    // null↔non-null) resets the machine and bumps the generation.
-    if (this.state.sessionId === id) {
+    // null↔non-null) resets the machine and bumps the generation. Null never
+    // early-returns: invalidateSession() clears the id while tripping
+    // sessionInvalidated, and a follow-up setSessionId(null) must still clear
+    // that flag (otherwise the stale flag nulls the next session's id).
+    if (id !== null && this.state.sessionId === id) {
       return;
     }
     this.state.sessionId = id;

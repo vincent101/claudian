@@ -106,6 +106,16 @@ describe('SessionManager', () => {
 
       expect(manager.consumeInvalidation()).toBe(false);
     });
+
+    it('should clear invalidation when setSessionId(null) re-syncs after invalidateSession', () => {
+      manager.setSessionId('test-session');
+      manager.invalidateSession();
+      // syncConversationState(null) after invalidation re-supplies null:
+      // same-id early-return must not fire for null, or the flag lingers.
+      manager.setSessionId(null);
+
+      expect(manager.consumeInvalidation()).toBe(false);
+    });
   });
 
   describe('generation recovery state machine', () => {
