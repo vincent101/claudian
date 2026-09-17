@@ -1520,6 +1520,81 @@ describe('InputController - Message Queue', () => {
     });
   });
 
+  describe('Ask-user-question cancel and background gating (2.5.1 F1/F2)', () => {
+    /** Input container wired to a parent so the ask card can mount. */
+    function createAskDeps(overrides: Partial<InputControllerDeps> = {}) {
+      const askDeps = createMockDeps(overrides);
+      const parentEl = createMockEl();
+      const containerEl = createMockEl();
+      (containerEl as any).parentElement = parentEl;
+      askDeps.getInputContainerEl = () => containerEl as any;
+      return askDeps;
+    }
+
+    function askInput(): Record<string, unknown> {
+      return {
+        questions: [{
+          question: 'Proceed?',
+          options: [{ label: 'Yes', value: 'yes' }, { label: 'No', value: 'no' }],
+          isOther: false,
+          isSecret: false,
+        }],
+      };
+    }
+
+    it('F1: the cancel path (dismissPendingApprovalPrompt) destroys a pending ask inline so its promise resolves', () => {
+      const askDeps = createAskDeps();
+      const askController = new InputController(askDeps);
+      const mockAskInline = { destroy: jest.fn() };
+      (askController as any).pendingAskInline = mockAskInline;
+
+      askController.dismissPendingApprovalPrompt();
+
+      expect(mockAskInline.destroy).toHaveBeenCalled();
+      expect((askController as any).pendingAskInline).toBeNull();
+    });
+
+    it('F2: an auto (background) turn denies the ask without rendering any UI', async () => {
+      const askDeps = createAskDeps();
+      const turnCoordinator = new TurnCoordinator({
+        state: askDeps.state,
+        getConversationId: () => askDeps.state.currentConversationId,
+        processQueuedMessage: () => {},
+      });
+      askDeps.getTurnCoordinator = () => turnCoordinator;
+      const askController = new InputController(askDeps);
+
+      expect(turnCoordinator.beginAutoTurn('auto-1', 2)).toBe(true);
+
+      const result = await askController.handleAskUserQuestion(askInput());
+
+      // null → ClaudeApprovalHandler deny+interrupt: the SDK canUseTool never blocks.
+      expect(result).toBeNull();
+      expect((askController as any).pendingAskInline).toBeNull();
+      expect((askDeps.streamController as any).hideThinkingIndicator).not.toHaveBeenCalled();
+    });
+
+    it('F2: a user turn still renders the ask card (existing behavior unchanged)', async () => {
+      const askDeps = createAskDeps();
+      const turnCoordinator = new TurnCoordinator({
+        state: askDeps.state,
+        getConversationId: () => askDeps.state.currentConversationId,
+        processQueuedMessage: () => {},
+      });
+      askDeps.getTurnCoordinator = () => turnCoordinator;
+      const askController = new InputController(askDeps);
+
+      expect(turnCoordinator.beginUserTurn('user-1', 5)).toBe(true);
+
+      const askPromise = askController.handleAskUserQuestion(askInput());
+      expect((askController as any).pendingAskInline).not.toBeNull();
+      expect((askDeps.streamController as any).hideThinkingIndicator).toHaveBeenCalled();
+
+      askController.dismissPendingApproval();
+      await expect(askPromise).resolves.toBeNull();
+    });
+  });
+
   describe('Built-in commands - /add-dir', () => {
     beforeEach(() => {
       mockNotice.mockClear();

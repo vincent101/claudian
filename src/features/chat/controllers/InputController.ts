@@ -1615,6 +1615,16 @@ export class InputController {
     input: Record<string, unknown>,
     signal?: AbortSignal,
   ): Promise<Record<string, string | string[]> | null> {
+    // 2.5.1 F2: background auto turns (notification-continuation / peer) have
+    // no user attending the tab — an ask card there can never be answered and
+    // its pending canUseTool promise would block the auto turn forever. Deny
+    // immediately: null flows through ClaudeApprovalHandler as deny+interrupt,
+    // the model wraps up on its own and the lease settles on the result line.
+    // The feature lease is exclusive, so its kind attributes the ask reliably.
+    if (this.getTurnCoordinator()?.getActiveTurn()?.kind === 'auto') {
+      return null;
+    }
+
     const inputContainerEl = this.deps.getInputContainerEl();
     const parentEl = inputContainerEl.parentElement;
     if (!parentEl) {
@@ -1716,14 +1726,19 @@ export class InputController {
       this.pendingApprovalInline.destroy();
       this.pendingApprovalInline = null;
     }
-  }
-
-  dismissPendingApproval(): void {
-    this.dismissPendingApprovalPrompt();
+    // 2.5.1 F1: the pending ask's unresolved promise is the only thing keeping
+    // the SDK's canUseTool (and with it the whole turn) blocked — a cancel path
+    // that skips it leaves the CLI waiting on control_response forever
+    // (2026-09-17 e000fea0: auto lease stuck, isStreaming never cleared).
+    // destroy() resolves the promise with null → deny+interrupt → CLI unblocks.
     if (this.pendingAskInline) {
       this.pendingAskInline.destroy();
       this.pendingAskInline = null;
     }
+  }
+
+  dismissPendingApproval(): void {
+    this.dismissPendingApprovalPrompt();
     if (this.pendingExitPlanModeInline) {
       this.pendingExitPlanModeInline.destroy();
       this.pendingExitPlanModeInline = null;
