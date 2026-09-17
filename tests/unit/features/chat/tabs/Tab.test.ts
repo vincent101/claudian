@@ -3148,10 +3148,38 @@ describe('Tab - handleForkRequest', () => {
       forkAtUserMessage: 2, // u2 is the 2nd user message
     }));
 
-    // Messages should be deep-cloned and sliced before the fork point
+    // Messages are only a bounded initial view, never asserted as a complete
+    // provider prefix; sourceSessionId + resumeAt carry that durable fact.
     const ctx = forkRequestCallback.mock.calls[0][0];
-    expect(ctx.messages).toHaveLength(3); // a0, u1, a1 (before u2)
+    expect(ctx.messages).toHaveLength(3);
     expect(ctx.messages.map((m: any) => m.id)).toEqual(['a0', 'u1', 'a1']);
+    expect(ctx.prefill).toBe('world');
+  });
+
+  it('loads exact detail for a summary fork and uses its text and global turn ordinal', async () => {
+    const plugin = createMockPlugin({
+      getConversationSync: jest.fn().mockReturnValue({ title: 'Paged Conversation' }),
+    });
+    const { tab, forkCallback, forkRequestCallback } = setupForkTest({ plugin });
+    const loadMessageDetail = jest.fn().mockResolvedValue({ status: 'exact', message: {
+      id: 'u9', role: 'user', content: 'expanded exact', displayContent: 'exact input', timestamp: 2,
+      userMessageId: 'user-u9', projectionLevel: 'detail', historyTurnOrdinal: 8,
+    } });
+    tab.state.historyLease = { loadMessageDetail } as any;
+    tab.state.messages = [
+      { id: 'a8', role: 'assistant', content: 'prev', timestamp: 1, assistantMessageId: 'asst-8', projectionLevel: 'summary' },
+      { id: 'u9', role: 'user', content: 'summary', timestamp: 2, userMessageId: 'user-u9', projectionLevel: 'summary' },
+      { id: 'a9', role: 'assistant', content: 'response', timestamp: 3, assistantMessageId: 'asst-9', projectionLevel: 'summary' },
+    ];
+    tab.service = { resolveSessionIdForFork: jest.fn().mockReturnValue('session-1') } as any;
+    tab.conversationId = 'conv-1';
+
+    await forkCallback('u9');
+
+    expect(loadMessageDetail).toHaveBeenCalledWith('u9', { maxSourceBytes: 16 * 1024 * 1024 });
+    expect(forkRequestCallback).toHaveBeenCalledWith(expect.objectContaining({
+      sourceSessionId: 'session-1', resumeAt: 'asst-8', prefill: 'exact input', forkAtUserMessage: 9,
+    }));
   });
 
   it('should fall back to conversation session ID when service has none', async () => {

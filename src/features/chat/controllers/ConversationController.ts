@@ -105,7 +105,6 @@ type HistoryRenderOptions = {
 export class ConversationController {
   private deps: ConversationControllerDeps;
   private callbacks: ConversationCallbacks;
-  private rangeRequests = new Map<string, Promise<void>>();
   private projectionCache = new Map<string, HTMLElement>();
   /**
    * Candidates the provider index verified in detail text but the current
@@ -263,9 +262,7 @@ export class ConversationController {
       let transferred = false;
       try {
         await lease.ready;
-        const firstScreen = lease.loadWindow
-          ? await this.loadFirstScreenWindow(lease)
-          : await this.loadLegacyFirstScreen(lease);
+        const firstScreen = await this.loadFirstScreenWindow(lease);
         if (!shouldApply()) {
           return;
         }
@@ -347,23 +344,7 @@ export class ConversationController {
     const { state } = this.deps;
     const lease = state.historyLease;
     if (!lease || state.historyLoading) return;
-    if (lease.loadWindow) {
-      await this.loadOlderWindow(lease);
-      return;
-    }
-    const range = this.nextOlderRange(state.loadedRanges, lease.totalTurns, 50);
-    if (!range) return;
-    state.historyLoading = true;
-    state.historyError = null;
-    this.renderHistoryPager();
-    try {
-      await this.loadRange(range.start, range.end, false);
-    } catch (error) {
-      state.historyError = error instanceof Error ? error.message : String(error);
-    } finally {
-      state.historyLoading = false;
-      this.renderHistoryPager();
-    }
+    await this.loadOlderWindow(lease);
   }
 
   /**
@@ -404,34 +385,16 @@ export class ConversationController {
       budget: HISTORY_RESOURCE_POLICY.firstScreen,
       projectionLevel: 'summary',
     };
-    const planned = lease.planWindow?.(request);
+    const planned = lease.planWindow(request);
     this.deps.onHistoryLoadProgress?.({
       phase: 'loading',
-      turnCount: planned ? Math.max(0, planned.end - planned.start) : HISTORY_RESOURCE_POLICY.firstScreen.maxTurns,
+      turnCount: Math.max(0, planned.end - planned.start),
     });
-    const page = await lease.loadWindow!(request);
+    const page = await lease.loadWindow(request);
     return {
       messages: page.messages,
       range: page.range,
       hasMoreBefore: page.hasMoreBefore,
-      snapshotOffset: page.snapshotOffset,
-    };
-  }
-
-  /** Legacy providers without loadWindow keep the fixed 50-turn first page. */
-  private async loadLegacyFirstScreen(lease: HistoryIndexLease): Promise<{
-    messages: ChatMessage[];
-    range: LoadedTurnRange;
-    hasMoreBefore: boolean;
-    snapshotOffset?: number;
-  }> {
-    const start = Math.max(0, lease.totalTurns - 50);
-    this.deps.onHistoryLoadProgress?.({ phase: 'loading', turnCount: lease.totalTurns - start });
-    const page = await lease.loadRange(start, lease.totalTurns);
-    return {
-      messages: page.messages,
-      range: page.range,
-      hasMoreBefore: page.range.start > 0,
       snapshotOffset: page.snapshotOffset,
     };
   }
@@ -454,7 +417,7 @@ export class ConversationController {
     this.renderHistoryPager();
     try {
       await this.runStoredTransaction(async isStale => {
-        const page = await lease.loadWindow!({
+        const page = await lease.loadWindow({
           anchorTurn: anchor,
           direction: 'older',
           budget: HISTORY_RESOURCE_POLICY.paging,
@@ -516,8 +479,9 @@ export class ConversationController {
     const results: HistorySearchResult[] = [];
     for (const group of grouped.values()) {
       const loaded = this.deps.renderer.findMessageElement(group[0].projectionKey);
+      const loadedMessage = this.deps.state.messages.find(message => message.id === group[0].projectionKey);
       let count: number;
-      if (loaded) {
+      if (loaded && loadedMessage?.projectionLevel !== 'summary') {
         await this.deps.renderer.waitForMessageContentRendered(group[0].projectionKey);
         count = enumerateVisibleMatches(loaded, query).length;
       } else {
@@ -579,11 +543,11 @@ export class ConversationController {
     return results;
   }
 
-  private async loadSearchCandidate(turnIndex: number, projectionKey: string) {
+  private async loadSearchCandidate(_turnIndex: number, projectionKey: string) {
     const lease = this.deps.state.historyLease;
     if (!lease) return null;
-    const page = await lease.loadRange(turnIndex, Math.min(lease.totalTurns, turnIndex + 1));
-    return page.messages.find(message => message.id === projectionKey) ?? null;
+    const detail = await lease.loadMessageDetail(projectionKey, { maxSourceBytes: 16 * 1024 * 1024 });
+    return detail.status === 'exact' ? detail.message : null;
   }
 
   private contentHash(value: string): string {
@@ -629,16 +593,20 @@ export class ConversationController {
 
   async locateHistorySearchResult(result: HistorySearchResult): Promise<HTMLElement> {
     const { renderer } = this.deps;
+    const conversationId = this.deps.state.currentConversationId;
     if (result.status === 'projection_mismatch') throw new Error('projection_mismatch');
     let target = renderer.findMessageElement(result.projectionKey);
-    if (!target) {
+    const mountedMessage = this.deps.state.messages.find(message => message.id === result.projectionKey);
+    if (!target || mountedMessage?.projectionLevel === 'summary') {
       // UX (coord protocol risk 1): the re-locate queues behind a live
       // streaming turn (P3) — say so instead of letting the click look dead
       // until the response completes.
       if (this.deps.getProjectionCoordinator?.()?.hasLiveTurn()) {
         new Notice(t('chat.search.locateDeferred'));
       }
-      await this.loadSearchResultWindow(result.turnIndex);
+      const detail = await this.loadSearchCandidate(result.turnIndex, result.projectionKey);
+      if (!detail || this.deps.state.currentConversationId !== conversationId) throw new Error('projection_mismatch');
+      await this.loadSearchResultWindow(result.turnIndex, detail);
       // Frame-batched rendering mounts asynchronously; the element can only be
       // located after the queue drains.
       await renderer.waitForRenderedMessages?.();
@@ -651,78 +619,37 @@ export class ConversationController {
   /**
    * Search locate materializes only the hit turn through the searchLocate
    * budget window. The summary projection matches the first screen, so the
-   * materialized ids align with the already-rendered summary messages and
-   * dedupe stays effective (a full-range loadRange would produce different
-   * ids for oversized turns and render the same turn twice).
+   * The around window supplies neighboring context; the separately loaded
+   * exact detail replaces the target projection before mounting.
    */
-  private async loadSearchResultWindow(turnIndex: number): Promise<void> {
+  private async loadSearchResultWindow(turnIndex: number, detail: ChatMessage): Promise<void> {
     const { state } = this.deps;
     const lease = state.historyLease;
     if (!lease) throw new Error('History lease unavailable');
-    if (lease.loadWindow) {
-      // P3: the whole re-locate (load → merge → clear-rebuild → drain) is one
-      // stored transaction, queued behind a live turn when one is streaming —
-      // the rebuild then merges the latest ChatState including stream output.
-      await this.runStoredTransaction(async isStale => {
-        const page = await lease.loadWindow!({
-          anchorTurn: turnIndex,
-          direction: 'around',
-          budget: HISTORY_RESOURCE_POLICY.searchLocate,
-          projectionLevel: 'summary',
-        });
-        if (isStale()) return;
-        const existingIds = new Set(state.messages.map(message => message.id));
-        const added = page.messages.filter(message => !existingIds.has(message.id));
-        const combined = [...state.messages, ...added].sort(compareChatDisplayOrder);
-        state.messages = combined;
-        this.deps.renderer.renderMessages(combined, () => this.getGreeting());
-        await this.deps.renderer.waitForRenderedMessages();
-        if (isStale()) return;
-        state.loadedRanges = this.mergeRanges([...state.loadedRanges, page.range]);
-        state.historyHasMore = !this.coversAll(state.loadedRanges, lease.totalTurns);
-        state.historySnapshotOffset = page.snapshotOffset ?? state.historySnapshotOffset;
+    // P3: the whole re-locate (load → exact replacement → rebuild → drain) is
+    // one stored transaction, queued behind a live turn when one is streaming.
+    await this.runStoredTransaction(async isStale => {
+      const page = await lease.loadWindow({
+        anchorTurn: turnIndex,
+        direction: 'around',
+        budget: HISTORY_RESOURCE_POLICY.searchLocate,
+        projectionLevel: 'summary',
       });
-      return;
-    }
-    const start = Math.max(0, Math.min(turnIndex, lease.totalTurns - 50));
-    await this.loadRange(start, Math.min(lease.totalTurns, start + 50));
-  }
-
-  private async loadRange(start: number, end: number, rerenderAll = true): Promise<void> {
-    const { state, renderer } = this.deps;
-    const lease = state.historyLease;
-    if (!lease) throw new Error('History lease unavailable');
-    const key = `${start}:${end}`;
-    const existing = this.rangeRequests.get(key);
-    if (existing) return existing;
-    const request = (async () => {
-      await this.runStoredTransaction(async isStale => {
-        const page = await lease.loadRange(start, end);
-        if (isStale()) return;
-        const existingIds = new Set(state.messages.map(message => message.id));
-        const added = page.messages.filter(message => !existingIds.has(message.id));
-        const combined = [...state.messages, ...added].sort(compareChatDisplayOrder);
-        state.messages = combined;
-        if (rerenderAll) {
-          renderer.renderMessages(combined, () => this.getGreeting());
-        } else {
-          const addedIds = new Set(added.map(message => message.id));
-          const prepend = combined.filter(message => addedIds.has(message.id));
-          renderer.prependMessages(prepend, combined);
-        }
-        await renderer.waitForRenderedMessages();
-        if (isStale()) return;
-        state.loadedRanges = this.mergeRanges([...state.loadedRanges, page.range]);
-        state.historyHasMore = !this.coversAll(state.loadedRanges, lease.totalTurns);
-        state.historySnapshotOffset = page.snapshotOffset ?? state.historySnapshotOffset;
-      });
-    })();
-    this.rangeRequests.set(key, request);
-    try {
-      await request;
-    } finally {
-      this.rangeRequests.delete(key);
-    }
+      if (isStale()) return;
+      const byId = new Map(state.messages.map(message => [message.id, message]));
+      for (const message of page.messages) if (!byId.has(message.id)) byId.set(message.id, message);
+      const windowProjection = page.messages.find(message => message.id === detail.id);
+      if (!detail.displayOrder && windowProjection?.displayOrder) detail.displayOrder = windowProjection.displayOrder;
+      byId.set(detail.id, detail);
+      const combined = [...byId.values()].sort(compareChatDisplayOrder);
+      state.messages = combined;
+      this.deps.renderer.renderMessages(combined, () => this.getGreeting());
+      await this.deps.renderer.waitForRenderedMessages();
+      if (isStale()) return;
+      state.loadedRanges = this.mergeRanges([...state.loadedRanges, page.range]);
+      state.historyHasMore = !this.coversAll(state.loadedRanges, lease.totalTurns);
+      state.historySnapshotOffset = page.snapshotOffset ?? state.historySnapshotOffset;
+    });
   }
 
   private mergeRanges(ranges: LoadedTurnRange[]): LoadedTurnRange[] {
@@ -738,17 +665,6 @@ export class ConversationController {
 
   private coversAll(ranges: LoadedTurnRange[], total: number): boolean {
     return total === 0 || (ranges.length === 1 && ranges[0].start === 0 && ranges[0].end >= total);
-  }
-
-  private nextOlderRange(ranges: LoadedTurnRange[], total: number, pageSize: number): LoadedTurnRange | null {
-    const merged = this.mergeRanges(ranges);
-    const newest = merged.find(range => range.start <= total - 1 && range.end >= total);
-    if (!newest) return total > 0 ? { start: Math.max(0, total - pageSize), end: total } : null;
-    const older = [...merged].reverse().find(range => range.end <= newest!.start);
-    const end = newest.start;
-    if (end === 0) return null;
-    const start = older ? Math.max(older.end, end - pageSize) : Math.max(0, end - pageSize);
-    return start < end ? { start, end } : null;
   }
 
   private bindHistoryLease(conversation: Conversation): void {
@@ -906,7 +822,16 @@ export class ConversationController {
       new Notice(t('chat.rewind.failed', { error: 'Message not found' }));
       return;
     }
-    const userMsg = msgs[userIdx];
+    const projectedUserMsg = msgs[userIdx];
+    let userMsg = projectedUserMsg;
+    if (projectedUserMsg.projectionLevel !== 'detail' && state.historyLease) {
+      const detail = await state.historyLease.loadMessageDetail(projectedUserMsg.id, { maxSourceBytes: 16 * 1024 * 1024 });
+      if (detail.status !== 'exact') {
+        new Notice(t(detail.status === 'too_large' ? 'chat.rewind.detailTooLarge' : 'chat.rewind.detailUnavailable'));
+        return;
+      }
+      userMsg = detail.message;
+    }
     if (!userMsg.userMessageId) {
       new Notice(t('chat.rewind.unavailableNoUuid'));
       return;
@@ -952,7 +877,7 @@ export class ConversationController {
     state.truncateAt(userMessageId);
 
     const inputEl = this.deps.getInputEl();
-    inputEl.value = userMsg.content;
+    inputEl.value = userMsg.displayContent ?? userMsg.content;
     inputEl.focus();
 
     const welcomeEl = renderer.renderMessages(state.messages, () => this.getGreeting());

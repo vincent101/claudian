@@ -32,7 +32,9 @@
       "failed": "Error al rebobinar: {error}",
       "cannot": "No se puede rebobinar: {error}",
       "unavailableStreaming": "No se puede rebobinar durante la transmisión",
-      "unavailableNoUuid": "No se puede rebobinar: faltan identificadores de mensaje"
+      "unavailableNoUuid": "No se puede rebobinar: faltan identificadores de mensaje",
+      "detailUnavailable": "No se puede rebobinar: el contenido exacto del mensaje no está disponible",
+      "detailTooLarge": "No se puede rebobinar: este mensaje supera el límite de detalle de 16 MiB"
     },
     "fork": {
       "ariaLabel": "Bifurcar conversación",
@@ -52,7 +54,9 @@
       "commandNoMessages": "No se puede bifurcar: no hay mensajes en la conversación",
       "commandNoAssistantUuid": "No se puede bifurcar: no hay respuesta del asistente con identificadores",
       "unsupportedProvider": "Fork is not supported by this provider.",
-      "unavailable": "Fork not available."
+      "unavailable": "Fork not available.",
+      "detailUnavailable": "No se puede bifurcar: el contenido exacto del mensaje no está disponible",
+      "detailTooLarge": "No se puede bifurcar: este mensaje supera el límite de detalle de 16 MiB"
     },
     "bangBash": {
       "placeholder": "> Ejecuta un comando bash...",

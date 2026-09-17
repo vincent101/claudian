@@ -32,7 +32,9 @@
       "failed": "Échec du rembobinage : {error}",
       "cannot": "Impossible de rembobiner : {error}",
       "unavailableStreaming": "Impossible de rembobiner pendant le streaming",
-      "unavailableNoUuid": "Impossible de rembobiner : identifiants de message manquants"
+      "unavailableNoUuid": "Impossible de rembobiner : identifiants de message manquants",
+      "detailUnavailable": "Impossible de revenir en arrière : le contenu exact du message n’est pas disponible",
+      "detailTooLarge": "Impossible de revenir en arrière : ce message dépasse la limite de détail de 16 Mio"
     },
     "fork": {
       "ariaLabel": "Bifurquer la conversation",
@@ -52,7 +54,9 @@
       "commandNoMessages": "Impossible de bifurquer : aucun message dans la conversation",
       "commandNoAssistantUuid": "Impossible de bifurquer : aucune réponse de l’assistant avec des identifiants",
       "unsupportedProvider": "Fork is not supported by this provider.",
-      "unavailable": "Fork not available."
+      "unavailable": "Fork not available.",
+      "detailUnavailable": "Impossible de bifurquer : le contenu exact du message n’est pas disponible",
+      "detailTooLarge": "Impossible de bifurquer : ce message dépasse la limite de détail de 16 Mio"
     },
     "bangBash": {
       "placeholder": "> Exécuter une commande bash...",

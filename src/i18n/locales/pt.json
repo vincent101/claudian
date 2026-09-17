@@ -32,7 +32,9 @@
       "failed": "Falha ao retroceder: {error}",
       "cannot": "Não é possível retroceder: {error}",
       "unavailableStreaming": "Não é possível retroceder durante a transmissão",
-      "unavailableNoUuid": "Não é possível retroceder: identificadores de mensagem ausentes"
+      "unavailableNoUuid": "Não é possível retroceder: identificadores de mensagem ausentes",
+      "detailUnavailable": "Não é possível voltar: o conteúdo exato da mensagem não está disponível",
+      "detailTooLarge": "Não é possível voltar: esta mensagem excede o limite de detalhes de 16 MiB"
     },
     "fork": {
       "ariaLabel": "Bifurcar conversa",
@@ -52,7 +54,9 @@
       "commandNoMessages": "Não é possível bifurcar: não há mensagens na conversa",
       "commandNoAssistantUuid": "Não é possível bifurcar: não há resposta do assistente com identificadores",
       "unsupportedProvider": "Fork is not supported by this provider.",
-      "unavailable": "Fork not available."
+      "unavailable": "Fork not available.",
+      "detailUnavailable": "Não é possível bifurcar: o conteúdo exato da mensagem não está disponível",
+      "detailTooLarge": "Não é possível bifurcar: esta mensagem excede o limite de detalhes de 16 MiB"
     },
     "bangBash": {
       "placeholder": "> Executar um comando bash...",

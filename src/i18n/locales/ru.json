@@ -32,7 +32,9 @@
       "failed": "Ошибка отката: {error}",
       "cannot": "Невозможно откатить: {error}",
       "unavailableStreaming": "Невозможно откатить во время потоковой передачи",
-      "unavailableNoUuid": "Невозможно откатить: отсутствуют идентификаторы сообщений"
+      "unavailableNoUuid": "Невозможно откатить: отсутствуют идентификаторы сообщений",
+      "detailUnavailable": "Невозможно откатить: точное содержимое сообщения недоступно",
+      "detailTooLarge": "Невозможно откатить: сообщение превышает лимит детализации 16 МиБ"
     },
     "fork": {
       "ariaLabel": "Ответвить разговор",
@@ -52,7 +54,9 @@
       "commandNoMessages": "Нельзя форкнуть: в диалоге нет сообщений",
       "commandNoAssistantUuid": "Нельзя форкнуть: нет ответа ассистента с идентификаторами",
       "unsupportedProvider": "Fork is not supported by this provider.",
-      "unavailable": "Fork not available."
+      "unavailable": "Fork not available.",
+      "detailUnavailable": "Невозможно создать ветку: точное содержимое сообщения недоступно",
+      "detailTooLarge": "Невозможно создать ветку: сообщение превышает лимит детализации 16 МиБ"
     },
     "bangBash": {
       "placeholder": "> Выполнить команду bash...",

@@ -32,7 +32,9 @@
       "failed": "Zurückspulen fehlgeschlagen: {error}",
       "cannot": "Zurückspulen nicht möglich: {error}",
       "unavailableStreaming": "Zurückspulen während des Streamings nicht möglich",
-      "unavailableNoUuid": "Zurückspulen nicht möglich: Nachrichtenkennungen fehlen"
+      "unavailableNoUuid": "Zurückspulen nicht möglich: Nachrichtenkennungen fehlen",
+      "detailUnavailable": "Zurückspulen nicht möglich: Der genaue Nachrichteninhalt ist nicht verfügbar",
+      "detailTooLarge": "Zurückspulen nicht möglich: Diese Nachricht überschreitet das Detail-Limit von 16 MiB"
     },
     "fork": {
       "ariaLabel": "Konversation verzweigen",
@@ -52,7 +54,9 @@
       "commandNoMessages": "Verzweigung nicht möglich: keine Nachrichten in der Konversation",
       "commandNoAssistantUuid": "Verzweigung nicht möglich: keine Assistentenantwort mit Kennungen",
       "unsupportedProvider": "Fork is not supported by this provider.",
-      "unavailable": "Fork not available."
+      "unavailable": "Fork not available.",
+      "detailUnavailable": "Fork nicht möglich: Der genaue Nachrichteninhalt ist nicht verfügbar",
+      "detailTooLarge": "Fork nicht möglich: Diese Nachricht überschreitet das Detail-Limit von 16 MiB"
     },
     "bangBash": {
       "placeholder": "> Einen Bash-Befehl ausführen...",

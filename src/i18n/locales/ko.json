@@ -32,7 +32,9 @@
       "failed": "되감기 실패: {error}",
       "cannot": "되감기 불가: {error}",
       "unavailableStreaming": "스트리밍 중에는 되감기할 수 없습니다",
-      "unavailableNoUuid": "되감기 불가: 메시지 식별자 누락"
+      "unavailableNoUuid": "되감기 불가: 메시지 식별자 누락",
+      "detailUnavailable": "되돌릴 수 없음: 정확한 메시지 내용을 불러올 수 없습니다",
+      "detailTooLarge": "되돌릴 수 없음: 이 메시지가 16 MiB 세부 정보 제한을 초과합니다"
     },
     "fork": {
       "ariaLabel": "대화 분기",
@@ -52,7 +54,9 @@
       "commandNoMessages": "포크할 수 없습니다: 대화에 메시지가 없습니다",
       "commandNoAssistantUuid": "포크할 수 없습니다: 식별자가 있는 어시스턴트 응답이 없습니다",
       "unsupportedProvider": "이 프로바이더는 포크를 지원하지 않습니다.",
-      "unavailable": "포크를 사용할 수 없습니다."
+      "unavailable": "포크를 사용할 수 없습니다.",
+      "detailUnavailable": "분기할 수 없음: 정확한 메시지 내용을 불러올 수 없습니다",
+      "detailTooLarge": "분기할 수 없음: 이 메시지가 16 MiB 세부 정보 제한을 초과합니다"
     },
     "bangBash": {
       "placeholder": "> bash 명령 실행...",

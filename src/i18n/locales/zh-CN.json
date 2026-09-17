@@ -32,7 +32,9 @@
       "failed": "回退失败：{error}",
       "cannot": "无法回退：{error}",
       "unavailableStreaming": "流式响应中无法回退",
-      "unavailableNoUuid": "无法回退：缺少消息标识符"
+      "unavailableNoUuid": "无法回退：缺少消息标识符",
+      "detailUnavailable": "无法回退：无法读取消息的精确内容",
+      "detailTooLarge": "无法回退：该消息超过 16 MiB 详情上限"
     },
     "fork": {
       "ariaLabel": "分叉对话",
@@ -52,7 +54,9 @@
       "commandNoMessages": "无法分叉：对话中没有消息",
       "commandNoAssistantUuid": "无法分叉：没有带标识符的助手回复",
       "unsupportedProvider": "当前提供商不支持分叉。",
-      "unavailable": "分叉不可用。"
+      "unavailable": "分叉不可用。",
+      "detailUnavailable": "无法分支：无法读取消息的精确内容",
+      "detailTooLarge": "无法分支：该消息超过 16 MiB 详情上限"
     },
     "bangBash": {
       "placeholder": "> 运行命令...",

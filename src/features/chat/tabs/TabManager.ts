@@ -787,6 +787,7 @@ export class TabManager implements TabManagerInterface {
         new Notice(t('chat.fork.maxTabsReached', { count: String(maxTabs) }));
         return;
       }
+      if (context.prefill) tab.dom.inputEl.value = context.prefill;
       new Notice(t('chat.fork.notice'));
     } else {
       const success = await this.forkInCurrentTab(context);
@@ -794,6 +795,8 @@ export class TabManager implements TabManagerInterface {
         new Notice(t('chat.fork.failed', { error: t('chat.fork.errorNoActiveTab') }));
         return;
       }
+      const activeTab = this.getActiveTab();
+      if (context.prefill && activeTab) activeTab.dom.inputEl.value = context.prefill;
       new Notice(t('chat.fork.noticeCurrentTab'));
     }
   }

@@ -999,7 +999,9 @@ export function initializeTabUI(
 }
 
 export interface ForkContext {
+  /** Bounded initial view only; provider checkpoint remains the history fact. */
   messages: ChatMessage[];
+  prefill?: string;
   providerId?: ProviderId;
   sourceSessionId: string;
   sourceProviderState?: Record<string, unknown>;
@@ -1099,17 +1101,33 @@ async function handleForkRequest(
     return;
   }
 
+  const projectedUser = msgs[userIdx];
+  let exactUser = projectedUser;
+  if (projectedUser.projectionLevel !== 'detail' && state.historyLease) {
+    const detail = await state.historyLease.loadMessageDetail(projectedUser.id, { maxSourceBytes: 16 * 1024 * 1024 });
+    if (detail.status !== 'exact') {
+      new Notice(t(detail.status === 'too_large' ? 'chat.fork.detailTooLarge' : 'chat.fork.detailUnavailable'));
+      return;
+    }
+    exactUser = detail.message;
+  }
+
   const source = resolveForkSource(tab, plugin);
   if (!source) return;
 
   await forkRequestCallback({
+    // This is only the bounded initial view. The fork source + checkpoint below
+    // is the durable prefix and the target tab rebuilds it through its index.
     messages: deepCloneMessages(msgs.slice(0, userIdx)),
+    prefill: exactUser.displayContent ?? exactUser.content,
     providerId: source.providerId,
     sourceSessionId: source.sourceSessionId,
     sourceProviderState: source.sourceProviderState,
     resumeAt: rewindCtx.prevAssistantUuid,
     sourceTitle: source.sourceTitle,
-    forkAtUserMessage: countUserMessagesForForkTitle(msgs.slice(0, userIdx + 1)),
+    forkAtUserMessage: exactUser.historyTurnOrdinal !== undefined
+      ? exactUser.historyTurnOrdinal + 1
+      : countUserMessagesForForkTitle(msgs.slice(0, userIdx + 1)),
     currentNote: source.currentNote,
   });
 }

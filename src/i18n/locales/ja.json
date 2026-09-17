@@ -32,7 +32,9 @@
       "failed": "巻き戻しに失敗：{error}",
       "cannot": "巻き戻しできません：{error}",
       "unavailableStreaming": "ストリーミング中は巻き戻しできません",
-      "unavailableNoUuid": "巻き戻しできません：メッセージ識別子がありません"
+      "unavailableNoUuid": "巻き戻しできません：メッセージ識別子がありません",
+      "detailUnavailable": "巻き戻せません：メッセージの正確な内容を取得できません",
+      "detailTooLarge": "巻き戻せません：このメッセージは詳細の上限 16 MiB を超えています"
     },
     "fork": {
       "ariaLabel": "会話を分岐",
@@ -52,7 +54,9 @@
       "commandNoMessages": "フォークできません: 会話にメッセージがありません",
       "commandNoAssistantUuid": "フォークできません: 識別子付きのアシスタント応答がありません",
       "unsupportedProvider": "このプロバイダはフォークをサポートしていません。",
-      "unavailable": "フォークは利用できません。"
+      "unavailable": "フォークは利用できません。",
+      "detailUnavailable": "フォークできません：メッセージの正確な内容を取得できません",
+      "detailTooLarge": "フォークできません：このメッセージは詳細の上限 16 MiB を超えています"
     },
     "bangBash": {
       "placeholder": "> bash コマンドを実行...",

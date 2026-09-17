@@ -32,7 +32,9 @@
       "failed": "Rewind failed: {error}",
       "cannot": "Cannot rewind: {error}",
       "unavailableStreaming": "Cannot rewind while streaming",
-      "unavailableNoUuid": "Cannot rewind: missing message identifiers"
+      "unavailableNoUuid": "Cannot rewind: missing message identifiers",
+      "detailUnavailable": "Cannot rewind: exact message content is unavailable",
+      "detailTooLarge": "Cannot rewind: this message exceeds the 16 MiB detail limit"
     },
     "fork": {
       "ariaLabel": "Fork conversation",
@@ -52,7 +54,9 @@
       "commandNoMessages": "Cannot fork: no messages in conversation",
       "commandNoAssistantUuid": "Cannot fork: no assistant response with identifiers",
       "unsupportedProvider": "Fork is not supported by this provider.",
-      "unavailable": "Fork not available."
+      "unavailable": "Fork not available.",
+      "detailUnavailable": "Cannot fork: exact message content is unavailable",
+      "detailTooLarge": "Cannot fork: this message exceeds the 16 MiB detail limit"
     },
     "bangBash": {
       "placeholder": "> Run a bash command...",

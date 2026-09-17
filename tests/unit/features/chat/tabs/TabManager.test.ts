@@ -1005,9 +1005,9 @@ describe('TabManager - Tab Lifecycle', () => {
         createdAt: 1,
         updatedAt: 1,
       };
-      const lease = { conversationId: 'large-conv', totalTurns: 100, ready: Promise.resolve(), search: jest.fn(), release: jest.fn(), loadRange: jest.fn().mockResolvedValue({
+      const lease = { conversationId: 'large-conv', totalTurns: 100, ready: Promise.resolve(), search: jest.fn(), release: jest.fn(), loadMessageDetail: jest.fn(), planWindow: jest.fn().mockReturnValue({ start: 50, end: 100 }), loadWindow: jest.fn().mockResolvedValue({
         messages: [{ id: 'turn-50', role: 'user', content: 'latest', timestamp: 2 }],
-        range: { start: 50, end: 100 }, snapshotOffset: 4096,
+        range: { start: 50, end: 100 }, snapshotOffset: 4096, sourceBytes: 1, projectedChars: 1, oversizedTurnCount: 0, pageKey: 'w:50:100', hasMoreBefore: true, hasMoreAfter: false,
       }) };
       const acquireHistoryIndex = jest.fn().mockReturnValue(lease);
       const historyService = {
@@ -1078,7 +1078,7 @@ describe('TabManager - Tab Lifecycle', () => {
         createdAt: 1,
         updatedAt: 1,
       };
-      const acquireHistoryIndex = jest.fn().mockReturnValue({ conversationId: 'large-conv', totalTurns: 0, ready: Promise.reject(new Error('index build failed: worker crashed')), search: jest.fn(), loadRange: jest.fn(), release: jest.fn() });
+      const acquireHistoryIndex = jest.fn().mockReturnValue({ conversationId: 'large-conv', totalTurns: 0, ready: Promise.reject(new Error('index build failed: worker crashed')), search: jest.fn(), loadMessageDetail: jest.fn(), loadWindow: jest.fn(), planWindow: jest.fn(), release: jest.fn() });
       const serviceSpy = jest.spyOn(ProviderRegistry, 'getConversationHistoryService')
         .mockReturnValue({
           acquireHistoryIndex,

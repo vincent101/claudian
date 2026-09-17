@@ -132,7 +132,10 @@ describe('ConversationController', () => {
 
   describe('paged history', () => {
     const makeLease = (totalTurns = 120) => ({
-      conversationId: 'large', totalTurns, ready: Promise.resolve(), release: jest.fn(), search: jest.fn(), loadRange: jest.fn(),
+      conversationId: 'large', totalTurns, ready: Promise.resolve(), release: jest.fn(), search: jest.fn(),
+      loadMessageDetail: jest.fn().mockImplementation(async (projectionKey: string) => ({
+        status: 'exact', message: { id: projectionKey, role: 'user', content: 'needle', timestamp: 1, projectionLevel: 'detail' },
+      })),
       loadWindow: jest.fn(),
       planWindow: jest.fn().mockImplementation(({ anchorTurn, direction, budget }: any) => {
         const turns = Math.min(budget.maxTurns, anchorTurn);
@@ -158,7 +161,6 @@ describe('ConversationController', () => {
         projectionLevel: 'summary',
         budget: expect.objectContaining({ maxTurns: 25, maxSourceBytes: 8 * 1024 * 1024, maxProjectedChars: 2_000_000 }),
       }));
-      expect(lease.loadRange).not.toHaveBeenCalled();
       expect(deps.state.loadedRanges).toEqual([{ start: 110, end: 120 }]);
       expect(deps.state.historyHasMore).toBe(true);
       expect(deps.state.historySnapshotOffset).toBe(123);
@@ -298,21 +300,8 @@ describe('ConversationController', () => {
         projectionLevel: 'summary',
         budget: expect.objectContaining({ maxTurns: 1, maxSourceBytes: 8 * 1024 * 1024, maxProjectedChars: 2_000_000 }),
       }));
-      expect(lease.loadRange).not.toHaveBeenCalled();
       expect(deps.state.loadedRanges).toEqual([{ start: 25, end: 26 }, { start: 150, end: 200 }]);
       expect(deps.state.messages.map(message => message.id)).toEqual(['target', 'latest']);
-    });
-
-    it('keeps the legacy 50-turn page for search locate when the provider has no loadWindow', async () => {
-      const lease = makeLease(120);
-      delete (lease as any).loadWindow;
-      deps.state.historyLease = lease as any;
-      lease.loadRange.mockResolvedValue({ messages: [{ id: 'target', role: 'user', content: 'needle', timestamp: 50 }], range: { start: 25, end: 75 } });
-      (deps.renderer.findMessageElement as jest.Mock).mockReturnValueOnce(null).mockReturnValue({} as HTMLElement);
-
-      await expect(controller.locateHistorySearchResult({ projectionKey: 'target', turnIndex: 25, matchOrdinal: 0, matchedText: 'needle' })).resolves.toBeDefined();
-
-      expect(lease.loadRange).toHaveBeenCalledWith(25, 75);
     });
 
     it('does not paginate when a search hit is already loaded', async () => {
@@ -323,7 +312,6 @@ describe('ConversationController', () => {
 
       await expect(controller.locateHistorySearchResult({ projectionKey: 'loaded', turnIndex: 10, matchOrdinal: 0, matchedText: 'needle' })).resolves.toBe(loaded);
 
-      expect(lease.loadRange).not.toHaveBeenCalled();
     });
 
     it('reuses an offscreen rendered candidate across different queries', async () => {
@@ -332,10 +320,7 @@ describe('ConversationController', () => {
       lease.search
         .mockResolvedValueOnce([{ projectionKey: 'target', turnIndex: 3, matchOrdinal: 0, matchedText: 'needle' }])
         .mockResolvedValueOnce([{ projectionKey: 'target', turnIndex: 3, matchOrdinal: 0, matchedText: 'other' }]);
-      lease.loadRange.mockResolvedValue({
-        messages: [{ id: 'target', role: 'user', content: 'needle other', timestamp: 1 }],
-        range: { start: 3, end: 4 },
-      });
+      lease.loadMessageDetail.mockResolvedValue({ status: 'exact', message: { id: 'target', role: 'user', content: 'needle other', timestamp: 1, projectionLevel: 'detail' } });
       const detached = createMockEl() as unknown as HTMLElement;
       (deps.renderer.renderSearchCandidate as jest.Mock).mockResolvedValue(detached);
 
@@ -604,31 +589,6 @@ describe('ConversationController', () => {
       expect(deps.state.historyError).toBeNull();
     });
 
-    it('discards a legacy loadRange page when the conversation switches mid-load', async () => {
-      // No coordinator: the legacy path runs the task directly, but the
-      // mid-await switch must abort it all the same.
-      deps.state.currentConversationId = 'large';
-      deps.state.messages = [{ id: 'latest', role: 'user', content: 'latest', timestamp: 100 }] as any;
-      const lease = makeLease(120);
-      delete (lease as any).loadWindow;
-      deps.state.historyLease = lease as any;
-      deps.state.loadedRanges = [{ start: 70, end: 120 }];
-      deps.state.historyHasMore = true;
-      lease.loadRange.mockImplementationOnce(async () => {
-        deps.state.currentConversationId = 'switched';
-        deps.state.messages = [{ id: 'new-1', role: 'user', content: 'new', timestamp: 1 }] as any;
-        deps.state.loadedRanges = [];
-        return { messages: [{ id: 'older', role: 'user', content: 'older', timestamp: 1 }], range: { start: 20, end: 70 } };
-      });
-
-      await controller.loadOlderHistory();
-
-      expect(deps.renderer.prependMessages).not.toHaveBeenCalled();
-      expect(deps.renderer.renderMessages).not.toHaveBeenCalled();
-      expect(deps.state.messages.map(message => message.id)).toEqual(['new-1']);
-      expect(deps.state.loadedRanges).toEqual([]);
-    });
-
     it('notifies when an unloaded search locate is deferred behind a live turn', async () => {
       const coordinator = new ProjectionWriteCoordinator();
       deps.getProjectionCoordinator = () => coordinator;
@@ -713,7 +673,7 @@ describe('ConversationController', () => {
       const mounted = createMockEl();
       const detached = createMockEl();
       (deps.renderer.findMessageElement as jest.Mock).mockImplementation((key: string) => (key === 'm1' ? mounted : null));
-      lease.loadRange.mockResolvedValue({ messages: [{ id: 'm2', role: 'assistant', content: 'needle once', timestamp: 2 }], range: { start: 1, end: 2 } });
+      lease.loadMessageDetail.mockResolvedValue({ status: 'exact', message: { id: 'm2', role: 'assistant', content: 'needle once', timestamp: 2, projectionLevel: 'detail' } });
       (deps.renderer.renderSearchCandidate as jest.Mock).mockResolvedValue(detached);
       const mockEnumerate = jest.spyOn(historySearchModule, 'enumerateVisibleMatches')
         .mockImplementation((root: HTMLElement) =>
@@ -806,25 +766,6 @@ describe('ConversationController', () => {
       expect(rendered.map(message => message.id)).toEqual(['hit', 'sdk', 'live']);
     });
 
-    it('merges a legacy loadRange page by displayOrder', async () => {
-      deps.state.currentConversationId = 'large';
-      deps.state.messages = [
-        { id: 'sdk', role: 'user', content: 'sdk', timestamp: 100, displayOrder: [1, 0, 0] },
-        { id: 'live', role: 'assistant', content: 'live', timestamp: 101 },
-      ] as any;
-      const lease = makeLease(120);
-      delete (lease as any).loadWindow;
-      deps.state.historyLease = lease as any;
-      deps.state.loadedRanges = [{ start: 70, end: 120 }];
-      deps.state.historyHasMore = true;
-      const older = { id: 'older', role: 'user', content: 'older', timestamp: 999, displayOrder: [0, 5, 0] } as any;
-      lease.loadRange.mockResolvedValue({ messages: [older], range: { start: 20, end: 70 } });
-
-      await controller.loadOlderHistory();
-
-      const prepend = (deps.renderer.prependMessages as jest.Mock).mock.calls[0] as Array<any>;
-      expect(prepend[1].map((message: { id: string }) => message.id)).toEqual(['older', 'sdk', 'live']);
-    });
   });
 
   describe('Queue Management', () => {
@@ -3383,6 +3324,43 @@ describe('ConversationController - Rewind', () => {
       getAgentService: () => mockAgentService,
     });
     controller = new ConversationController(deps);
+  });
+
+  it('loads exact detail before confirming a summary rewind and prefills displayContent', async () => {
+    deps.state.currentConversationId = 'conv-1';
+    deps.state.messages = [
+      { id: 'm1', role: 'assistant', content: '', timestamp: 1, assistantMessageId: 'prev-a', projectionLevel: 'detail' },
+      { id: 'm2', role: 'user', content: 'summary', timestamp: 2, userMessageId: 'user-uuid', projectionLevel: 'summary' },
+      { id: 'm3', role: 'assistant', content: 'resp', timestamp: 3, assistantMessageId: 'resp-a', projectionLevel: 'detail' },
+    ];
+    const loadMessageDetail = jest.fn().mockResolvedValue({
+      status: 'exact',
+      message: { id: 'm2', role: 'user', content: 'expanded exact', displayContent: 'exact input', timestamp: 2, userMessageId: 'user-uuid', projectionLevel: 'detail' },
+    });
+    deps.state.historyLease = { loadMessageDetail } as any;
+
+    await controller.rewind('m2');
+
+    expect(loadMessageDetail).toHaveBeenCalledWith('m2', { maxSourceBytes: 16 * 1024 * 1024 });
+    expect(confirm).toHaveBeenCalled();
+    expect(mockAgentService.rewind).toHaveBeenCalledWith('user-uuid', 'prev-a');
+    expect(deps.getInputEl().value).toBe('exact input');
+  });
+
+  it.each(['not_found', 'too_large'] as const)('aborts a summary rewind when detail is %s without changing input', async status => {
+    deps.state.messages = [
+      { id: 'm1', role: 'assistant', content: '', timestamp: 1, assistantMessageId: 'prev-a', projectionLevel: 'detail' },
+      { id: 'm2', role: 'user', content: 'summary', timestamp: 2, userMessageId: 'user-uuid', projectionLevel: 'summary' },
+      { id: 'm3', role: 'assistant', content: 'resp', timestamp: 3, assistantMessageId: 'resp-a', projectionLevel: 'detail' },
+    ];
+    deps.getInputEl().value = 'unchanged';
+    deps.state.historyLease = { loadMessageDetail: jest.fn().mockResolvedValue({ status }) } as any;
+
+    await controller.rewind('m2');
+
+    expect(confirm).not.toHaveBeenCalled();
+    expect(mockAgentService.rewind).not.toHaveBeenCalled();
+    expect(deps.getInputEl().value).toBe('unchanged');
   });
 
   it('should find prev/response assistants with bounded scan (skipping non-uuid messages)', async () => {
