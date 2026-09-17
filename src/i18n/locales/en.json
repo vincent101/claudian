@@ -70,6 +70,9 @@
       "needsAttention": "Tab {index} \"{title}\" needs your response",
       "streamComplete": "Tab {index} \"{title}\" finished. Ready for review."
     },
+    "cancel": {
+      "toolInterrupted": "Interrupted"
+    },
     "history": {
       "loading": "Loading conversation…",
       "waitingForIndex": "Waiting for index…",

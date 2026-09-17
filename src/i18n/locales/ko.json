@@ -70,6 +70,9 @@
       "needsAttention": "Tab {index} \"{title}\" needs your response",
       "streamComplete": "Tab {index} \"{title}\" finished. Ready for review."
     },
+    "cancel": {
+      "toolInterrupted": "중단됨"
+    },
     "history": {
       "loading": "Loading conversation…",
       "waitingForIndex": "인덱스 대기 중…",

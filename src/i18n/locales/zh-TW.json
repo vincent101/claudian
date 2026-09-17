@@ -70,6 +70,9 @@
       "needsAttention": "Tab {index}「{title}」需要你回應",
       "streamComplete": "Tab {index}「{title}」已完成，待檢查"
     },
+    "cancel": {
+      "toolInterrupted": "已中斷"
+    },
     "history": {
       "loading": "正在載入對話…",
       "waitingForIndex": "等待索引（排隊）…",

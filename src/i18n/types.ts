@@ -49,6 +49,9 @@ export type TranslationKey =
   | 'chat.notifications.needsAttention'
   | 'chat.notifications.streamComplete'
 
+  // Chat - Cancel settle-down
+  | 'chat.cancel.toolInterrupted'
+
   // Chat - History hydration
   | 'chat.history.loading'
   | 'chat.history.waitingForIndex'

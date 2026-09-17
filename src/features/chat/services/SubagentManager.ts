@@ -644,6 +644,29 @@ export class SubagentManager {
     return orphaned;
   }
 
+  /**
+   * Cancel-path settle-down (2.3.2 ③): a user interrupt detaches the stream
+   * before the rejected tool_results project, so live subagent panels would
+   * keep their spinner/Initializing state forever. Forces every live sync
+   * panel into an error terminal state and orphans every async task; the
+   * maps are cleared so no stale record survives into the next turn.
+   */
+  public interruptAllActive(interruptResultText: string): void {
+    for (const [toolId, record] of this.syncSubagentRecords) {
+      const domState = this.syncDomStates.get(toolId);
+      if (domState) {
+        finalizeSubagentBlock(domState, interruptResultText, true);
+      } else {
+        // Domain-only terminal transition (v3 §5.2): no projector attached.
+        record.status = 'error';
+        record.result = interruptResultText;
+      }
+    }
+    this.syncSubagentRecords.clear();
+    this.syncDomStates.clear();
+    this.orphanAllActive();
+  }
+
   public clear(): void {
     this.syncSubagentRecords.clear();
     this.syncDomStates.clear();

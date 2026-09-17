@@ -37,6 +37,7 @@ import { InlinePlanApproval,type PlanApprovalDecision } from '../rendering/Inlin
 import type { MessageRenderer } from '../rendering/MessageRenderer';
 import type { ProjectionWriteLease } from '../rendering/ProjectionWriteCoordinator';
 import { setToolIcon, updateToolCallResult } from '../rendering/ToolCallRenderer';
+import { finalizeWriteEditBlock } from '../rendering/WriteEditRenderer';
 import type { SubagentManager } from '../services/SubagentManager';
 import type { ChatState } from '../state/ChatState';
 import type { QueuedMessage } from '../state/types';
@@ -560,6 +561,9 @@ export class InputController {
       // Skip remaining cleanup if stream was invalidated (tab closed or conversation switched)
       if (!wasInvalidated && state.streamGeneration === streamGeneration) {
         didCancelThisTurn = wasInterrupted || state.cancelRequested;
+        if (didCancelThisTurn) {
+          this.settleInterruptedTurn(finalAssistantMsg);
+        }
         if (didCancelThisTurn && !state.pendingNewSessionPlan && turnContext) {
           await streamController.appendTurnText('\n\n<span class="claudian-interrupted">Interrupted</span> <span class="claudian-interrupted-hint">· What should Claudian do instead?</span>', turnContext);
         }
@@ -794,6 +798,38 @@ export class InputController {
         this.sendMessage().catch(() => {});
       }
     }
+  }
+
+  // ============================================
+  // Cancel Settle-Down
+  // ============================================
+
+  /**
+   * Cancel-path settle-down (2.3.2 ③): the stream loop breaks on interrupt
+   * before the provider's rejected tool_results project, so running tool
+   * elements and subagent panels would keep their spinner/Initializing state
+   * forever. Forces every in-flight tool call of the turn into a terminal
+   * error state and settles live subagent panels. Natural-completion and
+   * error paths never reach this — their terminal semantics are untouched.
+   */
+  private settleInterruptedTurn(assistantMsg: ChatMessage): void {
+    const { state } = this.deps;
+    const interruptResultText = t('chat.cancel.toolInterrupted');
+
+    for (const toolCall of assistantMsg.toolCalls ?? []) {
+      if (toolCall.status !== 'running') continue;
+      toolCall.status = 'error';
+      toolCall.result = interruptResultText;
+
+      const writeEditState = state.writeEditStates.get(toolCall.id);
+      if (writeEditState) {
+        finalizeWriteEditBlock(writeEditState, true);
+      } else {
+        updateToolCallResult(toolCall.id, toolCall, state.toolCallElements);
+      }
+    }
+
+    this.deps.getSubagentManager().interruptAllActive(interruptResultText);
   }
 
   // ============================================

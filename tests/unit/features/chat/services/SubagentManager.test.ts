@@ -2170,3 +2170,46 @@ Only this is the final result.
       expect(updates.some((u) => u.status === 'error')).toBe(true);
     });
   });
+
+  describe('interruptAllActive (cancel-path settle-down)', () => {
+    it('finalizes running sync subagent panels and clears sync state', () => {
+      const { manager } = createManager();
+      const parentEl = createMockEl();
+
+      manager.handleTaskToolUse('sync-1', { description: 'Sync', run_in_background: false }, parentEl);
+
+      const { finalizeSubagentBlock } = jest.requireMock('@/features/chat/rendering/SubagentRenderer');
+      manager.interruptAllActive('Interrupted');
+
+      expect(finalizeSubagentBlock).toHaveBeenCalledWith(
+        expect.objectContaining({ info: expect.objectContaining({ id: 'sync-1' }) }),
+        'Interrupted',
+        true,
+      );
+      expect(manager.getSyncSubagent('sync-1')).toBeUndefined();
+    });
+
+    it('finalizes detached sync records in domain only', () => {
+      const { manager } = createManager();
+
+      manager.handleTaskToolUse('sync-2', { description: 'Sync', run_in_background: false }, null);
+
+      manager.interruptAllActive('Interrupted');
+
+      expect(manager.getSyncSubagent('sync-2')).toBeUndefined();
+    });
+
+    it('marks pending and running async subagents orphaned and clears indexes', () => {
+      const { manager, updates } = createManager();
+      const parentEl = createMockEl();
+
+      manager.handleTaskToolUse('async-1', { description: 'Bg', run_in_background: true }, parentEl);
+
+      manager.interruptAllActive('Interrupted');
+
+      expect(updates.some((u) => u.asyncStatus === 'orphaned')).toBe(true);
+      expect(manager.getByTaskId('async-1')).toBeUndefined();
+      const { markAsyncSubagentOrphaned } = jest.requireMock('@/features/chat/rendering/SubagentRenderer');
+      expect(markAsyncSubagentOrphaned).toHaveBeenCalled();
+    });
+  });

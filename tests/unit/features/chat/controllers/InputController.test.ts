@@ -1,6 +1,7 @@
 import { createMockEl } from '@test/helpers/mockElement';
 import { Notice } from 'obsidian';
 
+import type { ToolCallInfo } from '@/core/types';
 import { InputController, type InputControllerDeps } from '@/features/chat/controllers/InputController';
 import { TurnCoordinator } from '@/features/chat/controllers/TurnCoordinator';
 import { ProjectionWriteCoordinator as ProjectionWriteCoordinatorForTest } from '@/features/chat/rendering/ProjectionWriteCoordinator';
@@ -190,7 +191,7 @@ function createMockDeps(overrides: Partial<InputControllerDeps> = {}): InputCont
     generateId: () => `msg-${Date.now()}-${Math.random().toString(36).substring(2, 11)}`,
     resetInputHeight: jest.fn(),
     getAgentService: () => mockAgentService as any,
-    getSubagentManager: () => ({ resetSpawnedCount: jest.fn(), resetStreamingState: jest.fn() }) as any,
+    getSubagentManager: () => ({ resetSpawnedCount: jest.fn(), resetStreamingState: jest.fn(), interruptAllActive: jest.fn() }) as any,
     mockAgentService,
     ...overrides,
   };
@@ -3922,6 +3923,90 @@ describe('InputController - Message Queue', () => {
         expect.anything(),
       );
       expect(onTurnCompleted).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('Cancel UI settle-down (interrupted tools & subagents)', () => {
+    function makeSubagentManager() {
+      return {
+        resetSpawnedCount: jest.fn(),
+        resetStreamingState: jest.fn(),
+        interruptAllActive: jest.fn(),
+      };
+    }
+
+    function pushRunningToolCall(deps: InputControllerDeps, cancelDuringChunk: boolean): void {
+      ((deps as any).mockAgentService.query as jest.Mock).mockImplementation(() =>
+        createMockStream([{ type: 'text', content: 'streamed' }]));
+      (deps.streamController.handleStreamChunk as jest.Mock).mockImplementation(
+        (_chunk: unknown, context: { message: { toolCalls?: ToolCallInfo[] } }) => {
+          context.message.toolCalls = context.message.toolCalls ?? [];
+          if (!context.message.toolCalls.some((tc) => tc.id === 'tool-1')) {
+            context.message.toolCalls.push({
+              id: 'tool-1',
+              name: 'Bash',
+              input: {},
+              status: 'running',
+              isExpanded: false,
+            });
+          }
+          if (cancelDuringChunk) {
+            deps.state.cancelRequested = true;
+          }
+        },
+      );
+    }
+
+    function getAssistantToolCalls(deps: InputControllerDeps): ToolCallInfo[] {
+      const assistantMsg = [...deps.state.messages].reverse().find((m) => m.role === 'assistant');
+      return assistantMsg?.toolCalls ?? [];
+    }
+
+    it('forces running tool calls into an interrupted terminal state on cancel', async () => {
+      const subagentManager = makeSubagentManager();
+      const deps = createSendableDeps({ getSubagentManager: () => subagentManager as any });
+      pushRunningToolCall(deps, true);
+      const inputEl = deps.getInputEl() as ReturnType<typeof createMockInputEl>;
+      inputEl.value = 'cancel mid-tool';
+      const controller = new InputController(deps);
+      await controller.sendMessage();
+
+      const tool = getAssistantToolCalls(deps).find((tc) => tc.id === 'tool-1');
+      expect(tool).toBeDefined();
+      expect(tool?.status).toBe('error');
+      expect(tool?.result).toBe(t('chat.cancel.toolInterrupted'));
+      expect(subagentManager.interruptAllActive).toHaveBeenCalledWith(t('chat.cancel.toolInterrupted'));
+    });
+
+    it('leaves tool terminal states and subagents untouched on a natural turn', async () => {
+      const subagentManager = makeSubagentManager();
+      const deps = createSendableDeps({ getSubagentManager: () => subagentManager as any });
+      ((deps as any).mockAgentService.query as jest.Mock).mockImplementation(() =>
+        createMockStream([{ type: 'text', content: 'streamed' }]));
+      (deps.streamController.handleStreamChunk as jest.Mock).mockImplementation(
+        (_chunk: unknown, context: { message: { toolCalls?: ToolCallInfo[] } }) => {
+          context.message.toolCalls = context.message.toolCalls ?? [];
+          if (!context.message.toolCalls.some((tc) => tc.id === 'tool-1')) {
+            context.message.toolCalls.push({
+              id: 'tool-1',
+              name: 'Bash',
+              input: {},
+              status: 'completed',
+              result: 'done',
+              isExpanded: false,
+            });
+          }
+        },
+      );
+      const inputEl = deps.getInputEl() as ReturnType<typeof createMockInputEl>;
+      inputEl.value = 'normal turn';
+      const controller = new InputController(deps);
+      await controller.sendMessage();
+
+      const tool = getAssistantToolCalls(deps).find((tc) => tc.id === 'tool-1');
+      expect(tool?.status).toBe('completed');
+      expect(tool?.result).toBe('done');
+      expect(subagentManager.interruptAllActive).not.toHaveBeenCalled();
     });
   });
 });
