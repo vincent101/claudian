@@ -176,7 +176,8 @@ export function createTransformUsageState(): TransformUsageState {
   let snapshotOwner: string | null = null;
   // Session-scoped: unlike prompt usage, the resolved model survives clear()
   // (which fires per assistant message_start) because system/init is emitted
-  // once per query while later turns still need it for modelUsage matching.
+  // once per query while later turns still need it to label usage with the
+  // model that actually served the session.
   let resolvedModel: string | null = null;
 
   return {

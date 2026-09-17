@@ -3206,6 +3206,74 @@ describe('ClaudianService', () => {
       expect(onError).toHaveBeenCalledWith(crashError);
     });
 
+    it('crash recovery replay clears notificationResultPending so the replayed turn settles on its first result', async () => {
+      // 2.3.2: the original query armed notificationResultPending on this turn
+      // (a task-notification turn was dequeued) but crashed before the
+      // notification's result arrived. The replayed query contains no
+      // notification turn, so the user turn's first result must settle it —
+      // a stale armed flag would swallow that result and hang the turn.
+      const crashError = new Error('process crashed');
+      let iterationCount = 0;
+      const mockPQ = {
+        [Symbol.asyncIterator]() { return this; },
+        async next() {
+          iterationCount++;
+          if (iterationCount === 1) throw crashError;
+          return { done: true, value: undefined };
+        },
+        async return() { return { done: true, value: undefined }; },
+        interrupt: jest.fn().mockResolvedValue(undefined),
+      };
+
+      (service as any).persistentQuery = mockPQ;
+      const channel = new MessageChannel(
+        undefined,
+        (turnId: string) => (service as any).handleTurnDequeued(turnId),
+      );
+      (service as any).messageChannel = channel;
+      (service as any).queryAbortController = { abort: jest.fn() };
+      (service as any).shuttingDown = false;
+      (service as any).coldStartInProgress = false;
+      (service as any).crashRecoveryAttempted = false;
+      (service as any).responseConsumerRunning = false;
+
+      const onDone = jest.fn();
+      const handler = createResponseHandler({
+        id: 'notif-crash-handler',
+        onChunk: jest.fn(),
+        onDone,
+        onError: jest.fn(),
+      });
+      const turn = createRuntimeTurn({ id: 'user-notif-crash', kind: 'user', phase: 'collecting' });
+      turn.waiters.add(handler);
+      turn.notificationResultPending = true;
+      (service as any).responseHandlers = [handler];
+      (service as any).runtimeTurns.set('user-notif-crash', turn);
+      channel.beginExternalTurn('user-notif-crash');
+
+      (service as any).lastSentMessage = {
+        type: 'user',
+        message: { role: 'user', content: 'test' },
+        parent_tool_use_id: null,
+        session_id: 'test-session',
+      };
+      (service as any).lastSentTurnId = 'user-notif-crash';
+
+      jest.spyOn(service, 'ensureReady').mockResolvedValue(true);
+      jest.spyOn(service as any, 'applyDynamicUpdates').mockResolvedValue(undefined);
+
+      (service as any).startResponseConsumer();
+      await new Promise(resolve => setTimeout(resolve, 50));
+
+      // The replay re-registered the turn with the stale notification flag cleared.
+      expect(turn.notificationResultPending).toBe(false);
+
+      // The replayed query delivers the user turn's own result first: it must settle.
+      await (service as any).routeMessage({ type: 'result', subtype: 'success' });
+      expect(onDone).toHaveBeenCalledTimes(1);
+      expect((service as any).runtimeTurns.has('user-notif-crash')).toBe(false);
+    });
+
     it('should skip error handling when consumer is orphaned (replaced)', async () => {
       const crashError = new Error('old consumer error');
       let resolveDelay: () => void;

@@ -12,13 +12,9 @@ The persistent query stays alive across turns. Model, thinking budget, permissio
 
 The SDK delivers assistant text twice: incrementally via `stream_event/content_block_delta`, and again as complete text in the `assistant` message. The handler tracks `sawStreamText` — if stream events were seen, the assistant message's text blocks are skipped. Without this, every response would render double.
 
-### Usage Chunk Two-Phase Buffering
+### Usage Chunk Single-Source (Assistant Message)
 
-Usage info comes from two SDK messages:
-1. **Assistant message**: accurate input-side token counts (`input_tokens`, `cache_creation_input_tokens`, `cache_read_input_tokens`), but only from main-agent messages (`parent_tool_use_id === null` filter) — subagent messages are excluded to avoid inflated counts
-2. **Result message**: authoritative `contextWindow` from `modelUsage` that corrects the estimated percentage
-
-Using result-message token counts would be wrong because they aggregate across subagents. Using assistant-message context window would be wrong because it's estimated. The two-phase merge gets the input-side counts plus the final context-window value.
+Usage info comes from one SDK message — the assistant message: accurate input-side token counts (`input_tokens`, `cache_creation_input_tokens`, `cache_read_input_tokens`), but only from main-agent messages (`parent_tool_use_id === null` filter) — subagent messages are excluded to avoid inflated counts. The `contextWindow` denominator follows the model selector's preset configuration only; the earlier result-side `modelUsage` window chain was removed (2.3.2 ②, user ruling 2026-09-17) because result-message token counts aggregate across subagents and the SDK-reported window must never override the selector preset.
 
 ### Custom Spawn — Electron Workarounds
 

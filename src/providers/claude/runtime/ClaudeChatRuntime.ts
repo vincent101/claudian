@@ -210,8 +210,8 @@ export class ClaudianService implements ChatRuntime {
   private cachedSdkCommands: SlashCommand[] = [];
 
   // SDK-resolved model from system/init (concrete id, not the settings alias).
-  // Session-scoped so turns after the first still label usage and match
-  // result modelUsage against what actually serves the query.
+  // Session-scoped so turns after the first still label usage with what
+  // actually serves the query.
   private sessionResolvedModel: string | null = null;
 
   // Subagent hook state provider (set from feature layer to avoid core→feature dependency)
@@ -1313,6 +1313,11 @@ export class ClaudianService implements ChatRuntime {
   private reRegisterTurnForRetry(turn: RuntimeTurn): void {
     turn.abortController = new AbortController();
     turn.phase = 'queued';
+    // 2.3.2: the crashed query may have armed notificationResultPending (a
+    // task-notification turn was dequeued before the crash). The replayed
+    // query contains no notification turn, so a stale armed flag would make
+    // the replayed turn swallow its own first result and hang its waiters.
+    turn.notificationResultPending = false;
     this.runtimeTurns.set(turn.id, turn);
     if (this.abortController) {
       this.abortController = turn.abortController;
