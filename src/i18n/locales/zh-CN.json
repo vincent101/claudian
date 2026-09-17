@@ -85,7 +85,24 @@
       "errorDescription": "无法加载会话历史。",
       "retry": "重试",
       "switchFailed": "切换会话失败：{error}",
-      "oversizeSegmentDetail": "{id}（{size} MiB）"
+      "oversizeSegmentDetail": "{id}（{size} MiB）",
+      "export": {
+        "file": "导出完整会话到文件",
+        "clipboard": "复制完整会话文本",
+        "fileSuccess": "会话已导出到 {path}",
+        "clipboardSuccess": "会话已复制到剪贴板",
+        "clipboardTooLarge": "会话超过 4 MiB，无法复制到剪贴板。请改用“导出完整会话到文件”。",
+        "sourceUnavailable": "会话原始记录不可用。",
+        "failed": "导出会话失败。"
+      },
+      "recovery": {
+        "title": "历史恢复已停止",
+        "description": "自动上下文恢复已失败两次。",
+        "newConversation": "新建会话",
+        "retry": "重试恢复",
+        "stale": "此恢复请求已过期。",
+        "failed": "历史恢复失败。"
+      }
     },
     "search": {
       "placeholder": "搜索对话历史（{shortcut}）",

@@ -1,11 +1,14 @@
 import { Menu, Notice, setIcon } from 'obsidian';
 
+import { consumeHistoryText } from '../../../core/providers/consumeHistoryText';
 import { ProviderRegistry } from '../../../core/providers/ProviderRegistry';
 import {
   ConversationHistoryHydrationError,
+  type FullHistoryIterable,
   type HistoryIndexLease,
   type HistoryLoadProgress,
   type HistorySearchResult,
+  HistorySourceUnavailableError,
   type HistoryWindowRequest,
   type LoadedTurnRange,
   type ProviderId,
@@ -1365,6 +1368,13 @@ export class ConversationController {
     }
 
     menu.addItem((menuItem) => menuItem
+      .setTitle(t('chat.history.export.file'))
+      .onClick(() => void this.exportHistory(conversationId, title, false)));
+    menu.addItem((menuItem) => menuItem
+      .setTitle(t('chat.history.export.clipboard'))
+      .onClick(() => void this.exportHistory(conversationId, title, true)));
+
+    menu.addItem((menuItem) => menuItem
       .setTitle('Rename')
       .onClick(() => {
         this.showRenameInput(item, conversationId, title);
@@ -1379,6 +1389,64 @@ export class ConversationController {
       }));
 
     menu.showAtMouseEvent(event);
+  }
+
+  private async exportHistory(conversationId: string, title: string, clipboard: boolean): Promise<void> {
+    const conversation = this.deps.plugin.getConversationSync(conversationId);
+    const service = conversation ? ProviderRegistry.getConversationHistoryService(conversation.providerId) : null;
+    if (!conversation || !service?.iterateFullHistory) {
+      new Notice(t('chat.history.export.sourceUnavailable'));
+      return;
+    }
+    let iterable: FullHistoryIterable;
+    try {
+      iterable = service.iterateFullHistory(conversation, getVaultPath(this.deps.plugin.app), {
+        maxTurnsPerChunk: 50,
+        maxSourceBytesPerChunk: 8 * 1024 * 1024,
+        maxProjectedCharsPerChunk: 2 * 1024 * 1024,
+        projectionLevel: 'detail',
+      });
+    } catch (error) {
+      new Notice(error instanceof HistorySourceUnavailableError
+        ? t('chat.history.export.sourceUnavailable')
+        : t('chat.history.export.failed'));
+      return;
+    }
+    try {
+      if (clipboard) {
+        const parts: string[] = [];
+        let bytes = 0;
+        await consumeHistoryText(iterable, {
+          write: async text => {
+            bytes += new TextEncoder().encode(text).byteLength;
+            if (bytes > 4 * 1024 * 1024) throw new RangeError('clipboard_limit');
+            parts.push(text);
+          },
+        });
+        await navigator.clipboard.writeText(parts.join(''));
+        new Notice(t('chat.history.export.clipboardSuccess'));
+        return;
+      }
+      const adapter = this.deps.plugin.app.vault.adapter;
+      const safeTitle = title.replace(/[\\/:*?"<>|]/g, '-').trim() || 'conversation';
+      const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+      const directory = '.claudian/exports';
+      const path = `${directory}/${safeTitle}-${stamp}.md`;
+      const partial = `${path}.partial`;
+      if (!await adapter.exists(directory)) await adapter.mkdir(directory);
+      await adapter.write(partial, '');
+      await consumeHistoryText(iterable, { write: text => adapter.append(partial, text) });
+      await adapter.rename(partial, path);
+      new Notice(t('chat.history.export.fileSuccess', { path }));
+    } catch (error) {
+      if (error instanceof RangeError && error.message === 'clipboard_limit') {
+        new Notice(t('chat.history.export.clipboardTooLarge'));
+      } else if (error instanceof HistorySourceUnavailableError) {
+        new Notice(t('chat.history.export.sourceUnavailable'));
+      } else {
+        new Notice(t('chat.history.export.failed'));
+      }
+    }
   }
 
   private async deleteHistoryConversation(

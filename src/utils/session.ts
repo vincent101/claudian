@@ -141,60 +141,37 @@ function formatThinkingBlocks(message: ChatMessage): string[] {
   return [`[Thinking: ${thinkingBlocks.length} block(s)${durationPart}]`];
 }
 
-export function buildContextFromHistory(messages: ChatMessage[]): string {
-  const parts: string[] = [];
-
-  for (const message of messages) {
-    if (message.role !== 'user' && message.role !== 'assistant') {
-      continue;
-    }
-
-    if (message.isInterrupt) {
-      continue;
-    }
-
-    if (message.role === 'assistant') {
-      const hasContent = message.content && message.content.trim().length > 0;
-      const hasToolCalls = message.toolCalls && message.toolCalls.length > 0;
-      const hasThinking = message.contentBlocks?.some(b => b.type === 'thinking');
-      if (!hasContent && !hasToolCalls && !hasThinking) {
-        continue;
-      }
-    }
-
-    const role = message.role === 'user' ? 'User' : 'Assistant';
-    const lines: string[] = [];
-    const content = message.content?.trim();
-    const contextLine = formatContextLine(message);
-
-    const userPayload = contextLine
-      ? content
-        ? `${contextLine}\n\n${content}`
-        : contextLine
-      : content;
-
-    lines.push(userPayload ? `${role}: ${userPayload}` : `${role}:`);
-
-    if (message.role === 'assistant') {
-      const thinkingLines = formatThinkingBlocks(message);
-      if (thinkingLines.length > 0) {
-        lines.push(...thinkingLines);
-      }
-    }
-
-    if (message.role === 'assistant' && message.toolCalls?.length) {
-      const toolLines = message.toolCalls
-        .map(tc => formatToolCallForContext(tc))
-        .filter(Boolean) as string[];
-      if (toolLines.length > 0) {
-        lines.push(...toolLines);
-      }
-    }
-
-    parts.push(lines.join('\n'));
+export function formatHistoryMessage(message: ChatMessage): string | null {
+  if ((message.role !== 'user' && message.role !== 'assistant') || message.isInterrupt) {
+    return null;
   }
 
-  return parts.join('\n\n');
+  if (message.role === 'assistant') {
+    const hasContent = message.content && message.content.trim().length > 0;
+    const hasToolCalls = message.toolCalls && message.toolCalls.length > 0;
+    const hasThinking = message.contentBlocks?.some(b => b.type === 'thinking');
+    if (!hasContent && !hasToolCalls && !hasThinking) return null;
+  }
+
+  const role = message.role === 'user' ? 'User' : 'Assistant';
+  const lines: string[] = [];
+  const content = message.content?.trim();
+  const contextLine = formatContextLine(message);
+  const payload = contextLine
+    ? content ? `${contextLine}\n\n${content}` : contextLine
+    : content;
+  lines.push(payload ? `${role}: ${payload}` : `${role}:`);
+
+  if (message.role === 'assistant') {
+    lines.push(...formatThinkingBlocks(message));
+    const toolLines = message.toolCalls?.map(tc => formatToolCallForContext(tc)).filter(Boolean) as string[] | undefined;
+    if (toolLines?.length) lines.push(...toolLines);
+  }
+  return lines.join('\n');
+}
+
+export function buildContextFromHistory(messages: ChatMessage[]): string {
+  return messages.map(formatHistoryMessage).filter((part): part is string => part !== null).join('\n\n');
 }
 
 export function getLastUserMessage(messages: ChatMessage[]): ChatMessage | undefined {

@@ -85,7 +85,24 @@
       "errorDescription": "The conversation history could not be loaded.",
       "retry": "Retry",
       "switchFailed": "Failed to switch conversation: {error}",
-      "oversizeSegmentDetail": "{id} ({size} MiB)"
+      "oversizeSegmentDetail": "{id} ({size} MiB)",
+      "export": {
+        "file": "Export full conversation to file",
+        "clipboard": "Copy full conversation text",
+        "fileSuccess": "Conversation exported to {path}",
+        "clipboardSuccess": "Conversation copied to clipboard",
+        "clipboardTooLarge": "The conversation exceeds 4 MiB and cannot be copied. Use “Export full conversation to file” instead.",
+        "sourceUnavailable": "The conversation transcript is unavailable.",
+        "failed": "Failed to export conversation."
+      },
+      "recovery": {
+        "title": "History recovery stopped",
+        "description": "Automatic context recovery failed twice.",
+        "newConversation": "New conversation",
+        "retry": "Retry recovery",
+        "stale": "This recovery request is no longer current.",
+        "failed": "History recovery failed."
+      }
     },
     "search": {
       "placeholder": "Buscar en el historial ({shortcut})",

@@ -85,7 +85,24 @@
       "errorDescription": "無法載入對話歷史。",
       "retry": "重試",
       "switchFailed": "切換會話失敗：{error}",
-      "oversizeSegmentDetail": "{id}（{size} MiB）"
+      "oversizeSegmentDetail": "{id}（{size} MiB）",
+      "export": {
+        "file": "匯出完整對話到檔案",
+        "clipboard": "複製完整對話文字",
+        "fileSuccess": "對話已匯出至 {path}",
+        "clipboardSuccess": "對話已複製到剪貼簿",
+        "clipboardTooLarge": "對話超過 4 MiB，無法複製到剪貼簿。請改用「匯出完整對話到檔案」。",
+        "sourceUnavailable": "對話原始記錄無法使用。",
+        "failed": "匯出對話失敗。"
+      },
+      "recovery": {
+        "title": "歷史恢復已停止",
+        "description": "自動內容恢復已失敗兩次。",
+        "newConversation": "新增對話",
+        "retry": "重試恢復",
+        "stale": "此恢復請求已過期。",
+        "failed": "歷史恢復失敗。"
+      }
     },
     "search": {
       "placeholder": "搜尋對話歷史（{shortcut}）",
