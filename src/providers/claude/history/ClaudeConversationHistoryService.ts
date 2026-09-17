@@ -694,9 +694,10 @@ export class ClaudeConversationHistoryService implements ProviderConversationHis
       if (sourceBytes > options.maxSourceBytes) return { status: 'too_large' };
       const native = await materializeTranscriptEntries(segment.index, entries);
       if (options.signal?.aborted) throw new Error('History detail load aborted');
-      const associations = associationEntries.length === entries.length
-        ? native
-        : await materializeTranscriptEntries(segment.index, associationEntries);
+      // Equal cardinality does not imply equal entries: a descriptor entry
+      // without tool ids can mask an out-of-range tool_result of the same
+      // count, so associations always come from the association set itself.
+      const associations = await materializeTranscriptEntries(segment.index, associationEntries);
       const messages = await materializeSDKMessages(
         state.vaultPath,
         segment.sessionId,

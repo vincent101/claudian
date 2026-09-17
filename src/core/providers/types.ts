@@ -389,12 +389,6 @@ export interface LoadedTurnRange {
   end: number;
 }
 
-export interface HistoryRangePage {
-  messages: ChatMessage[];
-  range: LoadedTurnRange;
-  snapshotOffset?: number;
-}
-
 export type HistoryLoadProgress =
   | { phase: 'queued' }
   | { phase: 'indexing'; percent: number }
