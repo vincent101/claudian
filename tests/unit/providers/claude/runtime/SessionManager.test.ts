@@ -108,6 +108,38 @@ describe('SessionManager', () => {
     });
   });
 
+  describe('generation recovery state machine', () => {
+    it('requires successful result, dispatch session, and unchanged snapshot', () => {
+      manager.captureSession('old'); manager.captureSession('new');
+      const generation = manager.markRecoveryDispatched()!;
+      expect(manager.confirmRecovery(generation, 'other', true)).toBe(false);
+      expect(manager.needsHistoryRebuild()).toBe(true);
+      manager.markRecoveryDispatched();
+      expect(manager.confirmRecovery(generation, 'new', true)).toBe(true);
+      expect(manager.needsHistoryRebuild()).toBe(false);
+    });
+
+    it('trips after two failed attempts and retries only matching generation', () => {
+      manager.captureSession('old'); manager.captureSession('new');
+      const generation = manager.markRecoveryDispatched()!;
+      manager.confirmRecovery(generation, 'new', false);
+      manager.markRecoveryDispatched();
+      manager.confirmRecovery(generation, 'new', false);
+      expect(manager.getHistoryRecoveryState().status).toBe('tripped');
+      expect(manager.retryHistoryRecovery(generation - 1)).toBe(false);
+      expect(manager.retryHistoryRecovery(generation)).toBe(true);
+      expect(manager.needsHistoryRebuild()).toBe(true);
+    });
+
+    it('rejects an old generation after a newer reset', () => {
+      manager.captureSession('old'); manager.captureSession('new');
+      const oldGeneration = manager.getHistoryRecoveryState().generation;
+      manager.setSessionId('explicit-new');
+      expect(manager.retryHistoryRecovery(oldGeneration)).toBe(false);
+      expect(manager.getHistoryRecoveryState().status).toBe('idle');
+    });
+  });
+
   describe('session mismatch recovery', () => {
     it('should initially not need history rebuild', () => {
       expect(manager.needsHistoryRebuild()).toBe(false);

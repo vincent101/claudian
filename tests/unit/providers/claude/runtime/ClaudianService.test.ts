@@ -2140,7 +2140,9 @@ describe('ClaudianService', () => {
 
       // Set up session mismatch state: capture a session, then directly set the flag
       service.setSessionId('old-session');
-      (service as any).sessionManager.state.needsHistoryRebuild = true;
+      (service as any).sessionManager.state.historyRecovery = {
+        status: 'pending', generation: 1, lostSessionId: 'lost-session', attempts: 0,
+      };
 
       const history: any[] = [
         { id: '1', role: 'user', content: 'Previous question', timestamp: 1000 },

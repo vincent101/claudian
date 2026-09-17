@@ -29,8 +29,9 @@ import { ProviderSettingsCoordinator } from '../../../core/providers/ProviderSet
 import type {
   AppAgentManager,
   AppPluginManager,
+  FullHistoryIterable,
 } from '../../../core/providers/types';
-import type { ChatRuntime } from '../../../core/runtime/ChatRuntime';
+import type { ChatRuntime, HistoryRecoveryStatus } from '../../../core/runtime/ChatRuntime';
 import type {
   ApprovalCallback,
   AskUserQuestionCallback,
@@ -89,6 +90,7 @@ import {
 } from '../stream/transformClaudeMessage';
 import { ClaudeTranscriptDiagnosticLog } from '../transcript/ClaudeTranscriptDiagnosticLog';
 import { ClaudeTranscriptTurnObserver } from '../transcript/ClaudeTranscriptTurnObserver';
+import { getContextWindowSize } from '../types/models';
 import { type ClaudeProviderState, getClaudeState } from '../types/providerState';
 import { createClaudeApprovalCallback } from './ClaudeApprovalHandler';
 import { applyClaudeDynamicUpdates } from './ClaudeDynamicUpdates';
@@ -105,6 +107,7 @@ import {
   buildClaudePromptWithImages,
   buildClaudeSDKUserMessage,
 } from './ClaudeUserMessageFactory';
+import { HistoryContextAccumulator, recoveryCharacterBudget } from './HistoryContextAccumulator';
 import {
   type ClaudeEnsureReadyOptions,
   type ClosePersistentQueryOptions,
@@ -248,6 +251,7 @@ export class ClaudianService implements ChatRuntime {
   private transcriptObserverTarget: string | null = null;
   private transcriptObserverRestartChain: Promise<void> = Promise.resolve();
   private transcriptObserverStartOffset: number | null = null;
+  private historyRecoverySource: (() => FullHistoryIterable) | null = null;
   private fullHistoryExporter: (() => Promise<ChatMessage[]>) | null = null;
   private transcriptDiagnosticLog: ClaudeTranscriptDiagnosticLog | null = null;
 
@@ -1033,8 +1037,17 @@ export class ClaudianService implements ChatRuntime {
       this.recordTurnMetadata(activeTurn, { assistantMessageId: message.uuid });
     }
 
-    // Check for turn completion
+    // Recovery confirmation is tied to the exact dispatched session/result;
+    // session_init alone is not a completion signal for persistent queries.
     if (isTurnCompleteMessage(message)) {
+      const result = message as SDKMessage & { session_id?: string; subtype?: string; is_error?: boolean };
+      if (activeTurn.recoveryGeneration !== undefined) {
+        this.sessionManager.confirmRecovery(
+          activeTurn.recoveryGeneration,
+          result.session_id ?? null,
+          result.subtype === 'success' && result.is_error !== true,
+        );
+      }
       await this.settleTurnAtResult(activeTurn);
     }
   }
@@ -1070,12 +1083,9 @@ export class ClaudianService implements ChatRuntime {
     }
     // Fork: suppress needsHistoryRebuild since SDK returns a different session ID by design
     const wasFork = this.pendingForkSession;
-    this.sessionManager.captureSession(event.sessionId);
+    this.sessionManager.captureSession(event.sessionId, wasFork);
     this.restartTranscriptObserver(event.sessionId);
-    if (wasFork) {
-      this.sessionManager.clearHistoryRebuild();
-      this.pendingForkSession = false;
-    }
+    if (wasFork) this.pendingForkSession = false;
     this.messageChannel?.setSessionId(event.sessionId);
     if (event.agents) {
       try { this.getAgentManager()?.setBuiltinAgentNames(event.agents); } catch { /* non-critical */ }
@@ -1689,7 +1699,16 @@ export class ClaudianService implements ChatRuntime {
     const images = normalized.request.images;
     let conversationHistory = normalized.conversationHistory;
     const queryOptions = normalized.queryOptions;
-    if (this.sessionManager.needsHistoryRebuild() && this.fullHistoryExporter) {
+    let streamedRecoveryContext: string | null = null;
+    let streamedRecoveryLastUser: ChatMessage | null = null;
+    if (this.sessionManager.needsHistoryRebuild() && this.historyRecoverySource) {
+      const model = queryOptions?.model || this.getScopedSettings().model;
+      const contextTokens = getContextWindowSize(model, this.getScopedSettings().customContextLimits);
+      const accumulator = new HistoryContextAccumulator(recoveryCharacterBudget(contextTokens));
+      for await (const chunk of this.historyRecoverySource()) accumulator.appendChunk(chunk);
+      streamedRecoveryContext = accumulator.build();
+      streamedRecoveryLastUser = accumulator.getLastUserMessage();
+    } else if (this.sessionManager.needsHistoryRebuild() && this.fullHistoryExporter) {
       conversationHistory = await this.fullHistoryExporter();
     }
 
@@ -1755,11 +1774,14 @@ export class ClaudianService implements ChatRuntime {
 
     // Session mismatch recovery: SDK returned a different session ID (context lost)
     // Inject history to restore context without forcing cold-start
-    if (this.sessionManager.needsHistoryRebuild() && conversationHistory && conversationHistory.length > 0) {
-      const historyContext = buildContextFromHistory(conversationHistory);
+    if (this.sessionManager.needsHistoryRebuild() && (streamedRecoveryContext || (conversationHistory && conversationHistory.length > 0))) {
+      const historyContext = streamedRecoveryContext ?? buildContextFromHistory(conversationHistory!);
       const actualPrompt = stripCurrentNoteContext(prompt);
-      promptToSend = buildPromptWithHistoryContext(historyContext, prompt, actualPrompt, conversationHistory);
-      this.sessionManager.clearHistoryRebuild();
+      promptToSend = buildPromptWithHistoryContext(
+        historyContext, prompt, actualPrompt,
+        streamedRecoveryLastUser ? [streamedRecoveryLastUser] : (conversationHistory ?? []),
+      );
+      turn.recoveryGeneration = this.sessionManager.getHistoryRecoveryState().generation;
     }
 
     const noSessionButHasHistory = !this.sessionManager.getSessionId() &&
@@ -2011,6 +2033,9 @@ export class ClaudianService implements ChatRuntime {
       // The channel could close between our null check above and this call
       try {
         const enqueueResult = this.messageChannel.enqueue(turn.id, message);
+        if (!enqueueResult.dropped && turn.recoveryGeneration !== undefined) {
+          turn.recoveryGeneration = this.sessionManager.markRecoveryDispatched() ?? undefined;
+        }
         if (enqueueResult.dropped) {
           // Queue overflow dropped this message (S1 leftover #1): settle the
           // turn immediately instead of leaving its handler waiting on a
@@ -2227,6 +2252,9 @@ export class ClaudianService implements ChatRuntime {
 
     try {
       const response = agentQuery({ prompt: queryPrompt, options });
+      if (turn.recoveryGeneration !== undefined && this.sessionManager.needsHistoryRebuild()) {
+        turn.recoveryGeneration = this.sessionManager.markRecoveryDispatched() ?? undefined;
+      }
       this.recordTurnMetadata(turn, { wasSent: true });
       let streamSessionId: string | null = this.sessionManager.getSessionId();
 
@@ -2267,8 +2295,19 @@ export class ClaudianService implements ChatRuntime {
         if (message.type === 'assistant' && message.uuid) {
           this.recordTurnMetadata(turn, { assistantMessageId: message.uuid });
         }
+        if (isTurnCompleteMessage(message) && turn.recoveryGeneration !== undefined) {
+          const result = message as SDKMessage & { session_id?: string; subtype?: string; is_error?: boolean };
+          this.sessionManager.confirmRecovery(
+            turn.recoveryGeneration,
+            result.session_id ?? null,
+            result.subtype === 'success' && result.is_error !== true,
+          );
+        }
       }
     } catch (error) {
+      if (turn.recoveryGeneration !== undefined) {
+        this.sessionManager.failRecoveryDispatch(turn.recoveryGeneration);
+      }
       // Re-throw session expired errors for outer retry logic to handle
       if (isSessionExpiredError(error)) {
         throw error;
@@ -2434,6 +2473,24 @@ export class ClaudianService implements ChatRuntime {
     this.transcriptObserverStartOffset = offset;
   }
 
+  setHistoryRecoverySource(source: (() => FullHistoryIterable) | null): void {
+    this.historyRecoverySource = source;
+  }
+
+  onHistoryRecoveryStateChange(listener: (state: HistoryRecoveryStatus) => void): () => void {
+    this.sessionManager.onHistoryRecoveryStateChange(state => listener({
+      status: state.status === 'tripped' ? 'tripped' : state.status === 'idle' ? 'idle' : 'recovering',
+      generation: state.generation,
+      ...(state.status === 'tripped' ? { reason: state.reason } : {}),
+    }));
+    return () => this.sessionManager.onHistoryRecoveryStateChange(null);
+  }
+
+  retryHistoryRecovery(generation: number): boolean {
+    return this.sessionManager.retryHistoryRecovery(generation);
+  }
+
+  /** @deprecated Use setHistoryRecoverySource. */
   setFullHistoryExporter(exporter: (() => Promise<ChatMessage[]>) | null): void {
     this.fullHistoryExporter = exporter;
   }

@@ -2,6 +2,30 @@
   position: static;
 }
 
+.claudian-history-recovery-banner {
+  margin: 8px 12px;
+  padding: 12px;
+  border: 1px solid var(--background-modifier-error);
+  border-radius: 8px;
+  background: var(--background-secondary);
+}
+
+.claudian-history-recovery-title {
+  font-weight: 600;
+  color: var(--text-error);
+}
+
+.claudian-history-recovery-description {
+  margin-top: 4px;
+  color: var(--text-muted);
+}
+
+.claudian-history-recovery-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 10px;
+}
+
 /* History dropup menu (opens upward since it's at bottom of view) */
 .claudian-history-menu {
   display: none;

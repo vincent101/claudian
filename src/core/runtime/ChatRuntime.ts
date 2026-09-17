@@ -1,4 +1,4 @@
-import type { ProviderCapabilities, ProviderId } from '../providers/types';
+import type { FullHistoryIterable, ProviderCapabilities, ProviderId } from '../providers/types';
 import type { ChatMessage, Conversation, SlashCommand, StreamChunk, ToolCallInfo } from '../types';
 import type {
   ApprovalCallback,
@@ -21,6 +21,12 @@ import type {
   SubagentRuntimeState,
   SubagentTaskNotificationHandler,
 } from './types';
+
+export interface HistoryRecoveryStatus {
+  status: 'idle' | 'recovering' | 'tripped';
+  generation: number;
+  reason?: string;
+}
 
 export interface ChatRuntime {
   readonly providerId: ProviderId;
@@ -46,6 +52,10 @@ export interface ChatRuntime {
   completeUserTurnProjection?(turnId: string): Promise<void>;
   /** Starts transcript observation at an already-materialized snapshot boundary. */
   setTranscriptObserverStartOffset?(offset: number | null): void;
+  setHistoryRecoverySource?(source: (() => FullHistoryIterable) | null): void;
+  onHistoryRecoveryStateChange?(listener: (state: HistoryRecoveryStatus) => void): () => void;
+  retryHistoryRecovery?(generation: number): boolean;
+  /** @deprecated Use setHistoryRecoverySource. */
   setFullHistoryExporter?(exporter: (() => Promise<ChatMessage[]>) | null): void;
   resetSession(): void;
   getSessionId(): string | null;

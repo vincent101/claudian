@@ -405,9 +405,14 @@ export class TabManager implements TabManagerInterface {
       const historyService = historyConversation
         ? ProviderRegistry.getConversationHistoryService(historyConversation.providerId)
         : null;
-      tab.service?.setFullHistoryExporter?.(
-        historyConversation && historyService?.exportFullHistory
-          ? () => historyService.exportFullHistory!(historyConversation, getVaultPath(this.plugin.app))
+      tab.service?.setHistoryRecoverySource?.(
+        historyConversation && historyService?.iterateFullHistory
+          ? () => historyService.iterateFullHistory!(historyConversation, getVaultPath(this.plugin.app), {
+              maxTurnsPerChunk: 50,
+              maxSourceBytesPerChunk: 8 * 1024 * 1024,
+              maxProjectedCharsPerChunk: 2 * 1024 * 1024,
+              projectionLevel: 'detail',
+            })
           : null,
       );
       setupServiceCallbacks(tab, this.plugin);

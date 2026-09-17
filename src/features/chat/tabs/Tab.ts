@@ -1830,6 +1830,25 @@ export function getTabTitle(tab: TabData, plugin: ClaudianPlugin): string {
 /** Shared between Tab.ts and TabManager.ts to avoid duplication. */
 export function setupServiceCallbacks(tab: TabData, plugin: ClaudianPlugin): void {
   if (tab.service && tab.controllers.inputController) {
+    const disposeRecovery = tab.service.onHistoryRecoveryStateChange?.((state) => {
+      tab.dom.contentEl.querySelector('.claudian-history-recovery-banner')?.remove();
+      if (state.status !== 'tripped') return;
+      const banner = tab.dom.contentEl.createDiv({ cls: 'claudian-history-recovery-banner' });
+      tab.dom.contentEl.insertBefore(banner, tab.dom.inputContainerEl);
+      banner.createDiv({ cls: 'claudian-history-recovery-title', text: t('chat.history.recovery.title') });
+      banner.createDiv({ cls: 'claudian-history-recovery-description', text: t('chat.history.recovery.description') });
+      const actions = banner.createDiv({ cls: 'claudian-history-recovery-actions' });
+      actions.createEl('button', { text: t('chat.history.recovery.newConversation') }).addEventListener('click', () => {
+        void tab.controllers.conversationController?.createNew({ force: true });
+      });
+      actions.createEl('button', { text: t('chat.history.recovery.retry') }).addEventListener('click', () => {
+        if (!tab.service?.retryHistoryRecovery?.(state.generation)) {
+          new Notice(t('chat.history.recovery.stale'));
+        }
+      });
+    });
+    if (disposeRecovery) tab.dom.eventCleanups.push(disposeRecovery);
+
     tab.service.setApprovalCallback(
       async (toolName, input, description, options) => {
         tab.state.beginAttention();

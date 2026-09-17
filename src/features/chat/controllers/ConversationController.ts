@@ -1400,18 +1400,29 @@ export class ConversationController {
     }
     let iterable: FullHistoryIterable;
     try {
-      iterable = service.iterateFullHistory(conversation, getVaultPath(this.deps.plugin.app), {
-        maxTurnsPerChunk: 50,
-        maxSourceBytesPerChunk: 8 * 1024 * 1024,
-        maxProjectedCharsPerChunk: 2 * 1024 * 1024,
-        projectionLevel: 'detail',
-      });
+      const hasTranscriptIdentity = service.resolveSessionIdForConversation(conversation) !== null;
+      if (!hasTranscriptIdentity && conversationId === this.deps.state.currentConversationId && this.deps.state.messages.length > 0) {
+        const messages = [...this.deps.state.messages];
+        iterable = {
+          async *[Symbol.asyncIterator]() {
+            yield { messages, range: { start: 0, end: 1 }, sourceBytes: 0, done: true };
+          },
+        };
+      } else {
+        iterable = service.iterateFullHistory(conversation, getVaultPath(this.deps.plugin.app), {
+          maxTurnsPerChunk: 50,
+          maxSourceBytesPerChunk: 8 * 1024 * 1024,
+          maxProjectedCharsPerChunk: 2 * 1024 * 1024,
+          projectionLevel: 'detail',
+        });
+      }
     } catch (error) {
       new Notice(error instanceof HistorySourceUnavailableError
         ? t('chat.history.export.sourceUnavailable')
         : t('chat.history.export.failed'));
       return;
     }
+    let partialPath: string | null = null;
     try {
       if (clipboard) {
         const parts: string[] = [];
@@ -1432,13 +1443,17 @@ export class ConversationController {
       const stamp = new Date().toISOString().replace(/[:.]/g, '-');
       const directory = '.claudian/exports';
       const path = `${directory}/${safeTitle}-${stamp}.md`;
-      const partial = `${path}.partial`;
+      partialPath = `${path}.partial`;
       if (!await adapter.exists(directory)) await adapter.mkdir(directory);
-      await adapter.write(partial, '');
-      await consumeHistoryText(iterable, { write: text => adapter.append(partial, text) });
-      await adapter.rename(partial, path);
+      await adapter.write(partialPath, '');
+      await consumeHistoryText(iterable, { write: text => adapter.append(partialPath!, text) });
+      await adapter.rename(partialPath, path);
+      partialPath = null;
       new Notice(t('chat.history.export.fileSuccess', { path }));
     } catch (error) {
+      if (partialPath) {
+        try { await this.deps.plugin.app.vault.adapter.remove(partialPath); } catch { /* best-effort cleanup */ }
+      }
       if (error instanceof RangeError && error.message === 'clipboard_limit') {
         new Notice(t('chat.history.export.clipboardTooLarge'));
       } else if (error instanceof HistorySourceUnavailableError) {

@@ -122,6 +122,8 @@ export interface RuntimeTurn {
    * settling on it would end this turn prematurely (2.3.2 fix ①).
    */
   notificationResultPending: boolean;
+  /** Recovery generation carried by the exact dispatch awaiting confirmation. */
+  recoveryGeneration?: number;
 }
 
 export interface RuntimeTurnOptions {
@@ -222,13 +224,18 @@ export interface PersistentQueryConfig {
   enableAutoMode: boolean;
 }
 
+export type HistoryRecoveryState =
+  | { status: 'idle'; generation: number }
+  | { status: 'pending'; generation: number; lostSessionId: string; attempts: number }
+  | { status: 'awaiting_result'; generation: number; dispatchSessionId: string; sessionSnapshot: string; attempts: number }
+  | { status: 'tripped'; generation: number; reason: string };
+
 export interface SessionState {
   sessionId: string | null;
   sessionModel: ClaudeModel | null;
   pendingSessionModel: ClaudeModel | null;
   wasInterrupted: boolean;
-  /** Set when SDK returns a different session ID than expected (context lost). */
-  needsHistoryRebuild: boolean;
+  historyRecovery: HistoryRecoveryState;
   /** Set when the current session is invalidated by SDK errors. */
   sessionInvalidated: boolean;
 }
