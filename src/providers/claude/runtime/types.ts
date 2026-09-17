@@ -114,6 +114,14 @@ export interface RuntimeTurn {
   waiters: Set<ResponseHandler>;
   /** Set when this turn's message merged into another turn's queue item. */
   mergedInto: string | null;
+  /**
+   * True after a task-notification user input was injected into the same
+   * persistent query while this (leased) turn was waiting for its result.
+   * The harness runs the injected notification as its own SDK turn, so the
+   * next result message belongs to that notification turn, not to this one —
+   * settling on it would end this turn prematurely (2.3.2 fix ①).
+   */
+  notificationResultPending: boolean;
 }
 
 export interface RuntimeTurnOptions {
@@ -140,6 +148,7 @@ export function createRuntimeTurn(options: RuntimeTurnOptions): RuntimeTurn {
     abortController: new AbortController(),
     waiters: new Set(),
     mergedInto: null,
+    notificationResultPending: false,
   };
 }
 

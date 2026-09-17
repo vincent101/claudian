@@ -4122,6 +4122,156 @@ describe('ClaudianService', () => {
         expect(channel.getActiveTurnId()).toBe('user-lease');
         expect((service as any).runtimeTurns.has('user-lease')).toBe(true);
       });
+
+      it('a second notification dispatch under the same lease is still accounting-only', async () => {
+        const notifications: any[] = [];
+        service.setSubagentNotificationHandler((taskId, status, result) => {
+          notifications.push({ taskId, status, result });
+        });
+
+        const channel = channelOf();
+        const turn = createRuntimeTurn({ id: 'user-lease', kind: 'user', phase: 'collecting' });
+        (service as any).runtimeTurns.set('user-lease', turn);
+        channel.beginExternalTurn('user-lease');
+
+        for (const taskId of ['agent-a', 'agent-b']) {
+          await (service as any).routeMessage({
+            type: 'queue-operation',
+            operation: 'enqueue',
+            content: `<task-notification><task-id>${taskId}</task-id><status>completed</status><result>done</result></task-notification>`,
+          });
+        }
+
+        expect(notifications.map((n) => n.taskId)).toEqual(['agent-a', 'agent-b']);
+        expect(channel.getActiveTurnId()).toBe('user-lease');
+      });
+    });
+
+    describe('notification-turn result attribution (2.3.2 fix ①)', () => {
+      beforeEach(() => {
+        (service as any).messageChannel = new MessageChannel(
+          undefined,
+          (turnId: string) => (service as any).handleTurnDequeued(turnId),
+        );
+        (service as any).responseHandlers = [];
+        (service as any).runtimeTurns.clear();
+      });
+
+      /**
+       * Harness injects a completed-task notification into the same persistent
+       * query as the user message; the notification becomes its own SDK turn
+       * whose result arrives while the user turn still holds the channel lease.
+       * That result must not settle the user turn (false "completed" notify).
+       */
+      function leaseUserTurnWithWaiter() {
+        const channel = channelOf();
+        const onDone = jest.fn();
+        const handler = createResponseHandler({
+          id: 'handler-notif',
+          onChunk: jest.fn(),
+          onDone,
+          onError: jest.fn(),
+        });
+        const turn = createRuntimeTurn({ id: 'user-lease', kind: 'user', phase: 'collecting' });
+        turn.waiters.add(handler);
+        (service as any).runtimeTurns.set('user-lease', turn);
+        channel.beginExternalTurn('user-lease');
+        return { channel, onDone, turn };
+      }
+
+      it('result of the notification-injected turn does not settle the leased user turn; the real result still does', async () => {
+        const { channel, onDone, turn } = leaseUserTurnWithWaiter();
+
+        // Injected notification turn input (echoed on the stream with origin).
+        // The notification accounting itself is settled by the queue-operation
+        // envelope / system shape (Fix 2); the echoed user turn input only
+        // marks the turn boundary this fix cares about.
+        await (service as any).routeMessage({
+          type: 'user',
+          origin: { kind: 'task-notification' },
+          message: { role: 'user', content: '<task-notification><task-id>agent-9</task-id><status>completed</status></task-notification>' },
+        });
+
+        // The notification turn's own result: the user turn must survive it.
+        await (service as any).routeMessage({ type: 'result', subtype: 'success' });
+        expect(onDone).not.toHaveBeenCalled();
+        expect(turn.phase).toBe('collecting');
+        expect((service as any).runtimeTurns.has('user-lease')).toBe(true);
+        expect(channel.getActiveTurnId()).toBe('user-lease');
+
+        // The queued user message's turn runs after the notification turn and
+        // completes with its own assistant output + result.
+        await (service as any).routeMessage({
+          type: 'assistant',
+          message: { content: [{ type: 'text', text: 'real answer' }] },
+          parent_tool_use_id: null,
+        });
+        await (service as any).routeMessage({ type: 'result', subtype: 'success' });
+
+        expect(onDone).toHaveBeenCalledTimes(1);
+        expect((service as any).runtimeTurns.has('user-lease')).toBe(false);
+        expect(channel.getActiveTurnId()).toBeNull();
+      });
+
+      it('two injected notification turns in a row are both skipped; the user result still settles', async () => {
+        service.setSubagentNotificationHandler(() => {});
+        const { channel, onDone, turn } = leaseUserTurnWithWaiter();
+
+        for (const taskId of ['agent-1', 'agent-2']) {
+          await (service as any).routeMessage({
+            type: 'user',
+            origin: { kind: 'task-notification' },
+            message: { role: 'user', content: `<task-notification><task-id>${taskId}</task-id><status>completed</status></task-notification>` },
+          });
+          await (service as any).routeMessage({ type: 'result', subtype: 'success' });
+        }
+
+        expect(onDone).not.toHaveBeenCalled();
+        expect(turn.phase).toBe('collecting');
+        expect(channel.getActiveTurnId()).toBe('user-lease');
+
+        await (service as any).routeMessage({ type: 'result', subtype: 'success' });
+        expect(onDone).toHaveBeenCalledTimes(1);
+        expect(channel.getActiveTurnId()).toBeNull();
+      });
+
+      it('a result without a prior injected notification settles the user turn as before', async () => {
+        const { channel, onDone } = leaseUserTurnWithWaiter();
+
+        await (service as any).routeMessage({
+          type: 'assistant',
+          message: { content: [{ type: 'text', text: 'plain answer' }] },
+          parent_tool_use_id: null,
+        });
+        await (service as any).routeMessage({ type: 'result', subtype: 'success' });
+
+        expect(onDone).toHaveBeenCalledTimes(1);
+        expect((service as any).runtimeTurns.has('user-lease')).toBe(false);
+        expect(channel.getActiveTurnId()).toBeNull();
+      });
+
+      it('a queue-operation notification envelope under a lease does not arm the skip: the turn result still settles', async () => {
+        // The envelope records an enqueue that has NOT become a turn input yet
+        // (e.g. a background task finishing mid-turn): the very next result is
+        // the running turn's own and must still settle it.
+        const notifications: any[] = [];
+        service.setSubagentNotificationHandler((taskId, status) => {
+          notifications.push({ taskId, status });
+        });
+        const { channel, onDone } = leaseUserTurnWithWaiter();
+
+        await (service as any).routeMessage({
+          type: 'queue-operation',
+          operation: 'enqueue',
+          content: '<task-notification><task-id>agent-mid</task-id><status>completed</status><result>queued</result></task-notification>',
+        });
+        expect(notifications).toEqual([{ taskId: 'agent-mid', status: 'completed' }]);
+
+        await (service as any).routeMessage({ type: 'result', subtype: 'success' });
+
+        expect(onDone).toHaveBeenCalledTimes(1);
+        expect(channel.getActiveTurnId()).toBeNull();
+      });
     });
 
     describe('protocol errors do not kill the consumer (v4 acceptance 4)', () => {

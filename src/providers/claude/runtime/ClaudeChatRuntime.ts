@@ -972,7 +972,19 @@ export class ClaudianService implements ChatRuntime {
     const turn = this.resolveActiveTurn();
     const user = message.type === 'user' ? message as SDKUserMessage : null;
     if (user?.origin) {
-      if (user.origin.kind === 'task-notification') this.dispatchTaskNotification(message);
+      if (user.origin.kind === 'task-notification') {
+        this.dispatchTaskNotification(message);
+        // 2.3.2 fix ①: the injected notification is dequeued as its own SDK
+        // turn of this persistent query, so the result message that follows it
+        // belongs to that notification turn. Arm the lease holder so its
+        // settlement skips that result — settling on it would complete the
+        // user turn seconds in while the model keeps running (false
+        // "completed" notify, 2026-09-17 evidence: four 4-5s premature
+        // completions in one morning). The queue-operation envelope / system
+        // shapes never arm this flag: they record an enqueue that may still
+        // sit behind the running turn, whose own result must still settle.
+        if (turn) turn.notificationResultPending = true;
+      }
       return;
     }
     if (this.dispatchTaskNotification(message)) return;
@@ -983,6 +995,17 @@ export class ClaudianService implements ChatRuntime {
     }
     if (turn.phase === 'cancelled' && isTurnCompleteMessage(message)) return;
     const activeTurn = turn;
+
+    // Result attribution (2.3.2 fix ①): a result armed as belonging to an
+    // injected notification turn settles nothing on this turn — not the
+    // waiters, not the lease. The user turn's own result arrives later (after
+    // the model finishes the queued user input) and settles normally. The
+    // transform is skipped too: the notification turn's usage/window figures
+    // must not project into the user turn's stream.
+    if (isTurnCompleteMessage(message) && activeTurn.notificationResultPending) {
+      activeTurn.notificationResultPending = false;
+      return;
+    }
 
     // Transform SDK message to StreamChunks using the turn's own state
     for (const event of transformSDKMessage(message, this.getTransformOptions(activeTurn))) {
