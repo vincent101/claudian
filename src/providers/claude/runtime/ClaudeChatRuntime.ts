@@ -2376,6 +2376,14 @@ export class ClaudianService implements ChatRuntime {
         // Silence abort/interrupt errors
       });
     }
+
+    // 2.5.1 F3: transcript-observed auto turns have no runtime-side lease, so
+    // none of the cancelTurn paths above can settle them. The CLI's trailing
+    // result line is not a reliable settlement signal after an interrupt
+    // (ignored while blocked on canUseTool; an abandoned notification turn may
+    // never run at all — 2026-09-17 18:22 ghost lease) — settle the promoted
+    // auto turn here so its feature lease finishes exactly once.
+    this.transcriptObserver?.interruptActiveTurn('user_cancel');
   }
 
   /**

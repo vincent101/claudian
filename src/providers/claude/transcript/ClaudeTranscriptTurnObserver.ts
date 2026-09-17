@@ -188,6 +188,22 @@ export class ClaudeTranscriptTurnObserver {
     this.active = null;
   }
 
+  /**
+   * 2.5.1 F3: user-cancel hook. The CLI's trailing result line is not a
+   * reliable settlement signal after an interrupt — the SDK ignores interrupt
+   * while blocked on canUseTool, and an abandoned turn may never run at all
+   * (2026-09-17 18:22 ghost lease). Terminate the promoted turn here so the
+   * feature auto lease finishes exactly once; a late transcript result for the
+   * same turn finds no pending record and is dropped. Mirrors the drainActive
+   * interrupted shape: cancelled first, then the release pump.
+   */
+  interruptActiveTurn(reason: string): void {
+    if (!this.active) return;
+    const turnId = this.active.started.turnId;
+    this.abandonActiveTurn(reason);
+    this.callbacks.released(turnId);
+  }
+
   private async promote(): Promise<void> {
     if (this.active || !this.canAcquire()) return;
     const pending = this.queue.shift();

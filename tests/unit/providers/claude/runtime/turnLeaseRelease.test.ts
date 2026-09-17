@@ -169,6 +169,20 @@ describe('ClaudianService - turn-lease hotfix (fix 6 + stress loops)', () => {
     expect((service as any).runtimeTurns.size).toBe(0);
   });
 
+  it('user cancel deterministically settles the transcript-observed auto turn (2.5.1 F3)', () => {
+    // 2026-09-17 18:22 ghost-lease pattern: ESC interrupts the CLI turn, but
+    // the transcript-observed auto turn's trailing result never arrives —
+    // cancel() must settle it through the observer instead of relying on the
+    // CLI writing a result line (interrupt is ignored while the CLI blocks on
+    // canUseTool, and the abandoned turn may never run at all).
+    const interruptActiveTurn = jest.fn();
+    (service as any).transcriptObserver = { interruptActiveTurn, stop: jest.fn() };
+
+    service.cancel();
+
+    expect(interruptActiveTurn).toHaveBeenCalledWith('user_cancel');
+  });
+
   describe('stress loops (each scenario × 20)', () => {
     it('new-session first turn: leases empty after every send', async () => {
       for (let i = 0; i < LOOPS; i++) {

@@ -220,6 +220,46 @@ describe('ClaudeTranscriptTurnObserver', () => {
     });
   });
 
+  it('deterministically settles the active turn on user cancel, exactly once, and drops its late result (2.5.1 F3)', async () => {
+    // 2026-09-17 18:22 ghost-lease pattern: the CLI turn is interrupted but the
+    // auto turn's trailing result never settles the promoted turn — cancel must
+    // settle it here instead, and a late transcript result must not re-settle.
+    await writeFile(file, '');
+    const { observer, callbacks } = setup();
+    try {
+      await observer.start(file);
+      const generation = (observer as any).generation;
+      await (observer as any).consumeBatch({ lines: peerTurn('peer-live', 'hello', false), reset: false }, generation);
+      expect(callbacks.started).toHaveBeenCalledWith(expect.objectContaining({ turnId: 'peer-live' }));
+
+      observer.interruptActiveTurn('user_cancel');
+
+      // started.generation + 1: the generation the feature TurnCoordinator's
+      // cancelAutoTurn accepts for this lease.
+      expect(callbacks.cancelled).toHaveBeenCalledTimes(1);
+      expect(callbacks.cancelled).toHaveBeenCalledWith({
+        turnId: 'peer-live',
+        generation: generation + 1,
+        reason: 'user_cancel',
+        interrupted: true,
+      });
+      expect(callbacks.released).toHaveBeenCalledTimes(1);
+      expect(callbacks.released).toHaveBeenCalledWith('peer-live');
+
+      // The interrupted CLI may still flush a trailing result line for the turn:
+      // no pending record owns it anymore, so it must not finish or re-cancel.
+      await (observer as any).consumeBatch(
+        { lines: [JSON.stringify({ type: 'result', subtype: 'success' })], reset: false },
+        generation,
+      );
+      expect(callbacks.finished).not.toHaveBeenCalled();
+      expect(callbacks.cancelled).toHaveBeenCalledTimes(1);
+      expect(callbacks.released).toHaveBeenCalledTimes(1);
+    } finally {
+      observer.stop();
+    }
+  });
+
   it('drops the whole FIFO on transcript reset and never promotes the stale turns', async () => {
     await writeFile(file, `${peerTurn('peer-old', 'old', false).join('\n')}\n`);
     const { observer, callbacks, order } = setup();
