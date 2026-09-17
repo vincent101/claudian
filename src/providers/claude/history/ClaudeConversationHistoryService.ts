@@ -1,13 +1,17 @@
-import type {
-  ConversationHistoryHydrationResult,
-  HistoryIndexLease,
-  HistoryLoadBudget,
-  HistoryLoadProgress,
-  HistoryRangePage,
-  HistorySearchResult,
-  HistoryWindowPage,
-  HistoryWindowRequest,
-  ProviderConversationHistoryService,
+import {
+  type ConversationHistoryHydrationResult,
+  type FullHistoryIterable,
+  type FullHistoryIterationOptions,
+  HistoryEntryTooLargeError,
+  type HistoryIndexLease,
+  type HistoryLoadBudget,
+  type HistoryLoadProgress,
+  type HistoryRangePage,
+  type HistorySearchResult,
+  HistorySourceUnavailableError,
+  type HistoryWindowPage,
+  type HistoryWindowRequest,
+  type ProviderConversationHistoryService,
 } from '../../../core/providers/types';
 import { isSubagentToolName, TOOL_TASK } from '../../../core/tools/toolNames';
 import type {
@@ -346,6 +350,7 @@ function sanitizeProviderState(
 
 interface IndexedSegment {
   sessionId: string;
+  segmentOrdinal: number;
   index: TranscriptHistoryIndex;
 }
 
@@ -603,7 +608,8 @@ export class ClaudeConversationHistoryService implements ProviderConversationHis
     const sessionIds = [...(providerState.previousProviderSessionIds ?? []), currentSessionId];
     const segments: IndexedSegment[] = [];
     onProgress?.({ phase: 'queued' });
-    for (const sessionId of sessionIds) {
+    for (let segmentOrdinal = 0; segmentOrdinal < sessionIds.length; segmentOrdinal += 1) {
+      const sessionId = sessionIds[segmentOrdinal];
       if (!sdkSessionExists(vaultPath, sessionId)) continue;
       const result = await buildTranscriptIndex(getSDKSessionPath(vaultPath, sessionId), {
         resumeAtMessageId: sessionId === currentSessionId
@@ -617,7 +623,7 @@ export class ClaudeConversationHistoryService implements ProviderConversationHis
         onFinalize: () => onProgress?.({ phase: 'finalizing' }),
       });
       if (result.status === 'failed' || result.status === 'partial') throw new Error(result.error);
-      segments.push({ sessionId, index: result.index });
+      segments.push({ sessionId, segmentOrdinal, index: result.index });
     }
     if (segments.length === 0) throw new Error('Conversation transcript is unavailable');
     const flattenedTurns = segments.flatMap(segment =>
@@ -685,7 +691,7 @@ export class ClaudeConversationHistoryService implements ProviderConversationHis
       // materializeTranscriptPage reads entries[firstTurn.startEntry..], so the
       // page slice starts at that segment-global entry index.
       messages.push(...await materializeSDKMessages(
-        state.vaultPath, segment.sessionId, native, associations, state.segments.indexOf(segment),
+        state.vaultPath, segment.sessionId, native, associations, segment.segmentOrdinal,
         segment.index.turns[indexes[0]].startEntry,
       ));
     }
@@ -722,7 +728,7 @@ export class ClaudeConversationHistoryService implements ProviderConversationHis
     // without the base every turn would restart the entry counter and all
     // turns of a window would collide on the same displayOrder keys.
     return materializeSDKMessages(
-      state.vaultPath, segment.sessionId, native, associations, state.segments.indexOf(segment),
+      state.vaultPath, segment.sessionId, native, associations, segment.segmentOrdinal,
       segment.index.turns[turnIndex].startEntry,
     );
   }
@@ -788,7 +794,7 @@ export class ClaudeConversationHistoryService implements ProviderConversationHis
       combined.push(buildOversizedTurnMarker(turn.turnId, skipped, entries[entries.length - 1]?.timestamp));
     }
     const messages = await materializeSDKMessages(
-      state.vaultPath, segment.sessionId, combined, combined, state.segments.indexOf(segment),
+      state.vaultPath, segment.sessionId, combined, combined, segment.segmentOrdinal,
       turn.startEntry,
     );
     // The tail-appended marker has no real entry slot; its natural index
@@ -799,7 +805,7 @@ export class ClaudeConversationHistoryService implements ProviderConversationHis
     // projection have no standalone key and stay untouched.
     const marker = messages.find(message => message.id === `oversized-marker-${turn.turnId}`);
     if (marker) {
-      marker.displayOrder = [state.segments.indexOf(segment), turn.endEntry, 1];
+      marker.displayOrder = [segment.segmentOrdinal, turn.endEntry, 1];
     }
     summarizeChatMessages(messages);
     return { messages, readBytes };
@@ -889,16 +895,117 @@ export class ClaudeConversationHistoryService implements ProviderConversationHis
     };
   }
 
-  async exportFullHistory(conversation: Conversation, vaultPath: string | null): Promise<ChatMessage[]> {
-    if (!vaultPath) return [...conversation.messages];
-    const lease = this.acquireHistoryIndex(conversation, vaultPath);
-    try {
-      await lease.ready;
-      if (lease.totalTurns === 0) return [];
-      return (await lease.loadRange(0, lease.totalTurns)).messages;
-    } finally {
-      lease.release();
+  iterateFullHistory(
+    conversation: Conversation,
+    vaultPath: string | null,
+    options: FullHistoryIterationOptions,
+  ): FullHistoryIterable {
+    if (!vaultPath) throw new HistorySourceUnavailableError('vault_unavailable');
+    const state = getClaudeState(conversation.providerState);
+    if (!(state.providerSessionId ?? conversation.sessionId ?? state.forkSource?.sessionId)) {
+      throw new HistorySourceUnavailableError('session_unavailable');
     }
+    const lease = this.acquireHistoryIndex(conversation, vaultPath);
+    const getShared = () => this.sharedIndexes.get(conversation.id);
+    const getTurnBytes = (fixed: ConversationIndexState) => this.turnSourceBytes(fixed);
+    const materialize = (fixed: ConversationIndexState, start: number, end: number) =>
+      this.materializeDetailChunk(fixed, start, end, options.maxProjectedCharsPerChunk);
+    return {
+      async *[Symbol.asyncIterator]() {
+        let released = false;
+        const release = () => {
+          if (released) return;
+          released = true;
+          lease.release();
+        };
+        const abort = () => release();
+        options.signal?.addEventListener('abort', abort, { once: true });
+        try {
+          await lease.ready;
+          const shared = getShared();
+          if (!shared) throw new HistorySourceUnavailableError('transcript_unavailable');
+          const fixed = await shared.ready;
+          let cursor = 0;
+          while (cursor < lease.totalTurns) {
+            if (options.signal?.aborted) throw options.signal.reason ?? new Error('History iteration aborted');
+            const plan = planHistoryWindow(getTurnBytes(fixed), {
+              anchorTurn: cursor,
+              direction: 'newer',
+              budget: {
+                maxTurns: options.maxTurnsPerChunk,
+                maxSourceBytes: options.maxSourceBytesPerChunk,
+                maxProjectedChars: options.maxProjectedCharsPerChunk,
+                timeSliceMs: 0,
+              },
+            });
+            if (plan.oversizedAnchor) {
+              throw new HistoryEntryTooLargeError(cursor, plan.plannedSourceBytes, null);
+            }
+            const page = await materialize(fixed, plan.start, plan.end);
+            if (page.projectedChars > options.maxProjectedCharsPerChunk) {
+              throw new HistoryEntryTooLargeError(cursor, page.sourceBytes, page.projectedChars);
+            }
+            cursor = page.range.end;
+            yield {
+              messages: page.messages,
+              range: page.range,
+              sourceBytes: page.sourceBytes,
+              done: cursor === lease.totalTurns,
+            };
+          }
+        } catch (error) {
+          if (error instanceof HistorySourceUnavailableError || error instanceof HistoryEntryTooLargeError) throw error;
+          throw new HistorySourceUnavailableError('transcript_unavailable');
+        } finally {
+          options.signal?.removeEventListener('abort', abort);
+          release();
+        }
+      },
+    };
+  }
+
+  private async materializeDetailChunk(
+    state: ConversationIndexState,
+    start: number,
+    plannedEnd: number,
+    maxProjectedChars: number,
+  ): Promise<{ messages: ChatMessage[]; range: { start: number; end: number }; sourceBytes: number; projectedChars: number }> {
+    const messages: ChatMessage[] = [];
+    let sourceBytes = 0;
+    let projectedChars = 0;
+    let end = start;
+    for (let index = start; index < plannedEnd; index += 1) {
+      const item = state.flattenedTurns[index];
+      const produced = await this.materializeTurn(state, item.segment, item.turnIndex);
+      const chars = measureChatProjectionChars(produced);
+      const bytes = item.segment.index.turns[item.turnIndex].sourceBytes ?? 0;
+      if (chars > maxProjectedChars) {
+        throw new HistoryEntryTooLargeError(index, bytes, chars);
+      }
+      if (index > start && projectedChars + chars > maxProjectedChars) break;
+      messages.push(...produced);
+      projectedChars += chars;
+      sourceBytes += bytes;
+      end = index + 1;
+    }
+    return {
+      messages: dedupeMessages(messages).sort(compareChatDisplayOrder),
+      range: { start, end },
+      sourceBytes,
+      projectedChars,
+    };
+  }
+
+  /** @deprecated Use iterateFullHistory with a bounded consumer. */
+  async exportFullHistory(conversation: Conversation, vaultPath: string | null): Promise<ChatMessage[]> {
+    const messages: ChatMessage[] = [];
+    for await (const chunk of this.iterateFullHistory(conversation, vaultPath, {
+      maxTurnsPerChunk: 100,
+      maxSourceBytesPerChunk: 8 * 1024 * 1024,
+      maxProjectedCharsPerChunk: 2 * 1024 * 1024,
+      projectionLevel: 'detail',
+    })) messages.push(...chunk.messages);
+    return messages;
   }
 
   async deleteConversationSession(

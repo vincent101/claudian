@@ -11,6 +11,9 @@ import type { SDKNativeMessage } from '@/providers/claude/history/sdkHistoryType
 const fixtureDir = join(process.env.TMPDIR ?? '/tmp', `claudian-display-order-${process.pid}`);
 const sessionId = 'display-order-fixture';
 const oversizeSessionId = 'display-order-oversize-fixture';
+const firstSegmentId = 'display-order-first-segment';
+const missingSegmentId = 'display-order-missing-segment';
+const thirdSegmentId = 'display-order-third-segment';
 const turnCount = 6;
 
 // Real modules everywhere; only session-path resolution is redirected into a
@@ -89,6 +92,8 @@ describe('HistoryDisplayOrderMaterialization with the real materialization chain
   beforeAll(async () => {
     await writeSmallTurnsFixture();
     await writeOversizeMarkerFixture();
+    await writeFile(join(fixtureDir, `${firstSegmentId}.jsonl`), `${JSON.stringify({ type: 'user', uuid: 'first-u', parentUuid: null, message: { content: 'first' } })}\n`);
+    await writeFile(join(fixtureDir, `${thirdSegmentId}.jsonl`), `${JSON.stringify({ type: 'user', uuid: 'third-u', parentUuid: null, message: { content: 'third' } })}\n`);
   });
 
   afterAll(async () => {
@@ -181,6 +186,27 @@ describe('HistoryDisplayOrderMaterialization with the real materialization chain
       expect(message.displayOrder).toEqual(hydratedOrderById.get(message.id));
     }
     expect(fullWindow.messages).toHaveLength(canonicalIds.length);
+  });
+
+  it('preserves missing-session ordinal holes across hydration and iterator materialization', async () => {
+    const source: Conversation = {
+      ...conversation(), id: 'segmented', sessionId: thirdSegmentId,
+      providerState: { previousProviderSessionIds: [firstSegmentId, missingSegmentId], providerSessionId: thirdSegmentId },
+    };
+    const service = new ClaudeConversationHistoryService();
+    const hydrated = (await Promise.all([firstSegmentId, thirdSegmentId].map(async (id, presentIndex) => {
+      const ordinal = presentIndex === 0 ? 0 : 2;
+      const entries = readFileSync(join(fixtureDir, `${id}.jsonl`), 'utf8')
+        .split('\n').filter(Boolean).map(line => JSON.parse(line) as SDKNativeMessage);
+      return materializeSDKMessages(fixtureDir, id, filterActiveBranch(entries, undefined), entries, ordinal);
+    }))).flat();
+    const iterated = [];
+    for await (const page of service.iterateFullHistory(source, fixtureDir, {
+      maxTurnsPerChunk: 10, maxSourceBytesPerChunk: 100_000, maxProjectedCharsPerChunk: 100_000, projectionLevel: 'detail',
+    })) iterated.push(...page.messages);
+    const hydrateById = new Map(hydrated.map(message => [message.id, message.displayOrder]));
+    expect(iterated.map(message => message.displayOrder)).toEqual(iterated.map(message => hydrateById.get(message.id)));
+    expect(iterated.find(message => message.id === 'third-u')?.displayOrder?.[0]).toBe(2);
   });
 
   it('keeps an oversized turn marker inside its turn when an older window is prepended', async () => {

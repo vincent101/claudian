@@ -412,12 +412,59 @@ export interface HistorySearchResult {
   status?: 'projection_mismatch';
 }
 
+export interface FullHistoryIterationOptions {
+  maxTurnsPerChunk: number;
+  maxSourceBytesPerChunk: number;
+  maxProjectedCharsPerChunk: number;
+  projectionLevel: 'detail';
+  signal?: AbortSignal;
+}
+
+export interface FullHistoryChunk {
+  messages: ChatMessage[];
+  range: LoadedTurnRange;
+  sourceBytes: number;
+  done: boolean;
+}
+
+export type FullHistoryIterable = AsyncIterable<FullHistoryChunk>;
+
+export interface WritableLike {
+  write(text: string): Promise<void>;
+  close?(): Promise<void>;
+  abort?(reason?: unknown): Promise<void>;
+}
+
+export class HistoryEntryTooLargeError extends Error {
+  constructor(
+    readonly turnIndex: number,
+    readonly sourceBytes: number,
+    readonly projectedChars: number | null,
+  ) {
+    super(`History turn ${turnIndex} exceeds the full-history iteration budget`);
+    this.name = 'HistoryEntryTooLargeError';
+  }
+}
+
+export type HistorySourceUnavailableReason =
+  | 'vault_unavailable'
+  | 'session_unavailable'
+  | 'transcript_unavailable';
+
+export class HistorySourceUnavailableError extends Error {
+  constructor(readonly reason: HistorySourceUnavailableReason) {
+    super(`Conversation history source is unavailable: ${reason}`);
+    this.name = 'HistorySourceUnavailableError';
+  }
+}
+
 export interface HistoryIndexLease {
   conversationId: string;
   /** Fixed total from the index snapshot acquired for this lease. */
   totalTurns: number;
   ready: Promise<void>;
   search(query: string): Promise<HistorySearchResult[]>;
+  /** @deprecated A2 removes this UI-bypass API after legacy callers migrate. */
   loadRange(startInclusive: number, endExclusive: number): Promise<HistoryRangePage>;
   /**
    * Budget-bounded window materialization for interactive UI. `loadRange` stays
@@ -481,6 +528,12 @@ export interface ProviderConversationHistoryService {
     onProgress?: (progress: HistoryLoadProgress) => void,
     forceNewSnapshot?: boolean,
   ): HistoryIndexLease;
+  iterateFullHistory?(
+    conversation: Conversation,
+    vaultPath: string | null,
+    options: FullHistoryIterationOptions,
+  ): FullHistoryIterable;
+  /** @deprecated Use iterateFullHistory with a bounded consumer. */
   exportFullHistory?(
     conversation: Conversation,
     vaultPath: string | null,
