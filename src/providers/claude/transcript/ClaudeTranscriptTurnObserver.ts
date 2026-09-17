@@ -38,6 +38,10 @@ export class ClaudeTranscriptTurnObserver {
   private active: PendingTurn | null = null;
   private embeddedQueue: AutoTurnStartedEvent[] = [];
   private hostUserTurnId: string | null = null;
+  /** 2.5.1 残余 a: host user turn was cancelled — CLI interrupt already
+   * killed the pipeline, so turns promoting after the cancel can never see
+   * their result line and must be settled deterministically. */
+  private hostCancelled = false;
   private consumeChain: Promise<void> = Promise.resolve();
   private quietTimer: ReturnType<typeof setTimeout> | null = null;
   private stopped = true;
@@ -51,6 +55,7 @@ export class ClaudeTranscriptTurnObserver {
   async start(filePath: string, fromOffset?: number): Promise<void> {
     this.stop('session_switch');
     this.stopped = false;
+    this.hostCancelled = false;
     const generation = ++this.generation;
     this.mapper.reset(generation);
     this.reader = new ClaudeTranscriptTailReader(filePath, undefined, undefined, error => {
@@ -86,6 +91,9 @@ export class ClaudeTranscriptTurnObserver {
 
   beginUserTurnProjection(turnId: string): void {
     this.hostUserTurnId = turnId;
+    // A new host user turn is live CLI work: a previous cancel no longer
+    // constrains turns that promote behind it.
+    this.hostCancelled = false;
   }
 
   async completeUserTurnProjection(turnId: string): Promise<void> {
@@ -189,15 +197,19 @@ export class ClaudeTranscriptTurnObserver {
   }
 
   /**
-   * 2.5.1 F3: user-cancel hook. The CLI's trailing result line is not a
-   * reliable settlement signal after an interrupt — the SDK ignores interrupt
-   * while blocked on canUseTool, and an abandoned turn may never run at all
-   * (2026-09-17 18:22 ghost lease). Terminate the promoted turn here so the
-   * feature auto lease finishes exactly once; a late transcript result for the
-   * same turn finds no pending record and is dropped. Mirrors the drainActive
-   * interrupted shape: cancelled first, then the release pump.
+   * 2.5.1 F3 + 残余 a: user-cancel hook. The CLI's trailing result line is
+   * not a reliable settlement signal after an interrupt — the SDK ignores
+   * interrupt while blocked on canUseTool, and an abandoned turn may never
+   * run at all (2026-09-17 18:22 ghost lease). Settle the promoted turn here
+   * so the feature auto lease finishes exactly once; a late transcript result
+   * for the same turn finds no pending record and is dropped. The latch also
+   * covers the promote-after-cancel race: at ESC time the dead turn may still
+   * sit in the FIFO (started() rejected and re-queued behind the user turn),
+   * so the cancel is latched and every turn promoting later is settled in
+   * promote() after draining its buffered content.
    */
   interruptActiveTurn(reason: string): void {
+    this.hostCancelled = true;
     if (!this.active) return;
     const turnId = this.active.started.turnId;
     this.abandonActiveTurn(reason);
@@ -216,6 +228,17 @@ export class ClaudeTranscriptTurnObserver {
       return;
     }
     await this.drainActive();
+    // 残余 a (promote-after-cancel): the latch means the host turn was
+    // cancelled and the CLI pipeline is dead — this turn will never see its
+    // result line. Its buffered content was just drained (kept in the
+    // projection); settle it now and keep promoting so the whole FIFO closes
+    // turn by turn instead of stranding the feature lease (18:22 ghost).
+    if (this.active === pending && this.hostCancelled) {
+      const turnId = pending.started.turnId;
+      this.abandonActiveTurn('user_cancel');
+      this.callbacks.released(turnId);
+      await this.promote();
+    }
   }
 
   private async drainActive(): Promise<void> {

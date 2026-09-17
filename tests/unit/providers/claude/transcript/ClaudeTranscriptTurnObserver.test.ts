@@ -17,6 +17,15 @@ function peerTurn(id: string, text: string, complete = true): string[] {
   return lines;
 }
 
+/** Task-notification turns keep showUser:false, so they queue behind a busy
+ * host user turn instead of becoming embedded bubbles (the 18:22 dead-turn shape). */
+function notificationTurn(id: string, text: string): string[] {
+  return [
+    JSON.stringify({ type: 'user', uuid: id, origin: { kind: 'task-notification' }, message: { role: 'user', content: text } }),
+    JSON.stringify({ type: 'assistant', uuid: `${id}-a1`, message: { id: `${id}-m1`, role: 'assistant', content: [{ type: 'text', text: 'working' }], stop_reason: 'tool_use' } }),
+  ];
+}
+
 describe('ClaudeTranscriptTurnObserver', () => {
   let dir: string;
   let file: string;
@@ -218,6 +227,69 @@ describe('ClaudeTranscriptTurnObserver', () => {
       reason: 'observer_stopped',
       interrupted: true,
     });
+  });
+
+  it('settles queued turns promoted after a user cancel deterministically, keeping drained content (2.5.1 残余 a)', async () => {
+    // 2026-09-17 18:22 exact pattern: at ESC time the dead auto turn is still
+    // in the FIFO (the user turn holds the feature lease, every promote
+    // attempt's started() is rejected and the turn re-queued), so
+    // interruptActiveTurn is a no-op; the cancel barrier handoff then frees
+    // the lease and promotes the dead turn onto it — no result line will ever
+    // come. The cancel latch must settle each promoted turn after draining its
+    // buffered content.
+    await writeFile(file, '');
+    let featureLeaseFree = false;
+    const order: string[] = [];
+    const callbacks = {
+      started: jest.fn((event: { turnId: string }) => { order.push(`start:${event.turnId}`); return featureLeaseFree; }),
+      chunk: jest.fn(async (event: { turnId: string; chunk: { type: string } }) => { order.push(`chunk:${event.turnId}:${event.chunk.type}`); }),
+      finished: jest.fn(async (event: { turnId: string }) => { order.push(`finish:${event.turnId}`); }),
+      released: jest.fn((turnId: string) => { order.push(`release:${turnId}`); }),
+      cancelled: jest.fn(),
+      projectEmbeddedExternal: jest.fn(async () => {}),
+    };
+    const observer = new ClaudeTranscriptTurnObserver(callbacks, () => true);
+    try {
+      await observer.start(file);
+      observer.beginUserTurnProjection('host');
+      const generation = (observer as any).generation;
+      await (observer as any).consumeBatch(
+        { lines: notificationTurn('notif-dead', 'bg task done'), reset: false },
+        generation,
+      );
+      // Promote was attempted and rejected (host user turn holds the feature
+      // lease): turn re-queued, nothing projected yet.
+      expect(callbacks.started).toHaveBeenCalledWith(expect.objectContaining({ turnId: 'notif-dead' }));
+      expect(callbacks.chunk).not.toHaveBeenCalled();
+
+      // ESC: no active turn in the observer yet — the latch is armed silently.
+      observer.interruptActiveTurn('user_cancel');
+      expect(callbacks.cancelled).not.toHaveBeenCalled();
+
+      // Cancel barrier handoff: the host user turn projection completes, the
+      // feature lease frees, the queued dead turn promotes.
+      featureLeaseFree = true;
+      await observer.completeUserTurnProjection('host');
+
+      // Deterministic settle: buffered content drained (kept), then exactly
+      // one cancelled+released pair for the promoted turn.
+      expect(order).toContain('chunk:notif-dead:text');
+      expect(callbacks.cancelled).toHaveBeenCalledTimes(1);
+      expect(callbacks.cancelled).toHaveBeenCalledWith({
+        turnId: 'notif-dead',
+        generation: generation + 1,
+        reason: 'user_cancel',
+        interrupted: true,
+      });
+      expect(callbacks.released).toHaveBeenCalledTimes(1);
+      expect(callbacks.released).toHaveBeenCalledWith('notif-dead');
+      // Queue drained, no residual active turn: the lease is free for the
+      // next turn.
+      expect((observer as any).queue).toHaveLength(0);
+      expect((observer as any).active).toBeNull();
+    } finally {
+      observer.stop();
+    }
   });
 
   it('deterministically settles the active turn on user cancel, exactly once, and drops its late result (2.5.1 F3)', async () => {
