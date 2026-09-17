@@ -55,8 +55,6 @@ export interface ChatRuntime {
   setHistoryRecoverySource?(source: (() => FullHistoryIterable) | null): void;
   onHistoryRecoveryStateChange?(listener: (state: HistoryRecoveryStatus) => void): () => void;
   retryHistoryRecovery?(generation: number): boolean;
-  /** @deprecated Use setHistoryRecoverySource. */
-  setFullHistoryExporter?(exporter: (() => Promise<ChatMessage[]>) | null): void;
   resetSession(): void;
   getSessionId(): string | null;
   consumeSessionInvalidation(): boolean;

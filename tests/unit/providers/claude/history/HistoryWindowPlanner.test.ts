@@ -81,6 +81,18 @@ describe('planHistoryWindow', () => {
     expect(plan).toMatchObject({ start: 8, end: 13, oversizedAnchor: false });
   });
 
+  it('keeps the anchor and stays centered when byte sizes are asymmetric', () => {
+    const sizes = [6 * MiB, 1 * MiB, 1 * MiB, 1 * MiB, 6 * MiB];
+    const plan = planHistoryWindow(sizes, {
+      anchorTurn: 2,
+      direction: 'around',
+      budget: budget({ maxTurns: 5, maxSourceBytes: 4 * MiB }),
+    });
+    expect(plan).toMatchObject({ start: 1, end: 4, oversizedAnchor: false });
+    expect(plan.start).toBeLessThanOrEqual(2);
+    expect(plan.end).toBeGreaterThan(2);
+  });
+
   it('keeps a single oversized anchor turn for around-direction requests', () => {
     const sizes = Array.from({ length: 10 }, () => 1024);
     sizes[5] = 20 * MiB;

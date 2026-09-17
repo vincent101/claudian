@@ -252,7 +252,6 @@ export class ClaudianService implements ChatRuntime {
   private transcriptObserverRestartChain: Promise<void> = Promise.resolve();
   private transcriptObserverStartOffset: number | null = null;
   private historyRecoverySource: (() => FullHistoryIterable) | null = null;
-  private fullHistoryExporter: (() => Promise<ChatMessage[]>) | null = null;
   private transcriptDiagnosticLog: ClaudeTranscriptDiagnosticLog | null = null;
 
   // S1 turn-lease base: live turn registry keyed by turnId. All transform,
@@ -1707,7 +1706,7 @@ export class ClaudianService implements ChatRuntime {
     );
     const prompt = normalized.encodedTurn.prompt;
     const images = normalized.request.images;
-    let conversationHistory = normalized.conversationHistory;
+    const conversationHistory = normalized.conversationHistory;
     const queryOptions = normalized.queryOptions;
     let streamedRecoveryContext: string | null = null;
     let streamedRecoveryLastUser: ChatMessage | null = null;
@@ -1718,8 +1717,6 @@ export class ClaudianService implements ChatRuntime {
       for await (const chunk of this.historyRecoverySource()) accumulator.appendChunk(chunk);
       streamedRecoveryContext = accumulator.build();
       streamedRecoveryLastUser = accumulator.getLastUserMessage();
-    } else if (this.sessionManager.needsHistoryRebuild() && this.fullHistoryExporter) {
-      conversationHistory = await this.fullHistoryExporter();
     }
 
     // v4 §2.1: the user turnId comes from the feature layer (PreparedChatTurn).
@@ -2505,11 +2502,6 @@ export class ClaudianService implements ChatRuntime {
 
   retryHistoryRecovery(generation: number): boolean {
     return this.sessionManager.retryHistoryRecovery(generation);
-  }
-
-  /** @deprecated Use setHistoryRecoverySource. */
-  setFullHistoryExporter(exporter: (() => Promise<ChatMessage[]>) | null): void {
-    this.fullHistoryExporter = exporter;
   }
 
   private restartTranscriptObserver(sessionId: string | null): void {

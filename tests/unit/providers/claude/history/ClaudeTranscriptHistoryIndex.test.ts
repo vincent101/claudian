@@ -197,7 +197,7 @@ describe('ClaudeTranscriptHistoryIndex', () => {
     clearTranscriptIndexCache();
     const paths: string[] = [];
     try {
-      for (let index = 0; index < 3; index += 1) {
+      for (let index = 0; index < 9; index += 1) {
         const path = join(process.env.TMPDIR ?? '/tmp', `claudian-cache-diag-${process.pid}-${index}.jsonl`);
         paths.push(path);
         await writeFile(path, `${JSON.stringify({ type: 'user', uuid: `u${index}`, message: { content: 'x' } })}\n`);
@@ -224,31 +224,40 @@ describe('ClaudeTranscriptHistoryIndex', () => {
     expect(second).toBe(first);
   });
 
-  it('keeps at most two unprotected completed indexes', async () => {
+  it('keeps at most eight unprotected completed indexes', async () => {
     clearTranscriptIndexCache();
-    for (let index = 0; index < 3; index += 1) {
+    for (let index = 0; index < 9; index += 1) {
       const path = join(process.env.TMPDIR ?? '/tmp', `claudian-lru-${process.pid}-${index}.jsonl`);
       await writeFile(path, `${JSON.stringify({ type: 'user', uuid: `u${index}`, message: { content: 'x' } })}\n`);
       await buildTranscriptIndex(path, { useWorker: false });
     }
-    expect(getTranscriptIndexCacheSize()).toBeLessThanOrEqual(2);
+    expect(getTranscriptIndexCacheSize()).toBeLessThanOrEqual(8);
   });
 
-  it('keeps the cache bound when more than two paths are protected', async () => {
+  it('never evicts protected indexes and shrinks immediately after release', async () => {
     clearTranscriptIndexCache();
+    const events: TranscriptIndexDiagnosticEvent[] = [];
+    setTranscriptIndexDiagnosticSink(event => events.push(event));
     const paths: string[] = [];
     try {
-      for (let index = 0; index < 3; index += 1) {
+      for (let index = 0; index < 10; index += 1) {
         const path = join(process.env.TMPDIR ?? '/tmp', `claudian-protected-lru-${process.pid}-${index}.jsonl`);
         paths.push(path);
         protectTranscriptIndex(path);
         await writeFile(path, `${JSON.stringify({ type: 'user', uuid: `p${index}`, message: { content: 'x' } })}\n`);
         await buildTranscriptIndex(path, { useWorker: false });
       }
-      expect(getTranscriptIndexCacheSize()).toBeLessThanOrEqual(2);
+      expect(getTranscriptIndexCacheSize()).toBe(10);
+      expect(events.some(event => event.phase === 'cache_overcommit')).toBe(true);
+      for (const path of paths) {
+        const result = await buildTranscriptIndex(path, { useWorker: false });
+        expect(result.status).toBe('complete');
+      }
     } finally {
       for (const path of paths) releaseTranscriptIndex(path);
+      setTranscriptIndexDiagnosticSink(null);
     }
+    expect(getTranscriptIndexCacheSize()).toBeLessThanOrEqual(8);
   });
 
   it('deduplicates concurrent worker builds for the same snapshot', async () => {
