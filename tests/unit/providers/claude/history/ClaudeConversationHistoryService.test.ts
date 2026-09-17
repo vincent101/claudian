@@ -113,7 +113,7 @@ describe('ClaudeConversationHistoryService M1 fuse', () => {
     expect(mockBuildTranscriptIndex).not.toHaveBeenCalled();
   });
 
-  it('shares one build across leases and loads exact stateless ranges', async () => {
+  it('shares one build across leases and loads stateless windows', async () => {
     const turns = Array.from({ length: 120 }, (_, index) => ({ turnId: `u${index}`, startEntry: index, endEntry: index, sourceBytes: 1024 }));
     mockBuildTranscriptIndex.mockResolvedValue({ status: 'complete', index: { filePath: '/current', dev: 1, ino: 1, snapshotSize: 999, mtimeMs: 1, entries: [], turns, searchCorpus: [], searchText: '', skippedLines: 0, buildDurationMs: 1, peakWorkerHeapBytes: 1 } });
     mockSdkSessionExists.mockImplementation((_vault, session) => session === 'current-session');
@@ -122,10 +122,11 @@ describe('ClaudeConversationHistoryService M1 fuse', () => {
     const first = service.acquireHistoryIndex(conversation, '/vault'); const second = service.acquireHistoryIndex(conversation, '/vault');
     await first.ready; await second.ready;
     expect(mockBuildTranscriptIndex).toHaveBeenCalledTimes(1); expect(first.totalTurns).toBe(120);
-    await first.loadRange(70, 120);
-    expect(mockMaterializeTranscriptPage).toHaveBeenCalledWith(expect.anything(), 70, 50);
-    await expect(first.loadRange(-1, 2)).rejects.toThrow(RangeError);
-    first.release(); first.release(); await expect(second.loadRange(0, 1)).resolves.toBeDefined(); second.release();
+    await first.loadWindow({ anchorTurn: 120, direction: 'older', budget: { maxTurns: 50, maxSourceBytes: 1024 * 1024, maxProjectedChars: 1024 * 1024, timeSliceMs: 8 }, projectionLevel: 'detail' });
+    expect(mockMaterializeTranscriptPage).toHaveBeenCalledWith(expect.anything(), 70, 1);
+    first.release(); first.release();
+    await expect(second.loadWindow({ anchorTurn: 1, direction: 'older', budget: { maxTurns: 1, maxSourceBytes: 1024, maxProjectedChars: 1024, timeSliceMs: 8 }, projectionLevel: 'detail' })).resolves.toBeDefined();
+    second.release();
   });
 
   it('enumerates every non-overlapping match with stable projection ordinals', async () => {
@@ -254,7 +255,7 @@ describe('ClaudeConversationHistoryService M1 fuse', () => {
       const lease = service.acquireHistoryIndex(createConversation(), '/vault');
       await lease.ready;
 
-      const page = await lease.loadWindow!({ anchorTurn: 30, direction: 'older', budget: budget(), projectionLevel: 'summary' });
+      const page = await lease.loadWindow({ anchorTurn: 30, direction: 'older', budget: budget(), projectionLevel: 'summary' });
 
       // 25 x 1 MiB exceeds the 8 MiB byte budget, so bytes bind before turns.
       expect(page.range).toEqual({ start: 22, end: 30 });
@@ -304,7 +305,7 @@ describe('ClaudeConversationHistoryService M1 fuse', () => {
       const lease = service.acquireHistoryIndex(createConversation(), '/vault');
       await lease.ready;
 
-      const page = await lease.loadWindow!({ anchorTurn: 3, direction: 'older', budget: budget(), projectionLevel: 'summary' });
+      const page = await lease.loadWindow({ anchorTurn: 3, direction: 'older', budget: budget(), projectionLevel: 'summary' });
 
       expect(page.range).toEqual({ start: 2, end: 3 });
       expect(page.oversizedTurnCount).toBe(1);
@@ -337,7 +338,7 @@ describe('ClaudeConversationHistoryService M1 fuse', () => {
       const lease = service.acquireHistoryIndex(createConversation(), '/vault');
       await lease.ready;
 
-      const page = await lease.loadWindow!({ anchorTurn: 30, direction: 'older', budget: budget(), projectionLevel: 'summary' });
+      const page = await lease.loadWindow({ anchorTurn: 30, direction: 'older', budget: budget(), projectionLevel: 'summary' });
 
       // Two 1M-char turns fit the 2M budget; the third would exceed it.
       expect(page.range).toEqual({ start: 28, end: 30 });
@@ -358,7 +359,7 @@ describe('ClaudeConversationHistoryService M1 fuse', () => {
       const lease = service.acquireHistoryIndex(createConversation(), '/vault');
       await lease.ready;
 
-      const page = await lease.loadWindow!({ anchorTurn: 3, direction: 'older', budget: budget({ maxProjectedChars: 1000 }), projectionLevel: 'summary' });
+      const page = await lease.loadWindow({ anchorTurn: 3, direction: 'older', budget: budget({ maxProjectedChars: 1000 }), projectionLevel: 'summary' });
 
       // The oversized anchor turn is included as a summary projection, not an empty page.
       expect(page.range).toEqual({ start: 2, end: 3 });
@@ -389,7 +390,7 @@ describe('ClaudeConversationHistoryService M1 fuse', () => {
       const lease = service.acquireHistoryIndex(createConversation(), '/vault');
       await lease.ready;
 
-      const page = await lease.loadWindow!({ anchorTurn: 1, direction: 'older', budget: budget({ maxProjectedChars: 1000 }), projectionLevel: 'summary' });
+      const page = await lease.loadWindow({ anchorTurn: 1, direction: 'older', budget: budget({ maxProjectedChars: 1000 }), projectionLevel: 'summary' });
 
       // Oversized source turn: hard-capped to the budget, shells kept.
       expect(page.range).toEqual({ start: 0, end: 1 });
@@ -412,7 +413,7 @@ describe('ClaudeConversationHistoryService M1 fuse', () => {
       const lease = service.acquireHistoryIndex(createConversation(), '/vault');
       await lease.ready;
 
-      const page = await lease.loadWindow!({ anchorTurn: 1, direction: 'older', budget: budget({ maxProjectedChars: 1000 }), projectionLevel: 'summary' });
+      const page = await lease.loadWindow({ anchorTurn: 1, direction: 'older', budget: budget({ maxProjectedChars: 1000 }), projectionLevel: 'summary' });
 
       expect(page.range).toEqual({ start: 0, end: 1 });
       expect(page.projectedChars).toBeLessThanOrEqual(1000);
@@ -435,7 +436,7 @@ describe('ClaudeConversationHistoryService M1 fuse', () => {
       await lease.ready;
       expect(lease.totalTurns).toBe(15);
 
-      const page = await lease.loadWindow!({ anchorTurn: 15, direction: 'older', budget: budget(), projectionLevel: 'summary' });
+      const page = await lease.loadWindow({ anchorTurn: 15, direction: 'older', budget: budget(), projectionLevel: 'summary' });
 
       expect(page.range).toEqual({ start: 7, end: 15 });
       expect(mockMaterializeTranscriptPage).toHaveBeenCalledTimes(8);
@@ -480,7 +481,7 @@ describe('ClaudeConversationHistoryService M1 fuse', () => {
       const lease = service.acquireHistoryIndex(createConversation(), '/vault');
       await lease.ready;
 
-      const page = await lease.loadWindow!({ anchorTurn: 3, direction: 'older', budget: budget(), projectionLevel: 'summary' });
+      const page = await lease.loadWindow({ anchorTurn: 3, direction: 'older', budget: budget(), projectionLevel: 'summary' });
 
       // The window loop materializes newest-first; only the canonical
       // displayOrder key restores the ascending structural order (identical
@@ -506,7 +507,7 @@ describe('ClaudeConversationHistoryService M1 fuse', () => {
       const lease = service.acquireHistoryIndex(createConversation(), '/vault');
       await lease.ready;
 
-      await lease.loadWindow!({ anchorTurn: 1, direction: 'older', budget: budget(), projectionLevel: 'summary' });
+      await lease.loadWindow({ anchorTurn: 1, direction: 'older', budget: budget(), projectionLevel: 'summary' });
 
       // The summary projection must keep the skipped entry's canonical slot:
       // placeholder between its neighbors, turn marker last — never a

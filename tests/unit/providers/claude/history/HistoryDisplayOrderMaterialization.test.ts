@@ -100,13 +100,30 @@ describe('HistoryDisplayOrderMaterialization with the real materialization chain
     await rm(fixtureDir, { recursive: true, force: true });
   });
 
+  it('loads one exact projection by descriptor without materializing its whole turn', async () => {
+    const service = new ClaudeConversationHistoryService();
+    const lease = service.acquireHistoryIndex(conversation(), fixtureDir);
+    await lease.ready;
+
+    const detail = await lease.loadMessageDetail('u3', { maxSourceBytes: 16 * 1024 * 1024 });
+    expect(detail).toMatchObject({
+      status: 'exact',
+      message: { id: 'u3', content: 'Question 3', projectionLevel: 'detail', historyTurnOrdinal: 3 },
+    });
+    await expect(lease.loadMessageDetail('missing', { maxSourceBytes: 16 * 1024 * 1024 }))
+      .resolves.toEqual({ status: 'not_found' });
+    await expect(lease.loadMessageDetail('u3', { maxSourceBytes: 1 }))
+      .resolves.toEqual({ status: 'too_large' });
+    lease.release();
+  });
+
   it('orders a multi-turn loadWindow page ascending without duplicate keys', async () => {
     const service = new ClaudeConversationHistoryService();
     const lease = service.acquireHistoryIndex(conversation(), fixtureDir);
     await lease.ready;
     expect(lease.totalTurns).toBe(turnCount);
 
-    const page = await lease.loadWindow!({
+    const page = await lease.loadWindow({
       anchorTurn: lease.totalTurns,
       direction: 'older',
       budget: looseBudget,
@@ -129,15 +146,19 @@ describe('HistoryDisplayOrderMaterialization with the real materialization chain
     expect(new Set(orders.map(order => order.join(':'))).size).toBe(orders.length);
   });
 
-  it('merges an older loadRange page behind the newest one without interleaving', async () => {
+  it('merges an older window behind the newest one without interleaving', async () => {
     const service = new ClaudeConversationHistoryService();
     const lease = service.acquireHistoryIndex(conversation(), fixtureDir);
     await lease.ready;
 
     // Newest page first (first screen), then the older page prepend — the
     // exact merge ConversationController performs on "load earlier".
-    const newestPage = await lease.loadRange(3, 6);
-    const olderPage = await lease.loadRange(0, 3);
+    const newestPage = await lease.loadWindow({
+      anchorTurn: 6, direction: 'older', budget: { ...looseBudget, maxTurns: 3 }, projectionLevel: 'detail',
+    });
+    const olderPage = await lease.loadWindow({
+      anchorTurn: 3, direction: 'older', budget: { ...looseBudget, maxTurns: 3 }, projectionLevel: 'detail',
+    });
     lease.release();
 
     const combined = [...newestPage.messages, ...olderPage.messages].sort(compareChatDisplayOrder);
@@ -151,7 +172,7 @@ describe('HistoryDisplayOrderMaterialization with the real materialization chain
     const lease = service.acquireHistoryIndex(conversation(), fixtureDir);
     await lease.ready;
 
-    const fullWindow = await lease.loadWindow!({
+    const fullWindow = await lease.loadWindow({
       anchorTurn: lease.totalTurns,
       direction: 'older',
       budget: looseBudget,
@@ -159,13 +180,15 @@ describe('HistoryDisplayOrderMaterialization with the real materialization chain
     });
     // A differently anchored window (search locate) re-materializes the same
     // turns through a different path; keys must be identical, not just ordered.
-    const aroundWindow = await lease.loadWindow!({
+    const aroundWindow = await lease.loadWindow({
       anchorTurn: 3,
       direction: 'around',
       budget: looseBudget,
       projectionLevel: 'summary',
     });
-    const paged = await lease.loadRange(0, 3);
+    const paged = await lease.loadWindow({
+      anchorTurn: 3, direction: 'older', budget: { ...looseBudget, maxTurns: 3 }, projectionLevel: 'detail',
+    });
     lease.release();
 
     // Hydration reference: readSDKSession shares a module with getSDKSessionPath
@@ -209,6 +232,25 @@ describe('HistoryDisplayOrderMaterialization with the real materialization chain
     expect(iterated.find(message => message.id === 'third-u')?.displayOrder?.[0]).toBe(2);
   });
 
+  it('keeps the around anchor when projected-char shrink removes distant endpoints', async () => {
+    const service = new ClaudeConversationHistoryService();
+    const lease = service.acquireHistoryIndex(conversation(), fixtureDir);
+    await lease.ready;
+
+    const page = await lease.loadWindow({
+      anchorTurn: 3,
+      direction: 'around',
+      budget: { ...looseBudget, maxTurns: 5, maxProjectedChars: 40 },
+      projectionLevel: 'summary',
+    });
+    lease.release();
+
+    expect(page.range.start).toBeLessThanOrEqual(3);
+    expect(page.range.end).toBeGreaterThan(3);
+    expect(page.messages.some(message => message.id === 'u3')).toBe(true);
+    expect(page.projectedChars).toBeLessThanOrEqual(40);
+  });
+
   it('keeps an oversized turn marker inside its turn when an older window is prepended', async () => {
     const pagingBudget = { ...looseBudget, maxSourceBytes: 256 * 1024 };
     const service = new ClaudeConversationHistoryService();
@@ -226,14 +268,14 @@ describe('HistoryDisplayOrderMaterialization with the real materialization chain
     // ConversationController.loadOlderWindow sequence. The oversized turn only
     // enters through the prepended older window, so its turn marker must not
     // tie with the already-loaded next turn's opener key.
-    const first = await lease.loadWindow!({
+    const first = await lease.loadWindow({
       anchorTurn: lease.totalTurns,
       direction: 'older',
       budget: pagingBudget,
       projectionLevel: 'summary',
     });
     expect(first.range).toEqual({ start: 1, end: 2 });
-    const older = await lease.loadWindow!({
+    const older = await lease.loadWindow({
       anchorTurn: first.range.start,
       direction: 'older',
       budget: pagingBudget,

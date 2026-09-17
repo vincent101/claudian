@@ -76,7 +76,7 @@ describe('HistoryBudgetMaterialization on a ~71MB giant session', () => {
     expect(lease.totalTurns).toBe(7);
     // Every turn is ~10 MB, so the fixed-50-turn path would materialize the
     // whole file; the budget window must not.
-    const page = await lease.loadWindow!({
+    const page = await lease.loadWindow({
       anchorTurn: lease.totalTurns,
       direction: 'older',
       budget: HISTORY_RESOURCE_POLICY.firstScreen,
@@ -122,13 +122,13 @@ describe('HistoryBudgetMaterialization on a ~71MB giant session', () => {
     const lease = service.acquireHistoryIndex(giantConversation(), '/vault');
     await lease.ready;
 
-    const first = await lease.loadWindow!({
+    const first = await lease.loadWindow({
       anchorTurn: lease.totalTurns,
       direction: 'older',
       budget: HISTORY_RESOURCE_POLICY.paging,
       projectionLevel: 'summary',
     });
-    const second = await lease.loadWindow!({
+    const second = await lease.loadWindow({
       anchorTurn: first.range.start,
       direction: 'older',
       budget: HISTORY_RESOURCE_POLICY.paging,
