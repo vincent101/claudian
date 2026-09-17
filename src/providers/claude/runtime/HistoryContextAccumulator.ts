@@ -55,7 +55,12 @@ export class HistoryContextAccumulator {
 }
 
 export function recoveryCharacterBudget(contextTokens: number): number {
-  // Four chars/token is the existing conservative approximation; half the
-  // window remains available for system/current prompts, tools and output.
-  return Math.max(16_384, Math.floor(contextTokens * 4 * 0.5));
+  // 2 chars/token is a conservative first-pass coefficient for this
+  // Chinese-heavy vault: CJK averages roughly 1-2 chars per token, so 2
+  // bounds the projection from above — underestimating the token cost of a
+  // recovery injection would overshoot the context window and trip the
+  // breaker on large sessions. Half the window remains available for
+  // system/current prompts, tools and output. TODO: calibrate against real
+  // tokenizer measurements on this vault's transcripts.
+  return Math.max(16_384, Math.floor(contextTokens * 2 * 0.5));
 }

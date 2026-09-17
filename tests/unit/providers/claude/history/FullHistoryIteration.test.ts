@@ -79,4 +79,24 @@ describe('iterateFullHistory real materialization', () => {
     };
     await expect(consume()).rejects.toBeInstanceOf(HistoryEntryTooLargeError);
   });
+
+  it('propagates the abort reason instead of mislabeling it transcript_unavailable', async () => {
+    await writeFixture('abortreason', 3);
+    const service = new ClaudeConversationHistoryService();
+    const controller = new AbortController();
+    const reason = new Error('consumer cancelled');
+    const consume = async () => {
+      for await (const chunk of service.iterateFullHistory(conversation('abortreason'), fixtureDir, {
+        maxTurnsPerChunk: 1, maxSourceBytesPerChunk: 10_000, maxProjectedCharsPerChunk: 10_000, projectionLevel: 'detail',
+        signal: controller.signal,
+      })) {
+        void chunk;
+        controller.abort(reason);
+      }
+    };
+    // An abort is a consumer-side cancellation, not a source failure — the
+    // reason must reach the caller as-is so cancel paths can be told apart
+    // from a genuinely missing transcript.
+    await expect(consume()).rejects.toBe(reason);
+  });
 });

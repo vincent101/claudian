@@ -955,6 +955,10 @@ export class ClaudeConversationHistoryService implements ProviderConversationHis
           }
         } catch (error) {
           if (error instanceof HistorySourceUnavailableError || error instanceof HistoryEntryTooLargeError) throw error;
+          // An abort is a consumer-side cancellation, not a source failure:
+          // rethrow the abort reason as-is so callers can tell a cancelled
+          // iteration apart from a genuinely missing transcript.
+          if (options.signal?.aborted) throw error;
           throw new HistorySourceUnavailableError('transcript_unavailable');
         } finally {
           options.signal?.removeEventListener('abort', abort);
