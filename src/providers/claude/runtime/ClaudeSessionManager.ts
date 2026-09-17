@@ -34,6 +34,14 @@ export class SessionManager {
   private nextGeneration(): number { return this.state.historyRecovery.generation + 1; }
 
   setSessionId(id: string | null, defaultModel?: ClaudeModel): void {
+    // Passive re-sync with an unchanged id (tab switch / external-context
+    // refresh via syncConversationState) is not a session change: clearing
+    // recovery state here would wipe pending injection between turns and
+    // silently dismiss a tripped banner. Only a real id change (incl.
+    // null↔non-null) resets the machine and bumps the generation.
+    if (this.state.sessionId === id) {
+      return;
+    }
     this.state.sessionId = id;
     this.state.sessionModel = id ? (defaultModel ?? null) : null;
     this.setRecovery({ status: 'idle', generation: this.nextGeneration() });

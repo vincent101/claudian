@@ -138,6 +138,44 @@ describe('SessionManager', () => {
       expect(manager.retryHistoryRecovery(oldGeneration)).toBe(false);
       expect(manager.getHistoryRecoveryState().status).toBe('idle');
     });
+
+    it('keeps pending recovery when setSessionId re-syncs the same id', () => {
+      // Passive re-sync (tab switch / external-context refresh) resolves the
+      // same session id — it is not a session change and must not clear the
+      // pending recovery, or recovery injection silently disappears.
+      manager.captureSession('old'); manager.captureSession('new');
+      expect(manager.needsHistoryRebuild()).toBe(true);
+
+      manager.setSessionId('new');
+
+      expect(manager.getHistoryRecoveryState().status).toBe('pending');
+      expect(manager.needsHistoryRebuild()).toBe(true);
+    });
+
+    it('keeps tripped recovery when setSessionId re-syncs the same id', () => {
+      // Only a new session, reset, fork or a matching manual retry may clear
+      // tripped — switching tabs away and back must not dismiss the banner.
+      manager.captureSession('old'); manager.captureSession('new');
+      const generation = manager.markRecoveryDispatched()!;
+      manager.confirmRecovery(generation, 'new', false);
+      manager.markRecoveryDispatched();
+      manager.confirmRecovery(generation, 'new', false);
+      expect(manager.getHistoryRecoveryState().status).toBe('tripped');
+
+      manager.setSessionId('new');
+
+      expect(manager.getHistoryRecoveryState().status).toBe('tripped');
+    });
+
+    it('still resets recovery when setSessionId changes the id', () => {
+      manager.captureSession('old'); manager.captureSession('new');
+      expect(manager.needsHistoryRebuild()).toBe(true);
+
+      manager.setSessionId('a-different-session');
+
+      expect(manager.getHistoryRecoveryState().status).toBe('idle');
+      expect(manager.needsHistoryRebuild()).toBe(false);
+    });
   });
 
   describe('session mismatch recovery', () => {

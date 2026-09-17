@@ -1389,6 +1389,16 @@ export class ClaudianService implements ChatRuntime {
     if (!turn) {
       return;
     }
+    // A cancelled turn can never receive its own result confirmation (its
+    // trailing result is dropped by the cancelled-phase gate in routeMessage),
+    // so its recovery dispatch must fail now: back to pending while the
+    // attempt budget lasts, tripped otherwise. Without this the state
+    // machine sticks in awaiting_result and recovery never re-runs
+    // (silent amnesia). Covers both the plain and the projection-barrier
+    // user-cancel paths (v3 §2.1: query interruption must not clear state).
+    if (turn.recoveryGeneration !== undefined) {
+      this.sessionManager.failRecoveryDispatch(turn.recoveryGeneration);
+    }
     if (turn.kind === 'user' && reason === 'user_cancel' && this._onAutoTurnStarted) {
       this.cancelUserTurnWithProjectionBarrier(turn, error);
       return;
@@ -2260,6 +2270,13 @@ export class ClaudianService implements ChatRuntime {
 
       for await (const message of response) {
         if (this.abortController?.signal.aborted) {
+          // Aborted mid-stream: the loop exits normally here — no catch, no
+          // result event — so without failing the dispatch the recovery
+          // state machine sticks in awaiting_result (v3 §2.1: query
+          // interruption must fall back to pending while budget remains).
+          if (turn.recoveryGeneration !== undefined) {
+            this.sessionManager.failRecoveryDispatch(turn.recoveryGeneration);
+          }
           await response.interrupt();
           break;
         }
