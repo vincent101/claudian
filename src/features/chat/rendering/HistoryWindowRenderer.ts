@@ -293,6 +293,7 @@ export class HistoryWindowRenderer {
     }
     this.options.clearPageReferences?.(record.messages ?? [], wrapper, record);
     this.options.invalidateDomEpoch?.();
+    intent.domEpoch = this.options.getDomEpoch();
     this.resizeObserver?.unobserve(wrapper);
     const spacer = document.createElement('div');
     spacer.className = 'claudian-history-page-spacer';
