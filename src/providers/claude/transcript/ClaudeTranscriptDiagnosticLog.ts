@@ -10,7 +10,8 @@ export type TranscriptDiagnosticPhase =
   | 'index_worker_fallback'
   | 'queued' | 'start' | 'progress' | 'finalize' | 'complete' | 'failed' | 'aborted' | 'stalled'
   | 'window_planned' | 'window_complete'
-  | 'cache_hit' | 'cache_evict' | 'cache_overcommit';
+  | 'cache_hit' | 'cache_evict' | 'cache_overcommit'
+  | 'page_render_timeout' | 'page_data_overcommit' | 'dom_overcommit';
 
 export interface TranscriptDiagnosticEvent {
   phase: TranscriptDiagnosticPhase;

@@ -1,4 +1,6 @@
 import type { UsageInfo } from '../../../core/types';
+import { recordHistoryRenderEvent } from '../history/HistoryDiagnostics';
+import { HistoryPageStore } from '../history/HistoryPageStore';
 import type {
   ChatMessage,
   ChatStateCallbacks,
@@ -19,6 +21,7 @@ function createInitialState(): ChatStateData {
     historyLoading: false,
     historyError: null,
     historySnapshotOffset: null,
+    historyPageStore: new HistoryPageStore({ onDiagnostic: recordHistoryRenderEvent }),
     isStreaming: false,
     cancelRequested: false,
     streamGeneration: 0,
@@ -113,6 +116,7 @@ export class ChatState {
   set historyError(value: string | null) { this.state.historyError = value; }
   get historySnapshotOffset(): number | null { return this.state.historySnapshotOffset; }
   set historySnapshotOffset(value: number | null) { this.state.historySnapshotOffset = value; }
+  get historyPageStore(): HistoryPageStore { return this.state.historyPageStore; }
 
   resetHistoryPagination(): void {
     this.state.historyLease?.release();
@@ -122,6 +126,7 @@ export class ChatState {
     this.state.historyLoading = false;
     this.state.historyError = null;
     this.state.historySnapshotOffset = null;
+    this.state.historyPageStore.clear();
   }
 
   truncateAt(messageId: string): number {

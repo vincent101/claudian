@@ -35,6 +35,7 @@ import { NavigationController } from '../controllers/NavigationController';
 import { SelectionController } from '../controllers/SelectionController';
 import { StreamController } from '../controllers/StreamController';
 import { TurnCoordinator } from '../controllers/TurnCoordinator';
+import { HistoryWindowRenderer } from '../rendering/HistoryWindowRenderer';
 import { MessageRenderer } from '../rendering/MessageRenderer';
 import { ProjectionWriteCoordinator } from '../rendering/ProjectionWriteCoordinator';
 import { cleanupThinkingBlock } from '../rendering/ThinkingBlockRenderer';
@@ -422,6 +423,7 @@ export function createTab(options: TabCreateOptions): TabData {
       navigationController: null,
       turnCoordinator: null,
       projectionWriteCoordinator: null,
+      historyWindowRenderer: null,
     },
     services: {
       subagentManager,
@@ -1325,6 +1327,7 @@ export function initializeTabControllers(
       getExternalContextSelector: () => ui.externalContextSelector,
       clearQueuedMessage: () => tab.controllers.inputController?.clearQueuedMessage(),
       getProjectionCoordinator: () => tab.controllers.projectionWriteCoordinator,
+      getHistoryWindowRenderer: () => tab.controllers.historyWindowRenderer,
       /**
        * S2 lifecycle cancellation: feature lease generation++ on reset/switch.
        * Also settles pending render flushes (turn-lease hotfix fix 3) so a
@@ -1439,6 +1442,53 @@ export function initializeTabControllers(
   // one arbitrates who may write the messagesEl projection (stored history
   // transactions vs live streaming turns), not turn ownership.
   tab.controllers.projectionWriteCoordinator = new ProjectionWriteCoordinator();
+  tab.controllers.historyWindowRenderer = new HistoryWindowRenderer({
+    root: dom.messagesEl,
+    viewport: dom.messagesEl,
+    pageStore: state.historyPageStore,
+    coordinator: tab.controllers.projectionWriteCoordinator,
+    getConversationId: () => state.currentConversationId,
+    getDomEpoch: () => tab.renderer?.domEpoch ?? 0,
+    isLive: () => state.isStreaming,
+    renderPage: (record, wrapper, ticket) => {
+      tab.renderer!.renderStoredPage(record.messages ?? [], wrapper);
+      for (const message of record.messages ?? []) {
+        const release = state.historyPageStore.registerRenderSlot(record.pageKey, ticket);
+        void tab.renderer!.waitForMessageContentRendered(message.id).finally(release);
+      }
+    },
+    clearPageReferences: (messages, wrapper, record) => {
+      wrapper.querySelectorAll<HTMLElement>('[data-message-id]').forEach(messageEl => {
+        const messageId = messageEl.dataset.messageId;
+        if (!messageId) return;
+        messageEl.querySelectorAll<HTMLElement>('[aria-expanded]').forEach((element, index) => {
+          state.historyPageStore.setUiState(record.pageKey, `${messageId}:expanded:${index}`, {
+            expanded: element.getAttribute('aria-expanded') === 'true',
+          });
+        });
+        messageEl.querySelectorAll<HTMLElement>('.claudian-text-block').forEach((element, index) => {
+          state.historyPageStore.setUiState(record.pageKey, `${messageId}:detail:${index}`, {
+            detailLoaded: !element.classList.contains('claudian-text-lazy'),
+          });
+        });
+      });
+      tab.renderer?.clearPageReferences(messages);
+    },
+    restorePageUiState: (wrapper, record) => {
+      wrapper.querySelectorAll<HTMLElement>('[data-message-id]').forEach(messageEl => {
+        const messageId = messageEl.dataset.messageId;
+        if (!messageId) return;
+        messageEl.querySelectorAll<HTMLElement>('[aria-expanded]').forEach((element, index) => {
+          if (record.uiState.get(`${messageId}:expanded:${index}`)?.expanded) element.click();
+        });
+        messageEl.querySelectorAll<HTMLElement>('.claudian-text-lazy-expand').forEach((element, index) => {
+          if (record.uiState.get(`${messageId}:detail:${index}`)?.detailLoaded) element.click();
+        });
+      });
+    },
+    rematerializePage: record => tab.controllers.conversationController?.rematerializeHistoryPage(record) ?? Promise.resolve(null),
+  });
+  tab.dom.eventCleanups.push(() => tab.controllers.historyWindowRenderer?.dispose());
 
   tab.controllers.autoTurnProjectionController = new AutoTurnProjectionController({
     state,

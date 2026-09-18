@@ -67,13 +67,19 @@ export default class ClaudianPlugin extends Plugin {
     const vaultPath = getVaultPath(this.app);
     if (vaultPath) {
       const renderDiagnostics = new ClaudeTranscriptDiagnosticLog(vaultPath, () => {}, 'history-render');
-      setHistoryRenderDiagnosticsSink(event => renderDiagnostics.record({
-        phase: event.kind === 'render_batch' ? 'render_batch' : 'render_complete',
-        batchLines: event.kind === 'render_batch' ? event.mounted : undefined,
-        entries: event.kind === 'render_batch' ? event.total : event.messages,
-        turns: event.kind === 'render_complete' ? event.batches : undefined,
-        elapsedMs: event.elapsedMs,
-      }));
+      setHistoryRenderDiagnosticsSink(event => {
+        if (event.kind === 'render_batch') {
+          renderDiagnostics.record({ phase: event.kind, batchLines: event.mounted, entries: event.total, elapsedMs: event.elapsedMs });
+        } else if (event.kind === 'render_complete') {
+          renderDiagnostics.record({ phase: event.kind, entries: event.messages, turns: event.batches, elapsedMs: event.elapsedMs });
+        } else if (event.kind === 'page_render_timeout') {
+          renderDiagnostics.record({ phase: event.kind, generation: event.ticket, elapsedMs: event.timeoutMs });
+        } else if (event.kind === 'page_data_overcommit') {
+          renderDiagnostics.record({ phase: event.kind, entries: event.pages, projectedChars: event.projectedWeight });
+        } else {
+          renderDiagnostics.record({ phase: event.kind, turns: event.turns });
+        }
+      });
     }
 
     this.registerView(

@@ -13,6 +13,7 @@ import type {
 import type { BrowserSelectionContext } from '../../../utils/browser';
 import type { CanvasSelectionContext } from '../../../utils/canvas';
 import type { EditorSelectionContext } from '../../../utils/editor';
+import type { HistoryPageStore } from '../history/HistoryPageStore';
 import type { ThinkingBlockState } from '../rendering/ThinkingBlockRenderer';
 import type { WriteEditState } from '../rendering/WriteEditRenderer';
 
@@ -53,6 +54,7 @@ export interface ChatStateData {
   historyLoading: boolean;
   historyError: string | null;
   historySnapshotOffset: number | null;
+  historyPageStore: HistoryPageStore;
 
   // Streaming control
   isStreaming: boolean;

@@ -22,6 +22,7 @@ import type ClaudianPlugin from '../../../main';
 import { confirm } from '../../../shared/modals/ConfirmModal';
 import { getVaultPath } from '../../../utils/path';
 import { HISTORY_RESOURCE_POLICY } from '../history/HistoryResourcePolicy';
+import type { HistoryPageInput, HistoryWindowRenderer } from '../rendering/HistoryWindowRenderer';
 import type { MessageRenderer } from '../rendering/MessageRenderer';
 import type { ProjectionWriteCoordinator } from '../rendering/ProjectionWriteCoordinator';
 import { cleanupThinkingBlock } from '../rendering/ThinkingBlockRenderer';
@@ -65,6 +66,7 @@ export interface ConversationControllerDeps {
    * legacy tests → transactions run unguarded as before.
    */
   getProjectionCoordinator?: () => ProjectionWriteCoordinator | null;
+  getHistoryWindowRenderer?: () => HistoryWindowRenderer | null;
   getTitleGenerationService: () => TitleGenerationService | null;
   getStatusPanel: () => StatusPanel | null;
   getAgentService?: () => ChatRuntime | null;
@@ -178,6 +180,7 @@ export class ConversationController {
       state.isStreaming = false;
 
       // Reset to entry point state - no conversation created yet
+      this.deps.getHistoryWindowRenderer?.()?.reset();
       state.currentConversationId = null;
       if (outgoingConversationId) this.deps.releaseConversation?.(outgoingConversationId);
       state.clearMessages();
@@ -331,6 +334,24 @@ export class ConversationController {
     await this.loadOlderWindow(lease);
   }
 
+  async rematerializeHistoryPage(record: { pageKey: string; range: LoadedTurnRange }): Promise<HistoryPageInput | null> {
+    const lease = this.deps.state.historyLease;
+    const conversationId = this.deps.state.currentConversationId;
+    if (!lease || !conversationId) return null;
+    const page = await lease.loadWindow({
+      anchorTurn: record.range.start,
+      direction: 'newer',
+      budget: {
+        ...HISTORY_RESOURCE_POLICY.paging,
+        maxTurns: Math.max(1, record.range.end - record.range.start),
+      },
+      projectionLevel: 'summary',
+      maxTurn: record.range.end,
+    });
+    if (conversationId !== this.deps.state.currentConversationId || page.pageKey !== record.pageKey) return null;
+    return this.toPageInput(page);
+  }
+
   /**
    * P3 stored transaction: history load + ChatState merge + render + queue
    * drain runs as one unit under the projection write lease, FIFO-queued
@@ -432,7 +453,9 @@ export class ConversationController {
         state.messages = combined;
         const addedIds = new Set(added.map(message => message.id));
         const prepend = combined.filter(message => addedIds.has(message.id));
-        this.deps.renderer.prependMessages(prepend, combined);
+        const windowRenderer = this.deps.getHistoryWindowRenderer?.();
+        if (windowRenderer) windowRenderer.addPage(this.toPageInput(page), total);
+        else this.deps.renderer.prependMessages(prepend, combined);
         await this.deps.renderer.waitForRenderedMessages();
         if (isStale()) return;
         state.loadedRanges = this.mergeRanges([...state.loadedRanges, page.range]);
@@ -597,6 +620,9 @@ export class ConversationController {
     const conversationId = this.deps.state.currentConversationId;
     if (result.status === 'projection_mismatch') throw new Error('projection_mismatch');
     let target = renderer.findMessageElement(result.projectionKey);
+    if (!target && await this.deps.getHistoryWindowRenderer?.()?.revealMessage(result.projectionKey)) {
+      target = renderer.findMessageElement(result.projectionKey);
+    }
     const mountedMessage = this.deps.state.messages.find(message => message.id === result.projectionKey);
     if (!target || mountedMessage?.projectionLevel === 'summary') {
       // UX (coord protocol risk 1): the re-locate queues behind a live
@@ -651,6 +677,15 @@ export class ConversationController {
       state.historyHasMore = !this.coversAll(state.loadedRanges, lease.totalTurns);
       state.historySnapshotOffset = page.snapshotOffset ?? state.historySnapshotOffset;
     });
+  }
+
+  private toPageInput(page: HistoryWindowPage): HistoryPageInput {
+    return {
+      pageKey: page.pageKey,
+      range: page.range,
+      messages: page.messages,
+      projectedWeight: page.projectedWeight ?? page.projectedChars * 2,
+    };
   }
 
   private mergeRanges(ranges: LoadedTurnRange[]): LoadedTurnRange[] {
@@ -750,6 +785,7 @@ export class ConversationController {
       this.deps.clearQueuedMessage();
 
       this.releaseSwitchedAwayHistory(previousConversationId, previousProviderId);
+      this.deps.getHistoryWindowRenderer?.()?.reset();
       if (lease && firstScreen) {
         state.historyLease = lease;
         state.loadedRanges = [firstScreen.range];
@@ -1029,11 +1065,21 @@ export class ConversationController {
     }
 
     await this.runStoredTransaction(async () => {
-      const welcomeEl = renderer.renderMessages(
-        state.messages,
-        () => this.getGreeting()
-      );
-      this.deps.setWelcomeEl(welcomeEl);
+      const windowRenderer = this.deps.getHistoryWindowRenderer?.();
+      if (page && windowRenderer) {
+        const messagesEl = this.deps.getMessagesEl();
+        messagesEl.empty();
+        const welcomeEl = messagesEl.createDiv({ cls: 'claudian-welcome' });
+        welcomeEl.createDiv({ cls: 'claudian-welcome-greeting', text: this.getGreeting() });
+        this.deps.setWelcomeEl(welcomeEl);
+        windowRenderer.addPage(this.toPageInput(page), state.historyLease?.totalTurns ?? page.range.end);
+      } else {
+        const welcomeEl = renderer.renderMessages(
+          state.messages,
+          () => this.getGreeting()
+        );
+        this.deps.setWelcomeEl(welcomeEl);
+      }
     });
   }
 

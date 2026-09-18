@@ -66,6 +66,16 @@
   overflow-wrap: anywhere;
 }
 
+.claudian-history-page {
+  display: flow-root;
+  min-width: 0;
+}
+
+.claudian-history-page-spacer {
+  min-height: 1px;
+  pointer-events: none;
+}
+
 .claudian-history-pager {
   display: flex;
   flex-direction: column;

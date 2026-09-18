@@ -13,6 +13,7 @@ import type { NavigationController } from '../controllers/NavigationController';
 import type { SelectionController } from '../controllers/SelectionController';
 import type { StreamController } from '../controllers/StreamController';
 import type { TurnCoordinator } from '../controllers/TurnCoordinator';
+import type { HistoryWindowRenderer } from '../rendering/HistoryWindowRenderer';
 import type { MessageRenderer } from '../rendering/MessageRenderer';
 import type { ProjectionWriteCoordinator } from '../rendering/ProjectionWriteCoordinator';
 import type { SubagentManager } from '../services/SubagentManager';
@@ -162,6 +163,7 @@ export interface TabControllers {
    * Disposed on tab close to settle queued waiters.
    */
   projectionWriteCoordinator: ProjectionWriteCoordinator | null;
+  historyWindowRenderer: HistoryWindowRenderer | null;
 }
 
 /**

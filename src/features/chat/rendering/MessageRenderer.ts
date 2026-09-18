@@ -283,6 +283,26 @@ export class MessageRenderer {
     this.startBatchedRender(messages, allMessages, true);
   }
 
+  /** Renders one history page into an isolated wrapper without changing the live target. */
+  renderStoredPage(messages: ChatMessage[], target: HTMLElement): void {
+    const original = this.messagesEl;
+    this.messagesEl = target;
+    try {
+      messages.forEach((message, index) => this.renderStoredMessage(message, messages, index));
+    } finally {
+      this.messagesEl = original;
+    }
+  }
+
+  /** Clears ephemeral references before a page wrapper leaves the DOM. */
+  clearPageReferences(messages: ChatMessage[]): void {
+    for (const message of messages) {
+      this.liveMessageEls.delete(message.id);
+      this.pendingContentRenders.delete(message.id);
+      this.contentRenderGenerations.delete(message.id);
+    }
+  }
+
   /** Current DOM epoch; see `domEpochValue`. */
   get domEpoch(): number {
     return this.domEpochValue;
