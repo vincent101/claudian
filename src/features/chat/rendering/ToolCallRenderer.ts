@@ -1053,6 +1053,7 @@ export function renderStoredToolCall(
 ): HTMLElement {
   const { toolEl, header, statusEl, content, currentTaskEl } =
     createToolElementStructure(parentEl, toolCall);
+  toolEl.dataset.toolId = toolCall.id;
 
   if (toolCall.name === TOOL_TODO_WRITE) {
     setTodoWriteStatus(statusEl, toolCall.input);

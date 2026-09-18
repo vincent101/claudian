@@ -437,9 +437,9 @@ export class AutoTurnProjectionController {
 
   /**
    * P5 turn-boundary re-projection: when the auto turn's mount was evicted
-   * mid-turn (a stored clear-rebuild ran between chunks), the streamed output
-   * stays invisible until a full render. Rebuild from the latest ChatState
-   * under a stored transaction, mirroring the user-turn path
+   * mid-turn, the streamed output stays invisible until the active projection
+   * is rebuilt. Indexed tabs rebuild mounted pages; non-index providers retain
+   * the legacy full render, mirroring the user-turn path
    * (InputController.sendMessage).
    *
    * Returns whether the final projection settled: nothing dirty to
@@ -452,6 +452,11 @@ export class AutoTurnProjectionController {
     if (this.active !== active || !this.isCurrent(active, turnId, generation)) return false;
     const coordinator = this.deps.getProjectionCoordinator?.() ?? null;
     const reproject = async (): Promise<void> => {
+      const windowRenderer = this.deps.getHistoryWindowRenderer?.();
+      if (windowRenderer) {
+        windowRenderer.rebuildMountedPages();
+        return;
+      }
       const welcomeEl = this.deps.renderer.renderMessages(
         this.deps.state.messages,
         () => this.deps.conversationController.getGreeting(),

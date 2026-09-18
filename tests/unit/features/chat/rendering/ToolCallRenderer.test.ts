@@ -35,6 +35,11 @@ describe('ToolCallRenderer', () => {
     jest.clearAllMocks();
   });
 
+  it('sets stable data-tool-id on stored tool roots', () => {
+    const toolEl = renderStoredToolCall(createMockEl(), createToolCall({ id: 'stored-id' }));
+    expect(toolEl.dataset.toolId).toBe('stored-id');
+  });
+
   describe('renderToolCall', () => {
     it('should store element in toolCallElements map', () => {
       const parentEl = createMockEl();

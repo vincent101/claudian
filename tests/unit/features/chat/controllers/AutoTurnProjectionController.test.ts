@@ -6,7 +6,7 @@ import { ProjectionWriteCoordinator } from '@/features/chat/rendering/Projection
 import { ChatState } from '@/features/chat/state/ChatState';
 
 describe('AutoTurnProjectionController', () => {
-  function setup(options: { coordinator?: ProjectionWriteCoordinator } = {}) {
+  function setup(options: { coordinator?: ProjectionWriteCoordinator; windowed?: boolean } = {}) {
     const state = new ChatState();
     state.currentConversationId = 'conv-1';
     const processQueuedMessage = jest.fn();
@@ -28,9 +28,14 @@ describe('AutoTurnProjectionController', () => {
       return messageEl;
     });
     const removeMessage = jest.fn();
+    const setMessagesEl = jest.fn();
     const renderMessages = jest.fn().mockReturnValue(createMockEl());
     const waitForRenderedMessages = jest.fn().mockResolvedValue(undefined);
     const setWelcomeEl = jest.fn();
+    const rebuildMountedPages = jest.fn();
+    const beginLivePage = jest.fn().mockReturnValue(null);
+    const freezeLivePage = jest.fn();
+    const getRoot = jest.fn().mockReturnValue(createMockEl());
     const handleStreamChunk = jest.fn(async (chunk, context) => {
       if (chunk.type === 'text') context.message.content += chunk.content;
       if (chunk.type === 'tool_use') context.message.toolCalls.push({
@@ -55,7 +60,7 @@ describe('AutoTurnProjectionController', () => {
     } as any;
     const controller = new AutoTurnProjectionController({
       state,
-      renderer: { addMessage, removeMessage, renderMessages, waitForRenderedMessages, domEpoch: 0 } as any,
+      renderer: { addMessage, removeMessage, setMessagesEl, renderMessages, waitForRenderedMessages, domEpoch: 0 } as any,
       streamController,
       conversationController: { save } as any,
       turnCoordinator,
@@ -65,13 +70,14 @@ describe('AutoTurnProjectionController', () => {
       generateId: (() => { let id = 0; return () => `msg-${++id}`; })(),
       notify,
       ...(options.coordinator ? { getProjectionCoordinator: () => options.coordinator! } : {}),
+      ...(options.windowed ? { getHistoryWindowRenderer: () => ({ rebuildMountedPages, beginLivePage, freezeLivePage, getRoot }) as any } : {}),
       setWelcomeEl,
       onTurnCompleted,
     });
     Object.defineProperty(contentEl, 'isConnected', { value: true, configurable: true });
     return {
       controller, state, turnCoordinator, processQueuedMessage, finishSpy,
-      addMessage, removeMessage, renderMessages, waitForRenderedMessages, setWelcomeEl,
+      addMessage, removeMessage, renderMessages, waitForRenderedMessages, setWelcomeEl, rebuildMountedPages,
       streamController, handleStreamChunk, save, notify, onTurnCompleted, contentEl,
     };
   }
@@ -467,6 +473,17 @@ describe('AutoTurnProjectionController', () => {
     expect(waitForRenderedMessages).toHaveBeenCalled();
     expect(setWelcomeEl).toHaveBeenCalledTimes(1);
     expect(turnCoordinator.isBusy()).toBe(false);
+  });
+
+  it('rebuilds mounted pages instead of full-rendering a dirty indexed auto turn', async () => {
+    const coordinator = new ProjectionWriteCoordinator();
+    const { controller, rebuildMountedPages, renderMessages } = setup({ coordinator, windowed: true });
+    controller.started({ turnId: 'auto-1', generation: 0, source: { kind: 'peer', label: 'researcher' }, displayContent: 'inspect' });
+    await (controller as any).active.mountTask;
+    (controller as any).active.context.projectionDirty = true;
+    await controller.finished({ turnId: 'auto-1', generation: 0, metadata: {} });
+    expect(rebuildMountedPages).toHaveBeenCalledTimes(1);
+    expect(renderMessages).not.toHaveBeenCalled();
   });
 
   it('does not re-project a clean auto turn at finish', async () => {
