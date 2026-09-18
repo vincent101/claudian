@@ -80,6 +80,44 @@ describe('ClaudeConversationHistoryService M1 fuse', () => {
   });
 
 
+  it('filters noisy title suffixes and falls back to recent short user messages', async () => {
+    const turns = Array.from({ length: 4 }, (_, index) => ({
+      turnId: `turn-${index}`,
+      startEntry: index,
+      endEntry: index,
+      sourceBytes: 10,
+    }));
+    mockBuildTranscriptIndex.mockResolvedValue({
+      status: 'complete',
+      index: { filePath: '/current', dev: 1, ino: 1, snapshotSize: 99, mtimeMs: 1, entries: [], turns, searchCorpus: [], searchText: '', skippedLines: 0, buildDurationMs: 1, peakWorkerHeapBytes: 1 },
+    });
+    mockSdkSessionExists.mockImplementation((_vault, session) => session === 'current-session');
+    mockMaterializeTranscriptPage.mockImplementation(async (_index, start) => [{ start }] as any);
+    mockMaterializeTranscriptToolAssociations.mockResolvedValue([]);
+    mockMaterializeSDKMessages.mockImplementation(async (_vault, _session, native: any[]) => native.map(item => ({
+      id: `user-${item.start}`,
+      role: 'user' as const,
+      content: [
+        'first request',
+        'This session is being continued from a previous conversation',
+        'short two',
+        'short three',
+      ][item.start],
+      timestamp: item.start,
+    })));
+
+    const material = await new ClaudeConversationHistoryService().loadTitleMaterial(createConversation(), '/vault');
+
+    expect(material).toEqual({
+      firstUserExcerpt: 'first request',
+      recentUserExcerpts: [
+        'This session is being continued from a previous conversation',
+        'short two',
+        'short three',
+      ],
+    });
+  });
+
   it('shares one build across leases and loads stateless windows', async () => {
     const turns = Array.from({ length: 120 }, (_, index) => ({ turnId: `u${index}`, startEntry: index, endEntry: index, sourceBytes: 1024 }));
     mockBuildTranscriptIndex.mockResolvedValue({ status: 'complete', index: { filePath: '/current', dev: 1, ino: 1, snapshotSize: 999, mtimeMs: 1, entries: [], turns, searchCorpus: [], searchText: '', skippedLines: 0, buildDurationMs: 1, peakWorkerHeapBytes: 1 } });

@@ -1340,7 +1340,6 @@ export function initializeTabControllers(
         return typeof service.acquireHistoryIndex === 'function' ? service : null;
       },
       dismissPendingInlinePrompts: () => tab.controllers.inputController?.dismissPendingApproval(),
-      switchToHydrationShell: hydrationHooks?.switchToHydrationShell,
       markHydrationReady: hydrationHooks?.markHydrationReady,
       isHydrationReady: hydrationHooks?.isHydrationReady,
       reserveConversation: hydrationHooks?.reserveConversation,

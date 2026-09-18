@@ -8,8 +8,10 @@ function percentile(samples: number[], value: number): number {
   return sorted[Math.ceil(sorted.length * value) - 1] ?? 0;
 }
 
-describe('indexed first-screen benchmark harness', () => {
-  it('measures 30 cold and cached planner runs and covers a budget-fitting fixture', () => {
+describe('first-screen planner microbenchmark scaffold', () => {
+  // This measures only pure planner overhead. It does not cover index scan,
+  // materialization, render, or the §3.2 device p95 acceptance gate.
+  it('measures 30 copied and reused descriptor-array planner runs', () => {
     const fixture = Array.from({ length: 200 }, () => 32 * 1024);
     const cold: number[] = [];
     const cached: number[] = [];

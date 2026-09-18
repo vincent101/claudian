@@ -83,13 +83,10 @@
       "buildingIndex": "Criando índice {percent}%",
       "finalizingIndex": "Finalizando índice…",
       "loadingRecentTurns": "Carregando os {count} turnos mais recentes…",
-      "oversizeTitle": "Large conversation",
-      "oversizeDescription": "On-demand loading will be available in the pagination milestone.",
       "errorTitle": "Conversation failed to load",
       "errorDescription": "The conversation history could not be loaded.",
       "retry": "Retry",
       "switchFailed": "Failed to switch conversation: {error}",
-      "oversizeSegmentDetail": "{id} ({size} MiB)",
       "export": {
         "file": "Export full conversation to file",
         "clipboard": "Copy full conversation text",

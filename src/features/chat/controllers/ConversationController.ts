@@ -74,12 +74,6 @@ export interface ConversationControllerDeps {
   ensureServiceForConversation?: (conversation: Conversation | null) => Promise<void>;
   dismissPendingInlinePrompts?: () => void;
   /**
-   * M1 shell semantics for active opens: route a hydration-blocked switch
-   * (oversize/failed segments) onto the tab-level shell state machine so the
-   * blocked placeholder renders instead of the switch failing silently.
-   */
-  switchToHydrationShell?: (conversationId: string) => void;
-  /**
    * Reports a direct (non-shell) load/switch completion so the tab-level
    * hydration state resets and a blocked input is re-enabled.
    */
@@ -265,6 +259,21 @@ export class ConversationController {
           state.historyHasMore = firstScreen.hasMoreBefore;
           state.historySnapshotOffset = firstScreen.snapshotOffset ?? null;
           state.historyError = null;
+          if (conversation.hasHistory !== true && firstScreen.messages.length > 0) {
+            const firstUser = firstScreen.messages.find(message => message.role === 'user');
+            const backfill = {
+              hasHistory: true as const,
+              messageCount: firstScreen.messages.length,
+              preview: firstUser ? (firstUser.displayContent ?? firstUser.content).slice(0, 50) : undefined,
+              firstUserExcerpt: firstUser
+                ? (firstUser.displayContent ?? firstUser.content).slice(0, 300)
+                : undefined,
+            };
+            // Update the shell before persistence so warmup/passive sync in the
+            // same restore observes history metadata immediately.
+            Object.assign(conversation, backfill);
+            await plugin.updateConversation(conversation.id, backfill);
+          }
         } finally {
           if (!transferred) lease.release();
           state.historyLoading = false;
@@ -694,7 +703,10 @@ export class ConversationController {
       subagentManager.clear();
 
       const conversation = await plugin.switchConversation(id);
-      if (!conversation) return;
+      if (!conversation) {
+        this.deps.cancelConversationReservation?.(id);
+        return;
+      }
 
       const historyService = this.deps.getHistoryIndexCapableService(conversation);
       let firstScreen: HistoryWindowPage | null = null;
@@ -723,8 +735,9 @@ export class ConversationController {
         state.historySnapshotOffset = firstScreen.snapshotOffset ?? null;
       }
       this.restoreConversation(conversation, firstScreen);
-      this.deps.commitConversation?.(id);
+      // Release while the tab still carries the outgoing claim; commit replaces it.
       if (previousConversationId) this.deps.releaseConversation?.(previousConversationId);
+      this.deps.commitConversation?.(id);
 
       this.deps.getHistoryDropdown()?.removeClass('visible');
       this.updateWelcomeVisibility();

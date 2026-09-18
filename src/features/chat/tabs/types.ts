@@ -116,7 +116,6 @@ export type TabHydrationState =
   | 'ERROR';
 
 export interface TabHydrationDiagnostic {
-  segments?: Array<{ sessionId: string; sizeBytes: number }>;
   message?: string;
 }
 
@@ -126,8 +125,6 @@ export interface TabHydrationDiagnostic {
  * state machine own every hydration transition.
  */
 export interface TabHydrationHooks {
-  /** Route a hydration-blocked active open onto the shell state machine. */
-  switchToHydrationShell: (conversationId: string) => void;
   /** Report a direct (non-shell) load/switch completion (reset to READY). */
   markHydrationReady: () => void;
   /** Whether the tab has fully hydrated (READY) and may persist session state. */

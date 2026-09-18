@@ -83,13 +83,10 @@
       "buildingIndex": "インデックスを作成中 {percent}%",
       "finalizingIndex": "インデックスを整理中…",
       "loadingRecentTurns": "最近の {count} ターンを読み込み中…",
-      "oversizeTitle": "Large conversation",
-      "oversizeDescription": "On-demand loading will be available in the pagination milestone.",
       "errorTitle": "Conversation failed to load",
       "errorDescription": "The conversation history could not be loaded.",
       "retry": "Retry",
       "switchFailed": "Failed to switch conversation: {error}",
-      "oversizeSegmentDetail": "{id}（{size} MiB）",
       "export": {
         "file": "Export full conversation to file",
         "clipboard": "Copy full conversation text",

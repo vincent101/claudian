@@ -4,6 +4,7 @@ import { ProviderRegistry } from '@/core/providers/ProviderRegistry';
 import { ProviderWorkspaceRegistry } from '@/core/providers/ProviderWorkspaceRegistry';
 import { ConversationController, type ConversationControllerDeps } from '@/features/chat/controllers/ConversationController';
 import { ChatState } from '@/features/chat/state/ChatState';
+import { ConversationOpenRegistry } from '@/features/chat/tabs/ConversationOpenRegistry';
 import { TabManager } from '@/features/chat/tabs/TabManager';
 import {
   DEFAULT_MAX_TABS,
@@ -147,7 +148,9 @@ function createMockPlugin(overrides: Record<string, any> = {}): any {
     getConversationById: jest.fn().mockResolvedValue(null),
     getConversationSync: jest.fn().mockReturnValue(null),
     getConversationList: jest.fn().mockReturnValue([]),
+    updateConversation: jest.fn().mockResolvedValue(undefined),
     findConversationAcrossViews: jest.fn().mockReturnValue(null),
+    conversationOpenRegistry: new ConversationOpenRegistry(),
     ...overrides,
   };
 }
@@ -868,47 +871,6 @@ describe('TabManager - Tab Lifecycle', () => {
       jest.useRealTimers();
     });
 
-    it('drops the parked runtime when a blocked switch routes to the shell', async () => {
-      const parkedRuntime = {
-        providerId: 'claude',
-        isReady: jest.fn().mockReturnValue(true),
-        cleanup: jest.fn(),
-      };
-      const manager = createManager({
-        callbacks,
-        tabFactory: () => createMockTabData({
-          id: 'shell-tab',
-          conversationId: 'conv-old',
-          hydrationState: 'READY',
-          state: { currentConversationId: 'conv-old', clearMessages: jest.fn() },
-          service: parkedRuntime,
-          serviceInitialized: true,
-          controllers: {
-            conversationController: {
-              loadActive: jest.fn().mockResolvedValue(undefined),
-              initializeWelcome: jest.fn(),
-            },
-          },
-        }),
-      });
-
-      const tab = (await manager.createTab('conv-old'))!;
-      const hydrationHooks = mockInitializeTabControllers.mock.calls.at(-1)?.[6] as {
-        switchToHydrationShell: (conversationId: string) => void;
-        isHydrationReady: () => boolean;
-      };
-
-      hydrationHooks.switchToHydrationShell('conv-blocked');
-
-      // The parked runtime from the previous conversation must be detached:
-      // it no longer matches the shell binding and would otherwise serve a
-      // foreign session to non-save paths (provider resolution, fork, warmup).
-      expect(parkedRuntime.cleanup).toHaveBeenCalled();
-      expect(tab.service).toBeNull();
-      expect(tab.serviceInitialized).toBe(false);
-      // The shell guard reflects the non-READY binding.
-      expect(hydrationHooks.isHydrationReady()).toBe(false);
-    });
 
     it('materializes an indexed restored tab to READY through the shared loadActive chain', async () => {
       const storedConversation = {
@@ -1475,6 +1437,38 @@ describe('TabManager - Conversation Management', () => {
   });
 
   describe('openConversation', () => {
+    it('allows A to reopen after one tab switches A to B', async () => {
+      const plugin = createMockPlugin({
+        getConversationSync: jest.fn((id: string) => ({ id, providerId: 'claude', messages: [] })),
+      });
+      const tab = createMockTabData({ id: 'owner', conversationId: 'conversation-a' });
+      manager = createManager({ plugin, tabFactory: () => tab });
+      await manager.createTab('conversation-a');
+      const hooks = mockInitializeTabControllers.mock.calls.at(-1)?.[6];
+
+      expect(await hooks.reserveConversation('conversation-b')).toBe(true);
+      hooks.releaseConversation('conversation-a');
+      hooks.commitConversation('conversation-b');
+      expect(await hooks.reserveConversation('conversation-a')).toBe(true);
+    });
+
+    it('allows only one concurrent owner and focuses it for the loser', async () => {
+      const plugin = createMockPlugin({
+        getConversationSync: jest.fn((id: string) => ({ id, providerId: 'claude', messages: [] })),
+      });
+      manager = createManager({ plugin });
+      const first = await manager.createTab();
+      const firstHooks = mockInitializeTabControllers.mock.calls.at(-1)?.[6];
+      const second = await manager.createTab();
+      const secondHooks = mockInitializeTabControllers.mock.calls.at(-1)?.[6];
+
+      expect(await firstHooks.reserveConversation('target')).toBe(true);
+      expect(await secondHooks.reserveConversation('target')).toBe(false);
+      expect(plugin.app.workspace.revealLeaf).toHaveBeenCalled();
+      expect(manager.getActiveTabId()).toBe(first?.id);
+      expect(second?.conversationOpenClaim).toBeFalsy();
+    });
+
     it('should switch to tab if conversation is already open', async () => {
       const tabWithConv = createMockTabData({
         id: 'tab-with-conv',
@@ -1624,6 +1618,51 @@ describe('TabManager - Persistence', () => {
       expect(plugin.getConversationSync).toHaveBeenCalledTimes(3);
       expect(manager.getTab('restored-1')?.hydrationState).toBe('SHELL');
       expect(mockCreateTab).toHaveBeenCalledTimes(2);
+    });
+
+    it('deduplicates a dirty snapshot and keeps the active occurrence', async () => {
+      const plugin = createMockPlugin({
+        getConversationSync: jest.fn((id: string) => ({ id, providerId: 'claude', messages: [] })),
+      });
+      manager = createManager({
+        plugin,
+        tabFactory: () => createMockTabData({ id: 'duplicate-active', conversationId: 'same' }),
+      });
+
+      await manager.restoreState({
+        openTabs: [
+          { tabId: 'duplicate-first', conversationId: 'same' },
+          { tabId: 'duplicate-active', conversationId: 'same' },
+        ],
+        activeTabId: 'duplicate-active',
+      });
+
+      expect(manager.getTab('duplicate-first')).toBeNull();
+      expect(manager.getTab('duplicate-active')).not.toBeNull();
+      expect(manager.getActiveTabId()).toBe('duplicate-active');
+    });
+
+    it('restores a cross-view rejected conversation as an enabled blank tab', async () => {
+      const plugin = createMockPlugin({
+        getConversationSync: jest.fn((id: string) => ({ id, providerId: 'claude', messages: [] })),
+      });
+      const owner = plugin.conversationOpenRegistry.reserve('claimed', jest.fn());
+      expect(owner).not.toBeNull();
+      manager = createManager({
+        plugin,
+        tabFactory: () => createMockTabData({ id: 'rejected', conversationId: 'claimed' }),
+      });
+
+      await manager.restoreState({
+        openTabs: [{ tabId: 'rejected', conversationId: 'claimed' }],
+        activeTabId: 'rejected',
+      });
+
+      const rejected = manager.getTab('rejected');
+      expect(rejected?.conversationId).toBeNull();
+      expect(rejected?.state.currentConversationId).toBeNull();
+      expect(rejected?.hydrationState).toBe('READY');
+      expect(rejected?.dom.inputEl.disabled).toBe(false);
     });
 
     it('should restore draftModel for blank tabs', async () => {

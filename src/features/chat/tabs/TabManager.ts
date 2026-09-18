@@ -275,7 +275,6 @@ export class TabManager implements TabManagerInterface {
       (conversationId) => this.openConversation(conversationId),
       () => this.getProviderCatalogConfig(tab),
       {
-        switchToHydrationShell: (conversationId) => this.switchTabConversationToShell(tab, conversationId),
         markHydrationReady: () => this.setHydrationState(tab, 'READY'),
         isHydrationReady: () => tab.hydrationState === 'READY',
         reserveConversation: (conversationId) => this.reserveConversationForTab(tab, conversationId),
@@ -288,7 +287,7 @@ export class TabManager implements TabManagerInterface {
     // Wire input event handlers
     wireTabInputEvents(tab, this.plugin);
 
-    if (conversation) {
+    if (conversation && tab.conversationId) {
       tab.state.currentConversationId = conversation.id;
       this.setHydrationState(tab, 'SHELL');
     }
@@ -507,22 +506,6 @@ export class TabManager implements TabManagerInterface {
    * like a restored tab (M1 shell semantics for active opens). The ChatState
    * setter fires onConversationChanged, which syncs tab.conversationId.
    */
-  private switchTabConversationToShell(tab: TabData, conversationId: string): void {
-    tab.state.currentConversationId = conversationId;
-    tab.state.clearMessages();
-    tab.hydrationDiagnostic = null;
-    tab.historyLoadProgress = null;
-    // Drop the runtime parked from the previous conversation: the blocked
-    // switch threw before ensureServiceForConversation rebinds it, so it
-    // would serve a foreign session to non-save paths (provider resolution,
-    // fork, command warmup). A later hydration or first send re-creates a
-    // runtime bound to the shell conversation.
-    cleanupTabRuntime(tab);
-    this.setHydrationState(tab, 'SHELL');
-    if (this.activeTabId === tab.id) {
-      this.scheduleTabHydration(tab);
-    }
-  }
 
   /**
    * Closes a tab.
@@ -549,6 +532,8 @@ export class TabManager implements TabManagerInterface {
 
     // Save conversation before closing
     await tab.controllers.conversationController?.save();
+    const pendingClaim = this.pendingConversationClaims.get(tab.id);
+    if (pendingClaim) this.cancelConversationForTab(tab, pendingClaim.conversationId);
     if (tab.conversationId) this.releaseConversationForTab(tab, tab.conversationId);
     tab.state.historyLease?.release();
     tab.state.historyLease = null;
@@ -699,6 +684,10 @@ export class TabManager implements TabManagerInterface {
       && this.conversationOpenRegistry.owns(tab.conversationOpenClaim)) return true;
     const pending = this.pendingConversationClaims.get(tab.id);
     if (pending?.conversationId === conversationId && this.conversationOpenRegistry.owns(pending)) return true;
+    if (pending) {
+      this.conversationOpenRegistry.release(pending.conversationId, pending.ownerToken);
+      this.pendingConversationClaims.delete(tab.id);
+    }
     const claim = this.conversationOpenRegistry.reserve(conversationId, async () => {
       this.plugin.app.workspace.revealLeaf(this.view.leaf);
       await this.switchToTab(tab.id);

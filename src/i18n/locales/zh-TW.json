@@ -83,13 +83,10 @@
       "buildingIndex": "建立索引 {percent}%",
       "finalizingIndex": "整理索引…",
       "loadingRecentTurns": "載入最近 {count} 輪…",
-      "oversizeTitle": "超大對話",
-      "oversizeDescription": "隨選載入將在分頁里程碑提供。",
       "errorTitle": "對話載入失敗",
       "errorDescription": "無法載入對話歷史。",
       "retry": "重試",
       "switchFailed": "切換會話失敗：{error}",
-      "oversizeSegmentDetail": "{id}（{size} MiB）",
       "export": {
         "file": "匯出完整對話到檔案",
         "clipboard": "複製完整對話文字",

@@ -181,12 +181,23 @@ export class ClaudeConversationHistoryService implements ProviderConversationHis
       });
       const firstUser = first.messages.find(message => message.role === 'user');
       if (!firstUser) return null;
+      const userTexts = recent.messages
+        .filter(message => message.role === 'user')
+        .map(message => message.displayContent ?? message.content);
+      const isNoise = (text: string): boolean => !text
+        || /^This session is being continued/i.test(text)
+        || /^\[Request interrupted by user/i.test(text)
+        || /^<command-/i.test(text)
+        || /^<local-command-caveat>/i.test(text);
+      const highInformation = userTexts
+        .filter(text => !isNoise(text) && text.length >= 40)
+        .slice(-5)
+        .map(text => text.slice(0, 250));
       return {
         firstUserExcerpt: (firstUser.displayContent ?? firstUser.content).slice(0, 300),
-        recentUserExcerpts: recent.messages
-          .filter(message => message.role === 'user')
-          .slice(-5)
-          .map(message => (message.displayContent ?? message.content).slice(0, 250)),
+        recentUserExcerpts: highInformation.length > 0
+          ? highInformation
+          : userTexts.slice(-3).map(text => text.slice(0, 100)),
       };
     } finally {
       lease.release();

@@ -83,13 +83,10 @@
       "buildingIndex": "建立索引 {percent}%",
       "finalizingIndex": "整理索引…",
       "loadingRecentTurns": "加载最近 {count} 轮…",
-      "oversizeTitle": "超大会话",
-      "oversizeDescription": "按需加载将在分页里程碑提供。",
       "errorTitle": "会话加载失败",
       "errorDescription": "无法加载会话历史。",
       "retry": "重试",
       "switchFailed": "切换会话失败：{error}",
-      "oversizeSegmentDetail": "{id}（{size} MiB）",
       "export": {
         "file": "导出完整会话到文件",
         "clipboard": "复制完整会话文本",

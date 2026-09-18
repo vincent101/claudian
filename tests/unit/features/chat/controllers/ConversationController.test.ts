@@ -168,6 +168,31 @@ describe('ConversationController', () => {
       expect(lease.release).not.toHaveBeenCalled();
     });
 
+    it('backfills legacy metadata before runtime initialization', async () => {
+      const conversation = { id: 'legacy', providerId: 'claude', title: 'Legacy', messages: [], sessionId: 'session', createdAt: 1, updatedAt: 1 } as any;
+      deps.state.currentConversationId = 'legacy';
+      (deps.plugin.getConversationById as jest.Mock).mockResolvedValue(conversation);
+      const lease = makeLease(1);
+      lease.loadWindow.mockResolvedValue({
+        messages: [{ id: 'first', role: 'user', content: 'legacy first request', timestamp: 1 }],
+        range: { start: 0, end: 1 }, sourceBytes: 10, projectedChars: 20,
+        oversizedTurnCount: 0, pageKey: 'w:0:1', hasMoreBefore: false, hasMoreAfter: false,
+      });
+      deps.getHistoryIndexCapableService = () => ({ acquireHistoryIndex: () => lease } as any);
+      deps.ensureServiceForConversation = jest.fn(async (shell) => {
+        expect(shell).toMatchObject({ hasHistory: true, messageCount: 1 });
+      });
+
+      await controller.loadActive();
+
+      expect(deps.plugin.updateConversation).toHaveBeenCalledWith('legacy', expect.objectContaining({
+        hasHistory: true,
+        messageCount: 1,
+        preview: 'legacy first request',
+        firstUserExcerpt: 'legacy first request',
+      }));
+    });
+
     it('releases the previous lease when indexed loadActive repeats', async () => {
       const conversation = { id: 'large', providerId: 'claude', title: 'Large', messages: [], sessionId: 'session', createdAt: 1, updatedAt: 1 } as any;
       deps.state.currentConversationId = 'large';
@@ -841,6 +866,29 @@ describe('ConversationController', () => {
     });
 
     describe('Switching conversations', () => {
+      it('releases the outgoing owner before committing the incoming owner', async () => {
+        deps.state.currentConversationId = 'conversation-a';
+        const calls: string[] = [];
+        deps.reserveConversation = jest.fn().mockResolvedValue(true);
+        deps.releaseConversation = jest.fn((id: string) => { calls.push(`release:${id}`); });
+        deps.commitConversation = jest.fn((id: string) => { calls.push(`commit:${id}`); });
+
+        await controller.switchTo('conversation-b');
+
+        expect(calls).toEqual(['release:conversation-a', 'commit:conversation-b']);
+      });
+
+      it('cancels the pending reservation when the target disappears', async () => {
+        deps.state.currentConversationId = 'conversation-a';
+        deps.reserveConversation = jest.fn().mockResolvedValue(true);
+        deps.cancelConversationReservation = jest.fn();
+        (deps.plugin.switchConversation as jest.Mock).mockResolvedValue(null);
+
+        await controller.switchTo('missing');
+
+        expect(deps.cancelConversationReservation).toHaveBeenCalledWith('missing');
+      });
+
       it('should clear queued message on conversation switch', async () => {
         deps.state.currentConversationId = 'old-conv';
         deps.state.queuedMessage = { content: 'test', images: undefined, editorContext: null, canvasContext: null };
@@ -1236,10 +1284,8 @@ describe('ConversationController', () => {
 
   describe('save hydration shell guard (M1 review fix)', () => {
     /**
-     * Rebuilds the oversize-switch pollution scenario: the dropdown switch to
-     * conv-X threw before ensureServiceForConversation ran, so the tab is
-     * bound to X (via switchToHydrationShell) while tab.service still parks
-     * the runtime of the previous conversation Y. save() at that point must
+     * Rebuilds a pre-READY shell scenario where tab.service still parks the
+     * runtime of the previous conversation Y. save() at that point must
      * not persist anything, or buildSessionUpdates overwrites X's meta with
      * Y's session and a loading-window close clears X's persisted fields.
      */
@@ -1290,7 +1336,7 @@ describe('ConversationController', () => {
       };
       deps.getAgentService = () => parkedRuntime as any;
 
-      // State left behind by switchToHydrationShell: bound to X, not hydrated.
+      // Pre-READY shell state: bound to X, not hydrated.
       deps.state.currentConversationId = 'conv-X';
       deps.state.messages = [];
       deps.isHydrationReady = () => false;
