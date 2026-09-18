@@ -18,6 +18,8 @@ export interface TranscriptDiagnosticEvent {
   tabIdHash?: string;
   turnIdHash?: string;
   generation?: number;
+  renderTicket?: number;
+  projectedWeight?: number;
   leaseKind?: 'user' | 'auto';
   batchBytes?: number;
   batchLines?: number;
@@ -81,7 +83,7 @@ export class ClaudeTranscriptDiagnosticLog {
 
   private serialize(event: TranscriptDiagnosticEvent): string {
     const clean: Record<string, unknown> = { ts: Date.now(), seq: ++this.seq, phase: event.phase };
-    for (const key of ['tabIdHash', 'turnIdHash', 'generation', 'leaseKind', 'batchBytes', 'batchLines', 'elapsedMs', 'errorName', 'buildId', 'mode', 'queueMs', 'bytes', 'totalBytes', 'entries', 'turns', 'turnCount', 'sourceBytes', 'projectedChars', 'oversizedTurns'] as const) {
+    for (const key of ['tabIdHash', 'turnIdHash', 'generation', 'renderTicket', 'projectedWeight', 'leaseKind', 'batchBytes', 'batchLines', 'elapsedMs', 'errorName', 'buildId', 'mode', 'queueMs', 'bytes', 'totalBytes', 'entries', 'turns', 'turnCount', 'sourceBytes', 'projectedChars', 'oversizedTurns'] as const) {
       const value = event[key];
       if (value !== undefined) clean[key] = typeof value === 'string' ? value.slice(0, 128) : value;
     }

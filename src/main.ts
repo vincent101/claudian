@@ -73,9 +73,9 @@ export default class ClaudianPlugin extends Plugin {
         } else if (event.kind === 'render_complete') {
           renderDiagnostics.record({ phase: event.kind, entries: event.messages, turns: event.batches, elapsedMs: event.elapsedMs });
         } else if (event.kind === 'page_render_timeout') {
-          renderDiagnostics.record({ phase: event.kind, generation: event.ticket, elapsedMs: event.timeoutMs });
+          renderDiagnostics.record({ phase: event.kind, renderTicket: event.ticket, elapsedMs: event.timeoutMs });
         } else if (event.kind === 'page_data_overcommit') {
-          renderDiagnostics.record({ phase: event.kind, entries: event.pages, projectedChars: event.projectedWeight });
+          renderDiagnostics.record({ phase: event.kind, entries: event.pages, projectedWeight: event.projectedWeight });
         } else {
           renderDiagnostics.record({ phase: event.kind, turns: event.turns });
         }
