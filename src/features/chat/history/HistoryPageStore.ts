@@ -112,7 +112,18 @@ export class HistoryPageStore {
   }
 
   findByMessageId(messageId: string): HistoryPageRecord | undefined {
-    return [...this.records.values()].find(record => record.messageIds.has(messageId));
+    const record = [...this.records.values()].find(candidate => candidate.messageIds.has(messageId));
+    if (record) record.lastAccess = ++this.clock;
+    return record;
+  }
+
+  replaceMessage(pageKey: string, message: ChatMessage): HistoryPageRecord | undefined {
+    const record = this.records.get(pageKey);
+    if (!record?.messages) return record;
+    record.messages = record.messages.map(current => current.id === message.id ? message : current);
+    record.messageIds.add(message.id);
+    record.lastAccess = ++this.clock;
+    return record;
   }
 
   clear(): void {
@@ -251,7 +262,7 @@ export class HistoryPageStore {
     };
     while (overweight()) {
       const victim = resident()
-        .filter(record => record.pins.size === 0)
+        .filter(record => record.pins.size === 0 && record.renderState !== 'mounted' && !record.pageKey.startsWith('live:'))
         .sort((a, b) => a.lastAccess - b.lastAccess)[0];
       if (!victim) {
         const pages = resident();
@@ -284,6 +295,10 @@ export class HistoryPageStore {
     const record = this.records.get(pageKey);
     if (record?.renderTicket === ticket) record.settledTicket = ticket;
     this.resolveWaiters(state);
+    const pageTickets = this.tickets.get(pageKey);
+    for (const prior of [...(pageTickets?.keys() ?? [])]) {
+      if (prior < ticket) pageTickets?.delete(prior);
+    }
   }
 
   private resolveWaiters(state: TicketState): void {

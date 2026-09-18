@@ -22,6 +22,28 @@ describe('HistoryPageStore', () => {
     expect(store.get('c')?.messages).not.toBeNull();
   });
 
+  it('never evicts mounted page data before DOM unmount', () => {
+    const diagnostics: string[] = [];
+    const store = new HistoryPageStore({ maxPages: 1, onDiagnostic: event => diagnostics.push(event.kind) });
+    const first = store.upsertPage({ pageKey: 'a', range: { start: 0, end: 1 }, messages: [message('a')], projectedWeight: 1 });
+    first.renderState = 'mounted';
+    const second = store.upsertPage({ pageKey: 'b', range: { start: 1, end: 2 }, messages: [message('b')], projectedWeight: 1, pins: ['transaction'] });
+    second.renderState = 'mounted';
+    store.unpin('b', 'transaction');
+    store.enforceLimits();
+    expect(first.messages).not.toBeNull();
+    expect(second.messages).not.toBeNull();
+    expect(diagnostics).toContain('page_data_overcommit');
+  });
+
+  it('does not evict frozen live pages that lack provider page identity', () => {
+    const store = new HistoryPageStore({ maxPages: 1 });
+    const live = store.upsertPage({ pageKey: 'live:t', range: { start: 2, end: 2 }, messages: [message('live')], projectedWeight: 1 });
+    live.renderState = 'spacer';
+    store.upsertPage({ pageKey: 'w:snapshot:0:1', range: { start: 0, end: 1 }, messages: [message('stored')], projectedWeight: 1 });
+    expect(live.messages).not.toBeNull();
+  });
+
   it('allows diagnosed overcommit when every resident page is pinned', () => {
     const diagnostics: string[] = [];
     const store = new HistoryPageStore({ maxPages: 1, maxProjectedWeight: 50, onDiagnostic: event => diagnostics.push(event.kind) });
@@ -55,6 +77,16 @@ describe('HistoryPageStore', () => {
     store.upsertPage({ pageKey: 'a', range: { start: 0, end: 1 }, messages: [message('a')], projectedWeight: 1 });
     store.upsertPage({ pageKey: 'b', range: { start: 1, end: 2 }, messages: [message('b')], projectedWeight: 1 });
     expect(store.findByMessageId('a')?.pageKey).toBe('a');
+  });
+
+  it('discards superseded settled ticket entries', () => {
+    const store = new HistoryPageStore();
+    store.upsertPage({ pageKey: 'a', range: { start: 0, end: 1 }, messages: [message('a')], projectedWeight: 1 });
+    const first = store.beginRender('a', 1);
+    store.closeRenderTicket('a', first);
+    const second = store.beginRender('a', 2);
+    store.closeRenderTicket('a', second);
+    expect((store as any).tickets.get('a').size).toBe(1);
   });
 
   it('settles only the current closed ticket and ignores late old slots', async () => {

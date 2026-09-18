@@ -51,6 +51,9 @@ describe('HistoryWindowRenderer', () => {
     const { renderer, coordinator, root } = createHarness();
     const runStored = jest.spyOn(coordinator, 'runStored');
     renderer.addPage({ pageKey: 'a', range: { start: 0, end: 100 }, messages: messages(100, 'a'), projectedWeight: 1 }, 300);
+    renderer.flushFrameForTest();
+    await Promise.resolve();
+    runStored.mockClear();
     renderer.flushForTest();
     const before = root.innerHTML;
     for (let index = 0; index < 20; index += 1) renderer.sampleIntent('older');
@@ -61,9 +64,18 @@ describe('HistoryWindowRenderer', () => {
     expect(runStored).toHaveBeenCalledTimes(1);
   });
 
-  it('keeps mounted turns at the hard cap after twenty pages', async () => {
+  it('keeps real newest-first load order sorted by turn range', () => {
+    const { renderer, root } = createHarness(400);
+    renderer.addPage({ pageKey: 'newest', range: { start: 300, end: 400 }, messages: messages(100, 'newest'), projectedWeight: 1 }, 400);
+    renderer.addPage({ pageKey: 'older', range: { start: 200, end: 300 }, messages: messages(100, 'older'), projectedWeight: 1 }, 400);
+
+    expect(Array.from(root.querySelectorAll<HTMLElement>('[data-page-key]')).map(el => el.dataset.pageKey))
+      .toEqual(['older', 'newest']);
+  });
+
+  it('keeps mounted turns at the hard cap after twenty pages loaded newest-first', async () => {
     const { renderer } = createHarness(400);
-    for (let page = 0; page < 20; page += 1) {
+    for (let page = 19; page >= 0; page -= 1) {
       renderer.addPage({
         pageKey: `p-${page}`,
         range: { start: page * 20, end: page * 20 + 20 },
@@ -80,15 +92,51 @@ describe('HistoryWindowRenderer', () => {
   it('queues behind live lease and retains only the latest intent per direction', async () => {
     const { renderer, coordinator } = createHarness();
     renderer.addPage({ pageKey: 'a', range: { start: 0, end: 20 }, messages: messages(20), projectedWeight: 1 }, 300);
+    renderer.flushFrameForTest();
+    await new Promise(resolve => setTimeout(resolve, 0));
+    const baseline = renderer.getCommittedIntentCount();
     const live = await coordinator.acquireLive();
     renderer.sampleIntent('older');
     renderer.flushFrameForTest();
     renderer.sampleIntent('older');
     renderer.flushFrameForTest();
-    expect(renderer.getCommittedIntentCount()).toBe(0);
+    expect(renderer.getCommittedIntentCount()).toBe(baseline);
     live?.release();
     await new Promise(resolve => setTimeout(resolve, 10));
-    expect(renderer.getCommittedIntentCount()).toBe(1);
+    expect(renderer.getCommittedIntentCount()).toBe(baseline + 1);
+  });
+
+  it('defers scroll-triggered spacer mounting until rAF and stored grant', async () => {
+    let resolvePage!: (page: any) => void;
+    const rematerializePage = jest.fn(() => new Promise(resolve => { resolvePage = resolve; }));
+    const { renderer, store, root, viewport, coordinator } = createHarness(300, { rematerializePage });
+    renderer.addPage({ pageKey: 'a', range: { start: 0, end: 100 }, messages: messages(100, 'a'), projectedWeight: 1 }, 300);
+    renderer.addPage({ pageKey: 'b', range: { start: 100, end: 200 }, messages: messages(100, 'b'), projectedWeight: 1 }, 300);
+    const record = store.peek('b')!;
+    record.messages = null;
+    record.renderState = 'spacer';
+    const wrapper = root.querySelector<HTMLElement>('[data-page-key="b"]')!;
+    jest.spyOn(wrapper, 'getBoundingClientRect').mockReturnValue({ top: 0, bottom: 100, height: 100 } as DOMRect);
+    Object.defineProperty(viewport, 'clientHeight', { configurable: true, value: 100 });
+    const before = root.innerHTML;
+    const runStored = jest.spyOn(coordinator, 'runStored');
+
+    viewport.dispatchEvent(new Event('scroll'));
+    expect(root.innerHTML).toBe(before);
+    expect(rematerializePage).not.toHaveBeenCalled();
+    renderer.flushFrameForTest();
+    await Promise.resolve();
+    resolvePage({ pageKey: 'b', range: record.range, messages: messages(100, 'b'), projectedWeight: 1 });
+    await new Promise(resolve => setTimeout(resolve, 0));
+    expect(runStored).toHaveBeenCalled();
+    expect(store.peek('b')?.renderState).toBe('mounted');
+  });
+
+  it('actively samples viewport after first indexed page mount', () => {
+    const { renderer } = createHarness();
+    const sample = jest.spyOn(renderer, 'sampleViewport');
+    renderer.addPage({ pageKey: 'a', range: { start: 200, end: 300 }, messages: messages(100), projectedWeight: 1 }, 300);
+    expect(sample).toHaveBeenCalledTimes(1);
   });
 
   it('detects visible pages from viewport geometry and pre-mounts neighbors', async () => {
@@ -117,11 +165,24 @@ describe('HistoryWindowRenderer', () => {
     store.peek('b')!.messages = null;
     store.peek('b')!.renderState = 'spacer';
     renderer.setVisiblePages(['a']);
+    (renderer as any).pendingVisiblePages = new Set(['a']);
+    renderer.sampleIntent('newer');
+    renderer.flushFrameForTest();
+    const reconcile = new Promise(resolve => setTimeout(resolve, 10));
+    await new Promise(resolve => setTimeout(resolve, 0));
     expect(rematerializePage).toHaveBeenCalledTimes(1);
     expect((renderer as any).options.coordinator.hasLiveTurn()).toBe(false);
     resolvePage({ pageKey: 'b', range: { start: 100, end: 200 }, messages: messages(100, 'b2'), projectedWeight: 1 });
-    await new Promise(resolve => setTimeout(resolve, 0));
+    await reconcile;
     expect(store.peek('b')?.renderState).toBe('mounted');
+  });
+
+  it('replaces a search detail in its existing mounted page without adding a duplicate wrapper', () => {
+    const { renderer, root } = createHarness();
+    renderer.addPage({ pageKey: 'existing', range: { start: 0, end: 2 }, messages: messages(2, 'hit'), projectedWeight: 1 }, 300);
+    expect(renderer.replaceMessage({ id: 'hit-0', role: 'assistant', content: 'exact', timestamp: 1 }, 'search')).toBe(true);
+    expect(root.querySelectorAll('[data-page-key]').length).toBe(1);
+    expect(root.querySelector('[data-message-id="hit-0"]')).not.toBeNull();
   });
 
   it.each(['mounted', 'spacer', 'evicted'] as const)('reveals search hits from %s pages', async renderState => {
@@ -151,10 +212,15 @@ describe('HistoryWindowRenderer', () => {
     store.peek('b')!.renderState = 'spacer';
     renderer.setVisiblePages(['a']);
     renderer.setVisiblePages(['a']);
+    (renderer as any).pendingVisiblePages = new Set(['a']);
+    renderer.sampleIntent('newer');
+    renderer.flushFrameForTest();
+    const reconcile = new Promise(resolve => setTimeout(resolve, 10));
+    await new Promise(resolve => setTimeout(resolve, 0));
     expect(rematerializePage).toHaveBeenCalledTimes(1);
     setConversationId('other');
     resolvePage({ pageKey: 'b', range: { start: 100, end: 200 }, messages: messages(100, 'b2'), projectedWeight: 1 });
-    await new Promise(resolve => setTimeout(resolve, 0));
+    await reconcile;
     expect(store.peek('b')?.messages).toBeNull();
   });
 
@@ -240,17 +306,31 @@ describe('HistoryWindowRenderer', () => {
     (global as any).MutationObserver = originalMutation;
   });
 
-  it('keeps anchor correction free of cumulative drift across ten remounts', () => {
-    const { renderer, viewport } = createHarness();
-    const record = renderer.addPage({ pageKey: 'a', range: { start: 0, end: 100 }, messages: messages(100), projectedWeight: 1 }, 300);
-    const message = document.querySelector<HTMLElement>('[data-message-id]')!;
-    jest.spyOn(message, 'getBoundingClientRect').mockReturnValue({ top: 20, bottom: 40, height: 20 } as DOMRect);
+  it('applies a second anchor correction after async page settlement', async () => {
+    let top = 20;
+    let release!: () => void;
+    const renderPage = (record: any, wrapper: HTMLElement, ticket: number) => {
+      const message = document.createElement('div');
+      message.dataset.messageId = record.messages[0].id;
+      jest.spyOn(message, 'getBoundingClientRect').mockImplementation(() => ({ top, bottom: top + 20, height: 20 } as DOMRect));
+      wrapper.appendChild(message);
+      release = record.__store.registerRenderSlot(record.pageKey, ticket);
+    };
+    const store = new HistoryPageStore();
+    document.body.innerHTML = '<div id="viewport"><div id="messages"></div></div>';
+    const viewport = document.querySelector('#viewport') as HTMLElement;
+    const root = document.querySelector('#messages') as HTMLElement;
+    const renderer = new HistoryWindowRenderer({ root, viewport, pageStore: store, coordinator: new ProjectionWriteCoordinator(), getConversationId: () => 'c', getDomEpoch: () => 1, isLive: () => false, renderPage: (record, wrapper, ticket) => renderPage(Object.assign(record, { __store: store }), wrapper, ticket) });
     viewport.scrollTop = 100;
-    for (let count = 0; count < 10; count += 1) {
-      record.renderState = 'spacer';
-      renderer.setVisiblePages(['a']);
-    }
-    expect(Math.abs(viewport.scrollTop - 100)).toBeLessThanOrEqual(20);
+    const anchor = document.createElement('div');
+    anchor.dataset.messageId = 'existing';
+    jest.spyOn(anchor, 'getBoundingClientRect').mockImplementation(() => ({ top, bottom: top + 20, height: 20 } as DOMRect));
+    root.appendChild(anchor);
+    renderer.addPage({ pageKey: 'a', range: { start: 0, end: 1 }, messages: messages(1), projectedWeight: 1 }, 300);
+    top = 40;
+    release();
+    await new Promise(resolve => setTimeout(resolve, 0));
+    expect(viewport.scrollTop).toBe(120);
   });
 
   it('drops search pins explicitly when search closes', () => {
