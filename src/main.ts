@@ -35,6 +35,7 @@ import {
 import type { ChatViewPlacement, EnvironmentScope } from './core/types/settings';
 import { ClaudianView } from './features/chat/ClaudianView';
 import { setHistoryRenderDiagnosticsSink } from './features/chat/history/HistoryDiagnostics';
+import { ConversationOpenRegistry } from './features/chat/tabs/ConversationOpenRegistry';
 import { type InlineEditContext, InlineEditModal } from './features/inline-edit/ui/InlineEditModal';
 import { ClaudianSettingTab } from './features/settings/ClaudianSettings';
 import { setLocale } from './i18n/i18n';
@@ -54,6 +55,7 @@ export default class ClaudianPlugin extends Plugin {
   settings!: ClaudianSettings;
   storage!: SharedAppStorage;
   private conversations: Conversation[] = [];
+  readonly conversationOpenRegistry = new ConversationOpenRegistry();
   private lastKnownTabManagerState: AppTabManagerState | null = null;
 
   async onload() {

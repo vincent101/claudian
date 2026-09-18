@@ -14,6 +14,7 @@ import { t } from '../../../i18n/i18n';
 import type ClaudianPlugin from '../../../main';
 import { chooseForkTarget } from '../../../shared/modals/ForkTargetModal';
 import { getVaultPath } from '../../../utils/path';
+import { type ConversationOpenClaim, ConversationOpenRegistry } from './ConversationOpenRegistry';
 import { type DesktopNotificationKind,notifyBackgroundTabStateChange } from './desktopNotifier';
 import { getTabProviderId } from './providerResolution';
 import {
@@ -98,6 +99,8 @@ export class TabManager implements TabManagerInterface {
   private providerCommandWarmups = new Map<TabId, ProviderCommandWarmupEntry>();
   private providerCommandCache = new Map<TabId, ProviderCommandCacheEntry>();
   private isRestoringState = false;
+  private readonly conversationOpenRegistry: ConversationOpenRegistry;
+  private pendingConversationClaims = new Map<TabId, ConversationOpenClaim>();
 
   /** Guard to prevent concurrent tab switches. */
   private isSwitchingTab = false;
@@ -150,6 +153,7 @@ export class TabManager implements TabManagerInterface {
     arg5: TabManagerCallbacks = {},
   ) {
     this.plugin = plugin;
+    this.conversationOpenRegistry = plugin.conversationOpenRegistry ?? new ConversationOpenRegistry();
 
     if (isTabManagerViewHost(arg3)) {
       this.containerEl = arg2 as HTMLElement;
@@ -241,6 +245,17 @@ export class TabManager implements TabManagerInterface {
       },
     });
 
+    if (conversation) {
+      if (await this.reserveConversationForTab(tab, conversation.id)) {
+        this.commitConversationForTab(tab, conversation.id);
+      } else {
+        tab.conversationId = null;
+        tab.state.currentConversationId = null;
+        tab.lifecycleState = 'blank';
+        tab.hydrationState = 'READY';
+      }
+    }
+
     // Initialize UI components with provider catalog
     initializeTabUI(tab, this.plugin, {
       getProviderCatalogConfig: () => this.getProviderCatalogConfig(tab),
@@ -263,6 +278,10 @@ export class TabManager implements TabManagerInterface {
         switchToHydrationShell: (conversationId) => this.switchTabConversationToShell(tab, conversationId),
         markHydrationReady: () => this.setHydrationState(tab, 'READY'),
         isHydrationReady: () => tab.hydrationState === 'READY',
+        reserveConversation: (conversationId) => this.reserveConversationForTab(tab, conversationId),
+        commitConversation: (conversationId) => this.commitConversationForTab(tab, conversationId),
+        cancelConversationReservation: (conversationId) => this.cancelConversationForTab(tab, conversationId),
+        releaseConversation: (conversationId) => this.releaseConversationForTab(tab, conversationId),
       },
     );
 
@@ -529,6 +548,7 @@ export class TabManager implements TabManagerInterface {
 
     // Save conversation before closing
     await tab.controllers.conversationController?.save();
+    if (tab.conversationId) this.releaseConversationForTab(tab, tab.conversationId);
     tab.state.historyLease?.release();
     tab.state.historyLease = null;
 
@@ -672,6 +692,47 @@ export class TabManager implements TabManagerInterface {
   // ============================================
   // Conversation Management
   // ============================================
+
+  private async reserveConversationForTab(tab: TabData, conversationId: string): Promise<boolean> {
+    if (tab.conversationOpenClaim?.conversationId === conversationId
+      && this.conversationOpenRegistry.owns(tab.conversationOpenClaim)) return true;
+    const pending = this.pendingConversationClaims.get(tab.id);
+    if (pending?.conversationId === conversationId && this.conversationOpenRegistry.owns(pending)) return true;
+    const claim = this.conversationOpenRegistry.reserve(conversationId, async () => {
+      this.plugin.app.workspace.revealLeaf(this.view.leaf);
+      await this.switchToTab(tab.id);
+    });
+    if (!claim) {
+      await this.conversationOpenRegistry.focusOwner(conversationId);
+      return false;
+    }
+    this.pendingConversationClaims.set(tab.id, claim);
+    return true;
+  }
+
+  private commitConversationForTab(tab: TabData, conversationId: string): void {
+    const claim = this.pendingConversationClaims.get(tab.id) ?? tab.conversationOpenClaim;
+    if (!claim || claim.conversationId !== conversationId || !this.conversationOpenRegistry.owns(claim)) {
+      throw new Error('Conversation ownership changed during restore');
+    }
+    tab.conversationOpenClaim = claim;
+    this.pendingConversationClaims.delete(tab.id);
+  }
+
+  private cancelConversationForTab(tab: TabData, conversationId: string): void {
+    const claim = this.pendingConversationClaims.get(tab.id);
+    if (!claim || claim.conversationId !== conversationId) return;
+    this.conversationOpenRegistry.release(conversationId, claim.ownerToken);
+    this.pendingConversationClaims.delete(tab.id);
+  }
+
+  private releaseConversationForTab(tab: TabData, conversationId: string): void {
+    const claim = tab.conversationOpenClaim;
+    if (!claim || claim.conversationId !== conversationId) return;
+    if (this.conversationOpenRegistry.release(conversationId, claim.ownerToken)) {
+      tab.conversationOpenClaim = null;
+    }
+  }
 
   /**
    * Opens a conversation in a new tab or existing tab.
@@ -879,7 +940,10 @@ export class TabManager implements TabManagerInterface {
   getPersistedState(): PersistedTabManagerState {
     const openTabs: PersistedTabState[] = [];
 
+    const persistedConversationIds = new Set<string>();
     for (const tab of this.tabs.values()) {
+      if (tab.conversationId && persistedConversationIds.has(tab.conversationId)) continue;
+      if (tab.conversationId) persistedConversationIds.add(tab.conversationId);
       openTabs.push({
         ...(tab.lifecycleState === 'blank' && tab.draftModel
           ? { draftModel: tab.draftModel }
@@ -899,8 +963,19 @@ export class TabManager implements TabManagerInterface {
   async restoreState(state: PersistedTabManagerState): Promise<void> {
     this.isRestoringState = true;
     try {
+      const selectedByConversation = new Map<string, PersistedTabState>();
+      for (const candidate of state.openTabs) {
+        if (!candidate.conversationId) continue;
+        const selected = selectedByConversation.get(candidate.conversationId);
+        if (!selected || candidate.tabId === state.activeTabId) {
+          selectedByConversation.set(candidate.conversationId, candidate);
+        }
+      }
+      const restoredTabs = state.openTabs.filter(candidate =>
+        !candidate.conversationId || selectedByConversation.get(candidate.conversationId) === candidate
+      );
       // Create tabs from persisted state with error handling.
-      for (const tabState of state.openTabs) {
+      for (const tabState of restoredTabs) {
         try {
           await this.createTab(tabState.conversationId, tabState.tabId, {
             activate: false,

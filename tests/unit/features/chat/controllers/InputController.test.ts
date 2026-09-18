@@ -191,6 +191,7 @@ function createMockDeps(overrides: Partial<InputControllerDeps> = {}): InputCont
     generateId: () => `msg-${Date.now()}-${Math.random().toString(36).substring(2, 11)}`,
     resetInputHeight: jest.fn(),
     getAgentService: () => mockAgentService as any,
+    openConversation: jest.fn().mockResolvedValue(undefined),
     getSubagentManager: () => ({ resetSpawnedCount: jest.fn(), resetStreamingState: jest.fn(), interruptAllActive: jest.fn() }) as any,
     mockAgentService,
     ...overrides,
@@ -1824,21 +1825,6 @@ describe('InputController - Message Queue', () => {
         expect.objectContaining({ onSelect: expect.any(Function), onDismiss: expect.any(Function) }),
       );
       expect(controller.isResumeDropdownVisible()).toBe(true);
-    });
-
-    it('should call switchTo on select callback', async () => {
-      (deps.plugin as any).getConversationList = jest.fn().mockReturnValue(mockConversations);
-      (deps.conversationController as any).switchTo = jest.fn().mockResolvedValue(undefined);
-      inputEl.value = '/resume';
-      controller = new InputController(deps);
-
-      await controller.sendMessage();
-
-      const callbacks = (ResumeSessionDropdown as jest.Mock).mock.calls[0][4];
-      callbacks.onSelect('conv-1');
-
-      expect((deps.conversationController as any).switchTo).toHaveBeenCalledWith('conv-1');
-      expect(mockDropdownInstance.destroy).toHaveBeenCalled();
     });
 
     it('should call openConversation on select callback when provided', async () => {

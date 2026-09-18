@@ -33,6 +33,7 @@ import type {
 import type { InstructionModeManager } from '../ui/InstructionModeManager';
 import type { NavigationSidebar } from '../ui/NavigationSidebar';
 import type { StatusPanel } from '../ui/StatusPanel';
+import type { ConversationOpenClaim } from './ConversationOpenRegistry';
 
 /**
  * Default number of tabs allowed.
@@ -131,6 +132,10 @@ export interface TabHydrationHooks {
   markHydrationReady: () => void;
   /** Whether the tab has fully hydrated (READY) and may persist session state. */
   isHydrationReady: () => boolean;
+  reserveConversation: (conversationId: string) => Promise<boolean>;
+  commitConversation: (conversationId: string) => void;
+  cancelConversationReservation: (conversationId: string) => void;
+  releaseConversation: (conversationId: string) => void;
 }
 
 /** Generates a unique tab ID. */
@@ -253,6 +258,9 @@ export interface TabData {
 
   /** Conversation ID bound to this tab (null for new/empty tabs). */
   conversationId: string | null;
+
+  /** Plugin-level ownership token for the bound conversation. */
+  conversationOpenClaim: ConversationOpenClaim | null;
 
   /** UI-only history hydration lifecycle for restored/bound tabs. */
   hydrationState: TabHydrationState;

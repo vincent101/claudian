@@ -91,6 +91,10 @@ export interface ConversationControllerDeps {
    */
   isHydrationReady?: () => boolean;
   onHistoryLoadProgress?: (progress: HistoryLoadProgress) => void;
+  reserveConversation?: (conversationId: string) => Promise<boolean>;
+  commitConversation?: (conversationId: string) => void;
+  cancelConversationReservation?: (conversationId: string) => void;
+  releaseConversation?: (conversationId: string) => void;
 }
 
 type SaveOptions = {
@@ -143,6 +147,7 @@ export class ConversationController {
     if (state.isCreatingConversation) return;
     if (state.isSwitchingConversation) return;
 
+    const outgoingConversationId = state.currentConversationId;
     // Set flag to block message sending during reset
     state.isCreatingConversation = true;
 
@@ -180,6 +185,7 @@ export class ConversationController {
 
       // Reset to entry point state - no conversation created yet
       state.currentConversationId = null;
+      if (outgoingConversationId) this.deps.releaseConversation?.(outgoingConversationId);
       state.clearMessages();
       state.resetHistoryPagination();
       state.usage = null;
@@ -670,6 +676,7 @@ export class ConversationController {
       ? plugin.getConversationSync(previousConversationId)?.providerId
       : undefined;
 
+    if (this.deps.reserveConversation && !(await this.deps.reserveConversation(id))) return;
     state.isSwitchingConversation = true;
 
     try {
@@ -716,6 +723,8 @@ export class ConversationController {
         state.historySnapshotOffset = firstScreen.snapshotOffset ?? null;
       }
       this.restoreConversation(conversation, firstScreen);
+      this.deps.commitConversation?.(id);
+      if (previousConversationId) this.deps.releaseConversation?.(previousConversationId);
 
       this.deps.getHistoryDropdown()?.removeClass('visible');
       this.updateWelcomeVisibility();
@@ -728,6 +737,9 @@ export class ConversationController {
       this.deps.markHydrationReady?.();
 
       this.callbacks.onConversationSwitched?.();
+    } catch (error) {
+      this.deps.cancelConversationReservation?.(id);
+      throw error;
     } finally {
       state.isSwitchingConversation = false;
     }

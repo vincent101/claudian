@@ -399,6 +399,7 @@ export function createTab(options: TabCreateOptions): TabData {
     draftModel,
     providerId: initialProviderId,
     conversationId: conversation?.id ?? null,
+    conversationOpenClaim: null,
     hydrationState: isBound ? 'SHELL' : 'READY',
     hydrationGeneration: 0,
     hydrationDiagnostic: null,
@@ -1330,6 +1331,10 @@ export function initializeTabControllers(
       switchToHydrationShell: hydrationHooks?.switchToHydrationShell,
       markHydrationReady: hydrationHooks?.markHydrationReady,
       isHydrationReady: hydrationHooks?.isHydrationReady,
+      reserveConversation: hydrationHooks?.reserveConversation,
+      commitConversation: hydrationHooks?.commitConversation,
+      cancelConversationReservation: hydrationHooks?.cancelConversationReservation,
+      releaseConversation: hydrationHooks?.releaseConversation,
       onHistoryLoadProgress: progress => handleTabHistoryLoadProgress(tab, progress),
       ensureServiceForConversation: async (conversation) => {
         const nextProviderId = getTabProviderId(tab, plugin, conversation);

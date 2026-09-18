@@ -1889,7 +1889,7 @@ export class InputController {
   }
 
   private showResumeDropdown(): void {
-    const { plugin, state, conversationController } = this.deps;
+    const { plugin, state } = this.deps;
 
     // Clean up any existing dropdown
     this.destroyResumeDropdown();
@@ -1900,8 +1900,8 @@ export class InputController {
       return;
     }
 
-    const openConversation = this.deps.openConversation
-      ?? ((id: string) => conversationController.switchTo(id));
+    const openConversation = this.deps.openConversation;
+    if (!openConversation) return;
 
     this.activeResumeDropdown = new ResumeSessionDropdown(
       this.deps.getInputContainerEl(),
