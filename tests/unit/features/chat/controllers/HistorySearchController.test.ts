@@ -18,6 +18,7 @@ describe('HistorySearchController', () => {
   let locate: jest.Mock;
   let controller: HistorySearchController;
   let isActive: jest.Mock;
+  let releaseSearchPins: jest.Mock;
 
   beforeEach(() => {
     jest.useFakeTimers();
@@ -28,6 +29,7 @@ describe('HistorySearchController', () => {
     searchHistory = jest.fn().mockResolvedValue([result('m1'), result('m2')]);
     locate = jest.fn().mockResolvedValue(undefined);
     isActive = jest.fn().mockReturnValue(true);
+    releaseSearchPins = jest.fn();
     controller = new HistorySearchController({
       rootEl: root,
       messagesEl: messages,
@@ -36,6 +38,7 @@ describe('HistorySearchController', () => {
       searchHistory,
       locateResult: locate,
       waitForResultRender: jest.fn().mockResolvedValue(undefined),
+      releaseSearchPins,
     });
   });
 
@@ -69,6 +72,12 @@ describe('HistorySearchController', () => {
     document.dispatchEvent(inactiveShortcut);
     expect(root.querySelector('.claudian-history-search')).toBeNull();
     expect(inactiveShortcut.defaultPrevented).toBe(false);
+  });
+
+  it('releases search page pins when the panel closes', () => {
+    controller.open();
+    controller.close({ restoreFocus: false });
+    expect(releaseSearchPins).toHaveBeenCalledTimes(1);
   });
 
   it('selects the existing query when the shortcut is repeated', () => {

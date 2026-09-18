@@ -2535,6 +2535,27 @@ describe('ConversationController - MCP Server Persistence', () => {
       expect(mockMcpServerSelector.clearEnabled).toHaveBeenCalled();
     });
 
+    it('keeps non-index Codex hydration on the legacy renderer without creating page windows', async () => {
+      const historyWindowRenderer = { addPage: jest.fn(), reset: jest.fn() };
+      const switchedConversation = {
+        id: 'codex-conv', providerId: 'codex', title: 'Codex',
+        messages: [{ id: 'm', role: 'user', content: 'hello', timestamp: 1 }],
+        sessionId: 'session-codex', createdAt: 1, updatedAt: 1,
+      };
+      deps = createMockDeps({
+        getHistoryWindowRenderer: () => historyWindowRenderer as any,
+        getHistoryIndexCapableService: () => null,
+        plugin: { ...createMockDeps().plugin, switchConversation: jest.fn().mockResolvedValue(switchedConversation) } as any,
+      });
+      controller = new ConversationController(deps);
+      deps.state.currentConversationId = 'old-conv';
+
+      await controller.switchTo('codex-conv');
+
+      expect(historyWindowRenderer.addPage).not.toHaveBeenCalled();
+      expect(deps.renderer.renderMessages).toHaveBeenCalledWith(switchedConversation.messages, expect.any(Function));
+    });
+
     it('should ensure the tab service matches the switched conversation provider', async () => {
       const ensureServiceForConversation = jest.fn().mockResolvedValue(undefined);
       const switchedConversation = {

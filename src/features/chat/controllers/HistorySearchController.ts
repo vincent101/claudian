@@ -85,6 +85,7 @@ interface HistorySearchControllerDeps {
   locateResult: (result: HistorySearchResult) => Promise<HTMLElement>;
   waitForResultRender: (projectionKey: string) => Promise<void>;
   refreshSearchSnapshot?: () => Promise<void>;
+  releaseSearchPins?: () => void;
 }
 interface CloseOptions { restoreFocus?: boolean }
 interface MarkEntry { generation: number; marks: HTMLElement[] }
@@ -149,6 +150,7 @@ export class HistorySearchController {
     this.timer = null; this.clearHighlights(); this.panel?.remove();
     this.panel = null; this.input = null; this.statusEl = null; this.previousButton = null; this.nextButton = null;
     this.results = []; this.selectedIndex = -1; this.openingFocus = null;
+    this.deps.releaseSearchPins?.();
     if ((options.restoreFocus ?? true) && focusTarget?.isConnected) focusTarget.focus();
   }
   destroy(): void { this.close({ restoreFocus: false }); this.eventDocument?.removeEventListener('keydown', this.onDocumentKeyDown, { capture: true }); }
