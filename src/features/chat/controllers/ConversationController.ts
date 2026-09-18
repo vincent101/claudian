@@ -454,8 +454,10 @@ export class ConversationController {
         const addedIds = new Set(added.map(message => message.id));
         const prepend = combined.filter(message => addedIds.has(message.id));
         const windowRenderer = this.deps.getHistoryWindowRenderer?.();
-        if (windowRenderer) windowRenderer.addPage(this.toPageInput(page), total);
-        else this.deps.renderer.prependMessages(prepend, combined);
+        if (windowRenderer) {
+          windowRenderer.addPage(this.toPageInput(page), total);
+          windowRenderer.sampleIntent('older');
+        } else this.deps.renderer.prependMessages(prepend, combined);
         await this.deps.renderer.waitForRenderedMessages();
         if (isStale()) return;
         state.loadedRanges = this.mergeRanges([...state.loadedRanges, page.range]);
