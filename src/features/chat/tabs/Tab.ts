@@ -1464,12 +1464,15 @@ export function initializeTabControllers(
         void tab.renderer!.waitForMessageContentRendered(message.id).finally(release);
       }
     },
-    clearPageReferences: (messages, wrapper, record) => {
+    clearPageReferences: (messageIds, wrapper, record) => {
       capturePageUiState(wrapper, record.uiState);
-      tab.renderer?.clearPageReferences(messages);
+      tab.renderer?.clearPageReferences(messageIds);
     },
     invalidateDomEpoch: () => tab.renderer?.invalidateDomEpoch(),
     restorePageUiState: (wrapper, record) => restorePageUiState(wrapper, record.uiState),
+    onPageSettled: (_wrapper, record) => {
+      for (const messageId of record.messageIds) tab.controllers.historySearchController?.onMessageContentRendered(messageId);
+    },
     rematerializePage: record => tab.controllers.conversationController?.rematerializeHistoryPage(record) ?? Promise.resolve(null),
   });
   tab.dom.eventCleanups.push(() => tab.controllers.historyWindowRenderer?.dispose());

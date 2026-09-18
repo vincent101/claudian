@@ -368,6 +368,24 @@ describe('ConversationController', () => {
       expect(deps.state.messages.map(message => message.id)).toEqual(['target', 'latest']);
     });
 
+    it('replaces an existing window page for a search detail instead of adding a duplicate page', async () => {
+      const replaceMessage = jest.fn().mockReturnValue(true);
+      const addPage = jest.fn();
+      deps = createMockDeps({ getHistoryWindowRenderer: () => ({ replaceMessage, addPage, revealMessage: jest.fn().mockResolvedValue(false) } as any) });
+      controller = new ConversationController(deps);
+      deps.state.currentConversationId = 'large';
+      deps.state.messages = [{ id: 'target', role: 'user', content: 'summary', timestamp: 1, projectionLevel: 'summary' }];
+      const lease = makeLease(10);
+      deps.state.historyLease = lease as any;
+      lease.loadWindow.mockResolvedValue({ messages: deps.state.messages, range: { start: 0, end: 1 }, sourceBytes: 1, projectedChars: 1, oversizedTurnCount: 0, pageKey: 'w:detail', hasMoreBefore: false, hasMoreAfter: true });
+      (deps.renderer.findMessageElement as jest.Mock).mockReturnValueOnce(null).mockReturnValue({} as HTMLElement);
+
+      await controller.locateHistorySearchResult({ projectionKey: 'target', turnIndex: 0, matchOrdinal: 0, matchedText: 'needle' });
+
+      expect(replaceMessage).toHaveBeenCalled();
+      expect(addPage).not.toHaveBeenCalled();
+    });
+
     it('does not paginate when a search hit is already loaded', async () => {
       const lease = makeLease(100);
       deps.state.historyLease = lease as any;
@@ -662,6 +680,15 @@ describe('ConversationController', () => {
     // ============================================
     // Unified results semantics (③ + P0a fallback)
     // ============================================
+
+    it('rematerializes detail when retained page UI says detail was loaded', async () => {
+      const lease = makeLease(10);
+      deps.state.currentConversationId = 'conv';
+      deps.state.historyLease = lease;
+      lease.loadWindow.mockResolvedValue({ messages: [], range: { start: 0, end: 1 }, sourceBytes: 1, projectedChars: 1, oversizedTurnCount: 0, pageKey: 'w:0:1', hasMoreBefore: false, hasMoreAfter: true });
+      await controller.rematerializeHistoryPage({ pageKey: 'w:0:1', range: { start: 0, end: 1 }, uiState: new Map([['m:detail:x', { detailLoaded: true }]]) });
+      expect(lease.loadWindow).toHaveBeenCalledWith(expect.objectContaining({ projectionLevel: 'detail' }));
+    });
 
     it('searches fully-hydrated loaded messages without a lease (Codex/OpenCode fallback)', async () => {
       deps.state.currentConversationId = 'codex-conv';

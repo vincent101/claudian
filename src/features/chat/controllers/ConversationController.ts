@@ -334,10 +334,11 @@ export class ConversationController {
     await this.loadOlderWindow(lease);
   }
 
-  async rematerializeHistoryPage(record: { pageKey: string; range: LoadedTurnRange }): Promise<HistoryPageInput | null> {
+  async rematerializeHistoryPage(record: { pageKey: string; range: LoadedTurnRange; uiState: Map<string, { detailLoaded?: boolean }> }): Promise<HistoryPageInput | null> {
     const lease = this.deps.state.historyLease;
     const conversationId = this.deps.state.currentConversationId;
     if (!lease || !conversationId) return null;
+    const requiresDetail = [...record.uiState.values()].some(ui => ui.detailLoaded);
     const page = await lease.loadWindow({
       anchorTurn: record.range.start,
       direction: 'newer',
@@ -345,7 +346,7 @@ export class ConversationController {
         ...HISTORY_RESOURCE_POLICY.paging,
         maxTurns: Math.max(1, record.range.end - record.range.start),
       },
-      projectionLevel: 'summary',
+      projectionLevel: requiresDetail ? 'detail' : 'summary',
       maxTurn: record.range.end,
     });
     if (conversationId !== this.deps.state.currentConversationId || page.pageKey !== record.pageKey) return null;
@@ -674,10 +675,12 @@ export class ConversationController {
       state.messages = combined;
       const windowRenderer = this.deps.getHistoryWindowRenderer?.();
       if (windowRenderer) {
-        windowRenderer.addPage(this.toPageInput({
-          ...page,
-          messages: page.messages.map(message => message.id === detail.id ? detail : message),
-        }), lease.totalTurns, 'search');
+        if (!windowRenderer.replaceMessage(detail, 'search')) {
+          windowRenderer.addPage(this.toPageInput({
+            ...page,
+            messages: page.messages.map(message => message.id === detail.id ? detail : message),
+          }), lease.totalTurns, 'search');
+        }
       } else {
         this.deps.renderer.renderMessages(combined, () => this.getGreeting());
       }

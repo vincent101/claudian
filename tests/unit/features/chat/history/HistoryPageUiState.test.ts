@@ -20,6 +20,19 @@ describe('HistoryPageUiState', () => {
     expect(toggle.getAttribute('aria-expanded')).toBe('true');
   });
 
+  it('uses stable block ids instead of sibling positions', () => {
+    const source = document.createElement('div');
+    source.innerHTML = '<div data-message-id="m"><div data-block-id="stable" aria-expanded="true"></div></div>';
+    const state = new Map<string, MessageUiState>();
+    capturePageUiState(source, state);
+    const target = document.createElement('div');
+    target.innerHTML = '<div data-message-id="m"><span aria-expanded="false"></span><div data-block-id="stable" aria-expanded="false"></div></div>';
+    const stable = target.querySelector<HTMLElement>('[data-block-id="stable"]')!;
+    stable.addEventListener('click', () => stable.setAttribute('aria-expanded', 'true'));
+    restorePageUiState(target, state);
+    expect(stable.getAttribute('aria-expanded')).toBe('true');
+  });
+
   it('restores loaded detail through its lazy expand control', () => {
     const source = document.createElement('div');
     source.innerHTML = '<div data-message-id="m"><div class="claudian-text-block">full</div></div>';

@@ -191,6 +191,7 @@ export class MessageRenderer {
         'data-role': msg.role,
       },
     });
+    (msgEl as HTMLElement & { __message?: ChatMessage }).__message = msg;
 
     const contentEl = msgEl.createDiv({ cls: 'claudian-message-content', attr: { dir: 'auto' } });
 
@@ -300,11 +301,11 @@ export class MessageRenderer {
   }
 
   /** Clears ephemeral references before a page wrapper leaves the DOM. */
-  clearPageReferences(messages: ChatMessage[]): void {
-    for (const message of messages) {
-      this.liveMessageEls.delete(message.id);
-      this.pendingContentRenders.delete(message.id);
-      this.contentRenderGenerations.delete(message.id);
+  clearPageReferences(messageIds: Iterable<string>): void {
+    for (const messageId of messageIds) {
+      this.liveMessageEls.delete(messageId);
+      this.pendingContentRenders.delete(messageId);
+      this.contentRenderGenerations.delete(messageId);
     }
   }
 
@@ -546,6 +547,7 @@ export class MessageRenderer {
         'data-role': msg.role,
       },
     });
+    (msgEl as HTMLElement & { __message?: ChatMessage }).__message = msg;
 
     const contentEl = msgEl.createDiv({ cls: 'claudian-message-content', attr: { dir: 'auto' } });
 

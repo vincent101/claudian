@@ -136,6 +136,7 @@ export class InputController {
   private steerInFlight = false;
   private pendingSteerMessage: QueuedMessage | null = null;
   private activeStreamingAssistantMessage: ChatMessage | null = null;
+  private activeLivePageMessages: ChatMessage[] = [];
   /** Turn projection context of the in-flight turn (v3 §5.1); cleared on turn end. */
   private activeTurnContext: TurnProjectionContext | null = null;
   private pendingProviderUserMessages: Array<{
@@ -369,6 +370,7 @@ export class InputController {
     }
 
     let turnContext: TurnProjectionContext | null = null;
+    this.activeLivePageMessages = [];
     let shouldReleaseUserTurn = false;
     let deferredAutoSendContent: string | null = null;
     let deferredNewSessionPlan: string | null = null;
@@ -424,6 +426,7 @@ export class InputController {
       images: imagesForMessage,
     };
     state.addMessage(userMsg);
+    this.activeLivePageMessages.push(userMsg);
     state.hasPendingConversationSave = true;
     const liveRoot = this.deps.getHistoryWindowRenderer?.()?.beginLivePage(
       `live:${turnId}`,
@@ -444,6 +447,7 @@ export class InputController {
       contentBlocks: [],
     };
     state.addMessage(assistantMsg);
+    this.activeLivePageMessages.push(assistantMsg);
     this.activeStreamingAssistantMessage = assistantMsg;
     this.activateStreamingAssistantMessage(assistantMsg);
     // v3 §5.1: explicit projection context — the data truth for this turn.
@@ -744,7 +748,8 @@ export class InputController {
       // would self-deadlock the FIFO.
       projectionLease?.release();
       const historyWindowRenderer = this.deps.getHistoryWindowRenderer?.();
-      historyWindowRenderer?.freezeLivePage(state.messages.slice(-2));
+      historyWindowRenderer?.freezeLivePage(this.activeLivePageMessages);
+      this.activeLivePageMessages = [];
       if (historyWindowRenderer) renderer.setMessagesEl(this.deps.getMessagesEl());
       // Whether the final visible projection settled — the completion event
       // may only fire after this is true. A dirty turn must re-project
@@ -757,6 +762,10 @@ export class InputController {
         && state.streamGeneration === streamGeneration
       ) {
         const reproject = async (): Promise<void> => {
+          if (historyWindowRenderer) {
+            historyWindowRenderer.rebuildMountedPages();
+            return;
+          }
           const welcomeEl = renderer.renderMessages(state.messages, () => conversationController.getGreeting());
           this.deps.setWelcomeEl?.(welcomeEl);
           await renderer.waitForRenderedMessages();
@@ -1257,6 +1266,7 @@ export class InputController {
         images,
       };
       this.deps.state.addMessage(userMessage);
+      this.activeLivePageMessages.push(userMessage);
       this.deps.renderer.addMessage(userMessage);
     }
 
@@ -1269,6 +1279,7 @@ export class InputController {
       contentBlocks: [],
     };
     this.deps.state.addMessage(assistantMessage);
+    this.activeLivePageMessages.push(assistantMessage);
     this.activeStreamingAssistantMessage = assistantMessage;
     this.activateStreamingAssistantMessage(assistantMessage);
     this.deps.streamController.showThinkingIndicator();
@@ -1297,6 +1308,7 @@ export class InputController {
       contentBlocks: [],
     };
     this.deps.state.addMessage(assistantMessage);
+    this.activeLivePageMessages.push(assistantMessage);
     this.activeStreamingAssistantMessage = assistantMessage;
     this.activateStreamingAssistantMessage(assistantMessage);
     this.deps.streamController.showThinkingIndicator();

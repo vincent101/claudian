@@ -62,6 +62,7 @@ interface AutoProjection {
   generation: number;
   conversationId: string | null;
   assistantMessage: ChatMessage;
+  pageMessages: ChatMessage[];
   context: TurnProjectionContext;
   /**
    * Live-lease-gated mount state (P2): the user/assistant DOM pair only
@@ -155,6 +156,7 @@ export class AutoTurnProjectionController {
       generation: event.generation,
       conversationId: this.deps.getConversationId(),
       assistantMessage,
+      pageMessages: [pendingUserMessage, assistantMessage].filter((message): message is ChatMessage => message !== null),
       context: createTurnProjectionContext({
         turnId: event.turnId,
         message: assistantMessage,
@@ -409,9 +411,7 @@ export class AutoTurnProjectionController {
         // queued — holding live while acquiring stored self-deadlocks the FIFO.
         this.releaseLiveLease(active);
         const historyWindowRenderer = this.deps.getHistoryWindowRenderer?.();
-        historyWindowRenderer?.freezeLivePage(
-          this.deps.state.messages.filter(message => message.id === active.assistantMessage.id),
-        );
+        historyWindowRenderer?.freezeLivePage(active.pageMessages);
         if (historyWindowRenderer) this.deps.renderer.setMessagesEl(historyWindowRenderer.getRoot());
         const reprojectionSettled = await this.reprojectIfDirty(active, event.turnId, event.generation);
         this.active = null;
