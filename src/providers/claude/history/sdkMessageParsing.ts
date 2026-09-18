@@ -15,6 +15,7 @@ import {
   extractExternalDisplayContent,
   isDisplayableExternalUser,
 } from './externalUserMessage';
+import { isRebuiltContextContent } from './rebuiltContext';
 import type {
   AsyncSubagentResult,
   SDKNativeContentBlock,
@@ -34,16 +35,6 @@ function extractTextContent(content: string | SDKNativeContentBlock[] | undefine
       block.type === 'text' && typeof block.text === 'string' && block.text.trim() !== '(no content)')
     .map(block => block.text)
     .join('\n');
-}
-
-function isRebuiltContextContent(textContent: string): boolean {
-  if (!/^(User|Assistant):\s/.test(textContent)) {
-    return false;
-  }
-
-  return textContent.includes('\n\nUser:')
-    || textContent.includes('\n\nAssistant:')
-    || textContent.includes('\n\nA:');
 }
 
 function extractDisplayContent(textContent: string): string | undefined {

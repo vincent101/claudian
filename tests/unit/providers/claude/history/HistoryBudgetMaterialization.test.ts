@@ -137,7 +137,7 @@ describe('HistoryBudgetMaterialization on a ~71MB giant session', () => {
 
     expect(second.range).toEqual({ start: 5, end: 6 });
     expect(second.sourceBytes).toBeLessThanOrEqual(HISTORY_RESOURCE_POLICY.paging.maxSourceBytes);
-    expect(second.pageKey).toBe('w:5:6');
+    expect(second.pageKey).toMatch(/^w:.+:5:6$/);
 
     lease.release();
   });

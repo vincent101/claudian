@@ -354,6 +354,9 @@ B 依赖 A，可独立部署。metadata 新字段必须向后兼容；回滚到 
 
 ## 4. 批次 C：B3 页面级 DOM 窗口化
 
+实现注记：`pageKey` 必须包含固定索引 snapshot 身份，不能仅由 turn range 构成。
+同一 range 在 transcript 增长或替换后必须生成不同 key，防止跨 snapshot 复用陈旧页。
+
 ### 4.1 页面模型
 
 新增 `/Users/vincentwang/Documents/NoteVault/tools/claudian/src/features/chat/history/HistoryPageStore.ts`：

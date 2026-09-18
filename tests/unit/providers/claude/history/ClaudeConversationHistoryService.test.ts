@@ -221,7 +221,7 @@ describe('ClaudeConversationHistoryService M1 fuse', () => {
       expect(page.sourceBytes).toBe(8 * 1024 * 1024);
       expect(page.projectedChars).toBe(0);
       expect(page.oversizedTurnCount).toBe(0);
-      expect(page.pageKey).toBe('w:22:30');
+      expect(page.pageKey).toBe('w:/current:1:1:999:1:22:30');
       expect(page.hasMoreBefore).toBe(true);
       expect(page.hasMoreAfter).toBe(false);
       expect(mockMaterializeTranscriptPage).toHaveBeenCalledTimes(8);

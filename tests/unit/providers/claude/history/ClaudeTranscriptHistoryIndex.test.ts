@@ -94,6 +94,25 @@ describe('ClaudeTranscriptHistoryIndex', () => {
     expect(corpus).not.toContain('fixture notification');
   });
 
+  it('excludes persisted recovery injections from every indexed projection', async () => {
+    const path = join(process.env.TMPDIR ?? '/tmp', `claudian-rebuilt-${process.pid}.jsonl`);
+    const lines = [
+      JSON.stringify({ type: 'user', uuid: 'u1', message: { content: 'real question' } }),
+      JSON.stringify({ type: 'assistant', uuid: 'a1', parentUuid: 'u1', message: { content: 'real answer' } }),
+      JSON.stringify({ type: 'user', uuid: 'recovery', parentUuid: 'a1', message: { content: 'User: old question\n\nAssistant: injected recovery secret\n\nUser: next question' } }),
+      JSON.stringify({ type: 'assistant', uuid: 'a2', parentUuid: 'recovery', message: { content: 'next answer' } }),
+    ];
+    await writeFile(path, `${lines.join('\n')}\n`);
+
+    const result = await buildTranscriptIndex(path, { useWorker: false });
+
+    expect(result.status).toBe('complete');
+    if (result.status !== 'complete') return;
+    expect(result.index.entries.map(entry => entry.messageKey)).toEqual(['u1', 'a1', 'a2']);
+    expect(result.index.turns.map(turn => turn.turnId)).toEqual(['u1']);
+    expect(result.index.searchText).not.toContain('injected recovery secret');
+  });
+
   it('uses materialization projection keys across merged assistants and compact boundaries', async () => {
     const path = join(process.env.TMPDIR ?? '/tmp', `claudian-projection-${process.pid}.jsonl`);
     const lines = [

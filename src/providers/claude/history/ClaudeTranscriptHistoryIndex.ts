@@ -9,6 +9,7 @@ import {
   isRealUserMessage,
   unwrapExternalEnvelope,
 } from './externalUserMessage';
+import { isRebuiltContextMessage } from './rebuiltContext';
 import { filterActiveBranchEntries } from './sdkBranchFilter';
 import type { SDKNativeMessage } from './sdkHistoryTypes';
 import {
@@ -110,6 +111,7 @@ async function yieldToMainThread(signal?: AbortSignal): Promise<void> {
 interface RawIndexEntry extends TranscriptIndexEntry {
   originMessageId?: string;
   searchText?: string;
+  rebuiltContext: boolean;
   projectionKind: 'skip' | 'user' | 'assistant' | 'compact-boundary';
 }
 
@@ -154,6 +156,7 @@ function toRawEntry(message: SDKNativeMessage, offset: number, length: number, l
     uuid: message.uuid,
     originMessageId: message.origin?.msg_id,
     searchText: extractSearchText(message),
+    rebuiltContext: isRebuiltContextMessage(message),
     projectionKind: getSDKProjectionKind(message),
     parentUuid: message.parentUuid,
     timestamp: message.timestamp,
@@ -175,7 +178,11 @@ async function finalizeIndex(
   signal?: AbortSignal,
 ): Promise<TranscriptHistoryIndex> {
   throwIfAborted(signal);
-  const canonical = filterActiveBranchEntries(rawEntries, resumeAtMessageId, entry => entry.realUser);
+  // Recovery prompts are transport artifacts, not conversation facts. Remove
+  // them before turns, descriptors and search corpus are derived so every
+  // projection consumer (window/detail/title/export) shares the same truth.
+  const canonical = filterActiveBranchEntries(rawEntries, resumeAtMessageId, entry => entry.realUser)
+    .filter(entry => !entry.rebuiltContext);
   await yieldToMainThread(signal);
   let currentTurn: TranscriptTurnIndex | undefined;
   let currentTurnIndex = -1;
@@ -247,6 +254,7 @@ async function finalizeIndex(
     }
     delete entry.originMessageId;
     delete entry.searchText;
+    delete (entry as Partial<RawIndexEntry>).rebuiltContext;
     delete (entry as Partial<RawIndexEntry>).projectionKind;
     if ((index + 1) % FINALIZE_BATCH_SIZE === 0) await yieldToMainThread(signal);
   }
@@ -455,6 +463,11 @@ function buildInWorker(filePath: string, options: BuildOptions): Promise<Transcr
     const advanceSDKProjection = (${serializeWorkerFunction(advanceSDKProjection)});
     const extractVisibleUserSearchText = (${serializeWorkerFunction(extractVisibleUserSearchText)});
     const extractSearchText = (${serializeWorkerFunction(extractSearchText)});
+    const isRebuiltContextContent = (${serializeWorkerFunction((textContent: string) => {
+      if (!/^(User|Assistant):\s/.test(textContent)) return false;
+      return textContent.includes('\n\nUser:') || textContent.includes('\n\nAssistant:') || textContent.includes('\n\nA:');
+    })});
+    const isRebuiltContextMessage = (${serializeWorkerFunction(isRebuiltContextMessage)});
     const toRawEntry = (${serializeWorkerFunction(toRawEntry)});
     const filterActiveBranchEntries = (${serializeWorkerFunction(filterActiveBranchEntries)});
     const finalizeIndex = (${serializeWorkerFunction(finalizeIndex)});

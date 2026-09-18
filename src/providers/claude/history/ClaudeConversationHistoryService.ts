@@ -566,6 +566,9 @@ export class ClaudeConversationHistoryService implements ProviderConversationHis
     const messages = turns.flatMap(turn => turn.messages);
     const oversizedTurnCount = turns.filter(turn => turn.shrunk).length;
     const current = state.segments[state.segments.length - 1];
+    const snapshotIdentity = state.segments
+      .map(segment => `${segment.index.filePath}:${segment.index.dev}:${segment.index.ino}:${segment.index.snapshotSize}:${segment.index.mtimeMs}`)
+      .join('|');
     this.windowDiagnostics?.record({
       phase: 'window_complete',
       turnCount: turns.length,
@@ -581,7 +584,7 @@ export class ClaudeConversationHistoryService implements ProviderConversationHis
       sourceBytes,
       projectedChars,
       oversizedTurnCount,
-      pageKey: `w:${actualStart}:${actualEnd}`,
+      pageKey: `w:${snapshotIdentity}:${actualStart}:${actualEnd}`,
       hasMoreBefore: actualStart > 0,
       hasMoreAfter: actualEnd < total,
     };
