@@ -207,6 +207,48 @@ type FullHistoryIterable = AsyncIterable<FullHistoryChunk>;
 
 ## 3. 批次 B：Claude 双轨统一
 
+### [v4.2 补遗 2026-09-18] capability 注入边界、旧测试迁移与实施顺序
+
+本补遗只闭合 §3 已定语义的可实施性，不改变 capability 分流、metadata 化、防双开、读者清单及 Codex/OpenCode 边界。
+
+#### 决定 1：以 controller deps 注入“可用服务”，不在 controller 直查全局 registry
+
+现状实证：`ConversationControllerDeps` 已用 `getAgentService`、`getTitleGenerationService`、`ensureServiceForConversation` 等 getter 注入运行时依赖；生产装配集中在 `/Users/vincentwang/Documents/NoteVault/tools/claudian/src/features/chat/tabs/Tab.ts`。反例是 `/Users/vincentwang/Documents/NoteVault/tools/claudian/tests/unit/features/chat/tabs/TabManager.test.ts`：文件顶层 `jest.mock('@/core/providers/ProviderRegistry')` 返回共享 `historyService` 外形，而 `/Users/vincentwang/Documents/NoteVault/tools/claudian/tests/unit/features/chat/controllers/ConversationController.test.ts` 又在模块级注册 Claude service 并于多例中 spy registry。把新分流直接绑定该 singleton，会使一个用例添加的 `acquireHistoryIndex` 改变其他用例路径。
+
+采用选项 ① 的窄化形式：在 `ConversationControllerDeps` 增加显式 `getHistoryIndexCapableService(conversation): ProviderConversationHistoryService | null`。返回值必须是 controller 随后实际 `acquireHistoryIndex` 的同一 service，不注入布尔值，避免“探针判定”和“再次查 registry”取得不同对象。`loadActive`、`switchTo` 的 Claude 单轨入口及 lease refresh/bind 共用该 getter；无 capability 返回 `null`，继续现有 provider hydration。`Tab.ts` 是唯一生产适配点：内部从 `ProviderRegistry.getConversationHistoryService(conversation.providerId)` 取 service，并按 `typeof service.acquireHistoryIndex === 'function'` 窄化。controller 不新增 `ProviderRegistry` 查询，也不接收 TabManager claim；各 controller 单测在 `createMockDeps` 内显式给 `null`，仅索引语义用例给独立 service stub，TabManager 的 real-controller harness 同样局部注入。
+
+| 选项 | 改动面 | 测试迁移 | 隔离性 | 结论 |
+|---|---:|---:|---|---|
+| ① deps 注入 capability service | controller 接口、`Tab.ts`、两个 fixture | 低；普通用例默认 `null`，索引用例逐例 stub | 强；无模块全局状态 | **采用** |
+| ② registry mock 改 `jest.isolateModules`/重做 factory | 多个测试文件及 import 顺序 | 高；需重构顶层 hoisted mock，类型与运行实例易分裂 | 中；仍围绕 singleton 清理 | 否决 |
+| ③ registry 直查，仅把判定包成可注入函数 | controller 仍有隐式 service 获取 | 中；判定可隔离但实际调用仍可串扰 | 弱；存在双来源/TOCTOU | 否决 |
+
+边界：该 getter 是 history capability 端口，不是 providerId 特判，也不把 registry 或 TabManager 下沉进 controller。以后新增 index provider 只改注册对象；测试不需要 `resetModules`。其他与本次分流无关的 registry 使用可留待对应读者迁移，不借此做全 controller 服务定位重构。
+
+#### 决定 2：旧双轨测试按“语义保留”而非按失败逐个打补丁
+
+| 分类 | 测试文件/套件 | 处置 |
+|---|---|---|
+| **a. 改写为单轨语义** | `/Users/vincentwang/Documents/NoteVault/tools/claudian/tests/unit/features/chat/controllers/ConversationController.test.ts` 的 `paged history` 首屏、lease takeover、ready/loadWindow 失败、generation 失效、progress，以及 `loadActive`/`switchTo` 成功恢复 | 统一由 deps stub 返回 index service；断言 `get metadata shell → acquire → await ready → loadWindow → bind lease → restore ChatState → render drain → READY`。小/大会话只改变 planner 结果，不再制造 oversize 异常。保留 paging/search/lease release/stale transaction 测试。 |
+| **a. 改写为单轨语义** | `/Users/vincentwang/Documents/NoteVault/tools/claudian/tests/unit/features/chat/tabs/TabManager.test.ts` 的 “materializes an oversize restored tab…” 与 “fails to index” real-controller harness | 改名为 indexed restored tab；`getConversationById` 返回 metadata shell，局部 capability stub 提供 lease。成功断言 page 仅进入 `ChatState`、`conversation.messages` 保持空；失败仍进入通用可重试 `ERROR`。 |
+| **a. 迁移测试归属** | `/Users/vincentwang/Documents/NoteVault/tools/claudian/tests/integration/main.test.ts` 的 `loadSdkMessagesForConversation - fork branch` 与 Claude subagent recovery 全套 | 不再经 `plugin.getConversationById` 验证全量 hydrate。fork session/truncate、displayOrder、subagent 富化等仍是有效业务语义，迁到 Claude index/materializer、`loadMessageDetail`、providerState sidecar 的定向测试；不得因删除旧入口而丢覆盖。 |
+| **a. 更新边界断言** | `/Users/vincentwang/Documents/NoteVault/tools/claudian/tests/unit/core/providers/ProviderRegistry.test.ts` | Claude service 不再断言 `hydrateConversationHistory`；改断言 `acquireHistoryIndex`。Codex/OpenCode 的 hydration contract 由各自 service 测试覆盖。 |
+| **b. 删除** | `ConversationController.test.ts` 中 catch oversize 才进入分页、`switchToHydrationShell`、oversize shell release；`TabManager.test.ts` 中 `OVERSIZE_BLOCKED` placeholder、blocked-shell hook、READY paged warmup catch workaround | 被测对象正是待删除的异常双轨、shell 状态和补偿分支；不改写成同义 mock。通用 `SHELL/SCHEDULED/LOADING/ERROR/READY` 生命周期、输入禁用、stale cleanup 继续保留。 |
+| **b. 删除** | `/Users/vincentwang/Documents/NoteVault/tools/claudian/tests/unit/providers/claude/history/ClaudeConversationHistoryService.test.ts` 中 “returns oversize… ”、hydrate canonical merge、hydrate failure retry/缓存，以及 `hydratedConversationIds` 相关断言 | 这些只证明 Claude 全量 hydration/大小阈值/已 hydrate 缓存；窗口内 oversized-turn summary、index build retry、displayOrder、iterator 超限仍是单轨能力，保留原测试。 |
+| **c. 保留不动** | `/Users/vincentwang/Documents/NoteVault/tools/claudian/tests/unit/providers/codex/history/CodexConversationHistoryService.test.ts` 全套；OpenCode 对应 hydration/搜索 fallback；`ConversationController.test.ts` 的 lease-less loaded-message 搜索 | §3.4 明确无 index provider 继续 hydration；不得批量替换 fixture 或断言。 |
+
+迁移顺序固定为：**先加 deps 默认 stub 与 per-test capability fixture，使现有套件隔离且仍绿；再在同一“核心单轨”提交内删除/改写旧契约测试与生产分流；最后迁移 integration 中仍有效的 Claude 富化语义。** 不先批量删失败测试，否则无法区分预期契约变化与真实回归。预计直接触及 5 个主测试文件、约 25–30 个测试；其中约 10 个旧 oversize/hydration 断言删除，约 8–10 个改写，约 11 个 integration 富化场景迁移归属。最终数量以实施时 `rg` 和 Jest 列表为准，不把估算当验收值。
+
+#### 决定 3：B 批提交与回归闸门重排
+
+1. **B0 注入缝（独立提交，语义不变）**：增加 `getHistoryIndexCapableService` deps、`Tab.ts` 适配与局部 fixture；移除 controller 新路径对 registry mock 的依赖。跑 controller、Tab、TabManager、ProviderRegistry 定向测试，再跑全量 `typecheck + lint + test`。
+2. **B1 单轨核心 + 契约测试（同一提交）**：`getConversationById/switchConversation` 对 index-capable provider 只取 metadata shell；Claude 删除 `hydrateConversationHistory`/`hydratedConversationIds`/oversize result；`loadActive/switchTo` 统一 `acquire → ready → loadWindow → bind → restore`。同步执行上表 a/b，避免生产与测试任一提交处于互相不兼容状态。定向跑 controller、Claude history、TabManager、integration main；再跑全量四门 `typecheck + lint + test + build`。
+3. **B2 §3.1.1 防双开**：实现 token/CAS registry、恢复去重及入口收口；测试并发 switch、跨 view restore、stale token release。全量四门。
+4. **B3 §3.3 读者清理与 metadata 化**：逐项迁移 save/passive sync/providerState/title/export/preview/图片清理；将 integration 中仍有效的 fork/subagent 富化语义落到 index/materializer/sidecar。每迁一类先跑对应定向套件；清单完成后以 `rg` 验证 Claude 路径无 `conversation.messages` 历史读、无 `hydrateConversationHistory`/`OVERSIZE_BLOCKED`/`hydratedConversationIds`，再跑全量四门。
+5. **B4 §3.2 性能保护**：仅在语义和读者均收口后做 1 KB、2.9 MB、63/65 MB、1.59 GB 同轨基准与缓存优化；不以恢复旧 reader 过门。跑全量四门及 30 次冷/热开性能门。
+
+提交纪律：B0 可独立回退；B1 起必须依序回退 B4→B3→B2→B1，B1 不拆成“先删测试/后改实现”。每一步全量回归除绿灯外，还要核对 Codex/OpenCode 测试文件无 diff；若其测试失败，只修共享契约兼容，不改其 hydration 预期。
+
 ### 3.1 语义重定义
 
 Claude 的 `hydrateConversationHistory` 不再读 transcript。推荐从 Claude service 接口移除该实现，`getConversationById` 对 Claude 仅返回 metadata/in-memory shell；`ConversationHistoryHydrationError` 继续保留给 Codex/Opencode 的真实 hydration error，不再包含 `oversize` 分支。若类型收敛后所有 provider 都不需要该异常，再单独删除，不能在共享层假设 Codex 行为。
