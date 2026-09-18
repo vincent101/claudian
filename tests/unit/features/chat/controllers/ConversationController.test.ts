@@ -878,6 +878,35 @@ describe('ConversationController', () => {
         expect(calls).toEqual(['release:conversation-a', 'commit:conversation-b']);
       });
 
+      it('backfills legacy metadata when switching to an old conversation', async () => {
+        const conversation = { id: 'legacy', providerId: 'claude', title: 'Legacy', messages: [], sessionId: 'session', createdAt: 1, updatedAt: 1 } as any;
+        deps.state.currentConversationId = 'old-conv';
+        (deps.plugin.switchConversation as jest.Mock).mockResolvedValue(conversation);
+        const lease = {
+          conversationId: 'legacy', totalTurns: 1, ready: Promise.resolve(), release: jest.fn(), search: jest.fn(),
+          loadMessageDetail: jest.fn(),
+          loadWindow: jest.fn().mockResolvedValue({
+            messages: [{ id: 'first', role: 'user', content: 'legacy first request', timestamp: 1 }],
+            range: { start: 0, end: 1 }, sourceBytes: 10, projectedChars: 20,
+            oversizedTurnCount: 0, pageKey: 'w:0:1', hasMoreBefore: false, hasMoreAfter: false,
+          }),
+          planWindow: jest.fn().mockReturnValue({ start: 0, end: 1 }),
+        };
+        deps.getHistoryIndexCapableService = () => ({ acquireHistoryIndex: () => lease } as any);
+        deps.ensureServiceForConversation = jest.fn(async (shell) => {
+          expect(shell).toMatchObject({ hasHistory: true, messageCount: 1 });
+        });
+
+        await controller.switchTo('legacy');
+
+        expect(deps.plugin.updateConversation).toHaveBeenCalledWith('legacy', expect.objectContaining({
+          hasHistory: true,
+          messageCount: 1,
+          preview: 'legacy first request',
+          firstUserExcerpt: 'legacy first request',
+        }));
+      });
+
       it('cancels the pending reservation when the target disappears', async () => {
         deps.state.currentConversationId = 'conversation-a';
         deps.reserveConversation = jest.fn().mockResolvedValue(true);

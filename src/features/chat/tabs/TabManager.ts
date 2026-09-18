@@ -499,15 +499,6 @@ export class TabManager implements TabManagerInterface {
   }
 
   /**
-   * Routes a blocked active open (e.g. an oversize conversation picked from
-   * the history dropdown) onto the shell state machine: bind the target
-   * conversation without loading messages, then re-enter the regular
-   * hydration schedule so the oversize/error placeholder renders exactly
-   * like a restored tab (M1 shell semantics for active opens). The ChatState
-   * setter fires onConversationChanged, which syncs tab.conversationId.
-   */
-
-  /**
    * Closes a tab.
    * @param tabId The tab to close.
    * @param force If true, close even if streaming.

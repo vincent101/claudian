@@ -259,21 +259,7 @@ export class ConversationController {
           state.historyHasMore = firstScreen.hasMoreBefore;
           state.historySnapshotOffset = firstScreen.snapshotOffset ?? null;
           state.historyError = null;
-          if (conversation.hasHistory !== true && firstScreen.messages.length > 0) {
-            const firstUser = firstScreen.messages.find(message => message.role === 'user');
-            const backfill = {
-              hasHistory: true as const,
-              messageCount: firstScreen.messages.length,
-              preview: firstUser ? (firstUser.displayContent ?? firstUser.content).slice(0, 50) : undefined,
-              firstUserExcerpt: firstUser
-                ? (firstUser.displayContent ?? firstUser.content).slice(0, 300)
-                : undefined,
-            };
-            // Update the shell before persistence so warmup/passive sync in the
-            // same restore observes history metadata immediately.
-            Object.assign(conversation, backfill);
-            await plugin.updateConversation(conversation.id, backfill);
-          }
+          await this.backfillLegacyHistoryMetadata(conversation, firstScreen);
         } finally {
           if (!transferred) lease.release();
           state.historyLoading = false;
@@ -361,6 +347,31 @@ export class ConversationController {
       return task(isStale);
     }
     return coordinator.runStored(isStale, () => task(isStale));
+  }
+
+  /**
+   * Backfills history metadata onto legacy conversations that predate the
+   * hasHistory/messageCount fields, so warmup/passive sync in the same
+   * restore observes history state instead of misjudging the session empty.
+   */
+  private async backfillLegacyHistoryMetadata(
+    conversation: Conversation,
+    firstScreen: HistoryWindowPage,
+  ): Promise<void> {
+    if (conversation.hasHistory === true || firstScreen.messages.length === 0) return;
+    const firstUser = firstScreen.messages.find(message => message.role === 'user');
+    const backfill = {
+      hasHistory: true as const,
+      messageCount: firstScreen.messages.length,
+      preview: firstUser ? (firstUser.displayContent ?? firstUser.content).slice(0, 50) : undefined,
+      firstUserExcerpt: firstUser
+        ? (firstUser.displayContent ?? firstUser.content).slice(0, 300)
+        : undefined,
+    };
+    // Update the shell before persistence so warmup/passive sync in the
+    // same restore observes history metadata immediately.
+    Object.assign(conversation, backfill);
+    await this.deps.plugin.updateConversation(conversation.id, backfill);
   }
 
   /** Budget-window first screen; every oversized turn arrives as a summary projection. */
@@ -716,6 +727,7 @@ export class ConversationController {
         try {
           await lease.ready;
           firstScreen = await this.loadFirstScreenWindow(lease);
+          await this.backfillLegacyHistoryMetadata(conversation, firstScreen);
         } catch (error) {
           lease.release();
           throw error;
