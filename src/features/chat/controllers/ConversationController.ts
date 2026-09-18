@@ -672,7 +672,15 @@ export class ConversationController {
       byId.set(detail.id, detail);
       const combined = [...byId.values()].sort(compareChatDisplayOrder);
       state.messages = combined;
-      this.deps.renderer.renderMessages(combined, () => this.getGreeting());
+      const windowRenderer = this.deps.getHistoryWindowRenderer?.();
+      if (windowRenderer) {
+        windowRenderer.addPage(this.toPageInput({
+          ...page,
+          messages: page.messages.map(message => message.id === detail.id ? detail : message),
+        }), lease.totalTurns, 'search');
+      } else {
+        this.deps.renderer.renderMessages(combined, () => this.getGreeting());
+      }
       await this.deps.renderer.waitForRenderedMessages();
       if (isStale()) return;
       state.loadedRanges = this.mergeRanges([...state.loadedRanges, page.range]);
