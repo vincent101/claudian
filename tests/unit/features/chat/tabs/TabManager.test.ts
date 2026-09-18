@@ -45,6 +45,7 @@ const mockCleanupTabRuntime = jest.fn(
 const mockWireTabInputEvents = jest.fn();
 const mockGetTabTitle = jest.fn().mockReturnValue('Test Tab');
 const mockCreateChatRuntime = jest.fn();
+let mockHistoryService: any;
 const mockGetProviderSettingsSnapshot = jest.fn().mockImplementation(() => ({}));
 const commandWarmupPolicy = { resolveMode: jest.fn().mockReturnValue('commands') };
 
@@ -92,7 +93,7 @@ const mockTabWarmupPolicies: Record<string, any> = {};
 jest.mock('@/core/providers/ProviderRegistry', () => ({
   ProviderRegistry: {
     createChatRuntime: (...args: any[]) => mockCreateChatRuntime(...args),
-    getConversationHistoryService: () => ({
+    getConversationHistoryService: () => mockHistoryService ?? ({
       buildForkProviderState: mockBuildForkProviderState,
     }),
     getCapabilities: (...args: any[]) => mockGetCapabilities(...args),
@@ -140,6 +141,7 @@ function createMockPlugin(overrides: Record<string, any> = {}): any {
       workspace: {
         revealLeaf: jest.fn(),
       },
+      vault: { adapter: { basePath: '/vault' } },
     },
     settings: {
       maxTabs: DEFAULT_MAX_TABS,
@@ -312,6 +314,7 @@ function createManager(options: {
 }
 
 beforeEach(() => {
+  mockHistoryService = undefined;
   for (const providerId of Object.keys(mockCommandCatalogs)) {
     delete mockCommandCatalogs[providerId];
   }
@@ -924,7 +927,7 @@ describe('TabManager - Tab Lifecycle', () => {
 
         const tab = await manager.createTab('large-conv');
         jest.runAllTimers();
-        await flushMicrotasks(10);
+        await flushMicrotasks(20);
         jest.useRealTimers();
 
         expect(acquireHistoryIndex).toHaveBeenCalledWith(storedConversation, '/vault', expect.any(Function));
@@ -982,7 +985,7 @@ describe('TabManager - Tab Lifecycle', () => {
 
         const tab = await manager.createTab('large-conv');
         jest.runAllTimers();
-        await flushMicrotasks(10);
+        await flushMicrotasks(20);
         jest.useRealTimers();
 
         expect(acquireHistoryIndex).toHaveBeenCalledWith(storedConversation, '/vault', expect.any(Function));
@@ -1615,7 +1618,7 @@ describe('TabManager - Persistence', () => {
       await manager.restoreState(persistedState);
 
       expect(plugin.getConversationById).not.toHaveBeenCalled();
-      expect(plugin.getConversationSync).toHaveBeenCalledTimes(3);
+      expect(plugin.getConversationSync).toHaveBeenCalledTimes(5);
       expect(manager.getTab('restored-1')?.hydrationState).toBe('SHELL');
       expect(mockCreateTab).toHaveBeenCalledTimes(2);
     });
@@ -2740,6 +2743,38 @@ describe('TabManager - Cleanup', () => {
   });
 
   describe('destroy', () => {
+    it('rebinds recovery history from A to B and clears it on cleanup', async () => {
+      const conversationA = { id: 'a', providerId: 'claude', messages: [], sessionId: 'session-a' };
+      const conversationB = { id: 'b', providerId: 'claude', messages: [], sessionId: 'session-b' };
+      const iterateFullHistory = jest.fn();
+      mockHistoryService = { iterateFullHistory };
+      const setHistoryRecoverySource = jest.fn();
+      const tab = createMockTabData({
+        id: 'recovery-tab',
+        conversationId: 'a',
+        hydrationState: 'SHELL',
+        service: { setHistoryRecoverySource, cleanup: jest.fn() },
+        serviceInitialized: true,
+      });
+      const plugin = createMockPlugin({
+        getConversationSync: jest.fn((id: string) => id === 'a' ? conversationA : conversationB),
+      });
+      manager = createManager({ plugin, tabFactory: () => tab });
+      await manager.createTab('a');
+      const hooks = mockInitializeTabControllers.mock.calls.at(-1)?.[6];
+      hooks.releaseConversation('a');
+      expect(await hooks.reserveConversation('b')).toBe(true);
+      hooks.commitConversation('b');
+
+      const source = setHistoryRecoverySource.mock.calls.at(-1)?.[0];
+      expect(source).toEqual(expect.any(Function));
+      source();
+      expect(iterateFullHistory).toHaveBeenLastCalledWith(conversationB, expect.anything(), expect.anything());
+
+      await manager.destroy();
+      expect(setHistoryRecoverySource).toHaveBeenLastCalledWith(null);
+    });
+
     it('should destroy all tabs', async () => {
       await manager.destroy();
 
@@ -2764,6 +2799,25 @@ describe('TabManager - Cleanup', () => {
       await manager.destroy();
 
       expect(manager.getActiveTabId()).toBeNull();
+    });
+
+    it('releases committed and pending conversation claims', async () => {
+      const plugin = createMockPlugin();
+      manager = createManager({ plugin });
+      const committed = await manager.createTab();
+      const committedHooks = mockInitializeTabControllers.mock.calls.at(-1)?.[6];
+      const pending = await manager.createTab();
+      const pendingHooks = mockInitializeTabControllers.mock.calls.at(-1)?.[6];
+      expect(await committedHooks.reserveConversation('committed')).toBe(true);
+      committedHooks.commitConversation('committed');
+      expect(await pendingHooks.reserveConversation('pending')).toBe(true);
+
+      await manager.destroy();
+
+      expect(plugin.conversationOpenRegistry.reserve('committed', jest.fn())).not.toBeNull();
+      expect(plugin.conversationOpenRegistry.reserve('pending', jest.fn())).not.toBeNull();
+      expect(committed).not.toBeNull();
+      expect(pending).not.toBeNull();
     });
   });
 });

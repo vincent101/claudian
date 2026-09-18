@@ -420,19 +420,7 @@ export class TabManager implements TabManagerInterface {
       // transcript observation covers the idle period. Shell/blocked tabs
       // never reach this point and therefore cannot start an observer.
       await initializeTabService(tab, this.plugin, historyConversation);
-      const historyService = historyConversation
-        ? ProviderRegistry.getConversationHistoryService(historyConversation.providerId)
-        : null;
-      tab.service?.setHistoryRecoverySource?.(
-        historyConversation && historyService?.iterateFullHistory
-          ? () => historyService.iterateFullHistory!(historyConversation, getVaultPath(this.plugin.app), {
-              maxTurnsPerChunk: 50,
-              maxSourceBytesPerChunk: 8 * 1024 * 1024,
-              maxProjectedCharsPerChunk: 2 * 1024 * 1024,
-              projectionLevel: 'detail',
-            })
-          : null,
-      );
+      this.bindHistoryRecoverySource(tab, historyConversation);
       setupServiceCallbacks(tab, this.plugin);
       if (this.isStaleHydration(tab, generation)) {
         // setupServiceCallbacks may have parked a runtime/observer before the
@@ -456,6 +444,7 @@ export class TabManager implements TabManagerInterface {
       tab.hydrationDiagnostic = null;
       tab.historyLoadProgress = null;
     } catch (error) {
+      this.bindHistoryRecoverySource(tab, null);
       if (this.isStaleHydration(tab, generation)) {
         // initializeTabService may have created a runtime before throwing;
         // a stale catch must not leave it parked on the tab.
@@ -698,6 +687,25 @@ export class TabManager implements TabManagerInterface {
     }
     tab.conversationOpenClaim = claim;
     this.pendingConversationClaims.delete(tab.id);
+    // Recovery traversal is conversation-scoped, not runtime-scoped. Rebind at
+    // the ownership commit so a reused runtime cannot retain the old transcript.
+    this.bindHistoryRecoverySource(tab, this.plugin.getConversationSync(conversationId));
+  }
+
+  private bindHistoryRecoverySource(tab: TabData, conversation: Conversation | null | undefined): void {
+    const historyService = conversation
+      ? ProviderRegistry.getConversationHistoryService(conversation.providerId)
+      : null;
+    tab.service?.setHistoryRecoverySource?.(
+      conversation && historyService?.iterateFullHistory
+        ? () => historyService.iterateFullHistory!(conversation, getVaultPath(this.plugin.app), {
+            maxTurnsPerChunk: 50,
+            maxSourceBytesPerChunk: 8 * 1024 * 1024,
+            maxProjectedCharsPerChunk: 2 * 1024 * 1024,
+            projectionLevel: 'detail',
+          })
+        : null,
+    );
   }
 
   private cancelConversationForTab(tab: TabData, conversationId: string): void {
@@ -712,6 +720,7 @@ export class TabManager implements TabManagerInterface {
     if (!claim || claim.conversationId !== conversationId) return;
     if (this.conversationOpenRegistry.release(conversationId, claim.ownerToken)) {
       tab.conversationOpenClaim = null;
+      this.bindHistoryRecoverySource(tab, null);
     }
   }
 
@@ -1326,6 +1335,22 @@ export class TabManager implements TabManagerInterface {
         tab => tab.controllers.conversationController?.save() ?? Promise.resolve()
       )
     );
+
+    // Release both committed and in-flight ownership before destroying tabs;
+    // registry.release requires the exact token, so tab-local claims are authoritative.
+    for (const tab of this.tabs.values()) {
+      const pending = this.pendingConversationClaims.get(tab.id);
+      if (pending) {
+        this.conversationOpenRegistry.release(pending.conversationId, pending.ownerToken);
+        this.pendingConversationClaims.delete(tab.id);
+      }
+      const committed = tab.conversationOpenClaim;
+      if (committed) {
+        this.conversationOpenRegistry.release(committed.conversationId, committed.ownerToken);
+        tab.conversationOpenClaim = null;
+      }
+      this.bindHistoryRecoverySource(tab, null);
+    }
 
     // Destroy all tabs in parallel (independent per-tab, must run after saves complete)
     await Promise.all(Array.from(this.tabs.values()).map(tab => destroyTab(tab)));

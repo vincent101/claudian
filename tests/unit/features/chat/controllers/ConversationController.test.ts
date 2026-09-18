@@ -143,6 +143,28 @@ describe('ConversationController', () => {
       }),
     });
 
+    it('restores a Claude draft without transcript identity instead of indexing it', async () => {
+      const draft = {
+        id: 'draft', providerId: 'claude', title: 'Draft', messages: [
+          { id: 'draft-user', role: 'user', content: 'unsent transcript tail', timestamp: 1 },
+        ], createdAt: 1, updatedAt: 1,
+      } as any;
+      deps.state.currentConversationId = 'draft';
+      (deps.plugin.getConversationById as jest.Mock).mockResolvedValue(draft);
+      const acquireHistoryIndex = jest.fn();
+      deps.getHistoryIndexCapableService = () => ({
+        acquireHistoryIndex,
+        resolveSessionIdForConversation: jest.fn().mockReturnValue(null),
+        isPendingForkConversation: jest.fn().mockReturnValue(false),
+      } as any);
+
+      await controller.loadActive();
+
+      expect(acquireHistoryIndex).not.toHaveBeenCalled();
+      expect(deps.state.messages).toEqual(draft.messages);
+      expect(deps.renderer.renderMessages).toHaveBeenCalled();
+    });
+
     it('loads indexed history through the single first-screen path', async () => {
       const conversation = { id: 'large', providerId: 'claude', title: 'Large', messages: [], sessionId: 'session', createdAt: 1, updatedAt: 1 } as any;
       deps.state.currentConversationId = 'large';
@@ -191,6 +213,23 @@ describe('ConversationController', () => {
         preview: 'legacy first request',
         firstUserExcerpt: 'legacy first request',
       }));
+    });
+
+    it('does not backfill messageCount from a partial window', async () => {
+      const conversation = { id: 'legacy', providerId: 'claude', title: 'Legacy', messages: [], sessionId: 'session', createdAt: 1, updatedAt: 1 } as any;
+      deps.state.currentConversationId = 'legacy';
+      (deps.plugin.getConversationById as jest.Mock).mockResolvedValue(conversation);
+      const lease = makeLease(120);
+      lease.loadWindow.mockResolvedValue({
+        messages: [{ id: 'latest', role: 'user', content: 'latest request', timestamp: 1 }],
+        range: { start: 110, end: 120 }, sourceBytes: 10, projectedChars: 20,
+        oversizedTurnCount: 0, pageKey: 'w:snapshot:110:120', hasMoreBefore: true, hasMoreAfter: false,
+      });
+      deps.getHistoryIndexCapableService = () => ({ acquireHistoryIndex: () => lease } as any);
+
+      await controller.loadActive();
+
+      expect(deps.plugin.updateConversation).toHaveBeenCalledWith('legacy', expect.not.objectContaining({ messageCount: expect.anything() }));
     });
 
     it('releases the previous lease when indexed loadActive repeats', async () => {

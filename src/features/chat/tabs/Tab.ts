@@ -292,6 +292,9 @@ function syncTabProviderServices(
 }
 
 export function cleanupTabRuntime(tab: TabData): void {
+  // Drop conversation-bound closures before cleanup so a retained runtime can
+  // never traverse a transcript after the tab has detached from its owner.
+  tab.service?.setHistoryRecoverySource?.(null);
   if (tab.service && typeof tab.service.cleanup === 'function') {
     tab.service.cleanup();
   }

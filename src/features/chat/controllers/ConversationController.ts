@@ -197,16 +197,18 @@ export class ConversationController {
         plugin.settings.persistentExternalContextPaths || []
       );
 
-      const messagesEl = this.deps.getMessagesEl();
-      messagesEl.empty();
+      await this.runStoredTransaction(async () => {
+        const messagesEl = this.deps.getMessagesEl();
+        messagesEl.empty();
 
-      // Recreate welcome element first (before StatusPanel for consistent ordering)
-      const welcomeEl = messagesEl.createDiv({ cls: 'claudian-welcome' });
-      welcomeEl.createDiv({ cls: 'claudian-welcome-greeting', text: this.getGreeting() });
-      this.deps.setWelcomeEl(welcomeEl);
+        // Recreate welcome element first (before StatusPanel for consistent ordering)
+        const welcomeEl = messagesEl.createDiv({ cls: 'claudian-welcome' });
+        welcomeEl.createDiv({ cls: 'claudian-welcome-greeting', text: this.getGreeting() });
+        this.deps.setWelcomeEl(welcomeEl);
 
-      // Remount StatusPanel to restore state for new conversation
-      this.deps.getStatusPanel()?.remount();
+        // Remount StatusPanel to restore state for new conversation
+        this.deps.getStatusPanel()?.remount();
+      });
 
       this.deps.getInputEl().value = '';
 
@@ -244,7 +246,12 @@ export class ConversationController {
     let firstScreen: HistoryWindowPage | null = null;
     if (conversation) {
       const historyService = this.deps.getHistoryIndexCapableService(conversation);
-      if (historyService) {
+      const isTranscriptlessDraft = historyService
+        && typeof historyService.resolveSessionIdForConversation === 'function'
+        && typeof historyService.isPendingForkConversation === 'function'
+        && historyService.resolveSessionIdForConversation(conversation) === null
+        && !historyService.isPendingForkConversation(conversation);
+      if (historyService && !isTranscriptlessDraft) {
         state.historyLoading = true;
         const lease = this.acquireLease(conversation, historyService);
         let transferred = false;
@@ -310,7 +317,7 @@ export class ConversationController {
     }
 
     await this.deps.ensureServiceForConversation?.(conversation);
-    this.restoreConversation(conversation, firstScreen, { autoAttachFile: true });
+    await this.restoreConversation(conversation, firstScreen, { autoAttachFile: true });
     this.updateWelcomeVisibility();
 
     this.renderHistoryPager();
@@ -360,9 +367,12 @@ export class ConversationController {
   ): Promise<void> {
     if (conversation.hasHistory === true || firstScreen.messages.length === 0) return;
     const firstUser = firstScreen.messages.find(message => message.role === 'user');
-    const backfill = {
-      hasHistory: true as const,
-      messageCount: firstScreen.messages.length,
+    const backfill: Partial<Conversation> = {
+      hasHistory: true,
+      // A partial page is not a truthful conversation message count.
+      ...(firstScreen.hasMoreBefore || firstScreen.hasMoreAfter
+        ? {}
+        : { messageCount: firstScreen.messages.length }),
       preview: firstUser ? (firstUser.displayContent ?? firstUser.content).slice(0, 50) : undefined,
       firstUserExcerpt: firstUser
         ? (firstUser.displayContent ?? firstUser.content).slice(0, 300)
@@ -746,7 +756,7 @@ export class ConversationController {
         state.historyHasMore = firstScreen.hasMoreBefore;
         state.historySnapshotOffset = firstScreen.snapshotOffset ?? null;
       }
-      this.restoreConversation(conversation, firstScreen);
+      await this.restoreConversation(conversation, firstScreen);
       // Release while the tab still carries the outgoing claim; commit replaces it.
       if (previousConversationId) this.deps.releaseConversation?.(previousConversationId);
       this.deps.commitConversation?.(id);
@@ -972,11 +982,11 @@ export class ConversationController {
    * Shared logic for restoring a conversation into the current tab.
    * Used by both loadActive() and switchTo() to avoid duplication.
    */
-  private restoreConversation(
+  private async restoreConversation(
     conversation: Conversation,
     page: HistoryWindowPage | null,
     options?: { autoAttachFile?: boolean }
-  ): void {
+  ): Promise<void> {
     const { plugin, state, renderer } = this.deps;
 
     state.currentConversationId = conversation.id;
@@ -1018,11 +1028,13 @@ export class ConversationController {
       mcpServerSelector?.clearEnabled();
     }
 
-    const welcomeEl = renderer.renderMessages(
-      state.messages,
-      () => this.getGreeting()
-    );
-    this.deps.setWelcomeEl(welcomeEl);
+    await this.runStoredTransaction(async () => {
+      const welcomeEl = renderer.renderMessages(
+        state.messages,
+        () => this.getGreeting()
+      );
+      this.deps.setWelcomeEl(welcomeEl);
+    });
   }
 
   /**
