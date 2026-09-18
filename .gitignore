@@ -94,3 +94,4 @@ dev
 .claude/
 .codex/
 main.js.orig-*
+.context/
