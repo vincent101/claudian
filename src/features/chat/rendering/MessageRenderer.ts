@@ -49,6 +49,7 @@ export class MessageRenderer {
   private readonly contentRenderGenerations = new Map<string, number>();
   private readonly pendingContentRenders = new Map<string, Promise<void>>();
   private readonly onMessageContentRendered?: (projectionKey: string, projectionLevel: HistoryProjectionLevel) => void;
+  private pageRenderWorkRegistrar: ((element: HTMLElement) => (() => void) | null) | null = null;
   private renderGeneration = 0;
   private renderIdlePromise: Promise<void> = Promise.resolve();
   private renderIdleResolver: (() => void) | null = null;
@@ -101,6 +102,10 @@ export class MessageRenderer {
   /** Sets the messages container element. */
   setMessagesEl(el: HTMLElement): void {
     this.messagesEl = el;
+  }
+
+  setPageRenderWorkRegistrar(registrar: ((element: HTMLElement) => (() => void) | null) | null): void {
+    this.pageRenderWorkRegistrar = registrar;
   }
 
   private getSubagentLifecycleAdapter(toolName?: string) {
@@ -886,6 +891,17 @@ export class MessageRenderer {
           alt: image.name,
         },
       });
+      const release = this.pageRenderWorkRegistrar?.(imgEl) ?? null;
+      if (release) {
+        let settled = false;
+        const settle = (): void => {
+          if (settled) return;
+          settled = true;
+          release();
+        };
+        imgEl.addEventListener('load', settle);
+        imgEl.addEventListener('error', settle);
+      }
 
       void this.setImageSrc(imgEl, image);
 
@@ -953,6 +969,7 @@ export class MessageRenderer {
     markdown: string,
     options?: RenderContentOptions
   ): Promise<void> {
+    const release = this.pageRenderWorkRegistrar?.(el) ?? null;
     el.empty();
 
     try {
@@ -1021,6 +1038,8 @@ export class MessageRenderer {
         cls: 'claudian-render-error',
         text: t('chat.message.renderFailedContent'),
       });
+    } finally {
+      release?.();
     }
   }
 

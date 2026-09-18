@@ -93,6 +93,35 @@ describe('MessageRenderer', () => {
     jest.clearAllMocks();
   });
 
+  it('registers page render work for every markdown render', async () => {
+    const release = jest.fn();
+    const register = jest.fn(() => release);
+    const { renderer } = createRenderer();
+    renderer.setPageRenderWorkRegistrar(register);
+    const el = createMockEl();
+
+    await renderer.renderContent(el, 'markdown');
+
+    expect(register).toHaveBeenCalledWith(el);
+    expect(release).toHaveBeenCalledTimes(1);
+  });
+
+  it('registers image load work until load or error settles', () => {
+    const release = jest.fn();
+    const register = jest.fn(() => release);
+    const { renderer } = createRenderer();
+    renderer.setPageRenderWorkRegistrar(register);
+    const parent = createMockEl();
+
+    renderer.renderMessageImages(parent, [{ id: 'x', name: 'x', mediaType: 'image/png', data: 'AA==', size: 2, source: 'file' }]);
+    const image = (register.mock.calls as unknown as [[any]])[0][0];
+    expect(register).toHaveBeenCalledTimes(1);
+    expect(image.tagName).toBe('IMG');
+    image.dispatchEvent('load');
+    image.dispatchEvent('error');
+    expect(release).toHaveBeenCalledTimes(1);
+  });
+
   // ============================================
   // renderMessages
   // ============================================

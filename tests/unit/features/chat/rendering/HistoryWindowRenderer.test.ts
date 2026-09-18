@@ -124,6 +124,23 @@ describe('HistoryWindowRenderer', () => {
     expect(store.peek('b')?.renderState).toBe('mounted');
   });
 
+  it.each(['mounted', 'spacer', 'evicted'] as const)('reveals search hits from %s pages', async renderState => {
+    const rematerializePage = jest.fn(async (record: any) => ({
+      pageKey: record.pageKey,
+      range: record.range,
+      messages: messages(1, 'hit'),
+      projectedWeight: 1,
+    }));
+    const { renderer, store } = createHarness(300, { rematerializePage });
+    renderer.addPage({ pageKey: 'hit-page', range: { start: 0, end: 1 }, messages: messages(1, 'hit'), projectedWeight: 1 }, 300);
+    const record = store.peek('hit-page')!;
+    record.renderState = renderState;
+    if (renderState === 'evicted') record.messages = null;
+    await renderer.revealMessage('hit-0');
+    expect(store.peek('hit-page')?.renderState).toBe('mounted');
+    expect(store.peek('hit-page')?.pins.has('search')).toBe(true);
+  });
+
   it('deduplicates rematerialization and drops its result after conversation changes', async () => {
     let resolvePage!: (value: any) => void;
     const rematerializePage = jest.fn(() => new Promise(resolve => { resolvePage = resolve; }));
@@ -149,6 +166,98 @@ describe('HistoryWindowRenderer', () => {
     renderer.setVisiblePages(['a']);
     await Promise.resolve();
     expect(restorePageUiState).toHaveBeenCalledWith(expect.any(HTMLElement), store.peek('a'));
+  });
+
+  it('keeps live page pinned until the turn freezes', () => {
+    const { renderer, store } = createHarness();
+    renderer.beginLivePage('live:1', messages(2, 'live'), 300);
+    expect(store.peek('live:1')?.pins.has('live')).toBe(true);
+    renderer.freezeLivePage(messages(3, 'live'));
+    expect(store.peek('live:1')?.pins.has('live')).toBe(false);
+  });
+
+  it('releases search pin after the located page leaves the viewport', async () => {
+    const { renderer, store } = createHarness();
+    renderer.addPage({ pageKey: 'hit', range: { start: 0, end: 100 }, messages: messages(100, 'hit'), projectedWeight: 1 }, 300, 'search');
+    renderer.setVisiblePages(['hit']);
+    renderer.setVisiblePages([]);
+    expect(store.peek('hit')?.pins.has('search')).toBe(false);
+  });
+
+  it('times out unsettled tickets to estimated height without accepting the late ticket', async () => {
+    jest.useFakeTimers();
+    const { renderer, store, root } = createHarness();
+    renderer.addPage({ pageKey: 'slow', range: { start: 0, end: 200 }, messages: messages(200, 'slow'), projectedWeight: 1 }, 400);
+    const record = store.peek('slow')!;
+    const release = store.registerCurrentRenderWork('slow');
+    const wrapper = root.querySelector('[data-page-key="slow"]') as HTMLElement;
+    jest.spyOn(wrapper, 'getBoundingClientRect').mockReturnValue({ height: 120, top: 0, bottom: 120 } as DOMRect);
+    const reconcile = renderer.reconcileNowForTest('newer');
+    await jest.advanceTimersByTimeAsync(3000);
+    await reconcile;
+    expect(record).toMatchObject({ renderState: 'spacer', heightQuality: 'estimated' });
+    release();
+    expect(record.heightQuality).toBe('estimated');
+    jest.useRealTimers();
+  });
+
+  it('marks height caches stale on width, font, and theme changes', async () => {
+    const resizeCallbacks: ResizeObserverCallback[] = [];
+    const mutationCallbacks: MutationCallback[] = [];
+    const originalResize = global.ResizeObserver;
+    const originalMutation = global.MutationObserver;
+    const loadingListeners: Array<() => void> = [];
+    (global as any).ResizeObserver = class {
+      constructor(callback: ResizeObserverCallback) { resizeCallbacks.push(callback); }
+      observe() {}
+      unobserve() {}
+      disconnect() {}
+    };
+    (global as any).MutationObserver = class {
+      constructor(callback: MutationCallback) { mutationCallbacks.push(callback); }
+      observe() {}
+      disconnect() {}
+    };
+    Object.defineProperty(document, 'fonts', { configurable: true, value: {
+      ready: Promise.resolve(),
+      addEventListener: (_name: string, callback: () => void) => loadingListeners.push(callback),
+      removeEventListener: jest.fn(),
+    } });
+    const { renderer } = createHarness();
+    const record = renderer.addPage({ pageKey: 'a', range: { start: 0, end: 1 }, messages: messages(1), projectedWeight: 1 }, 300);
+    record.measuredHeight = 100;
+    record.heightStale = false;
+    resizeCallbacks[1]([], {} as ResizeObserver);
+    expect(record.heightStale).toBe(true);
+    record.heightStale = false;
+    mutationCallbacks[0]([], {} as MutationObserver);
+    expect(record.heightStale).toBe(true);
+    record.heightStale = false;
+    loadingListeners[0]();
+    expect(record.heightStale).toBe(true);
+    renderer.dispose();
+    (global as any).ResizeObserver = originalResize;
+    (global as any).MutationObserver = originalMutation;
+  });
+
+  it('keeps anchor correction free of cumulative drift across ten remounts', () => {
+    const { renderer, viewport } = createHarness();
+    const record = renderer.addPage({ pageKey: 'a', range: { start: 0, end: 100 }, messages: messages(100), projectedWeight: 1 }, 300);
+    const message = document.querySelector<HTMLElement>('[data-message-id]')!;
+    jest.spyOn(message, 'getBoundingClientRect').mockReturnValue({ top: 20, bottom: 40, height: 20 } as DOMRect);
+    viewport.scrollTop = 100;
+    for (let count = 0; count < 10; count += 1) {
+      record.renderState = 'spacer';
+      renderer.setVisiblePages(['a']);
+    }
+    expect(Math.abs(viewport.scrollTop - 100)).toBeLessThanOrEqual(20);
+  });
+
+  it('drops search pins explicitly when search closes', () => {
+    const { renderer, store } = createHarness();
+    renderer.addPage({ pageKey: 'hit', range: { start: 0, end: 1 }, messages: messages(1), projectedWeight: 1 }, 300, 'search');
+    renderer.releaseSearchPins();
+    expect(store.peek('hit')?.pins.has('search')).toBe(false);
   });
 
   it('drops a queued commit after conversation changes', async () => {

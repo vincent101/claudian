@@ -54,6 +54,7 @@ export class HistoryWindowRenderer {
   private totalTurns = 0;
   private generation = 0;
   private lastScrollTop = 0;
+  private livePageKey: string | null = null;
   private disposed = false;
   private readonly onViewportChange = (): void => this.sampleViewport();
 
@@ -104,6 +105,48 @@ export class HistoryWindowRenderer {
     return record;
   }
 
+  beginLivePage(pageKey: string, messages: ChatMessage[], totalTurns: number): HTMLElement {
+    if (this.livePageKey && this.livePageKey !== pageKey) this.freezeLivePage();
+    this.livePageKey = pageKey;
+    const record = this.options.pageStore.upsertPage({
+      pageKey,
+      range: { start: totalTurns, end: totalTurns },
+      messages,
+      projectedWeight: this.estimateWeight(messages),
+      pins: ['live'],
+    });
+    const wrapper = this.ensureWrapper(record);
+    wrapper.className = 'claudian-history-page claudian-history-page-live';
+    record.renderState = 'mounted';
+    const ticket = this.options.pageStore.beginRender(record.pageKey, ++this.generation);
+    this.options.pageStore.closeRenderTicket(record.pageKey, ticket);
+    return wrapper;
+  }
+
+  freezeLivePage(messages?: ChatMessage[]): void {
+    if (!this.livePageKey) return;
+    const record = this.options.pageStore.peek(this.livePageKey);
+    if (record && messages) {
+      this.options.pageStore.upsertPage({
+        pageKey: record.pageKey,
+        range: record.range,
+        messages,
+        projectedWeight: this.estimateWeight(messages),
+      });
+    }
+    this.options.pageStore.unpin(this.livePageKey, 'live');
+    this.livePageKey = null;
+    this.sampleIntent('older');
+  }
+
+  releaseSearchPins(): void {
+    for (const record of this.options.pageStore.values()) this.options.pageStore.unpin(record.pageKey, 'search');
+  }
+
+  getRoot(): HTMLElement {
+    return this.options.root;
+  }
+
   reset(): void {
     if (this.rafId !== null) this.cancelFrame(this.rafId);
     this.rafId = null;
@@ -115,6 +158,7 @@ export class HistoryWindowRenderer {
     this.adjacentPages.clear();
     this.options.pageStore.clear();
     this.totalTurns = 0;
+    this.livePageKey = null;
     this.generation += 1;
   }
 
@@ -127,6 +171,7 @@ export class HistoryWindowRenderer {
   }
 
   setVisiblePages(pageKeys: string[]): void {
+    const previousVisible = new Set(this.visiblePages);
     for (const page of this.visiblePages) this.options.pageStore.unpin(page, 'visible');
     this.visiblePages.clear();
     for (const pageKey of pageKeys) {
@@ -134,6 +179,9 @@ export class HistoryWindowRenderer {
       this.options.pageStore.pin(pageKey, 'visible');
       const record = this.options.pageStore.peek(pageKey);
       if (record && record.renderState !== 'mounted') void this.ensureMounted(record);
+    }
+    for (const pageKey of previousVisible) {
+      if (!this.visiblePages.has(pageKey)) this.options.pageStore.unpin(pageKey, 'search');
     }
     this.recomputeAdjacentPages();
   }
@@ -375,11 +423,19 @@ export class HistoryWindowRenderer {
     this.rematerializations.set(record.pageKey, pending);
     if (!await pending) return;
     const current = this.options.pageStore.peek(record.pageKey);
-    if (!current || current.messages === null || (!this.visiblePages.has(record.pageKey) && !this.adjacentPages.has(record.pageKey))) return;
+    if (
+      !current
+      || current.messages === null
+      || (!this.visiblePages.has(record.pageKey) && !this.adjacentPages.has(record.pageKey) && !current.pins.has('search'))
+    ) return;
     await this.options.coordinator.runStored(
       () => this.disposed || conversationId !== this.options.getConversationId() || domEpoch !== this.options.getDomEpoch(),
       async () => { this.mount(current); },
     );
+  }
+
+  private estimateWeight(messages: ChatMessage[]): number {
+    return messages.reduce((sum, message) => sum + JSON.stringify(message).length * 2, 0);
   }
 
   private scrollDirection(): StoredIntentDirection {

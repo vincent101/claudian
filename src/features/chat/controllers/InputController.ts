@@ -31,6 +31,7 @@ import { formatDurationMmSs } from '../../../utils/date';
 import type { EditorSelectionContext } from '../../../utils/editor';
 import { appendMarkdownSnippet } from '../../../utils/markdown';
 import { COMPLETION_FLAVOR_WORDS } from '../constants';
+import type { HistoryWindowRenderer } from '../rendering/HistoryWindowRenderer';
 import { type InlineAskQuestionConfig, InlineAskUserQuestion } from '../rendering/InlineAskUserQuestion';
 import { InlineExitPlanMode } from '../rendering/InlineExitPlanMode';
 import { InlinePlanApproval,type PlanApprovalDecision } from '../rendering/InlinePlanApproval';
@@ -107,6 +108,7 @@ export interface InputControllerDeps {
     acquireLive: (isCancelled?: () => boolean) => Promise<ProjectionWriteLease | null>;
     runStored: <T>(isCancelled: () => boolean, task: () => Promise<T>) => Promise<T | null>;
   } | null;
+  getHistoryWindowRenderer?: () => HistoryWindowRenderer | null;
   /** Tab-level provider fallback for blank tabs (derived from draft model). */
   getTabProviderId?: () => ProviderId;
   /**
@@ -423,6 +425,12 @@ export class InputController {
     };
     state.addMessage(userMsg);
     state.hasPendingConversationSave = true;
+    const liveRoot = this.deps.getHistoryWindowRenderer?.()?.beginLivePage(
+      `live:${turnId}`,
+      [userMsg],
+      state.historyLease?.totalTurns ?? state.loadedRanges.at(-1)?.end ?? 0,
+    );
+    if (liveRoot) renderer.setMessagesEl(liveRoot);
     renderer.addMessage(userMsg);
 
     await this.triggerTitleGeneration();
@@ -735,6 +743,9 @@ export class InputController {
       // stored transaction is queued; holding live while queueing stored
       // would self-deadlock the FIFO.
       projectionLease?.release();
+      const historyWindowRenderer = this.deps.getHistoryWindowRenderer?.();
+      historyWindowRenderer?.freezeLivePage(state.messages.slice(-2));
+      if (historyWindowRenderer) renderer.setMessagesEl(this.deps.getMessagesEl());
       // Whether the final visible projection settled — the completion event
       // may only fire after this is true. A dirty turn must re-project
       // cleanly first; a cancelled stored wait resolves null and a failing

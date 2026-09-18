@@ -6,6 +6,7 @@ import type {
   AutoTurnStartedEvent,
 } from '../../../core/runtime/types';
 import type { ChatMessage } from '../../../core/types';
+import type { HistoryWindowRenderer } from '../rendering/HistoryWindowRenderer';
 import type { MessageRenderer } from '../rendering/MessageRenderer';
 import type { ProjectionWriteLease } from '../rendering/ProjectionWriteCoordinator';
 import type { SubagentManager } from '../services/SubagentManager';
@@ -45,6 +46,7 @@ interface AutoTurnProjectionControllerDeps {
     acquireLive: (isCancelled?: () => boolean) => Promise<ProjectionWriteLease | null>;
     runStored: <T>(isCancelled: () => boolean, task: () => Promise<T>) => Promise<T | null>;
   } | null;
+  getHistoryWindowRenderer?: () => HistoryWindowRenderer | null;
   /** Updates the tab's welcome element reference after a full re-projection. */
   setWelcomeEl?: (el: HTMLElement | null) => void;
   /**
@@ -132,6 +134,12 @@ export class AutoTurnProjectionController {
       contentBlocks: [],
     };
     if (!existingAssistant) this.deps.state.addMessage(assistantMessage);
+    const liveRoot = this.deps.getHistoryWindowRenderer?.()?.beginLivePage(
+      `live:${event.turnId}`,
+      [pendingUserMessage, assistantMessage].filter((message): message is ChatMessage => message !== null),
+      this.deps.state.historyLease?.totalTurns ?? this.deps.state.loadedRanges.at(-1)?.end ?? 0,
+    );
+    if (liveRoot) this.deps.renderer.setMessagesEl(liveRoot);
     this.deps.state.currentContentEl = null;
     this.deps.state.currentTextEl = null;
     this.deps.state.currentTextContent = '';
@@ -400,6 +408,11 @@ export class AutoTurnProjectionController {
         // P5: the live lease releases BEFORE the stored reprojection is
         // queued — holding live while acquiring stored self-deadlocks the FIFO.
         this.releaseLiveLease(active);
+        const historyWindowRenderer = this.deps.getHistoryWindowRenderer?.();
+        historyWindowRenderer?.freezeLivePage(
+          this.deps.state.messages.filter(message => message.id === active.assistantMessage.id),
+        );
+        if (historyWindowRenderer) this.deps.renderer.setMessagesEl(historyWindowRenderer.getRoot());
         const reprojectionSettled = await this.reprojectIfDirty(active, event.turnId, event.generation);
         this.active = null;
         this.deps.turnCoordinator.finish(event.turnId);

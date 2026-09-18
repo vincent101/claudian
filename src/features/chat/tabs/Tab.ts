@@ -35,6 +35,7 @@ import { NavigationController } from '../controllers/NavigationController';
 import { SelectionController } from '../controllers/SelectionController';
 import { StreamController } from '../controllers/StreamController';
 import { TurnCoordinator } from '../controllers/TurnCoordinator';
+import { capturePageUiState, restorePageUiState } from '../history/HistoryPageUiState';
 import { HistoryWindowRenderer } from '../rendering/HistoryWindowRenderer';
 import { MessageRenderer } from '../rendering/MessageRenderer';
 import { ProjectionWriteCoordinator } from '../rendering/ProjectionWriteCoordinator';
@@ -1425,6 +1426,7 @@ export function initializeTabControllers(
     locateResult: result => tab.controllers.conversationController!.locateHistorySearchResult(result),
     waitForResultRender: projectionKey => tab.renderer!.waitForMessageContentRendered(projectionKey),
     refreshSearchSnapshot: () => tab.controllers.conversationController!.refreshHistorySearchSnapshot(),
+    releaseSearchPins: () => tab.controllers.historyWindowRenderer?.releaseSearchPins(),
   });
   dom.eventCleanups.push(() => tab.controllers.historySearchController?.destroy());
 
@@ -1442,6 +1444,11 @@ export function initializeTabControllers(
   // one arbitrates who may write the messagesEl projection (stored history
   // transactions vs live streaming turns), not turn ownership.
   tab.controllers.projectionWriteCoordinator = new ProjectionWriteCoordinator();
+  tab.renderer.setPageRenderWorkRegistrar?.(element => {
+    const pageKey = element.closest<HTMLElement>('[data-page-key]')?.dataset.pageKey;
+    if (!pageKey) return null;
+    return state.historyPageStore.registerCurrentRenderWork(pageKey);
+  });
   tab.controllers.historyWindowRenderer = new HistoryWindowRenderer({
     root: dom.messagesEl,
     viewport: dom.messagesEl,
@@ -1458,35 +1465,11 @@ export function initializeTabControllers(
       }
     },
     clearPageReferences: (messages, wrapper, record) => {
-      wrapper.querySelectorAll<HTMLElement>('[data-message-id]').forEach(messageEl => {
-        const messageId = messageEl.dataset.messageId;
-        if (!messageId) return;
-        messageEl.querySelectorAll<HTMLElement>('[aria-expanded]').forEach((element, index) => {
-          state.historyPageStore.setUiState(record.pageKey, `${messageId}:expanded:${index}`, {
-            expanded: element.getAttribute('aria-expanded') === 'true',
-          });
-        });
-        messageEl.querySelectorAll<HTMLElement>('.claudian-text-block').forEach((element, index) => {
-          state.historyPageStore.setUiState(record.pageKey, `${messageId}:detail:${index}`, {
-            detailLoaded: !element.classList.contains('claudian-text-lazy'),
-          });
-        });
-      });
+      capturePageUiState(wrapper, record.uiState);
       tab.renderer?.clearPageReferences(messages);
     },
     invalidateDomEpoch: () => tab.renderer?.invalidateDomEpoch(),
-    restorePageUiState: (wrapper, record) => {
-      wrapper.querySelectorAll<HTMLElement>('[data-message-id]').forEach(messageEl => {
-        const messageId = messageEl.dataset.messageId;
-        if (!messageId) return;
-        messageEl.querySelectorAll<HTMLElement>('[aria-expanded]').forEach((element, index) => {
-          if (record.uiState.get(`${messageId}:expanded:${index}`)?.expanded) element.click();
-        });
-        messageEl.querySelectorAll<HTMLElement>('.claudian-text-lazy-expand').forEach((element, index) => {
-          if (record.uiState.get(`${messageId}:detail:${index}`)?.detailLoaded) element.click();
-        });
-      });
-    },
+    restorePageUiState: (wrapper, record) => restorePageUiState(wrapper, record.uiState),
     rematerializePage: record => tab.controllers.conversationController?.rematerializeHistoryPage(record) ?? Promise.resolve(null),
   });
   tab.dom.eventCleanups.push(() => tab.controllers.historyWindowRenderer?.dispose());
@@ -1504,6 +1487,7 @@ export function initializeTabControllers(
     notify: message => { new Notice(message); },
     recordDiagnostic: event => tab.service?.recordAutoTurnDiagnostic?.(event),
     getProjectionCoordinator: () => tab.controllers.projectionWriteCoordinator,
+    getHistoryWindowRenderer: () => state.historyLease ? tab.controllers.historyWindowRenderer : null,
     setWelcomeEl: (el) => { dom.welcomeEl = el; },
     onTurnCompleted: event => tab.onTurnCompleted?.(event),
   });
@@ -1519,6 +1503,7 @@ export function initializeTabControllers(
     conversationController: tab.controllers.conversationController,
     getTurnCoordinator: () => tab.controllers.turnCoordinator,
     getProjectionCoordinator: () => tab.controllers.projectionWriteCoordinator,
+    getHistoryWindowRenderer: () => state.historyLease ? tab.controllers.historyWindowRenderer : null,
     setWelcomeEl: (el) => { dom.welcomeEl = el; },
     getInputEl: () => dom.inputEl,
     getInputContainerEl: () => dom.inputContainerEl,
