@@ -685,9 +685,10 @@ describe('ConversationController', () => {
       const lease = makeLease(10);
       deps.state.currentConversationId = 'conv';
       deps.state.historyLease = lease;
-      lease.loadWindow.mockResolvedValue({ messages: [], range: { start: 0, end: 1 }, sourceBytes: 1, projectedChars: 1, oversizedTurnCount: 0, pageKey: 'w:0:1', hasMoreBefore: false, hasMoreAfter: true });
-      await controller.rematerializeHistoryPage({ pageKey: 'w:0:1', range: { start: 0, end: 1 }, uiState: new Map([['m:detail:x', { detailLoaded: true }]]) });
-      expect(lease.loadWindow).toHaveBeenCalledWith(expect.objectContaining({ projectionLevel: 'detail' }));
+      lease.loadWindow.mockResolvedValue({ messages: [{ id: 'm', role: 'user', content: 'truncated', timestamp: 1, projectionLevel: 'summary' }], range: { start: 0, end: 1 }, sourceBytes: 1, projectedChars: 1, oversizedTurnCount: 0, pageKey: 'w:0:1', hasMoreBefore: false, hasMoreAfter: true });
+      lease.loadMessageDetail.mockResolvedValue({ status: 'exact', message: { id: 'm', role: 'user', content: 'full detail body', timestamp: 1, projectionLevel: 'detail' } });
+      const result = await controller.rematerializeHistoryPage({ pageKey: 'w:0:1', range: { start: 0, end: 1 }, uiState: new Map([['m:detail:x', { detailLoaded: true }]]) });
+      expect(result?.messages[0]).toMatchObject({ content: 'full detail body', projectionLevel: 'detail' });
     });
 
     it('searches fully-hydrated loaded messages without a lease (Codex/OpenCode fallback)', async () => {

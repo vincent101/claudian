@@ -117,13 +117,13 @@ export class HistoryPageStore {
     return record;
   }
 
-  replaceMessage(pageKey: string, message: ChatMessage): HistoryPageRecord | undefined {
+  replaceMessage(pageKey: string, message: ChatMessage): boolean {
     const record = this.records.get(pageKey);
-    if (!record?.messages) return record;
+    if (!record?.messages) return false;
     record.messages = record.messages.map(current => current.id === message.id ? message : current);
     record.messageIds.add(message.id);
     record.lastAccess = ++this.clock;
-    return record;
+    return true;
   }
 
   clear(): void {
@@ -265,7 +265,8 @@ export class HistoryPageStore {
         .filter(record => record.pins.size === 0 && record.renderState !== 'mounted' && !record.pageKey.startsWith('live:'))
         .sort((a, b) => a.lastAccess - b.lastAccess)[0];
       if (!victim) {
-        const pages = resident();
+        const pages = resident().filter(page => !page.pageKey.startsWith('live:'));
+        if (pages.length === 0) return;
         this.onDiagnostic?.({
           kind: 'page_data_overcommit',
           pages: pages.length,

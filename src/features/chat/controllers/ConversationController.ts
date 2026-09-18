@@ -338,7 +338,9 @@ export class ConversationController {
     const lease = this.deps.state.historyLease;
     const conversationId = this.deps.state.currentConversationId;
     if (!lease || !conversationId) return null;
-    const requiresDetail = [...record.uiState.values()].some(ui => ui.detailLoaded);
+    const detailMessageIds = [...record.uiState.entries()]
+      .filter(([, ui]) => ui.detailLoaded)
+      .map(([key]) => key.split(':detail:')[0]);
     const page = await lease.loadWindow({
       anchorTurn: record.range.start,
       direction: 'newer',
@@ -346,11 +348,19 @@ export class ConversationController {
         ...HISTORY_RESOURCE_POLICY.paging,
         maxTurns: Math.max(1, record.range.end - record.range.start),
       },
-      projectionLevel: requiresDetail ? 'detail' : 'summary',
+      projectionLevel: 'summary',
       maxTurn: record.range.end,
     });
     if (conversationId !== this.deps.state.currentConversationId || page.pageKey !== record.pageKey) return null;
-    return this.toPageInput(page);
+    const details = new Map<string, ChatMessage>();
+    for (const messageId of new Set(detailMessageIds)) {
+      const result = await lease.loadMessageDetail(messageId, { maxSourceBytes: 16 * 1024 * 1024 });
+      if (result.status === 'exact') details.set(messageId, result.message);
+    }
+    return this.toPageInput({
+      ...page,
+      messages: page.messages.map(message => details.get(message.id) ?? message),
+    });
   }
 
   /**

@@ -44,6 +44,13 @@ describe('HistoryPageStore', () => {
     expect(live.messages).not.toBeNull();
   });
 
+  it('returns false when replacing a message whose page data was evicted', () => {
+    const store = new HistoryPageStore();
+    const record = store.upsertPage({ pageKey: 'a', range: { start: 0, end: 1 }, messages: [message('a')], projectedWeight: 1 });
+    record.messages = null;
+    expect(store.replaceMessage('a', message('a'))).toBe(false);
+  });
+
   it('allows diagnosed overcommit when every resident page is pinned', () => {
     const diagnostics: string[] = [];
     const store = new HistoryPageStore({ maxPages: 1, maxProjectedWeight: 50, onDiagnostic: event => diagnostics.push(event.kind) });

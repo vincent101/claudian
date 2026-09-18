@@ -175,7 +175,7 @@ export class HistoryWindowRenderer {
   replaceMessage(message: ChatMessage, pin?: 'search'): boolean {
     const record = this.options.pageStore.findByMessageId(message.id);
     if (!record) return false;
-    this.options.pageStore.replaceMessage(record.pageKey, message);
+    if (!this.options.pageStore.replaceMessage(record.pageKey, message)) return false;
     if (pin) this.options.pageStore.pin(record.pageKey, pin);
     if (record.renderState === 'mounted') this.mount(record);
     return true;
@@ -217,6 +217,11 @@ export class HistoryWindowRenderer {
       if (rect.bottom > top && rect.top < bottom) visible.push(pageKey);
     }
     this.pendingVisiblePages = new Set(visible);
+    if (!this.windowingActive()) {
+      this.pendingVisiblePages = null;
+      this.setVisiblePages(visible);
+      return;
+    }
     this.sampleIntent(direction ?? this.scrollDirection());
   }
 

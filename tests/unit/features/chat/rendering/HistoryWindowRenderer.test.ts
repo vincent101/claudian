@@ -40,6 +40,13 @@ function createHarness(totalTurns = 300, overrides: Record<string, unknown> = {}
 }
 
 describe('HistoryWindowRenderer', () => {
+  it('does not retain pending visible work while windowing is inactive', () => {
+    const { renderer } = createHarness(250);
+    renderer.addPage({ pageKey: 'small', range: { start: 0, end: 250 }, messages: messages(250), projectedWeight: 1 }, 250);
+    renderer.sampleViewport();
+    expect((renderer as any).pendingVisiblePages).toBeNull();
+  });
+
   it('does not create spacers for small conversations', () => {
     const { renderer, root } = createHarness(250);
     renderer.addPage({ pageKey: 'small', range: { start: 0, end: 250 }, messages: messages(250), projectedWeight: 1 }, 250);
@@ -268,14 +275,14 @@ describe('HistoryWindowRenderer', () => {
   });
 
   it('marks height caches stale on width, font, and theme changes', async () => {
-    const resizeCallbacks: ResizeObserverCallback[] = [];
+    const resizeCallbacks = new Map<Element, ResizeObserverCallback>();
     const mutationCallbacks: MutationCallback[] = [];
     const originalResize = global.ResizeObserver;
     const originalMutation = global.MutationObserver;
     const loadingListeners: Array<() => void> = [];
     (global as any).ResizeObserver = class {
-      constructor(callback: ResizeObserverCallback) { resizeCallbacks.push(callback); }
-      observe() {}
+      constructor(private readonly callback: ResizeObserverCallback) {}
+      observe(element: Element) { resizeCallbacks.set(element, this.callback); }
       unobserve() {}
       disconnect() {}
     };
@@ -293,7 +300,7 @@ describe('HistoryWindowRenderer', () => {
     const record = renderer.addPage({ pageKey: 'a', range: { start: 0, end: 1 }, messages: messages(1), projectedWeight: 1 }, 300);
     record.measuredHeight = 100;
     record.heightStale = false;
-    resizeCallbacks[1]([], {} as ResizeObserver);
+    resizeCallbacks.get((renderer as any).options.viewport)!([], {} as ResizeObserver);
     expect(record.heightStale).toBe(true);
     record.heightStale = false;
     mutationCallbacks[0]([], {} as MutationObserver);
