@@ -1322,6 +1322,10 @@ export function initializeTabControllers(
       getTitleGenerationService: () => services.titleGenerationService,
       getStatusPanel: () => ui.statusPanel,
       getAgentService: () => tab.service, // Use tab's service instead of plugin's
+      getHistoryIndexCapableService: (conversation) => {
+        const service = ProviderRegistry.getConversationHistoryService(conversation.providerId);
+        return typeof service.acquireHistoryIndex === 'function' ? service : null;
+      },
       dismissPendingInlinePrompts: () => tab.controllers.inputController?.dismissPendingApproval(),
       switchToHydrationShell: hydrationHooks?.switchToHydrationShell,
       markHydrationReady: hydrationHooks?.markHydrationReady,

@@ -11,6 +11,7 @@ import {
   HistorySourceUnavailableError,
   type HistoryWindowRequest,
   type LoadedTurnRange,
+  type ProviderConversationHistoryService,
   type ProviderId,
   type TitleGenerationService,
 } from '../../../core/providers/types';
@@ -67,6 +68,9 @@ export interface ConversationControllerDeps {
   getTitleGenerationService: () => TitleGenerationService | null;
   getStatusPanel: () => StatusPanel | null;
   getAgentService?: () => ChatRuntime | null;
+  getHistoryIndexCapableService: (
+    conversation: Conversation,
+  ) => ProviderConversationHistoryService | null;
   ensureServiceForConversation?: (conversation: Conversation | null) => Promise<void>;
   dismissPendingInlinePrompts?: () => void;
   /**

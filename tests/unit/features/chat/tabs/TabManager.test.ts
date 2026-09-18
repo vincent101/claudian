@@ -3,7 +3,7 @@ import { createMockEl } from '@test/helpers/mockElement';
 import { ProviderRegistry } from '@/core/providers/ProviderRegistry';
 import { ProviderWorkspaceRegistry } from '@/core/providers/ProviderWorkspaceRegistry';
 import { ConversationHistoryHydrationError } from '@/core/providers/types';
-import { ConversationController } from '@/features/chat/controllers/ConversationController';
+import { ConversationController, type ConversationControllerDeps } from '@/features/chat/controllers/ConversationController';
 import { ChatState } from '@/features/chat/state/ChatState';
 import { TabManager } from '@/features/chat/tabs/TabManager';
 import {
@@ -175,7 +175,10 @@ async function flushMicrotasks(count = 4): Promise<void> {
  * exercise the actual loadActive chain — including the oversize paged branch —
  * instead of a mock that only resembles it.
  */
-function createRealConversationControllerHarness(plugin: any): {
+function createRealConversationControllerHarness(
+  plugin: any,
+  getHistoryIndexCapableService: ConversationControllerDeps['getHistoryIndexCapableService'] = () => null,
+): {
   controller: ConversationController;
   state: ChatState;
 } {
@@ -223,6 +226,7 @@ function createRealConversationControllerHarness(plugin: any): {
     clearQueuedMessage: jest.fn(),
     invalidateTurnLifecycle: jest.fn(),
     getTitleGenerationService: () => null,
+    getHistoryIndexCapableService,
     getStatusPanel: () => ({ remount: jest.fn() }) as any,
     ensureServiceForConversation: jest.fn().mockResolvedValue(undefined),
     dismissPendingInlinePrompts: jest.fn(),

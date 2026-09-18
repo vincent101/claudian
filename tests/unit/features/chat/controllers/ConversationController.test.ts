@@ -112,6 +112,7 @@ function createMockDeps(overrides: Partial<ConversationControllerDeps> = {}): Co
     }) as any,
     clearQueuedMessage: jest.fn(),
     getTitleGenerationService: () => null,
+    getHistoryIndexCapableService: () => null,
     getStatusPanel: () => ({
       remount: jest.fn(),
     }) as any,
