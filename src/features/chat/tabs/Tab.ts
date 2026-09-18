@@ -1474,6 +1474,7 @@ export function initializeTabControllers(
       });
       tab.renderer?.clearPageReferences(messages);
     },
+    invalidateDomEpoch: () => tab.renderer?.invalidateDomEpoch(),
     restorePageUiState: (wrapper, record) => {
       wrapper.querySelectorAll<HTMLElement>('[data-message-id]').forEach(messageEl => {
         const messageId = messageEl.dataset.messageId;

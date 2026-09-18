@@ -34,6 +34,7 @@ export interface HistoryWindowRendererOptions {
   isLive: () => boolean;
   renderPage: (record: HistoryPageRecord, wrapper: HTMLElement, ticket: number) => void;
   clearPageReferences?: (messages: ChatMessage[], wrapper: HTMLElement, record: HistoryPageRecord) => void;
+  invalidateDomEpoch?: () => void;
   restorePageUiState?: (wrapper: HTMLElement, record: HistoryPageRecord) => void;
   rematerializePage?: (record: HistoryPageRecord) => Promise<HistoryPageInput | null>;
 }
@@ -291,6 +292,7 @@ export class HistoryWindowRenderer {
       });
     }
     this.options.clearPageReferences?.(record.messages ?? [], wrapper, record);
+    this.options.invalidateDomEpoch?.();
     this.resizeObserver?.unobserve(wrapper);
     const spacer = document.createElement('div');
     spacer.className = 'claudian-history-page-spacer';

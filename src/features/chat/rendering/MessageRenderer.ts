@@ -303,6 +303,11 @@ export class MessageRenderer {
     }
   }
 
+  /** Invalidates async projection callbacks after page-level structural changes. */
+  invalidateDomEpoch(): void {
+    this.domEpochValue += 1;
+  }
+
   /** Current DOM epoch; see `domEpochValue`. */
   get domEpoch(): number {
     return this.domEpochValue;
