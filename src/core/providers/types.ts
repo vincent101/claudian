@@ -500,6 +500,8 @@ export interface HistoryWindowRequest {
 
 export interface HistoryWindowPage {
   messages: ChatMessage[];
+  /** Estimated retained/render cost used by the page-data weighted LRU. */
+  projectedWeight?: number;
   /** Actual half-open turn range that satisfied the budgets. */
   range: LoadedTurnRange;
   snapshotOffset?: number;

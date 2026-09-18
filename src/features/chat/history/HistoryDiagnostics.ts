@@ -5,7 +5,10 @@
  */
 export type HistoryRenderDiagnosticEvent =
   | { kind: 'render_batch'; mounted: number; total: number; elapsedMs: number }
-  | { kind: 'render_complete'; messages: number; batches: number; elapsedMs: number };
+  | { kind: 'render_complete'; messages: number; batches: number; elapsedMs: number }
+  | { kind: 'page_render_timeout'; pageKey: string; ticket: number; timeoutMs: number }
+  | { kind: 'page_data_overcommit'; pages: number; projectedWeight: number }
+  | { kind: 'dom_overcommit'; pageKey: string; turns: number };
 
 type HistoryRenderDiagnosticSink = (event: HistoryRenderDiagnosticEvent) => void;
 

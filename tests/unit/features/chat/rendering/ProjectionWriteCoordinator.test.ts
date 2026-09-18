@@ -147,6 +147,20 @@ describe('ProjectionWriteCoordinator', () => {
     live!.release();
   });
 
+  it('keeps only the latest queued window intent for each direction', async () => {
+    const coordinator = new ProjectionWriteCoordinator();
+    const live = await coordinator.acquireLive();
+    const runs: string[] = [];
+
+    const first = coordinator.runLatestStoredIntent('older', () => false, async () => { runs.push('first'); });
+    const second = coordinator.runLatestStoredIntent('older', () => false, async () => { runs.push('second'); });
+    const opposite = coordinator.runLatestStoredIntent('newer', () => false, async () => { runs.push('newer'); });
+
+    live!.release();
+    await Promise.all([first, second, opposite]);
+    expect(runs).toEqual(['second', 'newer']);
+  });
+
   it('does not grant a live lease while an earlier live lease is still held', async () => {
     const coordinator = new ProjectionWriteCoordinator();
     const first = await coordinator.acquireLive();
