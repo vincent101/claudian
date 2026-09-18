@@ -59,10 +59,9 @@ describe('ClaudeConversationHistoryService M1 fuse', () => {
     mockSdkSessionExists.mockReturnValue(true);
   });
 
-  it('preserves subagent metadata outside the currently materialized page when saving', () => {
+  it('persists the incrementally maintained subagent sidecar without scanning messages', () => {
     const conversation = createConversation();
     const oldSubagent = { id: 'old-agent', mode: 'async', status: 'completed', taskId: 'old-task' } as any;
-    const visibleSubagent = { id: 'visible-agent', mode: 'sync', status: 'completed', taskId: 'visible-task' } as any;
     conversation.providerState = {
       ...conversation.providerState,
       subagentData: { 'old-agent': oldSubagent },
@@ -70,17 +69,13 @@ describe('ClaudeConversationHistoryService M1 fuse', () => {
     conversation.messages = [{
       id: 'assistant',
       role: 'assistant',
-      content: '',
+      content: 'materialized window must be ignored',
       timestamp: 1,
-      toolCalls: [{ id: 'tool', name: 'Task', input: {}, status: 'completed', subagent: visibleSubagent }],
     }];
     const service = new ClaudeConversationHistoryService();
 
     expect(service.buildPersistedProviderState(conversation)).toMatchObject({
-      subagentData: {
-        'old-agent': oldSubagent,
-        'visible-agent': visibleSubagent,
-      },
+      subagentData: { 'old-agent': oldSubagent },
     });
   });
 

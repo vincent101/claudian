@@ -89,8 +89,8 @@ export class SessionStorage {
       createdAt: meta.createdAt,
       updatedAt: meta.updatedAt,
       lastResponseAt: meta.lastResponseAt,
-      messageCount: 0,
-      preview: 'SDK session',
+      messageCount: meta.messageCount ?? 0,
+      preview: meta.preview ?? 'SDK session',
       titleGenerationStatus: meta.titleGenerationStatus,
     }));
 
@@ -115,6 +115,10 @@ export class SessionStorage {
       lastResponseAt: conversation.lastResponseAt,
       sessionId: conversation.sessionId,
       providerState: providerState && Object.keys(providerState).length > 0 ? providerState : undefined,
+      hasHistory: conversation.hasHistory,
+      messageCount: conversation.messageCount,
+      preview: conversation.preview,
+      firstUserExcerpt: conversation.firstUserExcerpt,
       currentNote: conversation.currentNote,
       externalContextPaths: conversation.externalContextPaths,
       enabledMcpServers: conversation.enabledMcpServers,

@@ -590,7 +590,8 @@ export async function initializeTabService(
     // Passive sync: set session state without starting the runtime process.
     // The runtime starts on demand when query() is called.
     if (conversation) {
-      const hasMessages = conversation.messages.length > 0;
+      const hasMessages = conversation.hasHistory === true
+        || (conversation.messageCount ?? conversation.messages.length) > 0;
       const externalContextPaths = hasMessages
         ? conversation.externalContextPaths || []
         : (plugin.settings.persistentExternalContextPaths || []);
@@ -1283,6 +1284,17 @@ export function initializeTabControllers(
   services.subagentManager.setCallback(
     (subagent) => {
       tab.controllers.streamController?.onAsyncSubagentStateChange(subagent);
+      const conversationId = tab.state.currentConversationId;
+      const conversation = conversationId ? plugin.getConversationSync(conversationId) : null;
+      if (conversation) {
+        const historyService = ProviderRegistry.getConversationHistoryService(conversation.providerId);
+        if (historyService.mergePersistedSubagentState) {
+          conversation.providerState = historyService.mergePersistedSubagentState(
+            conversation.providerState,
+            subagent,
+          );
+        }
+      }
 
       // During active stream, regular end-of-turn save captures latest state.
       if (!tab.state.isStreaming && tab.state.currentConversationId) {
@@ -1353,7 +1365,8 @@ export function initializeTabControllers(
 
         // If the runtime already exists for the right provider, sync it passively
         if (tab.service && tab.service.providerId === nextProviderId && conversation) {
-          const hasMessages = conversation.messages.length > 0;
+          const hasMessages = conversation.hasHistory === true
+        || (conversation.messageCount ?? conversation.messages.length) > 0;
           const externalContextPaths = hasMessages
             ? conversation.externalContextPaths || []
             : (plugin.settings.persistentExternalContextPaths || []);

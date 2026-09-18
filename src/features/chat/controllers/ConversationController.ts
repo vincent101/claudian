@@ -914,9 +914,17 @@ export class ConversationController {
       ? agentService.buildSessionUpdates({ conversation, sessionInvalidated })
       : { updates: {} };
 
+    const hasHistory = state.messages.length > 0 || conversation?.hasHistory === true;
+    const firstUser = state.messages.find(message => message.role === 'user');
     const updates: Partial<Conversation> = {
       ...sessionUpdates,
-      messages: state.messages,
+      messages: conversation?.sessionId ? [] : state.messages,
+      hasHistory,
+      messageCount: Math.max(conversation?.messageCount ?? 0, state.messages.length),
+      firstUserExcerpt: conversation?.firstUserExcerpt
+        ?? (firstUser ? (firstUser.displayContent ?? firstUser.content).slice(0, 300) : undefined),
+      preview: conversation?.preview
+        ?? (firstUser ? (firstUser.displayContent ?? firstUser.content).slice(0, 50) : undefined),
       currentNote: currentNote,
       externalContextPaths: externalContextPaths.length > 0 ? externalContextPaths : undefined,
       usage: state.usage ?? undefined,
@@ -956,7 +964,8 @@ export class ConversationController {
     // Clear status panels (auto-hide: panels reappear when agent creates new todos)
     state.currentTodos = null;
 
-    const hasMessages = state.messages.length > 0;
+    const hasMessages = conversation.hasHistory === true
+      || (conversation.messageCount ?? state.messages.length) > 0;
 
     // Determine external context paths for this session
     // Empty session: use persistent paths; session with messages: use saved paths
@@ -1514,41 +1523,24 @@ export class ConversationController {
     const { plugin } = this.deps;
     if (!plugin.settings.enableAutoTitleGeneration) return;
 
-    // Title generation is delegated to the active provider service
     const fullConv = await plugin.getConversationById(conversationId);
-    if (!fullConv || fullConv.messages.length < 1) return;
+    if (!fullConv) return;
+    const service = this.deps.getHistoryIndexCapableService(fullConv);
+    const bounded = service?.loadTitleMaterial
+      ? await service.loadTitleMaterial(fullConv, getVaultPath(plugin.app))
+      : null;
+    const firstUser = fullConv.messages.find(message => message.role === 'user');
+    const firstContent = bounded?.firstUserExcerpt
+      ?? fullConv.firstUserExcerpt
+      ?? (firstUser ? (firstUser.displayContent ?? firstUser.content).slice(0, 300) : '');
+    if (!firstContent) return;
 
     const titleService = this.deps.getTitleGenerationService();
     if (!titleService) return;
 
-    // Find first user message by role (not by index)
-    const firstUserMsg = fullConv.messages.find(m => m.role === 'user');
-    if (!firstUserMsg) return;
-
-    const isNoise = (text: string): boolean => {
-      if (!text) return true;
-      return /^This session is being continued/i.test(text) ||
-        /^\[Request interrupted by user/i.test(text) ||
-        /^<command-/i.test(text) ||
-        /^<local-command-caveat>/i.test(text);
-    };
-
-    const firstContent = (firstUserMsg.displayContent || firstUserMsg.content || '').slice(0, 300);
-    const userMsgs = fullConv.messages.filter(m => m.role === 'user');
-    const highInfoMsgs: string[] = [];
-    for (let i = userMsgs.length - 1; i >= 0 && highInfoMsgs.length < 5; i--) {
-      const text = userMsgs[i].displayContent || userMsgs[i].content || '';
-      if (!isNoise(text) && text.length >= 40) {
-        highInfoMsgs.push(text.slice(0, 250));
-      }
-    }
-    let recentExcerpt: string;
-    if (highInfoMsgs.length > 0) {
-      recentExcerpt = highInfoMsgs.join('\n- ');
-    } else {
-      const fallback = userMsgs.slice(-3).map(m => (m.displayContent || m.content || '').slice(0, 100));
-      recentExcerpt = fallback.join('\n- ');
-    }
+    const recentExcerpt = bounded?.recentUserExcerpts.join('\n- ')
+      ?? fullConv.messages.filter(message => message.role === 'user').slice(-3)
+        .map(message => (message.displayContent ?? message.content).slice(0, 100)).join('\n- ');
     const material = `Current title: "${fullConv.title || ''}"
 Return it unchanged if it still accurately summarizes the conversation below.
 

@@ -5,8 +5,6 @@ import * as path from 'path';
 
 import type { SDKNativeMessage, SDKSessionReadResult } from './sdkHistoryTypes';
 
-export const MAX_LEGACY_SESSION_BYTES = 64 * 1024 * 1024;
-
 /**
  * Encodes a vault path for the SDK project directory name.
  * The SDK replaces ALL non-alphanumeric characters with `-`.
@@ -76,16 +74,6 @@ export async function readSDKSession(
     const sessionPath = getSDKSessionPath(vaultPath, sessionId);
     if (!existsSync(sessionPath)) {
       return { messages: [], skippedLines: 0, status: 'missing' };
-    }
-
-    const stats = await fs.stat(sessionPath);
-    if (stats.size > MAX_LEGACY_SESSION_BYTES) {
-      return {
-        messages: [],
-        skippedLines: 0,
-        status: 'oversize',
-        sizeBytes: stats.size,
-      };
     }
 
     const content = await fs.readFile(sessionPath, 'utf-8');

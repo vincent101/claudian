@@ -106,7 +106,12 @@ export interface Conversation {
   sessionId: string | null;
   /** Opaque provider-owned state bag (session tracking, fork metadata, etc.). */
   providerState?: Record<string, unknown>;
+  /** Claude stores only an explicit transcript-less draft here; indexed pages are per-tab. */
   messages: ChatMessage[];
+  hasHistory?: boolean;
+  messageCount?: number;
+  preview?: string;
+  firstUserExcerpt?: string;
   currentNote?: string;
   /** Session-specific external context paths (directories with full access). Resets on new session. */
   externalContextPaths?: string[];
@@ -151,6 +156,10 @@ export interface SessionMetadata {
   sessionId?: string | null;
   /** Opaque provider-owned state bag. */
   providerState?: Record<string, unknown>;
+  hasHistory?: boolean;
+  messageCount?: number;
+  preview?: string;
+  firstUserExcerpt?: string;
   currentNote?: string;
   externalContextPaths?: string[];
   enabledMcpServers?: string[];

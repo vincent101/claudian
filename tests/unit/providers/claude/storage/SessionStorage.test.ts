@@ -457,8 +457,8 @@ describe('SessionStorage', () => {
     });
   });
 
-  describe('toSessionMetadata - extractSubagentData', () => {
-    it('extracts subagent data from Task toolCalls', () => {
+  describe('toSessionMetadata - provider sidecar', () => {
+    it('does not derive subagent data from a materialized message window', () => {
       const conversation: Conversation = {
         id: 'conv-subagent',
         providerId: 'claude' as ProviderId,
@@ -496,12 +496,7 @@ describe('SessionStorage', () => {
 
       const metadata = storage.toSessionMetadata(conversation);
 
-      expect((metadata.providerState as any)?.subagentData).toBeDefined();
-      expect((metadata.providerState as any)?.subagentData['task-1']).toEqual(expect.objectContaining({
-        id: 'task-1',
-        description: 'Test subagent',
-        status: 'completed',
-      }));
+      expect((metadata.providerState as any)?.subagentData).toBeUndefined();
     });
 
     it('returns undefined subagentData when no subagents present', () => {

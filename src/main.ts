@@ -343,6 +343,10 @@ export default class ClaudianPlugin extends Plugin {
         sessionId: resumeSessionId,
         providerState: meta.providerState,
         messages: [],
+        hasHistory: meta.hasHistory,
+        messageCount: meta.messageCount,
+        preview: meta.preview,
+        firstUserExcerpt: meta.firstUserExcerpt,
         currentNote: meta.currentNote,
         externalContextPaths: meta.externalContextPaths,
         enabledMcpServers: meta.enabledMcpServers,
@@ -466,7 +470,8 @@ export default class ClaudianPlugin extends Plugin {
         const conversation = tab.conversationId
           ? this.getConversationSync(tab.conversationId)
           : null;
-        const hasConversationContext = (conversation?.messages.length ?? 0) > 0;
+        const hasConversationContext = conversation?.hasHistory === true
+          || (conversation?.messageCount ?? conversation?.messages.length ?? 0) > 0;
         const externalContextPaths = tab.ui.externalContextSelector?.getExternalContexts()
           ?? (hasConversationContext
             ? conversation?.externalContextPaths ?? []
@@ -599,6 +604,7 @@ export default class ClaudianPlugin extends Plugin {
   }
 
   private getConversationPreview(conv: Conversation): string {
+    if (conv.preview) return conv.preview;
     const firstUserMsg = conv.messages.find(m => m.role === 'user');
     if (!firstUserMsg) {
       return 'New conversation';
@@ -699,17 +705,6 @@ export default class ClaudianPlugin extends Plugin {
       this.storage.sessions.toSessionMetadata(conversation)
     );
 
-    // Clear image data from memory after save (data is persisted by SDK).
-    // Skip for pending forks: their deep-cloned images aren't in SDK storage yet.
-    if (!ProviderRegistry.getConversationHistoryService(conversation.providerId).isPendingForkConversation(conversation)) {
-      for (const msg of conversation.messages) {
-        if (msg.images) {
-          for (const img of msg.images) {
-            img.data = '';
-          }
-        }
-      }
-    }
   }
 
   async getConversationById(id: string): Promise<Conversation | null> {
@@ -727,7 +722,10 @@ export default class ClaudianPlugin extends Plugin {
   }
 
   findEmptyConversation(): Conversation | null {
-    return this.conversations.find(c => c.messages.length === 0) || null;
+    return this.conversations.find(conversation =>
+      conversation.hasHistory !== true
+      && (conversation.messageCount ?? conversation.messages.length) === 0
+    ) || null;
   }
 
   getConversationList(): ConversationMeta[] {
@@ -738,8 +736,8 @@ export default class ClaudianPlugin extends Plugin {
       createdAt: c.createdAt,
       updatedAt: c.updatedAt,
       lastResponseAt: c.lastResponseAt,
-      messageCount: c.messages.length,
-      preview: this.getConversationPreview(c),
+      messageCount: c.messageCount ?? c.messages.length,
+      preview: c.preview ?? this.getConversationPreview(c),
       titleGenerationStatus: c.titleGenerationStatus,
     }));
   }

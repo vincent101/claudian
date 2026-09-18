@@ -12,7 +12,6 @@ import {
   type HistoryWindowRequest,
   type ProviderConversationHistoryService,
 } from '../../../core/providers/types';
-import { isSubagentToolName } from '../../../core/tools/toolNames';
 import type {
   ChatMessage,
   Conversation,
@@ -57,21 +56,6 @@ function dedupeMessages(messages: ChatMessage[]): ChatMessage[] {
     if (seen.has(message.id)) continue;
     seen.add(message.id);
     result.push(message);
-  }
-
-  return result;
-}
-
-function buildPersistedSubagentData(messages: ChatMessage[]): Record<string, SubagentInfo> {
-  const result: Record<string, SubagentInfo> = {};
-
-  for (const msg of messages) {
-    if (msg.role !== 'assistant' || !msg.toolCalls) continue;
-
-    for (const toolCall of msg.toolCalls) {
-      if (!isSubagentToolName(toolCall.name) || !toolCall.subagent) continue;
-      result[toolCall.subagent.id] = toolCall.subagent;
-    }
   }
 
   return result;
@@ -150,6 +134,14 @@ export class ClaudeConversationHistoryService implements ProviderConversationHis
     return state as Record<string, unknown>;
   }
 
+  mergePersistedSubagentState(
+    providerState: Record<string, unknown> | undefined,
+    subagent: SubagentInfo,
+  ): Record<string, unknown> {
+    const current = getClaudeState(providerState);
+    return { ...current, subagentData: { ...(current.subagentData ?? {}), [subagent.id]: subagent } };
+  }
+
   buildPersistedProviderState(
     conversation: Conversation,
   ): Record<string, unknown> | undefined {
@@ -157,13 +149,48 @@ export class ClaudeConversationHistoryService implements ProviderConversationHis
       ...getClaudeState(conversation.providerState),
     };
 
-    const subagentData = {
-      ...(providerState.subagentData ?? {}),
-      ...buildPersistedSubagentData(conversation.messages),
-    };
-    if (Object.keys(subagentData).length > 0) providerState.subagentData = subagentData;
-
     return sanitizeProviderState(providerState);
+  }
+
+  async loadTitleMaterial(
+    conversation: Conversation,
+    vaultPath: string | null,
+  ): Promise<{ firstUserExcerpt: string; recentUserExcerpts: string[] } | null> {
+    if (!vaultPath) return null;
+    const lease = this.acquireHistoryIndex(conversation, vaultPath);
+    try {
+      await lease.ready;
+      const budget: HistoryLoadBudget = {
+        maxTurns: 8,
+        maxSourceBytes: 256 * 1024,
+        maxProjectedChars: 32 * 1024,
+        timeSliceMs: 8,
+      };
+      const first = await lease.loadWindow({
+        anchorTurn: 0,
+        direction: 'newer',
+        maxTurn: Math.min(1, lease.totalTurns),
+        budget,
+        projectionLevel: 'detail',
+      });
+      const recent = await lease.loadWindow({
+        anchorTurn: lease.totalTurns,
+        direction: 'older',
+        budget,
+        projectionLevel: 'detail',
+      });
+      const firstUser = first.messages.find(message => message.role === 'user');
+      if (!firstUser) return null;
+      return {
+        firstUserExcerpt: (firstUser.displayContent ?? firstUser.content).slice(0, 300),
+        recentUserExcerpts: recent.messages
+          .filter(message => message.role === 'user')
+          .slice(-5)
+          .map(message => (message.displayContent ?? message.content).slice(0, 250)),
+      };
+    } finally {
+      lease.release();
+    }
   }
 
   acquireHistoryIndex(

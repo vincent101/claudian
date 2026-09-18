@@ -361,7 +361,8 @@ export class TabManager implements TabManagerInterface {
         // Passive sync is only safe once local tab state has been persisted.
         const conversation = this.plugin.getConversationSync(tab.conversationId);
         if (conversation) {
-          const hasMessages = conversation.messages.length > 0;
+          const hasMessages = conversation.hasHistory === true
+            || (conversation.messageCount ?? conversation.messages.length) > 0;
           const externalContextPaths = hasMessages
             ? conversation.externalContextPaths || []
             : (this.plugin.settings.persistentExternalContextPaths || []);
@@ -1174,7 +1175,8 @@ export class TabManager implements TabManagerInterface {
           ? await this.plugin.getConversationById(tab.conversationId)
           : this.plugin.getConversationSync(tab.conversationId))
       : null;
-    const hasConversationContext = (conversation?.messages.length ?? 0) > 0;
+    const hasConversationContext = conversation?.hasHistory === true
+      || (conversation?.messageCount ?? conversation?.messages.length ?? 0) > 0;
     const externalContextPaths = tab.ui.externalContextSelector?.getExternalContexts()
       ?? (hasConversationContext
         ? conversation?.externalContextPaths ?? []
