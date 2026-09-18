@@ -29,7 +29,7 @@ describe('ProviderRegistry', () => {
 
   it('returns boundary services for the default provider', () => {
     const historyService = ProviderRegistry.getConversationHistoryService();
-    expect(historyService).toHaveProperty('hydrateConversationHistory');
+    expect(historyService).toHaveProperty('acquireHistoryIndex');
 
     const taskInterpreter = ProviderRegistry.getTaskResultInterpreter();
     expect(taskInterpreter).toHaveProperty('resolveTerminalStatus');

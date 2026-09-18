@@ -1,5 +1,4 @@
 import {
-  type ConversationHistoryHydrationResult,
   type FullHistoryIterable,
   type FullHistoryIterationOptions,
   HistoryEntryTooLargeError,
@@ -13,22 +12,18 @@ import {
   type HistoryWindowRequest,
   type ProviderConversationHistoryService,
 } from '../../../core/providers/types';
-import { isSubagentToolName, TOOL_TASK } from '../../../core/tools/toolNames';
+import { isSubagentToolName } from '../../../core/tools/toolNames';
 import type {
-  AsyncSubagentStatus,
   ChatMessage,
   Conversation,
   ForkSource,
   SubagentInfo,
-  ToolCallInfo,
 } from '../../../core/types';
 import { compareChatDisplayOrder } from '../../../core/types';
 import { ClaudeTranscriptDiagnosticLog } from '../transcript/ClaudeTranscriptDiagnosticLog';
 import { type ClaudeProviderState, getClaudeState } from '../types/providerState';
 import {
   deleteSDKSession,
-  loadSDKSessionMessages,
-  loadSubagentToolCalls,
   materializeSDKMessages,
   sdkSessionExists,
 } from './ClaudeHistoryStore';
@@ -54,141 +49,6 @@ import { planHistoryWindow } from './HistoryWindowPlanner';
 import type { SDKNativeMessage } from './sdkHistoryTypes';
 import { getSDKSessionPath } from './sdkSessionPaths';
 
-function chooseRicherResult(sdkResult?: string, cachedResult?: string): string | undefined {
-  const sdkText = typeof sdkResult === 'string' ? sdkResult.trim() : '';
-  const cachedText = typeof cachedResult === 'string' ? cachedResult.trim() : '';
-
-  if (sdkText.length === 0 && cachedText.length === 0) return undefined;
-  if (sdkText.length === 0) return cachedResult;
-  if (cachedText.length === 0) return sdkResult;
-
-  return sdkText.length >= cachedText.length ? sdkResult : cachedResult;
-}
-
-function chooseRicherToolCalls(
-  sdkToolCalls: ToolCallInfo[] = [],
-  cachedToolCalls: ToolCallInfo[] = [],
-): ToolCallInfo[] {
-  if (sdkToolCalls.length >= cachedToolCalls.length) {
-    return sdkToolCalls;
-  }
-
-  return cachedToolCalls;
-}
-
-function normalizeAsyncStatus(
-  subagent: SubagentInfo | undefined,
-  modeOverride?: SubagentInfo['mode'],
-): AsyncSubagentStatus | undefined {
-  if (!subagent) return undefined;
-
-  const mode = modeOverride ?? subagent.mode;
-  if (mode === 'sync') return undefined;
-  if (mode === 'async') return subagent.asyncStatus ?? subagent.status;
-  return subagent.asyncStatus;
-}
-
-function isTerminalAsyncStatus(status: AsyncSubagentStatus | undefined): boolean {
-  return status === 'completed' || status === 'error' || status === 'orphaned';
-}
-
-function mergeSubagentInfo(
-  taskToolCall: ToolCallInfo,
-  cachedSubagent: SubagentInfo,
-): SubagentInfo {
-  const sdkSubagent = taskToolCall.subagent;
-  const cachedAsyncStatus = normalizeAsyncStatus(cachedSubagent);
-  if (!sdkSubagent) {
-    return {
-      ...cachedSubagent,
-      asyncStatus: cachedAsyncStatus,
-      result: chooseRicherResult(taskToolCall.result, cachedSubagent.result),
-    };
-  }
-
-  const sdkAsyncStatus = normalizeAsyncStatus(sdkSubagent);
-  const sdkIsTerminal = isTerminalAsyncStatus(sdkAsyncStatus);
-  const cachedIsTerminal = isTerminalAsyncStatus(cachedAsyncStatus);
-  const sdkResult = taskToolCall.result ?? sdkSubagent.result;
-
-  const preferred = (!sdkIsTerminal && cachedIsTerminal) ? cachedSubagent : sdkSubagent;
-
-  const mergedMode = sdkSubagent.mode
-    ?? cachedSubagent.mode
-    ?? (taskToolCall.input?.run_in_background === true ? 'async' : undefined);
-  const fallbackResult = chooseRicherResult(sdkResult, cachedSubagent.result);
-  const mergedResult = preferred === cachedSubagent
-    ? (cachedSubagent.result ?? fallbackResult)
-    : fallbackResult;
-  const mergedAsyncStatus = normalizeAsyncStatus(preferred, mergedMode);
-
-  return {
-    ...cachedSubagent,
-    ...sdkSubagent,
-    description: sdkSubagent.description || cachedSubagent.description,
-    prompt: sdkSubagent.prompt || cachedSubagent.prompt,
-    mode: mergedMode,
-    status: preferred.status,
-    asyncStatus: mergedAsyncStatus,
-    result: mergedResult,
-    toolCalls: chooseRicherToolCalls(sdkSubagent.toolCalls, cachedSubagent.toolCalls),
-    agentId: sdkSubagent.agentId || cachedSubagent.agentId,
-    outputToolId: sdkSubagent.outputToolId || cachedSubagent.outputToolId,
-    startedAt: sdkSubagent.startedAt ?? cachedSubagent.startedAt,
-    completedAt: sdkSubagent.completedAt ?? cachedSubagent.completedAt,
-    isExpanded: sdkSubagent.isExpanded ?? cachedSubagent.isExpanded,
-  };
-}
-
-function ensureTaskToolCall(
-  msg: ChatMessage,
-  subagentId: string,
-  subagent: SubagentInfo,
-): ToolCallInfo {
-  msg.toolCalls = msg.toolCalls || [];
-  let taskToolCall = msg.toolCalls.find(
-    tc => tc.id === subagentId && isSubagentToolName(tc.name),
-  );
-
-  if (!taskToolCall) {
-    taskToolCall = {
-      id: subagentId,
-      name: TOOL_TASK,
-      input: {
-        description: subagent.description,
-        prompt: subagent.prompt || '',
-        ...(subagent.mode === 'async' ? { run_in_background: true } : {}),
-      },
-      status: subagent.status,
-      result: subagent.result,
-      isExpanded: false,
-      subagent,
-    };
-    msg.toolCalls.push(taskToolCall);
-    return taskToolCall;
-  }
-
-  if (!taskToolCall.input.description) {
-    taskToolCall.input.description = subagent.description;
-  }
-  if (!taskToolCall.input.prompt) {
-    taskToolCall.input.prompt = subagent.prompt || '';
-  }
-  if (subagent.mode === 'async') {
-    taskToolCall.input.run_in_background = true;
-  }
-  const mergedSubagent = mergeSubagentInfo(taskToolCall, subagent);
-  taskToolCall.status = mergedSubagent.status;
-  if (mergedSubagent.mode === 'async') {
-    taskToolCall.input.run_in_background = true;
-  }
-  if (mergedSubagent.result !== undefined) {
-    taskToolCall.result = mergedSubagent.result;
-  }
-  taskToolCall.subagent = mergedSubagent;
-  return taskToolCall;
-}
-
 function dedupeMessages(messages: ChatMessage[]): ChatMessage[] {
   const seen = new Set<string>();
   const result: ChatMessage[] = [];
@@ -200,126 +60,6 @@ function dedupeMessages(messages: ChatMessage[]): ChatMessage[] {
   }
 
   return result;
-}
-
-async function enrichAsyncSubagentToolCalls(
-  subagentData: Record<string, SubagentInfo>,
-  vaultPath: string,
-  sessionIds: string[],
-): Promise<void> {
-  const uniqueSessionIds = [...new Set(sessionIds)];
-  if (uniqueSessionIds.length === 0) return;
-
-  const loaderCache = new Map<string, ReturnType<typeof loadSubagentToolCalls>>();
-
-  for (const subagent of Object.values(subagentData)) {
-    if (subagent.mode !== 'async') continue;
-    if (!subagent.agentId) continue;
-    if ((subagent.toolCalls?.length ?? 0) > 0) continue;
-
-    for (const sessionId of uniqueSessionIds) {
-      const cacheKey = `${sessionId}:${subagent.agentId}`;
-
-      let loader = loaderCache.get(cacheKey);
-      if (!loader) {
-        loader = loadSubagentToolCalls(vaultPath, sessionId, subagent.agentId);
-        loaderCache.set(cacheKey, loader);
-      }
-
-      const recoveredToolCalls = await loader;
-      if (recoveredToolCalls.length === 0) continue;
-
-      subagent.toolCalls = recoveredToolCalls.map(toolCall => ({
-        ...toolCall,
-        input: { ...toolCall.input },
-      }));
-      break;
-    }
-  }
-}
-
-function applySubagentData(
-  messages: ChatMessage[],
-  subagentData: Record<string, SubagentInfo>,
-): void {
-  const attachedSubagentIds = new Set<string>();
-
-  for (const msg of messages) {
-    if (msg.role !== 'assistant') continue;
-
-    for (const [subagentId, subagent] of Object.entries(subagentData)) {
-      const hasSubagentBlock = msg.contentBlocks?.some(
-        block => (block.type === 'subagent' && block.subagentId === subagentId)
-          || (block.type === 'tool_use' && block.toolId === subagentId),
-      );
-      const hasTaskToolCall = msg.toolCalls?.some(tc => tc.id === subagentId) ?? false;
-
-      if (!hasSubagentBlock && !hasTaskToolCall) continue;
-      ensureTaskToolCall(msg, subagentId, subagent);
-
-      if (!msg.contentBlocks) {
-        msg.contentBlocks = [];
-      }
-
-      let hasNormalizedSubagentBlock = false;
-      for (let i = 0; i < msg.contentBlocks.length; i++) {
-        const block = msg.contentBlocks[i];
-        if (block.type === 'tool_use' && block.toolId === subagentId) {
-          msg.contentBlocks[i] = {
-            type: 'subagent',
-            subagentId,
-            mode: subagent.mode,
-          };
-          hasNormalizedSubagentBlock = true;
-        } else if (block.type === 'subagent' && block.subagentId === subagentId && !block.mode) {
-          block.mode = subagent.mode;
-          hasNormalizedSubagentBlock = true;
-        } else if (block.type === 'subagent' && block.subagentId === subagentId) {
-          hasNormalizedSubagentBlock = true;
-        }
-      }
-
-      if (!hasNormalizedSubagentBlock && hasTaskToolCall) {
-        msg.contentBlocks.push({
-          type: 'subagent',
-          subagentId,
-          mode: subagent.mode,
-        });
-      }
-
-      attachedSubagentIds.add(subagentId);
-    }
-  }
-
-  for (const [subagentId, subagent] of Object.entries(subagentData)) {
-    if (attachedSubagentIds.has(subagentId)) continue;
-
-    let anchor = [...messages].reverse().find((msg): msg is ChatMessage => msg.role === 'assistant');
-    if (!anchor) {
-      anchor = {
-        id: `subagent-recovery-${subagentId}`,
-        role: 'assistant',
-        content: '',
-        timestamp: subagent.completedAt ?? subagent.startedAt ?? Date.now(),
-        contentBlocks: [],
-      };
-      messages.push(anchor);
-    }
-
-    ensureTaskToolCall(anchor, subagentId, subagent);
-
-    anchor.contentBlocks = anchor.contentBlocks || [];
-    const hasSubagentBlock = anchor.contentBlocks.some(
-      block => block.type === 'subagent' && block.subagentId === subagentId,
-    );
-    if (!hasSubagentBlock) {
-      anchor.contentBlocks.push({
-        type: 'subagent',
-        subagentId,
-        mode: subagent.mode,
-      });
-    }
-  }
 }
 
 function buildPersistedSubagentData(messages: ChatMessage[]): Record<string, SubagentInfo> {
@@ -370,7 +110,6 @@ interface SharedHistoryIndex {
 }
 
 export class ClaudeConversationHistoryService implements ProviderConversationHistoryService {
-  private hydratedConversationIds = new Set<string>();
   private sharedIndexes = new Map<string, SharedHistoryIndex>();
   private indexDiagnostics: ClaudeTranscriptDiagnosticLog | null = null;
   private windowDiagnostics: ClaudeTranscriptDiagnosticLog | null = null;
@@ -425,111 +164,6 @@ export class ClaudeConversationHistoryService implements ProviderConversationHis
     if (Object.keys(subagentData).length > 0) providerState.subagentData = subagentData;
 
     return sanitizeProviderState(providerState);
-  }
-
-  async hydrateConversationHistory(
-    conversation: Conversation,
-    vaultPath: string | null,
-  ): Promise<ConversationHistoryHydrationResult> {
-    if (!vaultPath || this.hydratedConversationIds.has(conversation.id)) {
-      return { status: 'ready' };
-    }
-    this.ensureIndexDiagnostics(vaultPath);
-
-    const state = getClaudeState(conversation.providerState);
-    const isPendingFork = this.isPendingForkConversation(conversation);
-    const allSessionIds: string[] = isPendingFork
-      ? [state.forkSource!.sessionId]
-      : [
-          ...(state.previousProviderSessionIds || []),
-          state.providerSessionId ?? conversation.sessionId,
-        ].filter((id): id is string => !!id);
-
-    if (allSessionIds.length === 0) {
-      return { status: 'ready' };
-    }
-
-    const allSdkMessages: ChatMessage[] = [];
-    let missingSessionCount = 0;
-    const errors: Array<{ sessionId: string; message: string }> = [];
-    const oversizeSegments: Array<{ sessionId: string; sizeBytes: number }> = [];
-
-    const currentSessionId = isPendingFork
-      ? state.forkSource!.sessionId
-      : (state.providerSessionId ?? conversation.sessionId);
-
-    for (let segmentOrdinal = 0; segmentOrdinal < allSessionIds.length; segmentOrdinal += 1) {
-      const sessionId = allSessionIds[segmentOrdinal];
-      if (!sdkSessionExists(vaultPath, sessionId)) {
-        missingSessionCount++;
-        continue;
-      }
-
-      const isCurrentSession = sessionId === currentSessionId;
-      const truncateAt = isCurrentSession
-        ? (isPendingFork ? state.forkSource!.resumeAt : conversation.resumeAtMessageId)
-        : undefined;
-      const result = await loadSDKSessionMessages(vaultPath, sessionId, truncateAt, segmentOrdinal);
-
-      if (result.status === 'oversize') {
-        oversizeSegments.push({ sessionId, sizeBytes: result.sizeBytes ?? 0 });
-        // Oversize hydration only reports structured state; the active tab
-        // builds the index exclusively through acquireHistoryIndex so the same
-        // snapshot is never rebuilt twice from split entry points.
-        continue;
-      }
-      if (result.status === 'failed') {
-        errors.push({ sessionId, message: result.error ?? 'Unknown history read error' });
-        continue;
-      }
-
-      allSdkMessages.push(...result.messages);
-    }
-
-    if (oversizeSegments.length > 0) {
-      return { status: 'oversize', segments: oversizeSegments };
-    }
-    if (errors.length > 0) {
-      return { status: 'error', errors };
-    }
-
-    const allSessionsMissing = missingSessionCount === allSessionIds.length;
-    if (allSessionsMissing) {
-      this.hydratedConversationIds.add(conversation.id);
-      return { status: 'ready' };
-    }
-
-    const filteredSdkMessages = allSdkMessages.filter(msg => !msg.isRebuiltContext);
-
-    const merged = dedupeMessages([
-      ...conversation.messages,
-      ...filteredSdkMessages,
-    ]);
-    // The SDK-materialized copy owns the canonical position: a cached
-    // conversation copy of the same id adopts the fresh key so dedupe (which
-    // prefers the cached copy) cannot strand it without structural order.
-    // Keyless leftovers (live turns, recovery anchors) sort stably at the tail.
-    const sdkOrderByMessageId = new Map(
-      filteredSdkMessages.filter(msg => msg.displayOrder).map(msg => [msg.id, msg.displayOrder!]),
-    );
-    for (const message of merged) {
-      const order = sdkOrderByMessageId.get(message.id);
-      if (order) message.displayOrder = order;
-    }
-    merged.sort(compareChatDisplayOrder);
-
-    if (state.subagentData) {
-      await enrichAsyncSubagentToolCalls(
-        state.subagentData,
-        vaultPath,
-        allSessionIds,
-      );
-      applySubagentData(merged, state.subagentData);
-    }
-
-    conversation.messages = merged;
-    this.hydratedConversationIds.add(conversation.id);
-    return { status: 'ready' };
   }
 
   acquireHistoryIndex(

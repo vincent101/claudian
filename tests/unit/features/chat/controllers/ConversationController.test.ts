@@ -2,7 +2,6 @@ import { createMockEl } from '@test/helpers/mockElement';
 import { Menu, Notice } from 'obsidian';
 
 import { ProviderRegistry } from '@/core/providers/ProviderRegistry';
-import { ConversationHistoryHydrationError } from '@/core/providers/types';
 import { ConversationController, type ConversationControllerDeps } from '@/features/chat/controllers/ConversationController';
 import * as historySearchModule from '@/features/chat/controllers/HistorySearchController';
 import { ProjectionWriteCoordinator } from '@/features/chat/rendering/ProjectionWriteCoordinator';
@@ -144,15 +143,15 @@ describe('ConversationController', () => {
       }),
     });
 
-    it('loads the first screen through a budget window for oversize history', async () => {
+    it('loads indexed history through the single first-screen path', async () => {
       const conversation = { id: 'large', providerId: 'claude', title: 'Large', messages: [], sessionId: 'session', createdAt: 1, updatedAt: 1 } as any;
       deps.state.currentConversationId = 'large';
-      (deps.plugin.getConversationById as jest.Mock).mockRejectedValue(new ConversationHistoryHydrationError({ status: 'oversize', segments: [{ sessionId: 'session', sizeBytes: 99 }] }));
+      (deps.plugin.getConversationById as jest.Mock).mockResolvedValue(conversation);
       (deps.plugin.getConversationSync as jest.Mock).mockReturnValue(conversation);
       const lease = makeLease();
       lease.loadWindow.mockResolvedValue({ messages: [{ id: 'latest', role: 'user', content: 'latest', timestamp: 1 }], range: { start: 110, end: 120 }, snapshotOffset: 123, sourceBytes: 1024, projectedChars: 7, oversizedTurnCount: 0, pageKey: 'w:110:120', hasMoreBefore: true, hasMoreAfter: false });
       const service = { acquireHistoryIndex: jest.fn().mockReturnValue(lease) };
-      jest.spyOn(ProviderRegistry, 'getConversationHistoryService').mockReturnValue(service as any);
+      deps.getHistoryIndexCapableService = () => service as any;
 
       await controller.loadActive();
 
@@ -160,7 +159,7 @@ describe('ConversationController', () => {
         anchorTurn: 120,
         direction: 'older',
         projectionLevel: 'summary',
-        budget: expect.objectContaining({ maxTurns: 25, maxSourceBytes: 8 * 1024 * 1024, maxProjectedChars: 2_000_000 }),
+        budget: expect.objectContaining({ maxTurns: 200, maxSourceBytes: 8 * 1024 * 1024, maxProjectedChars: 2_000_000 }),
       }));
       expect(deps.state.loadedRanges).toEqual([{ start: 110, end: 120 }]);
       expect(deps.state.historyHasMore).toBe(true);
@@ -169,10 +168,10 @@ describe('ConversationController', () => {
       expect(lease.release).not.toHaveBeenCalled();
     });
 
-    it('releases the previous lease when a repeat oversize loadActive overwrites it', async () => {
+    it('releases the previous lease when indexed loadActive repeats', async () => {
       const conversation = { id: 'large', providerId: 'claude', title: 'Large', messages: [], sessionId: 'session', createdAt: 1, updatedAt: 1 } as any;
       deps.state.currentConversationId = 'large';
-      (deps.plugin.getConversationById as jest.Mock).mockRejectedValue(new ConversationHistoryHydrationError({ status: 'oversize', segments: [{ sessionId: 'session', sizeBytes: 99 }] }));
+      (deps.plugin.getConversationById as jest.Mock).mockResolvedValue(conversation);
       (deps.plugin.getConversationSync as jest.Mock).mockReturnValue(conversation);
       const first = makeLease();
       const second = makeLease();
@@ -180,7 +179,7 @@ describe('ConversationController', () => {
       first.loadWindow.mockResolvedValue(page);
       second.loadWindow.mockResolvedValue(page);
       const service = { acquireHistoryIndex: jest.fn().mockReturnValueOnce(first).mockReturnValueOnce(second) };
-      jest.spyOn(ProviderRegistry, 'getConversationHistoryService').mockReturnValue(service as any);
+      deps.getHistoryIndexCapableService = () => service as any;
 
       await controller.loadActive();
       expect(first.release).not.toHaveBeenCalled();
@@ -197,12 +196,12 @@ describe('ConversationController', () => {
     it('releases the lease exactly once when the window load fails', async () => {
       const conversation = { id: 'large', providerId: 'claude', title: 'Large', messages: [], sessionId: 'session', createdAt: 1, updatedAt: 1 } as any;
       deps.state.currentConversationId = 'large';
-      (deps.plugin.getConversationById as jest.Mock).mockRejectedValue(new ConversationHistoryHydrationError({ status: 'oversize', segments: [{ sessionId: 'session', sizeBytes: 99 }] }));
+      (deps.plugin.getConversationById as jest.Mock).mockResolvedValue(conversation);
       (deps.plugin.getConversationSync as jest.Mock).mockReturnValue(conversation);
       const lease = makeLease();
       lease.loadWindow.mockRejectedValue(new Error('materialization failed'));
       const service = { acquireHistoryIndex: jest.fn().mockReturnValue(lease) };
-      jest.spyOn(ProviderRegistry, 'getConversationHistoryService').mockReturnValue(service as any);
+      deps.getHistoryIndexCapableService = () => service as any;
 
       await expect(controller.loadActive()).rejects.toThrow('materialization failed');
 
@@ -214,12 +213,12 @@ describe('ConversationController', () => {
     it('releases the lease when the index build fails', async () => {
       const conversation = { id: 'large', providerId: 'claude', title: 'Large', messages: [], sessionId: 'session', createdAt: 1, updatedAt: 1 } as any;
       deps.state.currentConversationId = 'large';
-      (deps.plugin.getConversationById as jest.Mock).mockRejectedValue(new ConversationHistoryHydrationError({ status: 'oversize', segments: [{ sessionId: 'session', sizeBytes: 99 }] }));
+      (deps.plugin.getConversationById as jest.Mock).mockResolvedValue(conversation);
       (deps.plugin.getConversationSync as jest.Mock).mockReturnValue(conversation);
       const lease = makeLease();
       (lease as any).ready = Promise.reject(new Error('index build failed'));
       const service = { acquireHistoryIndex: jest.fn().mockReturnValue(lease) };
-      jest.spyOn(ProviderRegistry, 'getConversationHistoryService').mockReturnValue(service as any);
+      deps.getHistoryIndexCapableService = () => service as any;
 
       await expect(controller.loadActive()).rejects.toThrow('index build failed');
 
@@ -229,12 +228,12 @@ describe('ConversationController', () => {
     it('releases the lease when the generation is invalidated before applying', async () => {
       const conversation = { id: 'large', providerId: 'claude', title: 'Large', messages: [], sessionId: 'session', createdAt: 1, updatedAt: 1 } as any;
       deps.state.currentConversationId = 'large';
-      (deps.plugin.getConversationById as jest.Mock).mockRejectedValue(new ConversationHistoryHydrationError({ status: 'oversize', segments: [{ sessionId: 'session', sizeBytes: 99 }] }));
+      (deps.plugin.getConversationById as jest.Mock).mockResolvedValue(conversation);
       (deps.plugin.getConversationSync as jest.Mock).mockReturnValue(conversation);
       const lease = makeLease();
       lease.loadWindow.mockResolvedValue({ messages: [{ id: 'latest', role: 'user', content: 'latest', timestamp: 1 }], range: { start: 110, end: 120 }, snapshotOffset: 123, sourceBytes: 1024, projectedChars: 7, oversizedTurnCount: 0, pageKey: 'w:110:120', hasMoreBefore: true, hasMoreAfter: false });
       const service = { acquireHistoryIndex: jest.fn().mockReturnValue(lease) };
-      jest.spyOn(ProviderRegistry, 'getConversationHistoryService').mockReturnValue(service as any);
+      deps.getHistoryIndexCapableService = () => service as any;
 
       await controller.loadActive(() => false);
 
@@ -343,7 +342,7 @@ describe('ConversationController', () => {
       previous.loadWindow.mockResolvedValue({ messages: [older], range: { start: 0, end: 50 }, snapshotOffset: 5, sourceBytes: 1, projectedChars: 1, oversizedTurnCount: 0, pageKey: 'w:0:50', hasMoreBefore: false, hasMoreAfter: true });
       const failed = { ...makeLease(100), ready: Promise.reject(new Error('index build failed')) };
       const service = { acquireHistoryIndex: jest.fn().mockReturnValue(failed) };
-      jest.spyOn(ProviderRegistry, 'getConversationHistoryService').mockReturnValue(service as any);
+      deps.getHistoryIndexCapableService = () => service as any;
 
       await expect(controller.refreshHistorySearchSnapshot()).rejects.toThrow('index build failed');
 
@@ -363,32 +362,16 @@ describe('ConversationController', () => {
       await expect(controller.locateHistorySearchResult({ projectionKey: 'missing', turnIndex: 3, matchOrdinal: 0, matchedText: 'needle' })).rejects.toThrow('projection_mismatch');
     });
 
-    it('binds the warm-up lease silently so index building cannot drive the hydration placeholder', async () => {
-      const conversation = { id: 'small', providerId: 'claude', title: 'Small', messages: [{ id: 'm1', role: 'user', content: 'hi', timestamp: 1 }], sessionId: 'session', createdAt: 1, updatedAt: 1 } as any;
-      deps.state.currentConversationId = 'small';
-      (deps.plugin.getConversationById as jest.Mock).mockResolvedValue(conversation);
-      const lease = makeLease(10);
-      const service = { acquireHistoryIndex: jest.fn().mockReturnValue(lease) };
-      jest.spyOn(ProviderRegistry, 'getConversationHistoryService').mockReturnValue(service as any);
-
-      await controller.loadActive();
-
-      // Non-paged loadActive renders the full transcript first; the warm-up
-      // acquire must not pass a progress callback or its async index events
-      // replace the rendered messages with the hydration placeholder.
-      expect(service.acquireHistoryIndex).toHaveBeenCalledWith(conversation, '/vault', undefined);
-      expect(deps.state.historyLease).toBe(lease);
-    });
 
     it('keeps progress reporting for the paged first-screen acquire', async () => {
       const conversation = { id: 'large', providerId: 'claude', title: 'Large', messages: [], sessionId: 'session', createdAt: 1, updatedAt: 1 } as any;
       deps.state.currentConversationId = 'large';
-      (deps.plugin.getConversationById as jest.Mock).mockRejectedValue(new ConversationHistoryHydrationError({ status: 'oversize', segments: [{ sessionId: 'session', sizeBytes: 99 }] }));
+      (deps.plugin.getConversationById as jest.Mock).mockResolvedValue(conversation);
       (deps.plugin.getConversationSync as jest.Mock).mockReturnValue(conversation);
       const lease = makeLease();
       lease.loadWindow.mockResolvedValue({ messages: [{ id: 'latest', role: 'user', content: 'latest', timestamp: 1 }], range: { start: 110, end: 120 }, snapshotOffset: 123, sourceBytes: 1024, projectedChars: 7, oversizedTurnCount: 0, pageKey: 'w:110:120', hasMoreBefore: true, hasMoreAfter: false });
       const service = { acquireHistoryIndex: jest.fn().mockReturnValue(lease) };
-      jest.spyOn(ProviderRegistry, 'getConversationHistoryService').mockReturnValue(service as any);
+      deps.getHistoryIndexCapableService = () => service as any;
 
       await controller.loadActive();
 
@@ -405,7 +388,7 @@ describe('ConversationController', () => {
       deps.state.historyLease = previous as any;
       const next = makeLease(100);
       const service = { acquireHistoryIndex: jest.fn().mockReturnValue(next) };
-      jest.spyOn(ProviderRegistry, 'getConversationHistoryService').mockReturnValue(service as any);
+      deps.getHistoryIndexCapableService = () => service as any;
 
       await controller.refreshHistorySearchSnapshot();
 
@@ -704,7 +687,7 @@ describe('ConversationController', () => {
       const next = makeLease(100);
       next.ready = new Promise<void>((_resolve, reject) => { rejectReady = reject; });
       const service = { acquireHistoryIndex: jest.fn().mockReturnValue(next) };
-      jest.spyOn(ProviderRegistry, 'getConversationHistoryService').mockReturnValue(service as any);
+      deps.getHistoryIndexCapableService = () => service as any;
 
       const refreshPromise = controller.refreshHistorySearchSnapshot();
       await Promise.resolve();
@@ -924,25 +907,7 @@ describe('ConversationController', () => {
         expect(invalidateTurnLifecycle).toHaveBeenCalledTimes(1);
       });
 
-      it('routes a hydration-blocked switch through the hydration shell instead of rejecting', async () => {
-        deps.state.currentConversationId = 'old-conv';
-        (deps.plugin.switchConversation as jest.Mock).mockRejectedValue(
-          new ConversationHistoryHydrationError({
-            status: 'oversize',
-            segments: [{ sessionId: 'large-session', sizeBytes: 65 * 1024 * 1024 }],
-          }),
-        );
-        const switchToHydrationShell = jest.fn();
-        deps.switchToHydrationShell = switchToHydrationShell;
-        const dropdown = deps.getHistoryDropdown()!;
-        dropdown.addClass('visible');
-
-        await expect(controller.switchTo('oversize-conv')).resolves.toBeUndefined();
-
-        expect(switchToHydrationShell).toHaveBeenCalledWith('oversize-conv');
-        expect(dropdown.hasClass('visible')).toBe(false);
-      });
-
+  
       it('still rejects non-hydration switch errors when no shell hook is configured', async () => {
         deps.state.currentConversationId = 'old-conv';
         (deps.plugin.switchConversation as jest.Mock).mockRejectedValue(new Error('storage failed'));
@@ -975,26 +940,7 @@ describe('ConversationController', () => {
         expect(release).toHaveBeenCalledTimes(1);
       });
 
-      it('releases the switched-away conversation history protection when a switch lands on the hydration shell', async () => {
-        deps.state.currentConversationId = 'old-conv';
-        (deps.plugin.getConversationSync as jest.Mock).mockImplementation((id: string) => (
-          id === 'old-conv'
-            ? { id: 'old-conv', providerId: 'claude', title: 'Old', messages: [], createdAt: 1, updatedAt: 1 }
-            : null
-        ));
-        (deps.plugin.switchConversation as jest.Mock).mockRejectedValue(new ConversationHistoryHydrationError({
-          status: 'oversize',
-          segments: [{ sessionId: 'large-session', sizeBytes: 65 * 1024 * 1024 }],
-        }));
-        deps.switchToHydrationShell = jest.fn();
-        const release = jest.fn();
-        deps.state.historyLease = { release } as any;
-
-        await controller.switchTo('oversize-conv');
-
-        expect(release).toHaveBeenCalledTimes(1);
-      });
-
+  
       it('does not release the current conversation history when the switch does not complete', async () => {
         deps.state.currentConversationId = 'old-conv';
         (deps.plugin.getConversationSync as jest.Mock).mockImplementation((id: string) => (

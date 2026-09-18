@@ -112,7 +112,6 @@ export type TabHydrationState =
   | 'SCHEDULED'
   | 'LOADING'
   | 'READY'
-  | 'OVERSIZE_BLOCKED'
   | 'ERROR';
 
 export interface TabHydrationDiagnostic {

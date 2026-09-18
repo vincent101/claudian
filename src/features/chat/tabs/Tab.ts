@@ -1671,21 +1671,6 @@ export function renderTabHydrationPlaceholder(
   messagesEl.empty();
   const placeholder = messagesEl.createDiv({ cls: 'claudian-history-placeholder' });
 
-  if (tab.hydrationState === 'OVERSIZE_BLOCKED') {
-    placeholder.createDiv({ cls: 'claudian-history-placeholder-title', text: t('chat.history.oversizeTitle') });
-    placeholder.createDiv({ text: t('chat.history.oversizeDescription') });
-    for (const segment of tab.hydrationDiagnostic?.segments ?? []) {
-      placeholder.createDiv({
-        cls: 'claudian-history-placeholder-detail',
-        text: t('chat.history.oversizeSegmentDetail', {
-          id: segment.sessionId,
-          size: (segment.sizeBytes / 1024 / 1024).toFixed(1),
-        }),
-      });
-    }
-    return;
-  }
-
   const isError = tab.hydrationState === 'ERROR';
   const progress = tab.historyLoadProgress;
   let loadingText = t('chat.history.loading');

@@ -9,7 +9,7 @@ const MiB = 1024 * 1024;
  * hard caps when tuning.
  */
 export const HISTORY_RESOURCE_POLICY = {
-  firstScreen: { maxTurns: 25, maxSourceBytes: 8 * MiB, maxProjectedChars: 2_000_000, timeSliceMs: 8 },
+  firstScreen: { maxTurns: 200, maxSourceBytes: 8 * MiB, maxProjectedChars: 2_000_000, timeSliceMs: 8 },
   paging: { maxTurns: 25, maxSourceBytes: 8 * MiB, maxProjectedChars: 2_000_000, timeSliceMs: 8 },
   searchLocate: { maxTurns: 1, maxSourceBytes: 8 * MiB, maxProjectedChars: 2_000_000, timeSliceMs: 8 },
 } satisfies Record<string, HistoryLoadBudget>;

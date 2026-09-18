@@ -1,7 +1,7 @@
 import type { HistoryLoadBudget } from '@/core/providers/types';
 import type { ChatMessage, Conversation } from '@/core/types';
 import { ClaudeConversationHistoryService } from '@/providers/claude/history/ClaudeConversationHistoryService';
-import { loadSDKSessionMessages, materializeSDKMessages, sdkSessionExists } from '@/providers/claude/history/ClaudeHistoryStore';
+import { materializeSDKMessages, sdkSessionExists } from '@/providers/claude/history/ClaudeHistoryStore';
 import {
   buildTranscriptIndex,
   clearTranscriptIndexCache,
@@ -29,7 +29,6 @@ jest.mock('@/providers/claude/history/ClaudeHistoryStore', () => ({
   deleteSDKSession: jest.fn().mockResolvedValue(undefined),
 }));
 
-const mockLoadSDKSessionMessages = loadSDKSessionMessages as jest.MockedFunction<typeof loadSDKSessionMessages>;
 const mockSdkSessionExists = sdkSessionExists as jest.MockedFunction<typeof sdkSessionExists>;
 const mockBuildTranscriptIndex = buildTranscriptIndex as jest.MockedFunction<typeof buildTranscriptIndex>;
 const mockMaterializeTranscriptEntries = materializeTranscriptEntries as jest.MockedFunction<typeof materializeTranscriptEntries>;
@@ -85,33 +84,6 @@ describe('ClaudeConversationHistoryService M1 fuse', () => {
     });
   });
 
-  it('returns oversize without merging a successful previous segment', async () => {
-    mockLoadSDKSessionMessages
-      .mockResolvedValueOnce({
-        status: 'complete',
-        messages: [{ id: 'old', role: 'user', content: 'old', timestamp: 1 }],
-        skippedLines: 0,
-      })
-      .mockResolvedValueOnce({
-        status: 'oversize',
-        messages: [],
-        skippedLines: 0,
-        sizeBytes: 65 * 1024 * 1024,
-      });
-    const conversation = createConversation();
-    const service = new ClaudeConversationHistoryService();
-
-    const result = await service.hydrateConversationHistory(conversation, '/vault');
-
-    expect(result).toEqual({
-      status: 'oversize',
-      segments: [{ sessionId: 'current-session', sizeBytes: 65 * 1024 * 1024 }],
-    });
-    expect(conversation.messages).toEqual([]);
-    // Shadow prewarm removed: the oversize hydration only reports structured
-    // state; the active tab builds the index through acquireHistoryIndex.
-    expect(mockBuildTranscriptIndex).not.toHaveBeenCalled();
-  });
 
   it('shares one build across leases and loads stateless windows', async () => {
     const turns = Array.from({ length: 120 }, (_, index) => ({ turnId: `u${index}`, startEntry: index, endEntry: index, sourceBytes: 1024 }));
@@ -160,40 +132,6 @@ describe('ClaudeConversationHistoryService M1 fuse', () => {
     expect(results.map(result => result.projectionKey)).toEqual(['zzz-user', 'aaa-assistant']);
   });
 
-  it('hydrates the merged history in canonical display order with the SDK key adopted by id', async () => {
-    mockLoadSDKSessionMessages
-      .mockResolvedValueOnce({
-        status: 'complete',
-        messages: [
-          { id: 'p1', role: 'user', content: 'previous first', timestamp: 300, displayOrder: [0, 0, 0] },
-          { id: 'p2', role: 'user', content: 'previous second', timestamp: 100, displayOrder: [0, 1, 0] },
-        ],
-        skippedLines: 0,
-      })
-      .mockResolvedValueOnce({
-        status: 'complete',
-        messages: [
-          { id: 'c1', role: 'user', content: 'current', timestamp: 200, displayOrder: [1, 0, 0] },
-        ],
-        skippedLines: 0,
-      });
-    const conversation = createConversation();
-    conversation.messages = [
-      { id: 'live', role: 'assistant', content: 'live tail', timestamp: 400 },
-      { id: 'c1', role: 'user', content: 'current (cached copy)', timestamp: 200 },
-    ];
-    const service = new ClaudeConversationHistoryService();
-
-    await service.hydrateConversationHistory(conversation, '/vault');
-
-    // The cached c1 copy adopts the SDK canonical key; the keyless live
-    // message stays at the tail; timestamps (p2 newest-looking) never reorder.
-    expect(conversation.messages.map(message => message.id)).toEqual(['p1', 'p2', 'c1', 'live']);
-    expect(conversation.messages.find(message => message.id === 'c1')?.displayOrder).toEqual([1, 0, 0]);
-    // Segment ordinals are explicit: previous sessions first, current last.
-    expect(mockLoadSDKSessionMessages).toHaveBeenNthCalledWith(1, '/vault', 'previous-session', undefined, 0);
-    expect(mockLoadSDKSessionMessages).toHaveBeenNthCalledWith(2, '/vault', 'current-session', undefined, 1);
-  });
 
   it('drops a failed shared build so acquire can retry', async () => {
     mockSdkSessionExists.mockImplementation((_vault, session) => session === 'current-session');
@@ -205,18 +143,6 @@ describe('ClaudeConversationHistoryService M1 fuse', () => {
     expect(mockBuildTranscriptIndex.mock.calls.length - callsBefore).toBe(2);
   });
 
-  it('does not cache failures so hydration can be retried', async () => {
-    mockLoadSDKSessionMessages
-      .mockResolvedValueOnce({ status: 'failed', messages: [], skippedLines: 0, error: 'disk error' })
-      .mockResolvedValueOnce({ status: 'failed', messages: [], skippedLines: 0, error: 'disk error' });
-    const service = new ClaudeConversationHistoryService();
-    const conversation = { ...createConversation(), providerState: {}, sessionId: 'current-session' };
-
-    await service.hydrateConversationHistory(conversation, '/vault');
-    await service.hydrateConversationHistory(conversation, '/vault');
-
-    expect(mockLoadSDKSessionMessages).toHaveBeenCalledTimes(2);
-  });
 
   describe('loadWindow budget materialization', () => {
     const MiB = 1024 * 1024;

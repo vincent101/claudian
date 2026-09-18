@@ -3,12 +3,12 @@ import { Menu, Notice, setIcon } from 'obsidian';
 import { consumeHistoryText } from '../../../core/providers/consumeHistoryText';
 import { ProviderRegistry } from '../../../core/providers/ProviderRegistry';
 import {
-  ConversationHistoryHydrationError,
   type FullHistoryIterable,
   type HistoryIndexLease,
   type HistoryLoadProgress,
   type HistorySearchResult,
   HistorySourceUnavailableError,
+  type HistoryWindowPage,
   type HistoryWindowRequest,
   type LoadedTurnRange,
   type ProviderConversationHistoryService,
@@ -240,56 +240,29 @@ export class ConversationController {
     const { plugin, state, renderer } = this.deps;
 
     const conversationId = state.currentConversationId;
-    let conversation: Conversation | null;
-    let paged = false;
-    try {
-      conversation = conversationId ? await plugin.getConversationById(conversationId) : null;
-    } catch (error) {
-      if (!(error instanceof ConversationHistoryHydrationError) || error.result.status !== 'oversize' || !conversationId) {
-        throw error;
-      }
-      conversation = plugin.getConversationSync(conversationId);
-      if (!conversation) throw error;
-      const historyService = ProviderRegistry.getConversationHistoryService(conversation.providerId);
-      if (!historyService.acquireHistoryIndex) throw error;
-      state.historyLoading = true;
-      // No catch on purpose: a failed initial page must propagate its real
-      // error so the tab-level catch renders it as a retryable ERROR
-      // placeholder; rethrowing the oversize error instead would show only
-      // the segment-size list and hide the cause (M3: any segment error
-      // must be visible).
-      const lease = this.acquireLease(conversation, historyService);
-      // Single ownership transfer: only a successful write to
-      // state.historyLease hands the lease over; every earlier failure
-      // (ready, window load, generation invalidation) releases it exactly
-      // once in the finally below.
-      let transferred = false;
-      try {
-        await lease.ready;
-        const firstScreen = await this.loadFirstScreenWindow(lease);
-        if (!shouldApply()) {
-          return;
+    const conversation = conversationId ? await plugin.getConversationById(conversationId) : null;
+    let firstScreen: HistoryWindowPage | null = null;
+    if (conversation) {
+      const historyService = this.deps.getHistoryIndexCapableService(conversation);
+      if (historyService) {
+        state.historyLoading = true;
+        const lease = this.acquireLease(conversation, historyService);
+        let transferred = false;
+        try {
+          await lease.ready;
+          firstScreen = await this.loadFirstScreenWindow(lease);
+          if (!shouldApply()) return;
+          state.historyLease?.release();
+          state.historyLease = lease;
+          transferred = true;
+          state.loadedRanges = [firstScreen.range];
+          state.historyHasMore = firstScreen.hasMoreBefore;
+          state.historySnapshotOffset = firstScreen.snapshotOffset ?? null;
+          state.historyError = null;
+        } finally {
+          if (!transferred) lease.release();
+          state.historyLoading = false;
         }
-        // Write the page back into the stored conversation so every later
-        // reader (tab service init, passive tab sync) sees the materialized
-        // view the tab renders. Mirrors full hydration mutating the stored
-        // conversation in place; session metadata never persists messages,
-        // so this stays an in-memory view only.
-        conversation.messages = firstScreen.messages;
-        paged = true;
-        // A previous oversize load may still hold the lease (user switched
-        // away before hydrate READY and back); release it on takeover, same
-        // as bindHistoryLease, or its index protection stays pinned forever.
-        state.historyLease?.release();
-        state.historyLease = lease;
-        transferred = true;
-        state.loadedRanges = [firstScreen.range];
-        state.historyHasMore = firstScreen.hasMoreBefore;
-        state.historySnapshotOffset = firstScreen.snapshotOffset ?? null;
-        state.historyError = null;
-      } finally {
-        if (!transferred) lease.release();
-        state.historyLoading = false;
       }
     }
     if (!shouldApply()) return;
@@ -336,8 +309,7 @@ export class ConversationController {
     }
 
     await this.deps.ensureServiceForConversation?.(conversation);
-    this.restoreConversation(conversation, { autoAttachFile: true });
-    if (!paged) this.bindHistoryLease(conversation);
+    this.restoreConversation(conversation, firstScreen, { autoAttachFile: true });
     this.updateWelcomeVisibility();
 
     this.renderHistoryPager();
@@ -377,12 +349,7 @@ export class ConversationController {
   }
 
   /** Budget-window first screen; every oversized turn arrives as a summary projection. */
-  private async loadFirstScreenWindow(lease: HistoryIndexLease): Promise<{
-    messages: ChatMessage[];
-    range: LoadedTurnRange;
-    hasMoreBefore: boolean;
-    snapshotOffset?: number;
-  }> {
+  private async loadFirstScreenWindow(lease: HistoryIndexLease): Promise<HistoryWindowPage> {
     const request: HistoryWindowRequest = {
       anchorTurn: lease.totalTurns,
       direction: 'older',
@@ -394,13 +361,7 @@ export class ConversationController {
       phase: 'loading',
       turnCount: Math.max(0, planned.end - planned.start),
     });
-    const page = await lease.loadWindow(request);
-    return {
-      messages: page.messages,
-      range: page.range,
-      hasMoreBefore: page.hasMoreBefore,
-      snapshotOffset: page.snapshotOffset,
-    };
+    return lease.loadWindow(request);
   }
 
   /**
@@ -566,8 +527,8 @@ export class ConversationController {
     if (!conversationId || !state.historyLease) return;
     const conversation = plugin.getConversationSync(conversationId);
     if (!conversation) return;
-    const service = ProviderRegistry.getConversationHistoryService(conversation.providerId);
-    if (!service.acquireHistoryIndex) return;
+    const service = this.deps.getHistoryIndexCapableService(conversation);
+    if (!service) return;
     const previous = state.historyLease;
     // Rollback path: the old lease stays live until the new snapshot is ready,
     // so a failed refresh keeps pagination and search usable on stale data.
@@ -671,27 +632,6 @@ export class ConversationController {
     return total === 0 || (ranges.length === 1 && ranges[0].start === 0 && ranges[0].end >= total);
   }
 
-  private bindHistoryLease(conversation: Conversation): void {
-    let service;
-    try {
-      service = ProviderRegistry.getConversationHistoryService(conversation.providerId);
-    } catch {
-      this.deps.state.resetHistoryPagination();
-      return;
-    }
-    if (!service.acquireHistoryIndex) {
-      this.deps.state.resetHistoryPagination();
-      return;
-    }
-    this.deps.state.historyLease?.release();
-    // Silent acquire: this lease only pre-warms the index for search and
-    // paging; the conversation is already rendered and its late progress
-    // events must not resurrect the hydration placeholder.
-    this.deps.state.historyLease = this.acquireLease(conversation, service, false, false);
-    this.deps.state.loadedRanges = [];
-    this.deps.state.historyHasMore = false;
-  }
-
   private acquireLease(conversation: Conversation, service: { acquireHistoryIndex?: (
     conversation: Conversation,
     vaultPath: string | null,
@@ -747,8 +687,20 @@ export class ConversationController {
       subagentManager.clear();
 
       const conversation = await plugin.switchConversation(id);
-      if (!conversation) {
-        return;
+      if (!conversation) return;
+
+      const historyService = this.deps.getHistoryIndexCapableService(conversation);
+      let firstScreen: HistoryWindowPage | null = null;
+      let lease: HistoryIndexLease | null = null;
+      if (historyService) {
+        lease = this.acquireLease(conversation, historyService);
+        try {
+          await lease.ready;
+          firstScreen = await this.loadFirstScreenWindow(lease);
+        } catch (error) {
+          lease.release();
+          throw error;
+        }
       }
 
       await this.deps.ensureServiceForConversation?.(conversation);
@@ -757,8 +709,13 @@ export class ConversationController {
       this.deps.clearQueuedMessage();
 
       this.releaseSwitchedAwayHistory(previousConversationId, previousProviderId);
-      this.restoreConversation(conversation);
-      this.bindHistoryLease(conversation);
+      if (lease && firstScreen) {
+        state.historyLease = lease;
+        state.loadedRanges = [firstScreen.range];
+        state.historyHasMore = firstScreen.hasMoreBefore;
+        state.historySnapshotOffset = firstScreen.snapshotOffset ?? null;
+      }
+      this.restoreConversation(conversation, firstScreen);
 
       this.deps.getHistoryDropdown()?.removeClass('visible');
       this.updateWelcomeVisibility();
@@ -771,21 +728,6 @@ export class ConversationController {
       this.deps.markHydrationReady?.();
 
       this.callbacks.onConversationSwitched?.();
-    } catch (error) {
-      // Hydration-blocked opens follow the M1 shell semantics: keep the
-      // switch but bind only the shell, then let the tab hydration state
-      // machine render the oversize/error placeholder. Other errors
-      // propagate to the caller (history dropdown surfaces a notice).
-      if (
-        error instanceof ConversationHistoryHydrationError
-        && this.deps.switchToHydrationShell
-      ) {
-        this.deps.getHistoryDropdown()?.removeClass('visible');
-        this.releaseSwitchedAwayHistory(previousConversationId, previousProviderId);
-        this.deps.switchToHydrationShell(id);
-        return;
-      }
-      throw error;
     } finally {
       state.isSwitchingConversation = false;
     }
@@ -987,12 +929,13 @@ export class ConversationController {
    */
   private restoreConversation(
     conversation: Conversation,
+    page: HistoryWindowPage | null,
     options?: { autoAttachFile?: boolean }
   ): void {
     const { plugin, state, renderer } = this.deps;
 
     state.currentConversationId = conversation.id;
-    state.messages = [...conversation.messages];
+    state.messages = page ? [...page.messages] : [...conversation.messages];
     state.usage = conversation.usage ?? null;
     this.refreshRestoredUsageWindow(conversation);
     state.autoScrollEnabled = plugin.settings.enableAutoScroll ?? true;

@@ -4,7 +4,6 @@ import { ProviderRegistry } from '../../../core/providers/ProviderRegistry';
 import { ProviderSettingsCoordinator } from '../../../core/providers/ProviderSettingsCoordinator';
 import { ProviderWorkspaceRegistry } from '../../../core/providers/ProviderWorkspaceRegistry';
 import {
-  ConversationHistoryHydrationError,
   type ProviderId,
   type ProviderTabWarmupContext,
   type ProviderTabWarmupMode,
@@ -444,15 +443,10 @@ export class TabManager implements TabManagerInterface {
         cleanupTabRuntime(tab);
         return;
       }
-      if (error instanceof ConversationHistoryHydrationError && error.result.status === 'oversize') {
-        this.setHydrationState(tab, 'OVERSIZE_BLOCKED');
-        tab.hydrationDiagnostic = { segments: error.result.segments };
-      } else {
-        this.setHydrationState(tab, 'ERROR');
-        tab.hydrationDiagnostic = {
-          message: error instanceof Error ? error.message : String(error),
-        };
-      }
+      this.setHydrationState(tab, 'ERROR');
+      tab.hydrationDiagnostic = {
+        message: error instanceof Error ? error.message : String(error),
+      };
       renderTabHydrationPlaceholder(tab, () => {
         if (this.activeTabId === tab.id) this.scheduleTabHydration(tab);
       });
@@ -1100,33 +1094,11 @@ export class TabManager implements TabManagerInterface {
     tab: TabData,
     providerId: ProviderId,
   ): Promise<ProviderWarmupContext> {
-    // A READY tab may carry a paged (oversize) conversation whose
-    // getConversationById re-throws the oversize hydration error on every
-    // call — that throw is load-bearing for switch/restore paths, but here it
-    // would reject getSdkCommands and silently kill the provider command
-    // catalog (runtime-supported commands like /compact would never appear in
-    // the dropdown). Fall back to the in-memory snapshot the paged tab
-    // actually renders, mirroring hydrateTab's initializeTabService override.
-    // Inlined (no helper) so the success path keeps its single await.
-    let conversation: Conversation | null = null;
-    if (tab.conversationId) {
-      if (tab.hydrationState === 'READY') {
-        try {
-          conversation = await this.plugin.getConversationById(tab.conversationId);
-        } catch (error) {
-          if (
-            error instanceof ConversationHistoryHydrationError
-            && error.result.status === 'oversize'
-          ) {
-            conversation = this.plugin.getConversationSync(tab.conversationId);
-          } else {
-            throw error;
-          }
-        }
-      } else {
-        conversation = this.plugin.getConversationSync(tab.conversationId);
-      }
-    }
+    const conversation = tab.conversationId
+      ? (tab.hydrationState === 'READY'
+          ? await this.plugin.getConversationById(tab.conversationId)
+          : this.plugin.getConversationSync(tab.conversationId))
+      : null;
     const hasConversationContext = (conversation?.messages.length ?? 0) > 0;
     const externalContextPaths = tab.ui.externalContextSelector?.getExternalContexts()
       ?? (hasConversationContext

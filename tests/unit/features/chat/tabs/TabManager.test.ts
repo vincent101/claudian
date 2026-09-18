@@ -2,7 +2,6 @@ import { createMockEl } from '@test/helpers/mockElement';
 
 import { ProviderRegistry } from '@/core/providers/ProviderRegistry';
 import { ProviderWorkspaceRegistry } from '@/core/providers/ProviderWorkspaceRegistry';
-import { ConversationHistoryHydrationError } from '@/core/providers/types';
 import { ConversationController, type ConversationControllerDeps } from '@/features/chat/controllers/ConversationController';
 import { ChatState } from '@/features/chat/state/ChatState';
 import { TabManager } from '@/features/chat/tabs/TabManager';
@@ -511,37 +510,6 @@ describe('TabManager - Tab Lifecycle', () => {
       expect(mockSetupServiceCallbacks).not.toHaveBeenCalled();
     });
 
-    it('shows an oversize placeholder without marking the shell ready', async () => {
-      jest.useFakeTimers();
-      const loadActive = jest.fn().mockRejectedValue(new ConversationHistoryHydrationError({
-        status: 'oversize',
-        segments: [{ sessionId: 'large-session', sizeBytes: 65 * 1024 * 1024 }],
-      }));
-      const manager = createManager({
-        callbacks,
-        tabFactory: () => createMockTabData({
-          id: 'large-tab',
-          conversationId: 'large-conv',
-          hydrationState: 'SHELL',
-          controllers: { conversationController: { loadActive, initializeWelcome: jest.fn() } },
-        }),
-      });
-
-      const tab = await manager.createTab('large-conv');
-      jest.runAllTimers();
-      await flushMicrotasks();
-      jest.useRealTimers();
-
-      expect(tab?.hydrationState).toBe('OVERSIZE_BLOCKED');
-      expect(tab?.hydrationDiagnostic?.segments).toEqual([
-        { sessionId: 'large-session', sizeBytes: 65 * 1024 * 1024 },
-      ]);
-      // Oversize placeholder blocks the input so sends cannot hit the
-      // hydration error path.
-      expect(tab?.dom.inputEl.disabled).toBe(true);
-      expect(mockInitializeTabService).not.toHaveBeenCalled();
-      expect(mockSetupServiceCallbacks).not.toHaveBeenCalled();
-    });
 
     it('shows a retryable error placeholder after hydration failure', async () => {
       jest.useFakeTimers();
@@ -861,54 +829,6 @@ describe('TabManager - Tab Lifecycle', () => {
       expect(loads[2]).toHaveBeenCalledTimes(1);
     });
 
-    it('routes blocked active opens through the hydration shell hooks wired into tab controllers', async () => {
-      const loadActive = jest.fn()
-        .mockRejectedValueOnce(new ConversationHistoryHydrationError({
-          status: 'oversize',
-          segments: [{ sessionId: 'large-session', sizeBytes: 65 * 1024 * 1024 }],
-        }))
-        .mockResolvedValueOnce(undefined);
-      const manager = createManager({
-        callbacks,
-        tabFactory: () => createMockTabData({
-          id: 'shell-tab',
-          conversationId: 'conv-old',
-          hydrationState: 'READY',
-          state: {
-            currentConversationId: 'conv-old',
-            clearMessages: jest.fn(),
-          },
-          controllers: { conversationController: { loadActive, initializeWelcome: jest.fn() } },
-        }),
-      });
-
-      const tab = (await manager.createTab('conv-old'))!;
-      const hydrationHooks = mockInitializeTabControllers.mock.calls.at(-1)?.[6] as {
-        switchToHydrationShell: (conversationId: string) => void;
-        markHydrationReady: () => void;
-      };
-      expect(hydrationHooks).toBeDefined();
-
-      jest.useFakeTimers();
-
-      // Blocked active open: bind the shell and schedule hydration.
-      hydrationHooks.switchToHydrationShell('conv-blocked');
-      expect(tab.state.currentConversationId).toBe('conv-blocked');
-      expect(tab.state.clearMessages).toHaveBeenCalled();
-      expect(tab.hydrationState).toBe('SCHEDULED');
-
-      jest.runAllTimers();
-      await flushMicrotasks();
-      expect(tab.hydrationState).toBe('OVERSIZE_BLOCKED');
-      expect(tab.dom.inputEl.disabled).toBe(true);
-
-      // Direct switch away from the blocked conversation resets to READY.
-      hydrationHooks.markHydrationReady();
-      expect(tab.hydrationState).toBe('READY');
-      expect(tab.dom.inputEl.disabled).toBe(false);
-
-      jest.useRealTimers();
-    });
 
     it('disables the input in every non-READY shell state so sends cannot race the hydration restore', async () => {
       let resolveLoad!: () => void;
@@ -990,16 +910,7 @@ describe('TabManager - Tab Lifecycle', () => {
       expect(hydrationHooks.isHydrationReady()).toBe(false);
     });
 
-    it('materializes an oversize restored tab to READY through the shared loadActive chain', async () => {
-      // Restore path (restart → switchToTab → hydrateTab) must run the same
-      // M3 materialization entry the dropdown path uses: loadActive's oversize
-      // catch → loadInitialHistory(50) → READY with input enabled. The plugin
-      // re-throws oversize on every fetch, exactly like the real history
-      // service for an oversized transcript.
-      const oversizeError = new ConversationHistoryHydrationError({
-        status: 'oversize',
-        segments: [{ sessionId: 'large-session', sizeBytes: 96 * 1024 * 1024 }],
-      });
+    it('materializes an indexed restored tab to READY through the shared loadActive chain', async () => {
       const storedConversation = {
         id: 'large-conv',
         providerId: 'claude',
@@ -1026,11 +937,11 @@ describe('TabManager - Tab Lifecycle', () => {
           workspace: { revealLeaf: jest.fn() },
           vault: { adapter: { basePath: '/vault' } },
         },
-        getConversationById: jest.fn().mockRejectedValue(oversizeError),
+        getConversationById: jest.fn().mockResolvedValue(storedConversation),
         getConversationSync: jest.fn().mockReturnValue(storedConversation),
         settings: { userName: '' },
       });
-      const harness = createRealConversationControllerHarness(plugin);
+      const harness = createRealConversationControllerHarness(plugin, () => historyService as any);
 
       try {
         jest.useFakeTimers();
@@ -1059,20 +970,13 @@ describe('TabManager - Tab Lifecycle', () => {
         expect(tab?.dom.inputEl.disabled).toBe(false);
         expect(tab?.state.messages.map((message: any) => message.id)).toEqual(['turn-50']);
         expect(tab?.state.historyLease).toBe(lease);
-        // The stored conversation carries the materialized page so the tab
-        // service handoff and passive tab sync see the same view the tab
-        // renders (mirrors full hydration mutating the stored conversation).
-        expect(storedConversation.messages.map((message: any) => message.id)).toEqual(['turn-50']);
+        expect(storedConversation.messages).toEqual([]);
       } finally {
         serviceSpy.mockRestore();
       }
     });
 
     it('keeps a retryable error placeholder when the restored oversize tab fails to index', async () => {
-      const oversizeError = new ConversationHistoryHydrationError({
-        status: 'oversize',
-        segments: [{ sessionId: 'large-session', sizeBytes: 96 * 1024 * 1024 }],
-      });
       const storedConversation = {
         id: 'large-conv',
         providerId: 'claude',
@@ -1083,21 +987,19 @@ describe('TabManager - Tab Lifecycle', () => {
         updatedAt: 1,
       };
       const acquireHistoryIndex = jest.fn().mockReturnValue({ conversationId: 'large-conv', totalTurns: 0, ready: Promise.reject(new Error('index build failed: worker crashed')), search: jest.fn(), loadMessageDetail: jest.fn(), loadWindow: jest.fn(), planWindow: jest.fn(), release: jest.fn() });
+      const historyService = { acquireHistoryIndex, buildForkProviderState: mockBuildForkProviderState };
       const serviceSpy = jest.spyOn(ProviderRegistry, 'getConversationHistoryService')
-        .mockReturnValue({
-          acquireHistoryIndex,
-            buildForkProviderState: mockBuildForkProviderState,
-        } as any);
+        .mockReturnValue(historyService as any);
       const plugin = createMockPlugin({
         app: {
           workspace: { revealLeaf: jest.fn() },
           vault: { adapter: { basePath: '/vault' } },
         },
-        getConversationById: jest.fn().mockRejectedValue(oversizeError),
+        getConversationById: jest.fn().mockResolvedValue(storedConversation),
         getConversationSync: jest.fn().mockReturnValue(storedConversation),
         settings: { userName: '' },
       });
-      const harness = createRealConversationControllerHarness(plugin);
+      const harness = createRealConversationControllerHarness(plugin, () => historyService as any);
 
       try {
         jest.useFakeTimers();
@@ -2002,59 +1904,6 @@ describe('TabManager - SDK Commands', () => {
     expect(readyClaudeService.getSupportedCommands).toHaveBeenCalledTimes(1);
   });
 
-  it('keeps the command warmup chain alive for a READY paged (oversize) conversation', async () => {
-    // Regression: a paged conversation never caches as hydrated in the history
-    // service, so plugin.getConversationById re-throws the oversize error on
-    // every call. The warmup context must fall back to the in-memory snapshot
-    // instead of rejecting, or the slash dropdown loses all provider entries
-    // (including runtime-supported commands like /compact).
-    const supportedCommands = [{ id: 'sdk:compact', name: 'compact', content: '' }];
-    const readyClaudeService = {
-      providerId: 'claude',
-      isReady: jest.fn().mockReturnValue(true),
-      getSupportedCommands: jest.fn().mockResolvedValue(supportedCommands),
-    };
-    const pagedConversation = {
-      id: 'conv-paged',
-      providerId: 'claude',
-      messages: [{ id: 'm1', role: 'user' as const, content: 'hi', timestamp: 1 }],
-    };
-    const plugin = createMockPlugin({
-      getConversationById: jest.fn().mockImplementation(async () => {
-        throw new ConversationHistoryHydrationError({
-          status: 'oversize',
-          segments: [{ sessionId: 'session-huge', sizeBytes: 95_871_725 }],
-        });
-      }),
-      getConversationSync: jest.fn().mockReturnValue(pagedConversation),
-    });
-    const mockCatalog = { setRuntimeCommands: jest.fn() };
-    ProviderWorkspaceRegistry.setServices('claude', {
-      commandCatalog: mockCatalog as any,
-      tabWarmupPolicy: commandWarmupPolicy as any,
-    });
-    const manager = createManager({
-      plugin,
-      tabFactory: (n) => createMockTabData(
-        n === 1
-          ? { id: 'tab-ready', providerId: 'claude', service: readyClaudeService }
-          : {
-            id: 'tab-paged',
-            providerId: 'claude',
-            conversationId: 'conv-paged',
-            lifecycleState: 'bound_active',
-            hydrationState: 'READY',
-          },
-      ),
-    });
-
-    await manager.createTab();
-    const pagedTab = await manager.createTab(undefined, 'tab-paged', { activate: false });
-
-    await expect(manager.getSdkCommands(pagedTab!.id)).resolves.toEqual(supportedCommands);
-    expect(plugin.getConversationSync).toHaveBeenCalledWith('conv-paged');
-    expect(mockCatalog.setRuntimeCommands).toHaveBeenLastCalledWith(supportedCommands);
-  });
 
   it('should not leak commands across providers', async () => {
     const claudeCommands = [{ id: 'sdk:commit', name: 'commit', content: '' }];

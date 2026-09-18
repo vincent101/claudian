@@ -605,9 +605,9 @@ export default class ClaudianPlugin extends Plugin {
   }
 
   private async loadSdkMessagesForConversation(conversation: Conversation): Promise<void> {
-    const result = await ProviderRegistry
-      .getConversationHistoryService(conversation.providerId)
-      .hydrateConversationHistory(conversation, getVaultPath(this.app));
+    const service = ProviderRegistry.getConversationHistoryService(conversation.providerId);
+    if (service.acquireHistoryIndex || !service.hydrateConversationHistory) return;
+    const result = await service.hydrateConversationHistory(conversation, getVaultPath(this.app));
     if (result && result.status !== 'ready') {
       throw new ConversationHistoryHydrationError(result);
     }

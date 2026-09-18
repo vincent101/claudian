@@ -372,12 +372,11 @@ export interface ProviderWorkspaceRegistration<
 
 export type ConversationHistoryHydrationResult =
   | { status: 'ready' }
-  | { status: 'oversize'; segments: Array<{ sessionId: string; sizeBytes: number }> }
   | { status: 'error'; errors: Array<{ sessionId: string; message: string }> };
 
 export class ConversationHistoryHydrationError extends Error {
   constructor(readonly result: Exclude<ConversationHistoryHydrationResult, { status: 'ready' }>) {
-    super(result.status === 'oversize' ? 'Conversation history is too large' : 'Conversation history failed to load');
+    super('Conversation history failed to load');
     this.name = 'ConversationHistoryHydrationError';
   }
 }
@@ -515,7 +514,7 @@ export interface HistoryWindowPage {
 }
 
 export interface ProviderConversationHistoryService {
-  hydrateConversationHistory(
+  hydrateConversationHistory?(
     conversation: Conversation,
     vaultPath: string | null,
   ): Promise<void | ConversationHistoryHydrationResult>;
