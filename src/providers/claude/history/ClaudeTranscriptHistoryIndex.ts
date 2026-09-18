@@ -19,6 +19,10 @@ import {
   isSDKMessageProjectionSkipped,
 } from './sdkMessageProjection';
 
+// Exists only in the eval'd worker source (see buildInWorker); declared so the
+// serialized helper sources type-check against the worker-local binding.
+declare const HISTORY_OMISSION_MARKER: string;
+
 const DEFAULT_CHUNK_SIZE = 1024 * 1024;
 const DEFAULT_MAX_LINE_BYTES = 16 * 1024 * 1024;
 
@@ -440,6 +444,9 @@ function buildInWorker(filePath: string, options: BuildOptions): Promise<Transcr
     const DEFAULT_CHUNK_SIZE = ${DEFAULT_CHUNK_SIZE};
     const DEFAULT_MAX_LINE_BYTES = ${DEFAULT_MAX_LINE_BYTES};
     const FINALIZE_BATCH_SIZE = ${FINALIZE_BATCH_SIZE};
+    // Mirrors HISTORY_OMISSION_MARKER from runtime/HistoryContextAccumulator —
+    // the eval'd worker source has no imports, so keep the two in sync.
+    const HISTORY_OMISSION_MARKER = '[Earlier history omitted: context recovery budget]';
     const throwIfAborted = (${serializeWorkerFunction(throwIfAborted)});
     const yieldToMainThread = (${serializeWorkerFunction(yieldToMainThread)});
     const DISPLAYABLE_EXTERNAL_KINDS = new Set(['peer', 'channel', 'coordinator']);
@@ -464,6 +471,7 @@ function buildInWorker(filePath: string, options: BuildOptions): Promise<Transcr
     const extractVisibleUserSearchText = (${serializeWorkerFunction(extractVisibleUserSearchText)});
     const extractSearchText = (${serializeWorkerFunction(extractSearchText)});
     const isRebuiltContextContent = (${serializeWorkerFunction((textContent: string) => {
+      if (textContent.startsWith(HISTORY_OMISSION_MARKER)) return true;
       if (!/^(User|Assistant):\s/.test(textContent)) return false;
       return textContent.includes('\n\nUser:') || textContent.includes('\n\nAssistant:') || textContent.includes('\n\nA:');
     })});

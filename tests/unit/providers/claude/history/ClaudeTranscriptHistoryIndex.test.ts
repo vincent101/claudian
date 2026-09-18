@@ -2,6 +2,8 @@ import { readFile, writeFile } from 'fs/promises';
 import { join } from 'path';
 import type * as workerThreadsModule from 'worker_threads';
 
+import type { Conversation } from '@/core/types';
+import { ClaudeConversationHistoryService } from '@/providers/claude/history/ClaudeConversationHistoryService';
 import {
   buildTranscriptIndex,
   clearTranscriptIndexCache,
@@ -15,6 +17,8 @@ import {
 } from '@/providers/claude/history/ClaudeTranscriptHistoryIndex';
 import { filterActiveBranch } from '@/providers/claude/history/sdkBranchFilter';
 import type { SDKNativeMessage } from '@/providers/claude/history/sdkHistoryTypes';
+import * as sdkSessionPaths from '@/providers/claude/history/sdkSessionPaths';
+import { HISTORY_OMISSION_MARKER } from '@/providers/claude/runtime/HistoryContextAccumulator';
 
 let mockWorkerConstructorMode: 'real' | 'throw' | 'record' | 'probe-error' | 'build-error' = 'real';
 const mockWorkerSources: string[] = [];
@@ -100,7 +104,8 @@ describe('ClaudeTranscriptHistoryIndex', () => {
       JSON.stringify({ type: 'user', uuid: 'u1', message: { content: 'real question' } }),
       JSON.stringify({ type: 'assistant', uuid: 'a1', parentUuid: 'u1', message: { content: 'real answer' } }),
       JSON.stringify({ type: 'user', uuid: 'recovery', parentUuid: 'a1', message: { content: 'User: old question\n\nAssistant: injected recovery secret\n\nUser: next question' } }),
-      JSON.stringify({ type: 'assistant', uuid: 'a2', parentUuid: 'recovery', message: { content: 'next answer' } }),
+      JSON.stringify({ type: 'user', uuid: 'recovery-omitted', parentUuid: 'recovery', message: { content: `${HISTORY_OMISSION_MARKER}\n\nUser: q1\n\nAssistant: omitted recovery secret\n\nUser: next question` } }),
+      JSON.stringify({ type: 'assistant', uuid: 'a2', parentUuid: 'recovery-omitted', message: { content: 'next answer' } }),
     ];
     await writeFile(path, `${lines.join('\n')}\n`);
 
@@ -111,6 +116,35 @@ describe('ClaudeTranscriptHistoryIndex', () => {
     expect(result.index.entries.map(entry => entry.messageKey)).toEqual(['u1', 'a1', 'a2']);
     expect(result.index.turns.map(turn => turn.turnId)).toEqual(['u1']);
     expect(result.index.searchText).not.toContain('injected recovery secret');
+    expect(result.index.searchText).not.toContain('omitted recovery secret');
+  });
+
+  it('excludes omission-marker-prefixed recovery injections through the full history path', async () => {
+    const path = join(process.env.TMPDIR ?? '/tmp', `claudian-omitted-recovery-${process.pid}.jsonl`);
+    const lines = [
+      JSON.stringify({ type: 'user', uuid: 'u1', message: { content: 'real question' } }),
+      JSON.stringify({ type: 'assistant', uuid: 'a1', parentUuid: 'u1', message: { content: 'real answer' } }),
+      JSON.stringify({ type: 'user', uuid: 'recovery', parentUuid: 'a1', message: { content: `${HISTORY_OMISSION_MARKER}\n\nUser: q1\n\nAssistant: omitted recovery secret` } }),
+      JSON.stringify({ type: 'assistant', uuid: 'a2', parentUuid: 'recovery', message: { content: 'next answer' } }),
+    ];
+    await writeFile(path, `${lines.join('\n')}\n`);
+
+    const service = new ClaudeConversationHistoryService();
+    const conversation: Conversation = {
+      id: 'omitted-recovery', providerId: 'claude', title: 'Fixture', createdAt: 1, updatedAt: 1,
+      sessionId: 'omitted-recovery', providerState: { providerSessionId: 'omitted-recovery' }, messages: [],
+    };
+    jest.spyOn(sdkSessionPaths, 'getSDKSessionPath').mockReturnValue(path);
+    jest.spyOn(sdkSessionPaths, 'sdkSessionExists').mockReturnValue(true);
+
+    const chunks = [];
+    for await (const chunk of service.iterateFullHistory(conversation, '/vault', {
+      maxTurnsPerChunk: 10, maxSourceBytesPerChunk: 100_000, maxProjectedCharsPerChunk: 100_000, projectionLevel: 'detail',
+    })) chunks.push(chunk);
+    const contents = chunks.flatMap(chunk => chunk.messages).map(message => message.content).join('\n');
+    expect(contents).toContain('real question');
+    expect(contents).toContain('next answer');
+    expect(contents).not.toContain('omitted recovery secret');
   });
 
   it('uses materialization projection keys across merged assistants and compact boundaries', async () => {
