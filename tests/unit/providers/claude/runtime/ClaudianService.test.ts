@@ -4508,6 +4508,43 @@ describe('ClaudianService', () => {
       expect(channelOf2().getActiveTurnId()).toBeNull();
     });
 
+    it('defensively clears notificationResultPending before normal settlement', async () => {
+      const turn = registerAutoTurn('auto-pending-settle');
+      turn.notificationResultPending = true;
+      service.setOnAutoTurnFinished(async () => {
+        expect(turn.notificationResultPending).toBe(false);
+      });
+
+      await (service as any).settleTurnAtResult(turn);
+
+      expect(channelOf2().getActiveTurnId()).toBeNull();
+    });
+
+    it('defensively clears notificationResultPending before cancellation branches', () => {
+      service.setOnAutoTurnStarted(() => {});
+      const turn = createRuntimeTurn({ id: 'user-pending-cancel', kind: 'user', phase: 'collecting' });
+      turn.notificationResultPending = true;
+      (service as any).runtimeTurns.set(turn.id, turn);
+      channelOf2().beginExternalTurn(turn.id);
+
+      (service as any).cancelTurn(turn.id, 'user_cancel');
+
+      expect(turn.notificationResultPending).toBe(false);
+    });
+
+    it('defensively clears notificationResultPending at user projection handoff', () => {
+      const turn = createRuntimeTurn({ id: 'user-pending-handoff', kind: 'user', phase: 'projecting' });
+      turn.notificationResultPending = true;
+      (service as any).runtimeTurns.set(turn.id, turn);
+      channelOf2().beginExternalTurn(turn.id);
+      const barrier = (service as any).registerUserTurnCompletionBarrier(turn.id);
+
+      (service as any).completeUserRuntimeHandoff(turn, barrier);
+
+      expect(turn.notificationResultPending).toBe(false);
+      expect(channelOf2().getActiveTurnId()).toBeNull();
+    });
+
     it('cancellation settles the turn waiters before releasing the channel lease', async () => {
       const order: string[] = [];
       service.setOnAutoTurnCancelled(() => order.push('featureCancellation'));
@@ -4637,6 +4674,16 @@ describe('ClaudianService', () => {
   });
 
   describe('S1 leftover #2: retry re-registration resets the abort controller', () => {
+    it('cold-start settlement asserts notificationResultPending was never armed', () => {
+      const turn = createRuntimeTurn({ id: 'cold-pending', kind: 'user', phase: 'collecting' });
+      turn.notificationResultPending = true;
+      (service as any).runtimeTurns.set(turn.id, turn);
+
+      expect(() => (service as any).settleColdStartTurn(turn)).toThrow(
+        'Cold-start turn cannot own a notification result',
+      );
+    });
+
     it('reRegisterTurnForRetry gives the turn a fresh, un-aborted controller', () => {
       const turn = createRuntimeTurn({ id: 'user-retry-abort', kind: 'user' });
       (service as any).runtimeTurns.set('user-retry-abort', turn);

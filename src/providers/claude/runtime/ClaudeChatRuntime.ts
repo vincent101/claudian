@@ -1189,6 +1189,10 @@ export class ClaudianService implements ChatRuntime {
    * the released signal that lets the UI queue proceed.
    */
   private async settleTurnAtResult(turn: RuntimeTurn): Promise<void> {
+    // Defensive only: terminal cleanup cannot prove attribution when the
+    // notification result itself never arrives; the dual-track state machine
+    // must close that remaining gap.
+    turn.notificationResultPending = false;
     turn.phase = 'projecting';
 
     if (turn.waiters.size > 0) {
@@ -1268,6 +1272,9 @@ export class ClaudianService implements ChatRuntime {
   }
 
   private completeUserRuntimeHandoff(turn: RuntimeTurn, barrier: UserTurnCompletionBarrier): void {
+    // Defense-in-depth at the projection barrier; this does not identify a
+    // missing notification result before a host result reaches routeMessage.
+    turn.notificationResultPending = false;
     this.runtimeTurns.delete(turn.id);
     this.completeChannelTurn(turn.id);
     barrier.resolveRuntimeHandoffDone();
@@ -1391,6 +1398,10 @@ export class ClaudianService implements ChatRuntime {
     if (!turn) {
       return;
     }
+    // Clear before branching so every cancellation exit drops stale defensive
+    // attribution state. This cannot fix a missing notification result while
+    // the turn remains live.
+    turn.notificationResultPending = false;
     // A cancelled turn can never receive its own result confirmation (its
     // trailing result is dropped by the cancelled-phase gate in routeMessage),
     // so its recovery dispatch must fail now: back to pending while the
@@ -2346,6 +2357,9 @@ export class ClaudianService implements ChatRuntime {
    * consumeTurnMetadata after the stream finishes).
    */
   private settleColdStartTurn(turn: RuntimeTurn): void {
+    if (turn.notificationResultPending) {
+      throw new Error('Cold-start turn cannot own a notification result');
+    }
     if (this.runtimeTurns.get(turn.id) !== turn) {
       // Already settled/cancelled elsewhere (e.g. session-expired retry reuses
       // a fresh registration) — nothing to do.
