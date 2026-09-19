@@ -37,6 +37,7 @@ import {
   type TranscriptHistoryIndex,
 } from './ClaudeTranscriptHistoryIndex';
 import {
+  buildOpaqueOversizedPlaceholders,
   buildOversizedEntryPlaceholder,
   buildOversizedTurnMarker,
   hardCapChatProjection,
@@ -454,11 +455,18 @@ export class ClaudeConversationHistoryService implements ProviderConversationHis
     // readIndexEntries preserves the input entry order, so native aligns with
     // the selected slots by cursor.
     const native = read.length > 0 ? await materializeTranscriptEntries(index, read) : [];
-    const placeholderByMessageKey = new Map(
-      skipped
-        .map(entry => [entry.messageKey, buildOversizedEntryPlaceholder(entry)] as const)
-        .filter((pair): pair is readonly [string, SDKNativeMessage] => pair[1] !== null),
-    );
+    const placeholderRowsByMessageKey = new Map<string, SDKNativeMessage[]>();
+    for (const entry of skipped) {
+      // Opaque oversized rows always surface a visible omission marker (plus
+      // a synthetic tool_result when ids were reliably extracted); ordinary
+      // skipped entries only get the tool-result pairing row.
+      if (entry.oversized) {
+        placeholderRowsByMessageKey.set(entry.messageKey, buildOpaqueOversizedPlaceholders(entry));
+        continue;
+      }
+      const placeholder = buildOversizedEntryPlaceholder(entry);
+      if (placeholder) placeholderRowsByMessageKey.set(entry.messageKey, [placeholder]);
+    }
     // Interleave placeholders at their original entry slots so the summary
     // projection keeps the turn's canonical row order; a tail-appended
     // synthetic block would detach the projection from the transcript order
@@ -472,8 +480,8 @@ export class ClaudeConversationHistoryService implements ProviderConversationHis
           nativeCursor += 1;
         }
       } else {
-        const placeholder = placeholderByMessageKey.get(entries[i].messageKey);
-        if (placeholder) combined.push(placeholder);
+        const rows = placeholderRowsByMessageKey.get(entries[i].messageKey);
+        if (rows) combined.push(...rows);
       }
     }
     if (skipped.length > 0) {

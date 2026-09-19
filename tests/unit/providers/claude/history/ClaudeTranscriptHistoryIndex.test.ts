@@ -13,6 +13,7 @@ import {
   releaseTranscriptIndex,
   resetTranscriptIndexWorkerProbe,
   setTranscriptIndexDiagnosticSink,
+  type TranscriptHistoryIndex,
   type TranscriptIndexDiagnosticEvent,
 } from '@/providers/claude/history/ClaudeTranscriptHistoryIndex';
 import { filterActiveBranch } from '@/providers/claude/history/sdkBranchFilter';
@@ -364,6 +365,168 @@ describe('ClaudeTranscriptHistoryIndex', () => {
   });
 });
 
+describe('ClaudeTranscriptHistoryIndex oversized line degradation', () => {
+  const oversizedRow = JSON.stringify({
+    type: 'user',
+    uuid: 'tr1',
+    parentUuid: 'tu0',
+    timestamp: '2026-01-01T00:00:00Z',
+    sourceToolUseID: 'toolu_1',
+    message: { content: [{ type: 'tool_result', tool_use_id: 'toolu_1', content: `SECRET ${'x'.repeat(200)}` }] },
+  });
+  const userRow = JSON.stringify({ type: 'user', uuid: 'u1', parentUuid: null, message: { content: 'question' } });
+  const answerRow = JSON.stringify({ type: 'assistant', uuid: 'a2', parentUuid: 'tr1', message: { content: 'answer' } });
+
+  async function writeOversizedFixture(path: string): Promise<void> {
+    await writeFile(path, `${[userRow, oversizedRow, answerRow].join('\n')}\n`);
+  }
+
+  it.each([7, 64, 512])(
+    'replaces an oversized line with an opaque entry and parses the following line (chunkSize %d)',
+    async chunkSize => {
+      const path = join(process.env.TMPDIR ?? '/tmp', `claudian-oversized-${process.pid}-${chunkSize}.jsonl`);
+      await writeOversizedFixture(path);
+      const result = await buildTranscriptIndex(path, { useWorker: false, chunkSize, maxLineBytes: 100 });
+      expect(result.status).toBe('complete');
+      if (result.status !== 'complete') return;
+      const [first, opaque, last] = result.index.entries;
+      expect(result.index.entries).toHaveLength(3);
+      expect(first).toMatchObject({ messageKey: 'u1', offset: 0, length: Buffer.byteLength(userRow) });
+      expect(opaque).toMatchObject({
+        oversized: true,
+        offset: Buffer.byteLength(userRow) + 1,
+        length: Buffer.byteLength(oversizedRow),
+        type: 'user',
+        uuid: 'tr1',
+        parentUuid: 'tu0',
+        timestamp: '2026-01-01T00:00:00Z',
+        sourceToolUseID: 'toolu_1',
+        toolResultIds: ['toolu_1'],
+        realUser: false,
+        displayable: false,
+        isMeta: false,
+      });
+      // The opaque row is never a real user: it neither opens a turn nor
+      // enters the search corpus.
+      expect(result.index.turns.map(turn => turn.turnId)).toEqual(['u1']);
+      expect(opaque.turnId).toBe('u1');
+      expect(result.index.searchCorpus.map(item => item.projectionKey)).toEqual(['u1', 'a2']);
+      expect(result.index.searchText).not.toContain('SECRET');
+      expect(last).toMatchObject({
+        messageKey: 'a2',
+        offset: Buffer.byteLength(userRow) + 1 + Buffer.byteLength(oversizedRow) + 1,
+        length: Buffer.byteLength(answerRow),
+      });
+    },
+  );
+
+  it('falls back to an unknown opaque entry when the oversized prefix yields no reliable facts', async () => {
+    const path = join(process.env.TMPDIR ?? '/tmp', `claudian-oversized-unknown-${process.pid}.jsonl`);
+    await writeFile(path, `${userRow}\n${'x'.repeat(150)}\n${answerRow}\n`);
+    const result = await buildTranscriptIndex(path, { useWorker: false, chunkSize: 13, maxLineBytes: 100 });
+    expect(result.status).toBe('complete');
+    if (result.status !== 'complete') return;
+    const opaque = result.index.entries[1];
+    expect(opaque).toMatchObject({
+      oversized: true,
+      type: 'unknown',
+      messageKey: 'line:1',
+      length: 150,
+      realUser: false,
+    });
+    expect(opaque.uuid).toBeUndefined();
+    expect(opaque.toolResultIds).toEqual([]);
+    // The line after the unusable oversized row still parses at its exact offset.
+    expect(result.index.entries[2]).toMatchObject({ messageKey: 'a2', offset: Buffer.byteLength(userRow) + 1 + 151 });
+  });
+
+  it('returns partial with committedSize at the oversized line start when EOF never closes it', async () => {
+    const path = join(process.env.TMPDIR ?? '/tmp', `claudian-oversized-eof-${process.pid}.jsonl`);
+    await writeFile(path, `${userRow}\n${'x'.repeat(150)}`);
+    const result = await buildTranscriptIndex(path, { useWorker: false, chunkSize: 13, maxLineBytes: 100 });
+    expect(result.status).toBe('partial');
+    if (result.status !== 'partial') return;
+    expect(result.index.entries.map(entry => entry.messageKey)).toEqual(['u1']);
+    expect(result.index.committedSize).toBe(Buffer.byteLength(userRow) + 1);
+    expect(result.index.snapshotSize).toBe(Buffer.byteLength(userRow) + 1 + 150);
+    expect(result.error).toMatch(/incomplete/i);
+  });
+
+  it('keeps committedSize after the last newline for a plain trailing half-line', async () => {
+    const path = join(process.env.TMPDIR ?? '/tmp', `claudian-halfline-${process.pid}.jsonl`);
+    await writeFile(path, `${userRow}\n${answerRow}\n{"type":"user","uuid":"u3","par`);
+    const result = await buildTranscriptIndex(path, { useWorker: false, chunkSize: 9 });
+    expect(result.status).toBe('partial');
+    if (result.status !== 'partial') return;
+    const committed = Buffer.byteLength(userRow) + 1 + Buffer.byteLength(answerRow) + 1;
+    expect(result.index.committedSize).toBe(committed);
+    expect(result.index.snapshotSize).toBeGreaterThan(committed);
+    expect(result.index.entries.map(entry => entry.messageKey)).toEqual(['u1', 'a2']);
+  });
+
+  it('records line_skipped diagnostics with separated reasons and no content', async () => {
+    const events: TranscriptIndexDiagnosticEvent[] = [];
+    setTranscriptIndexDiagnosticSink(event => events.push(event));
+    try {
+      const path = join(process.env.TMPDIR ?? '/tmp', `claudian-lineskip-${process.pid}.jsonl`);
+      const malformed = '{"type":"user","uuid":"broken" oops}';
+      await writeFile(path, `${userRow}\n${oversizedRow}\n${malformed}\n${answerRow}\n`);
+      const result = await buildTranscriptIndex(path, { useWorker: false, chunkSize: 16, maxLineBytes: 100 });
+      expect(result.status).toBe('complete');
+      const skipped = events.filter(event => event.phase === 'line_skipped');
+      expect(skipped).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          reason: 'oversized',
+          offset: Buffer.byteLength(userRow) + 1,
+          bytes: Buffer.byteLength(oversizedRow),
+          mode: 'direct',
+          buildId: expect.any(String),
+        }),
+        expect.objectContaining({ reason: 'malformed' }),
+      ]));
+      expect(JSON.stringify(events)).not.toContain('SECRET');
+    } finally {
+      setTranscriptIndexDiagnosticSink(null);
+    }
+  });
+
+  it('refuses a resume anchor that falls inside an oversized line', async () => {
+    const path = join(process.env.TMPDIR ?? '/tmp', `claudian-anchor-opaque-${process.pid}.jsonl`);
+    await writeOversizedFixture(path);
+    const result = await buildTranscriptIndex(path, { useWorker: false, chunkSize: 13, maxLineBytes: 100, resumeAtMessageId: 'tr1' });
+    expect(result.status).toBe('failed');
+    if (result.status !== 'failed') return;
+    expect(result.error).toMatch(/oversized/i);
+  });
+
+  it('refuses a resume anchor when an oversized line without reliable uuid breaks ancestry verification', async () => {
+    const path = join(process.env.TMPDIR ?? '/tmp', `claudian-anchor-unverified-${process.pid}.jsonl`);
+    await writeFile(path, `${userRow}\n${'x'.repeat(150)}\n${answerRow}\n`);
+    const result = await buildTranscriptIndex(path, { useWorker: false, chunkSize: 13, maxLineBytes: 100, resumeAtMessageId: 'u1' });
+    expect(result.status).toBe('failed');
+    if (result.status !== 'failed') return;
+    expect(result.error).toMatch(/oversized/i);
+  });
+
+  it('still honors a resume anchor when the oversized line on the ancestry has reliable facts', async () => {
+    const path = join(process.env.TMPDIR ?? '/tmp', `claudian-anchor-resolved-${process.pid}.jsonl`);
+    // A contiguous chain u1 -> oversized tr1 -> a2 -> u3 so the resume walk
+    // must pass through the opaque row to reach the anchor.
+    const chainedOversized = JSON.stringify({
+      type: 'user', uuid: 'tr1', parentUuid: 'u1', sourceToolUseID: 'toolu_1',
+      message: { content: [{ type: 'tool_result', tool_use_id: 'toolu_1', content: 'x'.repeat(200) }] },
+    });
+    const answer = JSON.stringify({ type: 'assistant', uuid: 'a2', parentUuid: 'tr1', message: { content: 'answer' } });
+    const later = JSON.stringify({ type: 'user', uuid: 'u3', parentUuid: 'a2', message: { content: 'later' } });
+    await writeFile(path, `${[userRow, chainedOversized, answer, later].join('\n')}\n`);
+    const result = await buildTranscriptIndex(path, { useWorker: false, chunkSize: 13, maxLineBytes: 100, resumeAtMessageId: 'a2' });
+    expect(result.status).toBe('complete');
+    if (result.status !== 'complete') return;
+    // Truncation lands on the requested anchor, not on the opaque row or the tail.
+    expect(result.index.entries.map(entry => entry.messageKey)).toEqual(['u1', 'tr1', 'a2']);
+  });
+});
+
 describe('ClaudeTranscriptHistoryIndex worker fallback', () => {
   afterEach(() => {
     mockWorkerConstructorMode = 'real';
@@ -402,9 +565,12 @@ describe('ClaudeTranscriptHistoryIndex worker fallback', () => {
   it('records failed and aborted terminal events', async () => {
     const events: TranscriptIndexDiagnosticEvent[] = [];
     setTranscriptIndexDiagnosticSink(event => events.push(event));
+    // Oversized lines no longer fail builds; the resume-anchor refusal is the
+    // explicit failure path that keeps a 'failed' event observable.
     const failedPath = join(process.env.TMPDIR ?? '/tmp', `claudian-failed-${process.pid}.jsonl`);
-    await writeFile(failedPath, `${JSON.stringify({ type: 'user', uuid: 'u1', message: { content: 'x'.repeat(100) } })}\n`);
-    await buildTranscriptIndex(failedPath, { useWorker: false, maxLineBytes: 10 });
+    const row = JSON.stringify({ type: 'user', uuid: 'u1', message: { content: 'x'.repeat(100) } });
+    await writeFile(failedPath, `${row}\n`);
+    await buildTranscriptIndex(failedPath, { useWorker: false, maxLineBytes: 10, resumeAtMessageId: 'u1' });
 
     const abortedPath = join(process.env.TMPDIR ?? '/tmp', `claudian-aborted-${process.pid}.jsonl`);
     await writeFile(abortedPath, `${JSON.stringify({ type: 'user', uuid: 'u2', message: { content: 'x' } })}\n`);
@@ -494,5 +660,40 @@ describe('ClaudeTranscriptHistoryIndex worker fallback', () => {
       'require("worker_threads").parentPort.postMessage("ready")',
       expect.any(String),
     ]);
+  });
+
+  it('produces identical oversized-degradation output through the worker and direct paths', async () => {
+    mockWorkerConstructorMode = 'record';
+    const oversized = JSON.stringify({
+      type: 'user', uuid: 'tr1', parentUuid: 'tu0', sourceToolUseID: 'toolu_1',
+      message: { content: [{ type: 'tool_result', tool_use_id: 'toolu_1', content: 'x'.repeat(300) }] },
+    });
+    const small = JSON.stringify({ type: 'user', uuid: 'u1', message: { content: 'question' } });
+    const tail = JSON.stringify({ type: 'assistant', uuid: 'a2', parentUuid: 'tr1', message: { content: 'answer' } });
+    const directPath = join(process.env.TMPDIR ?? '/tmp', `claudian-parity-direct-${process.pid}.jsonl`);
+    const workerPath = join(process.env.TMPDIR ?? '/tmp', `claudian-parity-worker-${process.pid}.jsonl`);
+    const content = `${[small, oversized, tail].join('\n')}\n`;
+    await writeFile(directPath, content);
+    await writeFile(workerPath, content);
+
+    const direct = await buildTranscriptIndex(directPath, { useWorker: false, chunkSize: 17, maxLineBytes: 100 });
+    const viaWorker = await buildTranscriptIndex(workerPath, { chunkSize: 17, maxLineBytes: 100 });
+    expect(direct.status).toBe('complete');
+    expect(viaWorker.status).toBe('complete');
+    if (direct.status !== 'complete' || viaWorker.status !== 'complete') return;
+
+    // Volatile identity/timing fields are the only allowed divergence.
+    const stable = (index: TranscriptHistoryIndex): object => {
+      const { entries, turns, searchCorpus, searchText, skippedLines, committedSize, snapshotSize, projectionDescriptors } = index;
+      return { entries, turns, searchCorpus, searchText, skippedLines, committedSize, snapshotSize, projectionDescriptors };
+    };
+    expect(stable(viaWorker.index)).toEqual(stable(direct.index));
+    expect(viaWorker.index.entries.some(entry => entry.oversized)).toBe(true);
+    // New helpers must be injected into the eval source explicitly; a missing
+    // injection silently diverges the worker path from direct.
+    const buildSource = mockWorkerSources[1] ?? '';
+    for (const helper of ['parseOversizedLineFacts', 'extractOversizedLineFacts', 'appendOversizedEntry', 'onLineSkipped']) {
+      expect(buildSource).toContain(helper);
+    }
   });
 });

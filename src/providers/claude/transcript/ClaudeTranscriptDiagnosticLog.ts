@@ -11,6 +11,7 @@ export type TranscriptDiagnosticPhase =
   | 'queued' | 'start' | 'progress' | 'finalize' | 'complete' | 'failed' | 'aborted' | 'stalled'
   | 'window_planned' | 'window_complete'
   | 'cache_hit' | 'cache_evict' | 'cache_overcommit'
+  | 'line_skipped' | 'partial_snapshot' | 'stale_partial_segment'
   | 'page_render_timeout' | 'page_data_overcommit' | 'dom_overcommit';
 
 export interface TranscriptDiagnosticEvent {
@@ -27,6 +28,8 @@ export interface TranscriptDiagnosticEvent {
   errorName?: string;
   buildId?: string;
   mode?: 'worker' | 'direct';
+  reason?: 'oversized' | 'malformed';
+  offset?: number;
   queueMs?: number;
   bytes?: number;
   totalBytes?: number;

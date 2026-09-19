@@ -269,3 +269,29 @@ export function buildOversizedTurnMarker(
     },
   };
 }
+
+/**
+ * Placeholder rows for an opaque oversized transcript entry (indexed but
+ * never read back). Always yields a visible omission marker; when the index
+ * extracted reliable tool-result ids, additionally yields the synthetic
+ * tool_result row so paired tool calls show completed instead of hanging in
+ * a running state. Unknown associations are never faked.
+ */
+export function buildOpaqueOversizedPlaceholders(entry: TranscriptIndexEntry): SDKNativeMessage[] {
+  const rows: SDKNativeMessage[] = [];
+  const toolResultRow = buildOversizedEntryPlaceholder(entry);
+  if (toolResultRow) rows.push(toolResultRow);
+  rows.push({
+    type: 'assistant',
+    uuid: `oversized-opaque-${entry.messageKey}`,
+    parentUuid: entry.parentUuid ?? null,
+    timestamp: entry.timestamp,
+    message: {
+      content: [{
+        type: 'text',
+        text: OMITTED_ENTRY_BYTES_TEXT(entry.length),
+      }],
+    },
+  });
+  return rows;
+}

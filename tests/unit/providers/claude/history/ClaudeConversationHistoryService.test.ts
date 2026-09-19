@@ -89,7 +89,7 @@ describe('ClaudeConversationHistoryService M1 fuse', () => {
     }));
     mockBuildTranscriptIndex.mockResolvedValue({
       status: 'complete',
-      index: { filePath: '/current', dev: 1, ino: 1, snapshotSize: 99, mtimeMs: 1, entries: [], turns, searchCorpus: [], searchText: '', skippedLines: 0, buildDurationMs: 1, peakWorkerHeapBytes: 1 },
+      index: { filePath: '/current', dev: 1, ino: 1, snapshotSize: 99, mtimeMs: 1, committedSize: 99, entries: [], turns, searchCorpus: [], searchText: '', skippedLines: 0, buildDurationMs: 1, peakWorkerHeapBytes: 1 },
     });
     mockSdkSessionExists.mockImplementation((_vault, session) => session === 'current-session');
     mockMaterializeTranscriptPage.mockImplementation(async (_index, start) => [{ start }] as any);
@@ -120,7 +120,7 @@ describe('ClaudeConversationHistoryService M1 fuse', () => {
 
   it('shares one build across leases and loads stateless windows', async () => {
     const turns = Array.from({ length: 120 }, (_, index) => ({ turnId: `u${index}`, startEntry: index, endEntry: index, sourceBytes: 1024 }));
-    mockBuildTranscriptIndex.mockResolvedValue({ status: 'complete', index: { filePath: '/current', dev: 1, ino: 1, snapshotSize: 999, mtimeMs: 1, entries: [], turns, searchCorpus: [], searchText: '', skippedLines: 0, buildDurationMs: 1, peakWorkerHeapBytes: 1 } });
+    mockBuildTranscriptIndex.mockResolvedValue({ status: 'complete', index: { filePath: '/current', dev: 1, ino: 1, snapshotSize: 999, mtimeMs: 1, committedSize: 999, entries: [], turns, searchCorpus: [], searchText: '', skippedLines: 0, buildDurationMs: 1, peakWorkerHeapBytes: 1 } });
     mockSdkSessionExists.mockImplementation((_vault, session) => session === 'current-session');
     mockMaterializeTranscriptPage.mockResolvedValue([]); mockMaterializeTranscriptToolAssociations.mockResolvedValue([]); mockMaterializeSDKMessages.mockResolvedValue([]);
     const service = new ClaudeConversationHistoryService(); const conversation = createConversation();
@@ -140,7 +140,7 @@ describe('ClaudeConversationHistoryService M1 fuse', () => {
       { projectionKey: 'same', turnIndex: 1, entryIndex: 0, timestamp: '', textOffset: 0, textLength: 13 },
       { projectionKey: 'same', turnIndex: 1, entryIndex: 1, timestamp: '', textOffset: 14, textLength: 12 },
     ];
-    mockBuildTranscriptIndex.mockResolvedValue({ status: 'complete', index: { filePath: '/current', dev: 1, ino: 1, snapshotSize: 1, mtimeMs: 1, entries: [], turns: [{ turnId: '0', startEntry: 0, endEntry: 0, sourceBytes: 1024 }, { turnId: '1', startEntry: 1, endEntry: 1, sourceBytes: 1024 }], searchCorpus, searchText, skippedLines: 0, buildDurationMs: 1, peakWorkerHeapBytes: 1 } });
+    mockBuildTranscriptIndex.mockResolvedValue({ status: 'complete', index: { filePath: '/current', dev: 1, ino: 1, snapshotSize: 1, mtimeMs: 1, committedSize: 1, entries: [], turns: [{ turnId: '0', startEntry: 0, endEntry: 0, sourceBytes: 1024 }, { turnId: '1', startEntry: 1, endEntry: 1, sourceBytes: 1024 }], searchCorpus, searchText, skippedLines: 0, buildDurationMs: 1, peakWorkerHeapBytes: 1 } });
     mockSdkSessionExists.mockImplementation((_vault, session) => session === 'current-session');
     const service = new ClaudeConversationHistoryService(); const lease = service.acquireHistoryIndex(createConversation(), '/vault'); await lease.ready;
     await expect(lease.search('needle')).resolves.toEqual([
@@ -156,7 +156,7 @@ describe('ClaudeConversationHistoryService M1 fuse', () => {
       { projectionKey: 'zzz-user', turnIndex: 0, entryIndex: 0, timestamp: '', textOffset: 0, textLength: 6 },
       { projectionKey: 'aaa-assistant', turnIndex: 0, entryIndex: 1, timestamp: '', textOffset: 7, textLength: 6 },
     ];
-    mockBuildTranscriptIndex.mockResolvedValue({ status: 'complete', index: { filePath: '/current', dev: 1, ino: 1, snapshotSize: 1, mtimeMs: 1, entries: [], turns: [{ turnId: '0', startEntry: 0, endEntry: 1, sourceBytes: 1024 }], searchCorpus, searchText: 'needle needle', skippedLines: 0, buildDurationMs: 1, peakWorkerHeapBytes: 1 } });
+    mockBuildTranscriptIndex.mockResolvedValue({ status: 'complete', index: { filePath: '/current', dev: 1, ino: 1, snapshotSize: 1, mtimeMs: 1, committedSize: 1, entries: [], turns: [{ turnId: '0', startEntry: 0, endEntry: 1, sourceBytes: 1024 }], searchCorpus, searchText: 'needle needle', skippedLines: 0, buildDurationMs: 1, peakWorkerHeapBytes: 1 } });
     mockSdkSessionExists.mockImplementation((_vault, session) => session === 'current-session');
     const service = new ClaudeConversationHistoryService(); const lease = service.acquireHistoryIndex(createConversation(), '/vault'); await lease.ready;
     const results = await lease.search('needle');
@@ -168,7 +168,7 @@ describe('ClaudeConversationHistoryService M1 fuse', () => {
 
   it('drops a failed shared build so acquire can retry', async () => {
     mockSdkSessionExists.mockImplementation((_vault, session) => session === 'current-session');
-    mockBuildTranscriptIndex.mockResolvedValueOnce({ status: 'failed', error: 'worker crashed' }).mockResolvedValueOnce({ status: 'complete', index: { filePath: '/current', dev: 1, ino: 1, snapshotSize: 1, mtimeMs: 1, entries: [], turns: [], searchCorpus: [], searchText: '', skippedLines: 0, buildDurationMs: 1, peakWorkerHeapBytes: 1 } });
+    mockBuildTranscriptIndex.mockResolvedValueOnce({ status: 'failed', error: 'worker crashed' }).mockResolvedValueOnce({ status: 'complete', index: { filePath: '/current', dev: 1, ino: 1, snapshotSize: 1, mtimeMs: 1, committedSize: 1, entries: [], turns: [], searchCorpus: [], searchText: '', skippedLines: 0, buildDurationMs: 1, peakWorkerHeapBytes: 1 } });
     const service = new ClaudeConversationHistoryService(); const conversation = createConversation();
     const callsBefore = mockBuildTranscriptIndex.mock.calls.length;
     const failed = service.acquireHistoryIndex(conversation, '/vault'); await expect(failed.ready).rejects.toThrow('worker crashed');
@@ -188,7 +188,7 @@ describe('ClaudeConversationHistoryService M1 fuse', () => {
     });
 
     function mockIndex(turns: Array<{ turnId: string; startEntry: number; endEntry: number; sourceBytes: number }>, entries: any[] = []) {
-      return { status: 'complete' as const, index: { filePath: '/current', dev: 1, ino: 1, snapshotSize: 999, mtimeMs: 1, entries, turns, searchCorpus: [], searchText: '', skippedLines: 0, buildDurationMs: 1, peakWorkerHeapBytes: 1 } };
+      return { status: 'complete' as const, index: { filePath: '/current', dev: 1, ino: 1, snapshotSize: 999, mtimeMs: 1, committedSize: 999, entries, turns, searchCorpus: [], searchText: '', skippedLines: 0, buildDurationMs: 1, peakWorkerHeapBytes: 1 } };
     }
 
     async function nativeToMessages(_vaultPath: string, _sessionId: string, native: any[]): Promise<ChatMessage[]> {

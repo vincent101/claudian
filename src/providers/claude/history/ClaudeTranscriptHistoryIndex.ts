@@ -1,4 +1,4 @@
-import { open, stat } from 'fs/promises';
+import { type FileHandle, open, stat } from 'fs/promises';
 import { Worker } from 'worker_threads';
 
 import { isCompactionCanceledStderr } from '../../../utils/interrupt';
@@ -9,6 +9,7 @@ import {
   isRealUserMessage,
   unwrapExternalEnvelope,
 } from './externalUserMessage';
+import { buildOpaqueOversizedPlaceholders } from './HistorySummaryProjection';
 import { isRebuiltContextMessage } from './rebuiltContext';
 import { filterActiveBranchEntries } from './sdkBranchFilter';
 import type { SDKNativeMessage } from './sdkHistoryTypes';
@@ -25,6 +26,10 @@ declare const HISTORY_OMISSION_MARKER: string;
 
 const DEFAULT_CHUNK_SIZE = 1024 * 1024;
 const DEFAULT_MAX_LINE_BYTES = 16 * 1024 * 1024;
+// Bounded prefix read used to extract reliable identity facts from an
+// oversized line; anything past this bound stays unknown rather than guessed.
+const OVERSIZED_FACTS_READ_BYTES = 256 * 1024;
+const OVERSIZED_FACTS_STRING_CAP = 4096;
 
 export interface TranscriptIndexEntry {
   offset: number;
@@ -41,6 +46,8 @@ export interface TranscriptIndexEntry {
   sourceToolUseID?: string;
   toolUseIds: string[];
   toolResultIds: string[];
+  /** Opaque stand-in for a line that exceeded maxLineBytes; never read back. */
+  oversized?: boolean;
 }
 
 export interface TranscriptTurnIndex {
@@ -75,6 +82,8 @@ export interface TranscriptHistoryIndex {
   ino: number;
   snapshotSize: number;
   mtimeMs: number;
+  /** Offset just past the last fully processed newline; tail reads start here. */
+  committedSize: number;
   entries: TranscriptIndexEntry[];
   turns: TranscriptTurnIndex[];
   searchCorpus: TranscriptSearchCorpusItem[];
@@ -90,6 +99,12 @@ export type TranscriptIndexResult =
   | { status: 'partial'; index: TranscriptHistoryIndex; error: string }
   | { status: 'failed'; error: string };
 
+export interface TranscriptLineSkipEvent {
+  reason: 'oversized' | 'malformed';
+  offset: number;
+  bytes: number;
+}
+
 interface BuildOptions {
   chunkSize?: number;
   maxLineBytes?: number;
@@ -98,6 +113,7 @@ interface BuildOptions {
   signal?: AbortSignal;
   onProgress?: (bytesRead: number, snapshotSize: number) => void;
   onFinalize?: () => void;
+  onLineSkipped?: (event: TranscriptLineSkipEvent) => void;
 }
 
 const FINALIZE_BATCH_SIZE = 2_000;
@@ -173,15 +189,328 @@ function toRawEntry(message: SDKNativeMessage, offset: number, length: number, l
   };
 }
 
+interface OversizedLineFacts {
+  type?: string;
+  uuid?: string;
+  parentUuid?: string | null;
+  timestamp?: string;
+  sourceToolUseID?: string;
+  toolResultIds: string[];
+}
+
+/**
+ * Structure-aware scanner over the bounded prefix of an oversized JSONL row.
+ * Walks object/array nesting and string-token boundaries so keys that merely
+ * occur inside string values can never be mistaken for real fields; whatever
+ * the read bound cuts off stays unknown rather than guessed.
+ */
+function parseOversizedLineFacts(buffer: Buffer): OversizedLineFacts | null {
+  let pos = 0;
+  const end = buffer.length;
+  const facts: OversizedLineFacts = { toolResultIds: [] };
+
+  const skipWhitespace = (): void => {
+    while (pos < end) {
+      const byte = buffer[pos];
+      if (byte === 0x20 || byte === 0x09 || byte === 0x0d || byte === 0x0a) pos += 1;
+      else break;
+    }
+  };
+
+  // Scans a JSON string token. Returns null when the buffer cuts the token
+  // (its extent is unknowable, the walk must stop) and value null when the
+  // string is complete but unusable (over cap / unparseable escapes).
+  const scanString = (): { value: string | null; next: number } | null => {
+    if (pos >= end || buffer[pos] !== 0x22) return null;
+    let cursor = pos + 1;
+    while (cursor < end) {
+      const byte = buffer[cursor];
+      if (byte === 0x5c) {
+        cursor += 2;
+        continue;
+      }
+      if (byte === 0x22) {
+        const raw = buffer.toString('utf8', pos + 1, cursor);
+        if (raw.length > OVERSIZED_FACTS_STRING_CAP) return { value: null, next: cursor + 1 };
+        try {
+          return { value: JSON.parse(`"${raw}"`) as string, next: cursor + 1 };
+        } catch {
+          return { value: null, next: cursor + 1 };
+        }
+      }
+      cursor += 1;
+    }
+    return null;
+  };
+
+  // Generic value skipper (numbers, literals, strings, nested containers).
+  // Returns false when the buffer cut the value mid-token.
+  const skipValue = (): boolean => {
+    skipWhitespace();
+    if (pos >= end) return false;
+    const byte = buffer[pos];
+    if (byte === 0x22) {
+      const scanned = scanString();
+      if (!scanned) return false;
+      pos = scanned.next;
+      return true;
+    }
+    if (byte === 0x7b || byte === 0x5b) return skipContainer();
+    const start = pos;
+    while (pos < end) {
+      const b = buffer[pos];
+      if (b === 0x2c || b === 0x7d || b === 0x5d || b === 0x20 || b === 0x09 || b === 0x0d || b === 0x0a) break;
+      pos += 1;
+    }
+    return pos > start;
+  };
+
+  const skipContainer = (): boolean => {
+    const opener = buffer[pos];
+    const closer = opener === 0x7b ? 0x7d : 0x5d;
+    pos += 1;
+    skipWhitespace();
+    if (pos < end && buffer[pos] === closer) {
+      pos += 1;
+      return true;
+    }
+    for (;;) {
+      skipWhitespace();
+      if (pos >= end) return false;
+      if (opener === 0x7b) {
+        if (buffer[pos] !== 0x22) return false;
+        const key = scanString();
+        if (!key) return false;
+        pos = key.next;
+        skipWhitespace();
+        if (pos >= end || buffer[pos] !== 0x3a) return false;
+        pos += 1;
+      }
+      if (!skipValue()) return false;
+      skipWhitespace();
+      if (pos >= end) return false;
+      if (buffer[pos] === 0x2c) {
+        pos += 1;
+        continue;
+      }
+      if (buffer[pos] === closer) {
+        pos += 1;
+        return true;
+      }
+      return false;
+    }
+  };
+
+  type VisitResult = 'consumed' | 'delegate' | 'cut';
+
+  // pos sits on '{'. The visitor consumes watched keys' values itself.
+  const walkObject = (visit: (key: string | null) => VisitResult): boolean => {
+    pos += 1;
+    for (;;) {
+      skipWhitespace();
+      if (pos >= end) return false;
+      if (buffer[pos] === 0x7d) {
+        pos += 1;
+        return true;
+      }
+      if (buffer[pos] !== 0x22) return false;
+      const key = scanString();
+      if (!key) return false;
+      pos = key.next;
+      skipWhitespace();
+      if (pos >= end || buffer[pos] !== 0x3a) return false;
+      pos += 1;
+      const result = visit(key.value);
+      if (result === 'cut') return false;
+      if (result === 'delegate' && !skipValue()) return false;
+      skipWhitespace();
+      if (pos >= end) return false;
+      if (buffer[pos] === 0x2c) {
+        pos += 1;
+        continue;
+      }
+      if (buffer[pos] === 0x7d) {
+        pos += 1;
+        return true;
+      }
+      return false;
+    }
+  };
+
+  // pos sits on '['. The visitor consumes watched elements itself.
+  const walkArray = (visitElement: () => VisitResult): boolean => {
+    pos += 1;
+    for (;;) {
+      skipWhitespace();
+      if (pos >= end) return false;
+      if (buffer[pos] === 0x5d) {
+        pos += 1;
+        return true;
+      }
+      const result = visitElement();
+      if (result === 'cut') return false;
+      if (result === 'delegate' && !skipValue()) return false;
+      skipWhitespace();
+      if (pos >= end) return false;
+      if (buffer[pos] === 0x2c) {
+        pos += 1;
+        continue;
+      }
+      if (buffer[pos] === 0x5d) {
+        pos += 1;
+        return true;
+      }
+      return false;
+    }
+  };
+
+  // Reads a string value at pos; 'cut' means the buffer ended mid-token.
+  const readStringHere = (): 'cut' | { consumed: false } | { consumed: true; value: string | null } => {
+    skipWhitespace();
+    if (pos >= end) return 'cut';
+    if (buffer[pos] !== 0x22) return { consumed: false };
+    const scanned = scanString();
+    if (!scanned) return 'cut';
+    pos = scanned.next;
+    return { consumed: true, value: scanned.value };
+  };
+
+  skipWhitespace();
+  if (pos >= end || buffer[pos] !== 0x7b) return null;
+  // A cut or malformed structure keeps every fact collected so far: each of
+  // them was verified at its own structural position in the real bytes.
+  walkObject(key => {
+    if (key === 'message') {
+      skipWhitespace();
+      if (pos >= end) return 'cut';
+      if (buffer[pos] !== 0x7b) return 'delegate';
+      const messageOk = walkObject(messageKey => {
+        if (messageKey !== 'content') return 'delegate';
+        skipWhitespace();
+        if (pos >= end) return 'cut';
+        if (buffer[pos] !== 0x5b) return 'delegate';
+        const contentOk = walkArray(() => {
+          skipWhitespace();
+          if (pos >= end) return 'cut';
+          if (buffer[pos] !== 0x7b) return 'delegate';
+          let isToolResult = false;
+          return walkObject(blockKey => {
+            if (blockKey === 'type') {
+              const value = readStringHere();
+              if (value === 'cut') return 'cut';
+              if (value.consumed) isToolResult = value.value === 'tool_result';
+              return 'consumed';
+            }
+            if (blockKey === 'tool_use_id' && isToolResult) {
+              const value = readStringHere();
+              if (value === 'cut') return 'cut';
+              if (value.consumed && value.value !== null && !facts.toolResultIds.includes(value.value)) {
+                facts.toolResultIds.push(value.value);
+              }
+              return 'consumed';
+            }
+            return 'delegate';
+          }) ? 'consumed' : 'cut';
+        });
+        return contentOk ? 'consumed' : 'cut';
+      });
+      return messageOk ? 'consumed' : 'cut';
+    }
+    if (key === 'parentUuid') {
+      skipWhitespace();
+      if (pos >= end) return 'cut';
+      if (buffer[pos] === 0x6e) {
+        if (!skipValue()) return 'cut';
+        if (facts.parentUuid === undefined) facts.parentUuid = null;
+        return 'consumed';
+      }
+    }
+    if (key !== 'type' && key !== 'uuid' && key !== 'parentUuid' && key !== 'timestamp' && key !== 'sourceToolUseID') {
+      return 'delegate';
+    }
+    const value = readStringHere();
+    if (value === 'cut') return 'cut';
+    if (!value.consumed) return 'delegate';
+    if (value.value !== null) {
+      if (key === 'type' && facts.type === undefined) facts.type = value.value;
+      else if (key === 'uuid' && facts.uuid === undefined) facts.uuid = value.value;
+      else if (key === 'parentUuid' && facts.parentUuid === undefined) facts.parentUuid = value.value;
+      else if (key === 'timestamp' && facts.timestamp === undefined) facts.timestamp = value.value;
+      else if (key === 'sourceToolUseID' && facts.sourceToolUseID === undefined) facts.sourceToolUseID = value.value;
+    }
+    return 'consumed';
+  });
+  return facts;
+}
+
+async function extractOversizedLineFacts(
+  handle: FileHandle,
+  offset: number,
+  length: number,
+): Promise<OversizedLineFacts | null> {
+  const readLength = Math.min(OVERSIZED_FACTS_READ_BYTES, length);
+  if (readLength <= 0) return null;
+  const buffer = Buffer.allocUnsafe(readLength);
+  const { bytesRead } = await handle.read(buffer, 0, readLength, offset);
+  if (bytesRead <= 0) return null;
+  return parseOversizedLineFacts(buffer.subarray(0, bytesRead));
+}
+
+async function appendOversizedEntry(
+  handle: FileHandle,
+  entries: RawIndexEntry[],
+  offset: number,
+  length: number,
+  lineNumber: number,
+): Promise<void> {
+  const facts = await extractOversizedLineFacts(handle, offset, length);
+  entries.push({
+    offset,
+    length,
+    // Facts the bounded prefix could not reliably read stay unknown; the
+    // opaque entry must not guess a type/uuid it never saw.
+    type: facts?.type ?? 'unknown',
+    messageKey: facts?.uuid ?? `line:${lineNumber}`,
+    uuid: facts?.uuid,
+    parentUuid: facts?.parentUuid,
+    timestamp: facts?.timestamp,
+    realUser: false,
+    displayable: false,
+    isMeta: false,
+    sourceToolUseID: facts?.sourceToolUseID,
+    toolUseIds: [],
+    toolResultIds: facts?.toolResultIds ?? [],
+    rebuiltContext: false,
+    projectionKind: 'skip',
+    oversized: true,
+  });
+}
+
 async function finalizeIndex(
   filePath: string,
   snapshot: { dev: number; ino: number; size: number; mtimeMs: number },
   rawEntries: RawIndexEntry[],
   skippedLines: number,
+  committedSize: number,
   resumeAtMessageId?: string,
   signal?: AbortSignal,
 ): Promise<TranscriptHistoryIndex> {
   throwIfAborted(signal);
+  const oversizedEntries = rawEntries.filter(entry => entry.oversized);
+  if (resumeAtMessageId && oversizedEntries.length > 0) {
+    // A resume anchor on or behind an opaque row cannot be honored safely:
+    // truncation could land on the wrong branch. Refuse explicitly instead
+    // of silently ignoring the anchor.
+    if (oversizedEntries.some(entry => entry.uuid === resumeAtMessageId)) {
+      throw new Error('Transcript resume anchor falls inside an oversized line');
+    }
+    if (oversizedEntries.some(entry => entry.uuid === undefined || entry.parentUuid === undefined)) {
+      // Without reliable uuid/parentUuid we cannot tell which ancestry chains
+      // cross the opaque row, so verification is impossible; disable rather
+      // than guess.
+      throw new Error('Transcript resume anchor cannot be verified: an oversized line is missing reliable uuid/parentUuid');
+    }
+  }
   // Recovery prompts are transport artifacts, not conversation facts. Remove
   // them before turns, descriptors and search corpus are derived so every
   // projection consumer (window/detail/title/export) shares the same truth.
@@ -269,6 +598,7 @@ async function finalizeIndex(
     ino: snapshot.ino,
     snapshotSize: snapshot.size,
     mtimeMs: snapshot.mtimeMs,
+    committedSize,
     entries: canonical,
     turns,
     searchCorpus,
@@ -284,12 +614,14 @@ async function scanSnapshot(
   filePath: string,
   chunkSize: number,
   maxLineBytes: number,
+  onLineSkipped?: (event: { reason: 'oversized' | 'malformed'; offset: number; bytes: number }) => void,
   onProgress?: (bytesRead: number, snapshotSize: number) => void,
   signal?: AbortSignal,
 ): Promise<{
   entries: RawIndexEntry[];
   skippedLines: number;
   incomplete: boolean;
+  committedSize: number;
   snapshot: { dev: number; ino: number; size: number; mtimeMs: number };
   peakHeapBytes: number;
 }> {
@@ -302,7 +634,54 @@ async function scanSnapshot(
   let partial = Buffer.alloc(0);
   let partialOffset = 0;
   let lineNumber = 0;
+  // Offset just past the last fully processed newline. Everything before it
+  // is committed index content; the tail reader must resume here, never at
+  // the stat-time EOF, or a half-written final line would be split in two.
+  let committedSize = 0;
+  // Oversized-line discard state: once a line passes the cap we stop
+  // accumulating it and drop bytes until its closing newline; only then does
+  // the opaque entry exist. EOF inside this state leaves the line
+  // uncommitted (the build reports partial).
+  let discardingOversizedLine = false;
+  let oversizedLineOffset = 0;
+  let oversizedLineBytes = 0;
   let peakHeapBytes = process.memoryUsage().heapUsed;
+
+  const scanData = async (data: Buffer, dataOffset: number): Promise<void> => {
+    let start = 0;
+    for (let cursor = 0; cursor < data.length; cursor += 1) {
+      if (data[cursor] !== 0x0a) continue;
+      const lineOffset = dataOffset + start;
+      const line = data.subarray(start, cursor);
+      if (line.length > maxLineBytes) {
+        await appendOversizedEntry(handle, entries, lineOffset, line.length, lineNumber);
+        onLineSkipped?.({ reason: 'oversized', offset: lineOffset, bytes: line.length });
+      } else if (line.toString('utf8').trim()) {
+        try {
+          const message = JSON.parse(line.toString('utf8').replace(/\r$/, '')) as SDKNativeMessage;
+          entries.push(toRawEntry(message, lineOffset, cursor - start, lineNumber));
+        } catch {
+          skippedLines += 1;
+          onLineSkipped?.({ reason: 'malformed', offset: lineOffset, bytes: line.length });
+        }
+      }
+      lineNumber += 1;
+      committedSize = dataOffset + cursor + 1;
+      start = cursor + 1;
+    }
+    partial = Buffer.from(data.subarray(start));
+    partialOffset = dataOffset + start;
+    if (partial.length > maxLineBytes) {
+      // Enter discard mode instead of throwing: clearing partial and
+      // continuing here would misread the oversized line's tail as a fresh
+      // JSON line, so the bytes are dropped until the next newline.
+      discardingOversizedLine = true;
+      oversizedLineOffset = partialOffset;
+      oversizedLineBytes = partial.length;
+      partial = Buffer.alloc(0);
+    }
+  };
+
   try {
     while (position < snapshot.size) {
       throwIfAborted(signal);
@@ -310,38 +689,46 @@ async function scanSnapshot(
       const chunk = Buffer.allocUnsafe(length);
       const { bytesRead } = await handle.read(chunk, 0, length, position);
       if (bytesRead === 0) break;
-      const data = partial.length > 0
-        ? Buffer.concat([partial, chunk.subarray(0, bytesRead)])
-        : chunk.subarray(0, bytesRead);
-      const dataOffset = partial.length > 0 ? partialOffset : position;
-      let start = 0;
-      for (let cursor = 0; cursor < data.length; cursor += 1) {
-        if (data[cursor] !== 0x0a) continue;
-        const line = data.subarray(start, cursor);
-        if (line.length > maxLineBytes) throw new Error(`Transcript line exceeds ${maxLineBytes} bytes at offset ${dataOffset + start}`);
-        if (line.toString('utf8').trim()) {
-          try {
-            const message = JSON.parse(line.toString('utf8').replace(/\r$/, '')) as SDKNativeMessage;
-            entries.push(toRawEntry(message, dataOffset + start, cursor - start, lineNumber));
-          } catch {
-            skippedLines += 1;
-          }
+      const chunkData = chunk.subarray(0, bytesRead);
+      if (discardingOversizedLine) {
+        const newlineIndex = chunkData.indexOf(0x0a);
+        if (newlineIndex === -1) {
+          oversizedLineBytes += chunkData.length;
+        } else {
+          oversizedLineBytes += newlineIndex;
+          await appendOversizedEntry(handle, entries, oversizedLineOffset, oversizedLineBytes, lineNumber);
+          onLineSkipped?.({ reason: 'oversized', offset: oversizedLineOffset, bytes: oversizedLineBytes });
+          lineNumber += 1;
+          committedSize = position + newlineIndex + 1;
+          discardingOversizedLine = false;
+          await scanData(chunkData.subarray(newlineIndex + 1), position + newlineIndex + 1);
         }
-        lineNumber += 1;
-        start = cursor + 1;
+      } else {
+        const data = partial.length > 0 ? Buffer.concat([partial, chunkData]) : chunkData;
+        const dataOffset = partial.length > 0 ? partialOffset : position;
+        await scanData(data, dataOffset);
       }
-      partial = Buffer.from(data.subarray(start));
-      partialOffset = dataOffset + start;
-      if (partial.length > maxLineBytes) throw new Error(`Transcript line exceeds ${maxLineBytes} bytes at offset ${partialOffset}`);
       position += bytesRead;
       peakHeapBytes = Math.max(peakHeapBytes, process.memoryUsage().heapUsed);
       onProgress?.(position, snapshot.size);
       await yieldToMainThread(signal);
     }
+    if (discardingOversizedLine) {
+      // EOF closed the file inside the oversized line: no committed entry and
+      // the committed boundary stays at the line start for the tail reader.
+      onLineSkipped?.({ reason: 'oversized', offset: oversizedLineOffset, bytes: oversizedLineBytes });
+    }
   } finally {
     await handle.close();
   }
-  return { entries, skippedLines, incomplete: partial.length > 0, snapshot, peakHeapBytes };
+  return {
+    entries,
+    skippedLines,
+    incomplete: partial.length > 0 || discardingOversizedLine,
+    committedSize,
+    snapshot,
+    peakHeapBytes,
+  };
 }
 
 async function buildDirect(filePath: string, options: BuildOptions): Promise<TranscriptIndexResult> {
@@ -351,6 +738,7 @@ async function buildDirect(filePath: string, options: BuildOptions): Promise<Tra
       filePath,
       options.chunkSize ?? DEFAULT_CHUNK_SIZE,
       options.maxLineBytes ?? DEFAULT_MAX_LINE_BYTES,
+      options.onLineSkipped,
       options.onProgress,
       options.signal,
     );
@@ -360,6 +748,7 @@ async function buildDirect(filePath: string, options: BuildOptions): Promise<Tra
       scanned.snapshot,
       scanned.entries,
       scanned.skippedLines,
+      scanned.committedSize,
       options.resumeAtMessageId,
       options.signal,
     );
@@ -444,6 +833,8 @@ function buildInWorker(filePath: string, options: BuildOptions): Promise<Transcr
     const DEFAULT_CHUNK_SIZE = ${DEFAULT_CHUNK_SIZE};
     const DEFAULT_MAX_LINE_BYTES = ${DEFAULT_MAX_LINE_BYTES};
     const FINALIZE_BATCH_SIZE = ${FINALIZE_BATCH_SIZE};
+    const OVERSIZED_FACTS_READ_BYTES = ${OVERSIZED_FACTS_READ_BYTES};
+    const OVERSIZED_FACTS_STRING_CAP = ${OVERSIZED_FACTS_STRING_CAP};
     // Mirrors HISTORY_OMISSION_MARKER from runtime/HistoryContextAccumulator —
     // the eval'd worker source has no imports, so keep the two in sync.
     const HISTORY_OMISSION_MARKER = '[Earlier history omitted: context recovery budget]';
@@ -477,6 +868,9 @@ function buildInWorker(filePath: string, options: BuildOptions): Promise<Transcr
     })});
     const isRebuiltContextMessage = (${serializeWorkerFunction(isRebuiltContextMessage)});
     const toRawEntry = (${serializeWorkerFunction(toRawEntry)});
+    const parseOversizedLineFacts = (${serializeWorkerFunction(parseOversizedLineFacts)});
+    const extractOversizedLineFacts = (${serializeWorkerFunction(extractOversizedLineFacts)});
+    const appendOversizedEntry = (${serializeWorkerFunction(appendOversizedEntry)});
     const filterActiveBranchEntries = (${serializeWorkerFunction(filterActiveBranchEntries)});
     const finalizeIndex = (${serializeWorkerFunction(finalizeIndex)});
     const scanSnapshot = (${serializeWorkerFunction(scanSnapshot)});
@@ -491,11 +885,12 @@ function buildInWorker(filePath: string, options: BuildOptions): Promise<Transcr
       ...workerData.options,
       onProgress: (bytesRead, snapshotSize) => parentPort.postMessage({ kind: 'progress', bytesRead, snapshotSize }),
       onFinalize: () => parentPort.postMessage({ kind: 'finalize' }),
+      onLineSkipped: (event) => parentPort.postMessage({ kind: 'line_skipped', event }),
     };
     buildDirect(workerData.filePath, options).then(result => parentPort.postMessage({ kind: 'result', result }), error => parentPort.postMessage({ kind: 'result', result: { status: 'failed', error: String(error) } }));
   `;
   return new Promise((resolve, reject) => {
-    const { onProgress: _, onFinalize: __, signal: ___, ...workerOptions } = options;
+    const { onProgress: _, onFinalize: __, onLineSkipped: ____, signal: ___, ...workerOptions } = options;
     const worker = new Worker(source, { eval: true, workerData: { filePath, options: { ...workerOptions, useWorker: false } } });
     let settled = false;
     const finish = (result: TranscriptIndexResult): void => {
@@ -513,9 +908,11 @@ function buildInWorker(filePath: string, options: BuildOptions): Promise<Transcr
     worker.on('message', message => {
       const payload = message as { kind: 'progress'; bytesRead: number; snapshotSize: number }
         | { kind: 'finalize' }
+        | { kind: 'line_skipped'; event: TranscriptLineSkipEvent }
         | { kind: 'result'; result: TranscriptIndexResult };
       if (payload.kind === 'progress') options.onProgress?.(payload.bytesRead, payload.snapshotSize);
       else if (payload.kind === 'finalize') options.onFinalize?.();
+      else if (payload.kind === 'line_skipped') options.onLineSkipped?.(payload.event);
       else finish(payload.result);
     });
     worker.once('error', error => {
@@ -536,10 +933,12 @@ function buildInWorker(filePath: string, options: BuildOptions): Promise<Transcr
 const requests = new Map<string, Promise<TranscriptIndexResult>>();
 
 export interface TranscriptIndexDiagnosticEvent {
-  phase: 'index_worker_fallback' | 'queued' | 'start' | 'progress' | 'finalize' | 'complete' | 'failed' | 'aborted' | 'stalled' | 'cache_hit' | 'cache_evict' | 'cache_overcommit';
+  phase: 'index_worker_fallback' | 'queued' | 'start' | 'progress' | 'finalize' | 'complete' | 'failed' | 'aborted' | 'stalled' | 'cache_hit' | 'cache_evict' | 'cache_overcommit' | 'line_skipped';
   errorName?: string;
   buildId?: string;
   mode?: 'worker' | 'direct';
+  reason?: 'oversized' | 'malformed';
+  offset?: number;
   queueMs?: number;
   elapsedMs?: number;
   bytes?: number;
@@ -608,6 +1007,13 @@ function observeBuild(
     onFinalize: () => {
       options.onFinalize?.();
       diagnosticSink?.({ phase: 'finalize', buildId, mode, elapsedMs: performance.now() - startedAt, bytes: lastBytes, totalBytes });
+    },
+    // Line-skip diagnostics flow through the build context (buildId/mode)
+    // instead of a global sink read inside scanSnapshot, keeping the scan
+    // worker-serializable and free of module-level timing assumptions.
+    onLineSkipped: event => {
+      options.onLineSkipped?.(event);
+      diagnosticSink?.({ phase: 'line_skipped', buildId, mode, reason: event.reason, offset: event.offset, bytes: event.bytes });
     },
   };
   return run(observedOptions).then(result => {
@@ -779,6 +1185,13 @@ async function readIndexEntries(
   try {
     const messages: SDKNativeMessage[] = [];
     for (const entry of entries) {
+      // Oversized lines are never read back — that read is the exact failure
+      // the opaque entry exists for. Facts-based placeholders keep tool
+      // pairing honest and mark the omission visibly.
+      if (entry.oversized) {
+        messages.push(...buildOpaqueOversizedPlaceholders(entry));
+        continue;
+      }
       const buffer = Buffer.allocUnsafe(entry.length);
       const { bytesRead } = await handle.read(buffer, 0, entry.length, entry.offset);
       if (bytesRead !== entry.length) throw new Error(`Short transcript read at offset ${entry.offset}`);
