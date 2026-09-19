@@ -109,7 +109,8 @@
         "charactersTail": "[… {count} 文字を省略 …]",
         "arrayItems": "[… 他 {count} 項目を省略 …]",
         "entryBytes": "[… {bytes} バイトのトランスクリプトエントリを省略 …]",
-        "turnEntries": "[… この特大ターンから {count} 件のトランスクリプトエントリ（{bytes} バイト）を省略 …]"
+        "turnEntries": "[… この特大ターンから {count} 件のトランスクリプトエントリ（{bytes} バイト）を省略 …]",
+        "hardCap": "[… 切り詰め …]"
       }
     },
     "search": {

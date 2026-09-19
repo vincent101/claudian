@@ -82,6 +82,7 @@ export type TranslationKey =
   | 'chat.history.omission.arrayItems'
   | 'chat.history.omission.entryBytes'
   | 'chat.history.omission.turnEntries'
+  | 'chat.history.omission.hardCap'
   | 'chat.search.placeholder'
   | 'chat.search.noResults'
   | 'chat.search.error'

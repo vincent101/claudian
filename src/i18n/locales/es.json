@@ -109,7 +109,8 @@
         "charactersTail": "[… {count} caracteres omitidos …]",
         "arrayItems": "[… {count} elementos más omitidos …]",
         "entryBytes": "[… entrada de transcripción de {bytes} bytes omitida …]",
-        "turnEntries": "[… {count} entradas de transcripción ({bytes} bytes) omitidas de este turno sobredimensionado …]"
+        "turnEntries": "[… {count} entradas de transcripción ({bytes} bytes) omitidas de este turno sobredimensionado …]",
+        "hardCap": "[… truncado …]"
       }
     },
     "search": {

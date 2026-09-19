@@ -109,7 +109,8 @@
         "charactersTail": "[… {count}자 생략 …]",
         "arrayItems": "[… {count}개 항목 더 생략 …]",
         "entryBytes": "[… {bytes}바이트 트랜스크립트 항목 생략 …]",
-        "turnEntries": "[… 이 초대형 턴에서 트랜스크립트 항목 {count}개({bytes}바이트)를 생략 …]"
+        "turnEntries": "[… 이 초대형 턴에서 트랜스크립트 항목 {count}개({bytes}바이트)를 생략 …]",
+        "hardCap": "[… 축약됨 …]"
       }
     },
     "search": {

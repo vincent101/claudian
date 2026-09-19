@@ -109,7 +109,8 @@
         "charactersTail": "[… 已省略 {count} 个字符 …]",
         "arrayItems": "[… 已省略 {count} 项 …]",
         "entryBytes": "[… 已省略 {bytes} 字节的会话记录条目 …]",
-        "turnEntries": "[… 已从此超大轮次省略 {count} 条会话记录（{bytes} 字节）…]"
+        "turnEntries": "[… 已从此超大轮次省略 {count} 条会话记录（{bytes} 字节）…]",
+        "hardCap": "[… 已截断 …]"
       }
     },
     "search": {

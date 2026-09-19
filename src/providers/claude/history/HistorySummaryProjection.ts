@@ -96,7 +96,14 @@ export interface HardCapResult {
   truncated: boolean;
 }
 
-const HARD_CAP_OMISSION_MARKER = '[… truncated …]';
+/**
+ * Marker for the anchor-turn hard cap. Read per call (not a module constant)
+ * so the active locale's text — and its length, which the budget arithmetic
+ * below depends on — are always current.
+ */
+function hardCapOmissionMarker(): string {
+  return t('chat.history.omission.hardCap');
+}
 
 /**
  * Budget-aware single-string truncation: keeps head+tail excerpts around an
@@ -106,13 +113,14 @@ const HARD_CAP_OMISSION_MARKER = '[… truncated …]';
 function capTextToBudget(text: string, budget: number): string {
   if (budget <= 0) return '';
   if (text.length <= budget) return text;
-  if (budget <= HARD_CAP_OMISSION_MARKER.length) {
-    return HARD_CAP_OMISSION_MARKER.slice(0, budget);
+  const marker = hardCapOmissionMarker();
+  if (budget <= marker.length) {
+    return marker.slice(0, budget);
   }
-  const body = budget - HARD_CAP_OMISSION_MARKER.length;
+  const body = budget - marker.length;
   const head = Math.ceil(body / 2);
   const tail = body - head;
-  return `${text.slice(0, head)}${HARD_CAP_OMISSION_MARKER}${tail > 0 ? text.slice(text.length - tail) : ''}`;
+  return `${text.slice(0, head)}${marker}${tail > 0 ? text.slice(text.length - tail) : ''}`;
 }
 
 /** Strips every surface measureChatProjectionChars counts, keeping the shell. */

@@ -343,15 +343,19 @@ describe('HistorySummaryProjection', () => {
       const text = (marker.message!.content as Array<{ text: string }>)[0].text;
       expect(text).toContain('已从此超大轮次省略 1 条会话记录');
       expect(text).toContain('300 字节');
+      // hardCap (capTextToBudget inside the anchor-turn hard cap)
+      const capped = hardCapChatProjection([assistantMessage({ content: 'x'.repeat(5000) })], 200);
+      expect(capped.messages[0].content).toContain('已截断');
     });
 
-    it('resolves the five omission keys with parameters in every locale', () => {
+    it('resolves the six omission keys with parameters in every locale', () => {
       const keys: TranslationKey[] = [
         'chat.history.omission.charactersMiddle',
         'chat.history.omission.charactersTail',
         'chat.history.omission.arrayItems',
         'chat.history.omission.entryBytes',
         'chat.history.omission.turnEntries',
+        'chat.history.omission.hardCap',
       ];
       for (const locale of getAvailableLocales()) {
         expect(setLocale(locale)).toBe(true);

@@ -109,7 +109,8 @@
         "charactersTail": "[… {count} caractères omis …]",
         "arrayItems": "[… {count} éléments supplémentaires omis …]",
         "entryBytes": "[… entrée de transcription de {bytes} octets omise …]",
-        "turnEntries": "[… {count} entrées de transcription ({bytes} octets) omises de ce tour surdimensionné …]"
+        "turnEntries": "[… {count} entrées de transcription ({bytes} octets) omises de ce tour surdimensionné …]",
+        "hardCap": "[… tronqué …]"
       }
     },
     "search": {

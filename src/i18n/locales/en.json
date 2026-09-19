@@ -109,7 +109,8 @@
         "charactersTail": "[… {count} characters omitted …]",
         "arrayItems": "[… {count} more items omitted …]",
         "entryBytes": "[… transcript entry of {bytes} bytes omitted …]",
-        "turnEntries": "[… {count} transcript entries ({bytes} bytes) omitted from this oversized turn …]"
+        "turnEntries": "[… {count} transcript entries ({bytes} bytes) omitted from this oversized turn …]",
+        "hardCap": "[… truncated …]"
       }
     },
     "search": {

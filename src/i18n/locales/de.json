@@ -109,7 +109,8 @@
         "charactersTail": "[… {count} Zeichen ausgelassen …]",
         "arrayItems": "[… {count} weitere Einträge ausgelassen …]",
         "entryBytes": "[… Transkript-Eintrag mit {bytes} Bytes ausgelassen …]",
-        "turnEntries": "[… {count} Transkript-Einträge ({bytes} Bytes) aus diesem übergroßen Zug ausgelassen …]"
+        "turnEntries": "[… {count} Transkript-Einträge ({bytes} Bytes) aus diesem übergroßen Zug ausgelassen …]",
+        "hardCap": "[… gekürzt …]"
       }
     },
     "search": {
