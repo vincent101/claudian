@@ -296,7 +296,17 @@ export class ClaudeConversationHistoryService implements ProviderConversationHis
         }),
         onFinalize: () => onProgress?.({ phase: 'finalizing' }),
       });
-      if (result.status === 'failed' || result.status === 'partial') throw new Error(result.error);
+      if (result.status === 'failed') throw new Error(result.error);
+      if (result.status === 'partial') {
+        // A partial snapshot still serves its committed prefix: search,
+        // paging, titles and windows all operate on complete lines only. The
+        // current segment's partial is a transient append-in-progress state;
+        // an older segment's partial will not heal on its own.
+        this.windowDiagnostics?.record({
+          phase: sessionId === currentSessionId ? 'partial_snapshot' : 'stale_partial_segment',
+          bytes: result.index.snapshotSize,
+        });
+      }
       segments.push({ sessionId, segmentOrdinal, index: result.index });
     }
     if (segments.length === 0) throw new Error('Conversation transcript is unavailable');
@@ -588,7 +598,10 @@ export class ClaudeConversationHistoryService implements ProviderConversationHis
     return {
       messages: dedupeMessages(messages).sort(compareChatDisplayOrder),
       range: { start: actualStart, end: actualEnd },
-      snapshotOffset: current.index.snapshotSize,
+      // Tail handoff must start at the committed boundary, not at the
+      // stat-time EOF: on a partial snapshot the observer would otherwise
+      // begin mid-line and lose every later row.
+      snapshotOffset: current.index.committedSize,
       sourceBytes,
       projectedChars,
       oversizedTurnCount,

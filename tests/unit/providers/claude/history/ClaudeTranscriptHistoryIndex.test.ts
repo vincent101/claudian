@@ -527,6 +527,189 @@ describe('ClaudeTranscriptHistoryIndex oversized line degradation', () => {
   });
 });
 
+describe('partial snapshot handling through the history service', () => {
+  const budget = {
+    maxTurns: 25,
+    maxSourceBytes: 8 * 1024 * 1024,
+    maxProjectedChars: 2_000_000,
+    timeSliceMs: 8,
+  };
+  const fixtureDir = join(process.env.TMPDIR ?? '/tmp', `claudian-partial-${process.pid}`);
+
+  function conversationFor(sessionId: string, extra: Record<string, unknown> = {}): Conversation {
+    return {
+      id: `partial-${sessionId}`, providerId: 'claude', title: 'Partial', createdAt: 1, updatedAt: 1,
+      sessionId, providerState: { providerSessionId: sessionId, ...extra }, messages: [],
+    };
+  }
+
+  beforeEach(async () => {
+    await (await import('fs/promises')).rm(fixtureDir, { recursive: true, force: true });
+    await (await import('fs/promises')).mkdir(fixtureDir, { recursive: true });
+  });
+
+  afterAll(async () => {
+    await (await import('fs/promises')).rm(fixtureDir, { recursive: true, force: true });
+  });
+
+  it('opens the committed prefix of a session whose last line is still being written', async () => {
+    const firstLine = JSON.stringify({ type: 'user', uuid: 'u1', parentUuid: null, message: { content: 'first question' } });
+    const path = join(fixtureDir, 'half-written.jsonl');
+    await writeFile(path, `${firstLine}\n{"type":"user","uuid":"u2","par`);
+    jest.spyOn(sdkSessionPaths, 'getSDKSessionPath').mockReturnValue(path);
+    jest.spyOn(sdkSessionPaths, 'sdkSessionExists').mockReturnValue(true);
+
+    const service = new ClaudeConversationHistoryService();
+    const lease = service.acquireHistoryIndex(conversationFor('half-written'), fixtureDir);
+    // A partial snapshot must open, not fail: everything before the last
+    // complete newline is a valid conversation prefix.
+    await expect(lease.ready).resolves.toBeUndefined();
+    expect(lease.totalTurns).toBe(1);
+
+    const page = await lease.loadWindow({ anchorTurn: 1, direction: 'older', budget, projectionLevel: 'detail' });
+    expect(page.messages.map(message => message.content)).toEqual(['first question']);
+    // The tail handoff point is the committed boundary, not the stat-time
+    // EOF: an observer starting at EOF would read the half line's tail as a
+    // standalone JSON line forever.
+    expect(page.snapshotOffset).toBe(Buffer.byteLength(firstLine) + 1);
+    const stat = await (await import('fs/promises')).stat(path);
+    expect(page.snapshotOffset).toBeLessThan(stat.size);
+    // Search only ever covers the committed prefix.
+    await expect(lease.search('first')).resolves.toHaveLength(1);
+    await expect(lease.search('par')).resolves.toHaveLength(0);
+    lease.release();
+  });
+
+  it('incorporates the completed tail line after a refresh', async () => {
+    const firstLine = JSON.stringify({ type: 'user', uuid: 'u1', parentUuid: null, message: { content: 'first question' } });
+    const path = join(fixtureDir, 'completing.jsonl');
+    await writeFile(path, `${firstLine}\n{"type":"user","uuid":"u2","par`);
+    jest.spyOn(sdkSessionPaths, 'getSDKSessionPath').mockReturnValue(path);
+    jest.spyOn(sdkSessionPaths, 'sdkSessionExists').mockReturnValue(true);
+
+    const service = new ClaudeConversationHistoryService();
+    const conversation = conversationFor('completing');
+    const first = service.acquireHistoryIndex(conversation, fixtureDir);
+    await first.ready;
+    const firstOffset = (await first.loadWindow({ anchorTurn: 1, direction: 'older', budget, projectionLevel: 'detail' })).snapshotOffset;
+    first.release();
+
+    // The writer finishes the half line and closes it.
+    await (await import('fs/promises')).appendFile(path, 'entUuid":null,"message":{"content":"second question"}}\n');
+
+    const second = service.acquireHistoryIndex(conversation, fixtureDir, undefined, true);
+    await second.ready;
+    expect(second.totalTurns).toBe(2);
+    const page = await second.loadWindow({ anchorTurn: 2, direction: 'older', budget, projectionLevel: 'detail' });
+    expect(page.messages.map(message => message.content)).toEqual(['first question', 'second question']);
+    // The committed boundary advanced past the line the first snapshot had
+    // parked on — an observer resumed at the old boundary reads it whole.
+    expect(page.snapshotOffset!).toBeGreaterThan(firstOffset!);
+    const stat = await (await import('fs/promises')).stat(path);
+    expect(page.snapshotOffset).toBe(stat.size);
+    await expect(second.search('second')).resolves.toHaveLength(1);
+    second.release();
+  });
+
+  it('marks current-segment partials as transient and older-segment partials as stale', async () => {
+    const currentLine = JSON.stringify({ type: 'user', uuid: 'c1', parentUuid: null, message: { content: 'current question' } });
+    const prevLine = JSON.stringify({ type: 'user', uuid: 'p1', parentUuid: null, message: { content: 'previous question' } });
+    const prevPath = join(fixtureDir, 'prev-half.jsonl');
+    const currentPath = join(fixtureDir, 'current-half.jsonl');
+    await writeFile(prevPath, `${prevLine}\n{"type":"user","uuid":"p2","par`);
+    await writeFile(currentPath, `${currentLine}\n{"type":"user","uuid":"c2","par`);
+    jest.spyOn(sdkSessionPaths, 'getSDKSessionPath').mockImplementation((_vault, id) =>
+      id === 'prev-half' ? prevPath : currentPath);
+    jest.spyOn(sdkSessionPaths, 'sdkSessionExists').mockReturnValue(true);
+
+    const service = new ClaudeConversationHistoryService();
+    const lease = service.acquireHistoryIndex(
+      conversationFor('current-half', { previousProviderSessionIds: ['prev-half'] }),
+      fixtureDir,
+    );
+    await expect(lease.ready).resolves.toBeUndefined();
+    expect(lease.totalTurns).toBe(2);
+    lease.release();
+
+    const diagnosticsPath = join(fixtureDir, '.claudian', 'diagnostics', 'history-window.current.jsonl');
+    const { readFile: readDiagnostics } = await import('fs/promises');
+    const events = (await readDiagnostics(diagnosticsPath, 'utf8')).trim().split('\n').map(line => JSON.parse(line));
+    expect(events.some(event => event.phase === 'partial_snapshot')).toBe(true);
+    expect(events.some(event => event.phase === 'stale_partial_segment')).toBe(true);
+  });
+
+  it('opens a session with a line above the default 16 MiB cap and degrades it visibly', async () => {
+    const giant = 17 * 1024 * 1024;
+    const lines = [
+      JSON.stringify({ type: 'user', uuid: 'u1', parentUuid: null, message: { content: 'giant question' } }),
+      JSON.stringify({ type: 'assistant', uuid: 'tu1', parentUuid: 'u1', message: { content: [{ type: 'tool_use', id: 'toolu_1', name: 'Read', input: { file_path: '/a.md' } }] } }),
+      JSON.stringify({
+        type: 'user', uuid: 'tr1', parentUuid: 'tu1', sourceToolUseID: 'toolu_1',
+        message: { content: [{ type: 'tool_result', tool_use_id: 'toolu_1', content: 'x'.repeat(giant) }] },
+      }),
+      JSON.stringify({ type: 'assistant', uuid: 'af1', parentUuid: 'tr1', message: { content: 'final summary' } }),
+    ];
+    const path = join(fixtureDir, 'giant-line.jsonl');
+    await writeFile(path, `${lines.join('\n')}\n`);
+    jest.spyOn(sdkSessionPaths, 'getSDKSessionPath').mockReturnValue(path);
+    jest.spyOn(sdkSessionPaths, 'sdkSessionExists').mockReturnValue(true);
+
+    const service = new ClaudeConversationHistoryService();
+    const lease = service.acquireHistoryIndex(conversationFor('giant-line'), fixtureDir);
+    // The exact real-machine failure: a 16.87 MB toolUseResult row used to
+    // throw and permanently block this conversation.
+    await expect(lease.ready).resolves.toBeUndefined();
+    expect(lease.totalTurns).toBe(1);
+
+    const page = await lease.loadWindow({ anchorTurn: 1, direction: 'older', budget, projectionLevel: 'summary' });
+    const text = page.messages.map(message => message.content).join('\n');
+    expect(text).toContain('giant question');
+    expect(text).toContain('final summary');
+    // The opaque row surfaces a visible omission marker...
+    expect(text).toContain('bytes omitted');
+    // ...and its reliably extracted tool id completes the paired tool call
+    // with an honest omission result instead of leaving it running.
+    const toolCalls = page.messages.flatMap(message => message.toolCalls ?? []);
+    expect(toolCalls).toHaveLength(1);
+    expect(toolCalls[0].status).toBe('completed');
+    expect(toolCalls[0].result).toContain('bytes omitted');
+    // Omission markers never leak into the search index.
+    const fresh = await buildTranscriptIndex(path, { useWorker: false });
+    expect(fresh.status).toBe('complete');
+    if (fresh.status !== 'complete') return;
+    expect(fresh.index.searchText).not.toContain('omitted');
+    expect(fresh.index.searchText).toContain('giant question');
+    lease.release();
+  });
+
+  it('does not fake tool completion when the giant line has no reliable ids', async () => {
+    const giant = 17 * 1024 * 1024;
+    const lines = [
+      JSON.stringify({ type: 'user', uuid: 'u1', parentUuid: null, message: { content: 'giant question' } }),
+      JSON.stringify({ type: 'assistant', uuid: 'tu1', parentUuid: 'u1', message: { content: [{ type: 'tool_use', id: 'toolu_1', name: 'Read', input: { file_path: '/a.md' } }] } }),
+      'x'.repeat(giant),
+      JSON.stringify({ type: 'assistant', uuid: 'af1', parentUuid: 'tu1', message: { content: 'final summary' } }),
+    ];
+    const path = join(fixtureDir, 'giant-garbage.jsonl');
+    await writeFile(path, `${lines.join('\n')}\n`);
+    jest.spyOn(sdkSessionPaths, 'getSDKSessionPath').mockReturnValue(path);
+    jest.spyOn(sdkSessionPaths, 'sdkSessionExists').mockReturnValue(true);
+
+    const service = new ClaudeConversationHistoryService();
+    const lease = service.acquireHistoryIndex(conversationFor('giant-garbage'), fixtureDir);
+    await expect(lease.ready).resolves.toBeUndefined();
+    const page = await lease.loadWindow({ anchorTurn: 1, direction: 'older', budget, projectionLevel: 'summary' });
+    const toolCalls = page.messages.flatMap(message => message.toolCalls ?? []);
+    expect(toolCalls).toHaveLength(1);
+    // No reliable tool id was extracted, so no synthetic completion: the
+    // omission marker still shows, the tool call stays honestly unfinished.
+    expect(toolCalls[0].result).toBeUndefined();
+    expect(toolCalls[0].status).not.toBe('completed');
+    expect(page.messages.map(message => message.content).join('\n')).toContain('bytes omitted');
+    lease.release();
+  });
+});
+
 describe('ClaudeTranscriptHistoryIndex worker fallback', () => {
   afterEach(() => {
     mockWorkerConstructorMode = 'real';
