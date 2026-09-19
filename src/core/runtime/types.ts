@@ -175,6 +175,10 @@ export interface AutoTurnFinishedEvent {
   generation: number;
   metadata: ChatTurnMetadata;
   replay?: boolean;
+  /** Byte offset of the transcript row that established completion. */
+  terminalOffset?: number;
+  /** A later host user row makes this completion a delayed report. */
+  supersededByHostUser?: boolean;
 }
 
 /**

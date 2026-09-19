@@ -23,6 +23,13 @@ describe('ClaudeTranscriptDiagnosticLog', () => {
     expect(content).not.toContain('secret-id');
   });
 
+  it('persists line offsets for skipped-line diagnostics', async () => {
+    const log = new ClaudeTranscriptDiagnosticLog(vault);
+    log.record({ phase: 'line_skipped', reason: 'oversized', offset: 1234, bytes: 99 });
+    const content = await readFile(join(vault, '.claudian/diagnostics/transcript-tail.current.jsonl'), 'utf8');
+    expect(content).toContain('"offset":1234');
+  });
+
   it('keeps each serialized event within one kilobyte', async () => {
     const log = new ClaudeTranscriptDiagnosticLog(vault);
     log.record({ phase: 'callback_error', errorName: 'X'.repeat(10_000) });

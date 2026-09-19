@@ -38,6 +38,8 @@ export class ClaudeTranscriptTurnObserver {
   private active: PendingTurn | null = null;
   private embeddedQueue: AutoTurnStartedEvent[] = [];
   private hostUserTurnId: string | null = null;
+  private readonly hostUserTranscriptIds = new Set<string>();
+  private lastHostUserOffset: number | null = null;
   /** 2.5.1 残余 a: host user turn was cancelled — CLI interrupt already
    * killed the pipeline, so turns promoting after the cancel can never see
    * their result line and must be settled deterministically. */
@@ -86,7 +88,13 @@ export class ClaudeTranscriptTurnObserver {
     this.queue = [];
     this.embeddedQueue = [];
     this.hostUserTurnId = null;
+    this.hostUserTranscriptIds.clear();
+    this.lastHostUserOffset = null;
     this.mapper.reset(this.generation);
+  }
+
+  registerHostUserTranscriptId(transcriptUserId: string): void {
+    this.hostUserTranscriptIds.add(transcriptUserId);
   }
 
   beginUserTurnProjection(turnId: string): void {
@@ -138,8 +146,14 @@ export class ClaudeTranscriptTurnObserver {
     }
     if (this.quietTimer) clearTimeout(this.quietTimer);
     this.quietTimer = null;
-    for (const line of batch.lines) {
-      for (const event of this.mapper.mapLine(line, false, { hostUserTurnActive: this.hostUserTurnId !== null })) {
+    for (let index = 0; index < batch.lines.length; index += 1) {
+      const line = batch.lines[index];
+      const lineOffset = batch.lineOffsets?.[index];
+      this.observeHostUserRow(line, lineOffset);
+      for (const event of this.mapper.mapLine(line, false, {
+        hostUserTurnActive: this.hostUserTurnId !== null,
+        lineOffset,
+      })) {
         this.diagnostics?.record({ phase: 'map', generation, turnIdHash: this.diagnostics.hashId(event.event.turnId) });
         this.enqueue(event);
       }
@@ -152,6 +166,17 @@ export class ClaudeTranscriptTurnObserver {
     if (promote) await this.promote();
     await this.drainActive();
     this.diagnostics?.record({ phase: 'tick_end', generation, batchBytes: batch.bytesRead, batchLines: batch.lines.length, elapsedMs: Date.now() - startedAt });
+  }
+
+  private observeHostUserRow(line: string, lineOffset?: number): void {
+    if (lineOffset === undefined || this.hostUserTranscriptIds.size === 0) return;
+    try {
+      const message = JSON.parse(line) as { type?: string; uuid?: string };
+      if (message.type !== 'user' || !message.uuid || !this.hostUserTranscriptIds.delete(message.uuid)) return;
+      this.lastHostUserOffset = lineOffset;
+    } catch {
+      // Malformed transcript rows cannot establish causal ownership.
+    }
   }
 
   private enqueue(event: TranscriptTurnEvent): void {
@@ -257,7 +282,13 @@ export class ClaudeTranscriptTurnObserver {
           await this.promote();
         }
         if (event.type === 'finished') {
-          await this.callbacks.finished(event.event);
+          const terminalOffset = event.event.terminalOffset;
+          await this.callbacks.finished({
+            ...event.event,
+            supersededByHostUser: terminalOffset !== undefined
+              && this.lastHostUserOffset !== null
+              && this.lastHostUserOffset > terminalOffset,
+          });
           this.active = null;
           this.callbacks.released(event.event.turnId);
           await this.promote();

@@ -543,6 +543,24 @@ describe('AutoTurnProjectionController', () => {
     expect(onTurnCompleted).toHaveBeenCalledWith({ turnId: 'auto-1', kind: 'auto', outcome: 'completed' });
   });
 
+  it('suppresses only the completion event for a delayed terminal superseded by a host row', async () => {
+    const { controller, onTurnCompleted, save, turnCoordinator } = setup();
+    controller.started({ turnId: 'auto-old', generation: 0, source: { kind: 'assistant-continuation' } });
+    await controller.chunk({ turnId: 'auto-old', generation: 0, chunk: { type: 'text', content: 'work' } });
+
+    await controller.finished({
+      turnId: 'auto-old',
+      generation: 0,
+      metadata: {},
+      terminalOffset: 10,
+      supersededByHostUser: true,
+    });
+
+    expect(onTurnCompleted).not.toHaveBeenCalled();
+    expect(save).toHaveBeenCalled();
+    expect(turnCoordinator.isBusy()).toBe(false);
+  });
+
   it('emits one completion event when a dirty turn re-projects successfully', async () => {
     const coordinator = new ProjectionWriteCoordinator();
     const { controller, onTurnCompleted } = setup({ coordinator });

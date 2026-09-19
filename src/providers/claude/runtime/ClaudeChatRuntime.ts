@@ -335,6 +335,9 @@ export class ClaudianService implements ChatRuntime {
       ...turn.metadata,
       ...update,
     };
+    if (update.userMessageId) {
+      this.transcriptObserver?.registerHostUserTranscriptId(update.userMessageId);
+    }
   }
 
   private bufferUsageChunk(

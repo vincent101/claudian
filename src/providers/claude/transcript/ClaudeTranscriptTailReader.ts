@@ -7,6 +7,7 @@ const MAX_BYTES_PER_TICK = 8 * 1024 * 1024;
 
 export interface TranscriptTailBatch {
   lines: string[];
+  lineOffsets?: number[];
   reset: boolean;
   bytesRead?: number;
 }
@@ -81,18 +82,24 @@ export class ClaudeTranscriptTailReader {
     }
     if (bytesRead === 0) return { lines: [], reset, bytesRead: 0 };
 
+    const readStart = this.byteOffset;
     this.byteOffset += bytesRead;
+    const partialStart = readStart - this.partial.length;
     const combined = Buffer.concat([this.partial, buffer.subarray(0, bytesRead)]);
     const lines: string[] = [];
+    const lineOffsets: number[] = [];
     let start = 0;
     for (let index = 0; index < combined.length; index += 1) {
       if (combined[index] !== 0x0a) continue;
       const line = combined.subarray(start, index).toString('utf8').replace(/\r$/, '');
-      if (line.trim()) lines.push(line);
+      if (line.trim()) {
+        lines.push(line);
+        lineOffsets.push(partialStart + start);
+      }
       start = index + 1;
     }
     this.partial = combined.subarray(start);
-    return { lines, reset, bytesRead };
+    return { lines, lineOffsets, reset, bytesRead };
   }
 
   start(onBatch: (batch: TranscriptTailBatch) => void | Promise<void>): void {

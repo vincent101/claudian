@@ -93,6 +93,23 @@ describe('ClaudeTranscriptTurnMapper', () => {
     expect(mapper.hasOpenTurn()).toBe(false);
   });
 
+  it('carries the terminal transcript offset into the finished event', () => {
+    const mapper = new ClaudeTranscriptTurnMapper();
+    mapper.map(peer, false, { hostUserTurnActive: false, lineOffset: 10 });
+    mapper.map(
+      { type: 'assistant', uuid: 'terminal', message: { id: 'm', role: 'assistant', content: [{ type: 'text', text: 'done' }], stop_reason: 'end_turn' } },
+      false,
+      { hostUserTurnActive: false, lineOffset: 42 },
+    );
+
+    expect(mapper.settleTerminalCandidate()).toEqual([
+      expect.objectContaining({
+        type: 'finished',
+        event: expect.objectContaining({ terminalOffset: 42 }),
+      }),
+    ]);
+  });
+
   it('settles a text-only single-row terminal exactly once', () => {
     const mapper = new ClaudeTranscriptTurnMapper();
     const events = [

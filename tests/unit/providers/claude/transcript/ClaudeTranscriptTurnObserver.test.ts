@@ -86,6 +86,48 @@ describe('ClaudeTranscriptTurnObserver', () => {
     expect(callbacks.chunk).not.toHaveBeenCalled();
   });
 
+  it('marks a delayed auto completion superseded when a later host user row exists', async () => {
+    await writeFile(file, '');
+    const { observer, callbacks } = setup();
+    await observer.start(file);
+    const generation = (observer as any).generation;
+    observer.registerHostUserTranscriptId('host-row');
+    const lines = [
+      ...peerTurn('peer-old', 'old').slice(0, -1),
+      JSON.stringify({ type: 'user', uuid: 'host-row', message: { role: 'user', content: 'new prompt' } }),
+    ];
+    await (observer as any).consumeBatch({ lines, lineOffsets: [0, 100, 200, 300], reset: false }, generation);
+    await (observer as any).settleQuietCandidate(generation);
+
+    expect(callbacks.finished).toHaveBeenCalledWith(expect.objectContaining({
+      turnId: 'peer-old',
+      terminalOffset: 200,
+      supersededByHostUser: true,
+    }));
+    observer.stop();
+  });
+
+  it('does not supersede an auto terminal that follows the latest host user row', async () => {
+    await writeFile(file, '');
+    const { observer, callbacks } = setup();
+    await observer.start(file);
+    const generation = (observer as any).generation;
+    observer.registerHostUserTranscriptId('host-row');
+    const lines = [
+      JSON.stringify({ type: 'user', uuid: 'host-row', message: { role: 'user', content: 'new prompt' } }),
+      ...peerTurn('peer-new', 'new').slice(0, -1),
+    ];
+    await (observer as any).consumeBatch({ lines, lineOffsets: [0, 100, 200, 300], reset: false }, generation);
+    await (observer as any).settleQuietCandidate(generation);
+
+    expect(callbacks.finished).toHaveBeenCalledWith(expect.objectContaining({
+      turnId: 'peer-new',
+      terminalOffset: 300,
+      supersededByHostUser: false,
+    }));
+    observer.stop();
+  });
+
   it('holds FIFO until the feature lease is available, then finishes before release', async () => {
     let available = false;
     const { observer, callbacks, order } = setup(() => available);

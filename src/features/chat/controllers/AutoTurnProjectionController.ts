@@ -417,7 +417,7 @@ export class AutoTurnProjectionController {
         this.active = null;
         this.deps.turnCoordinator.finish(event.turnId);
         this.deps.recordDiagnostic?.({ phase: 'lease_finish', turnId: event.turnId, generation: event.generation, leaseKind: 'auto' });
-        if (finalizedCleanly && reprojectionSettled) {
+        if (finalizedCleanly && reprojectionSettled && event.supersededByHostUser !== true) {
           // Emitted only after the final projection settled: save failures
           // still notify (the reply is visible), finalize failures never do.
           // Never emitted from TurnCoordinator.finish — that path also serves

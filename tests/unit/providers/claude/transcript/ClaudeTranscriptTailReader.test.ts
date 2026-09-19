@@ -29,6 +29,21 @@ describe('ClaudeTranscriptTailReader', () => {
     expect(await reader.readAvailable()).toEqual(expect.objectContaining({ lines: ['{"half":"中文"}'], reset: false }));
   });
 
+  it('reports the byte offset of each complete line across partial reads', async () => {
+    const reader = new ClaudeTranscriptTailReader(file, 8);
+    await reader.prime(5);
+    await writeFile(file, 'old!\nabc\ndefgh\n');
+
+    expect(await reader.readAvailable()).toEqual(expect.objectContaining({
+      lines: ['abc'],
+      lineOffsets: [5],
+    }));
+    expect(await reader.readAvailable()).toEqual(expect.objectContaining({
+      lines: ['defgh'],
+      lineOffsets: [9],
+    }));
+  });
+
   it('preserves UTF-8 split across byte batches and does not advance past unread bytes', async () => {
     const reader = new ClaudeTranscriptTailReader(file, 8);
     await reader.prime(0);

@@ -23,6 +23,7 @@ export type TranscriptTurnEvent =
 
 export interface TranscriptMapContext {
   hostUserTurnActive: boolean;
+  lineOffset?: number;
 }
 
 export interface TranscriptTurnStart {
@@ -64,6 +65,7 @@ interface ActiveTurn {
   currentAssistantMessageId?: string;
   assistantInstanceInterrupted: boolean;
   terminalCandidate: boolean;
+  terminalOffset?: number;
 }
 
 export class ClaudeTranscriptTurnMapper {
@@ -157,7 +159,9 @@ export class ClaudeTranscriptTurnMapper {
 
     if (message.type === 'assistant' && message.message?.stop_reason === 'end_turn') {
       active.terminalCandidate = true;
+      active.terminalOffset = context.lineOffset;
     } else if (message.type === 'result') {
+      active.terminalOffset = context.lineOffset;
       events.push(...this.finishActive(replay));
     } else if (stopHookBlockFeedback) {
       active.terminalCandidate = false;
@@ -202,6 +206,7 @@ export class ClaudeTranscriptTurnMapper {
       generation: active.generation,
       metadata: { assistantMessageId: active.assistantMessageId },
       replay,
+      terminalOffset: active.terminalOffset,
     } }];
   }
 }
