@@ -125,7 +125,9 @@
       "locating": "Localizando…",
       "locateDeferred": "Respuesta en curso: se localizará este resultado al finalizar.",
       "retryError": "No se pudo localizar el resultado. Inténtalo de nuevo.",
-      "projectionMismatch": "Este resultado ya no coincide con el mensaje renderizado."
+      "projectionMismatch": "Este resultado ya no coincide con el mensaje renderizado.",
+      "snapshotStale": "La instantánea puede estar desactualizada",
+      "snapshotRetry": "Reintentar"
     },
     "message": {
       "timestamp": "Enviado: {time}",

@@ -447,5 +447,150 @@ describe('HistorySearchController', () => {
       expect(messages.querySelector<HTMLElement>('[data-message-id="m2"] mark')?.classList.contains('is-current')).toBe(true);
       expect(messages.querySelector<HTMLElement>('[data-message-id="m3"] mark')).toBeNull();
     });
+
+    describe('snapshot refresh state machine', () => {
+      const settle = async (): Promise<void> => {
+        for (let index = 0; index < 8; index += 1) await Promise.resolve();
+      };
+      const staleEl = (): HTMLElement | null => root.querySelector('.claudian-history-search-stale');
+      const retryEl = (): HTMLButtonElement | null => root.querySelector('.claudian-history-search-retry');
+
+      it('keeps the stale snapshot searchable after a failed refresh and never auto-retries', async () => {
+        mountMessage('m1', 'needle one');
+        mountMessage('m2', 'needle two');
+        locate.mockImplementation(async result => {
+          const element = messages.querySelector<HTMLElement>(`[data-message-id="${result.projectionKey}"]`);
+          // jsdom does not implement scrollIntoView; production only needs it to exist.
+          if (element) element.scrollIntoView = () => {};
+          return element;
+        });
+        refreshSnapshot.mockRejectedValue(new Error('index build failed'));
+        const instance = makeController();
+        instance.open();
+        await typeQuery(instance, 'needle');
+
+        // The old snapshot still answers the query; the failure surfaces as
+        // a stale hint with a Retry affordance, not a fatal error banner.
+        expect(searchHistory).toHaveBeenCalledTimes(1);
+        expect(root.querySelector('.claudian-history-search-error')).toBeNull();
+        expect(staleEl()?.textContent).toBeTruthy();
+        expect(retryEl()).not.toBeNull();
+
+        await typeQuery(instance, 'needle t');
+        await typeQuery(instance, 'needle th');
+        // Keystrokes in the same open reuse the stale snapshot: exactly one
+        // acquire attempt per open, no per-key retries.
+        expect(refreshSnapshot).toHaveBeenCalledTimes(1);
+        expect(searchHistory).toHaveBeenCalledTimes(3);
+        // The hint coexists with the result count instead of hiding it.
+        expect(root.querySelector('.claudian-history-search-status')?.textContent).toBeTruthy();
+      });
+
+      it('treats a lease-less refresh as a normal capability branch without a stale hint', async () => {
+        refreshSnapshot.mockResolvedValue({ status: 'not_applicable', reason: 'provider_without_index' });
+        const instance = makeController();
+        instance.open();
+        await typeQuery(instance, 'needle');
+
+        // Codex/OpenCode DOM search is the designed path here: no warning,
+        // no retry affordance, and the search itself ran.
+        expect(refreshSnapshot).toHaveBeenCalledTimes(1);
+        expect(searchHistory).toHaveBeenCalledTimes(1);
+        expect(staleEl()).toBeNull();
+        expect(retryEl()).toBeNull();
+      });
+
+      it('recovers through the explicit Retry affordance and re-runs the current query', async () => {
+        refreshSnapshot.mockRejectedValueOnce(new Error('index build failed'));
+        const instance = makeController();
+        instance.open();
+        await typeQuery(instance, 'needle');
+        expect(staleEl()).not.toBeNull();
+
+        refreshSnapshot.mockResolvedValue({ status: 'rebuilt' });
+        retryEl()!.click();
+        await settle();
+
+        // The retry re-acquired exactly once, cleared the stale state, and
+        // re-ran the active query on the fresh snapshot.
+        expect(refreshSnapshot).toHaveBeenCalledTimes(2);
+        expect(searchHistory).toHaveBeenCalledTimes(2);
+        expect(staleEl()).toBeNull();
+        expect(retryEl()).toBeNull();
+      });
+
+      it('stays stale when the explicit retry fails again', async () => {
+        refreshSnapshot.mockRejectedValue(new Error('index build failed'));
+        const instance = makeController();
+        instance.open();
+        await typeQuery(instance, 'needle');
+
+        retryEl()!.click();
+        await settle();
+
+        expect(refreshSnapshot).toHaveBeenCalledTimes(2);
+        expect(staleEl()).not.toBeNull();
+        expect(retryEl()).not.toBeNull();
+      });
+
+      it('merges concurrent retry and stream-completion refreshes into one acquire', async () => {
+        refreshSnapshot.mockRejectedValueOnce(new Error('index build failed'));
+        const instance = makeController();
+        instance.open();
+        await typeQuery(instance, 'needle');
+        expect(refreshSnapshot).toHaveBeenCalledTimes(1);
+
+        let releaseRefresh!: (value: { status: 'rebuilt' }) => void;
+        refreshSnapshot.mockImplementationOnce(() => new Promise(resolve => { releaseRefresh = resolve; }));
+        retryEl()!.click();
+        // The stream completes while the retry refresh is still in flight:
+        // both must join the same acquire, not stack a second rebuild.
+        instance.onStreamComplete();
+        await Promise.resolve();
+        releaseRefresh({ status: 'rebuilt' });
+        await settle();
+
+        expect(refreshSnapshot).toHaveBeenCalledTimes(2);
+        // First query plus exactly one post-refresh re-run (the superseded
+        // generation's search bails before querying).
+        expect(searchHistory).toHaveBeenCalledTimes(2);
+        expect(staleEl()).toBeNull();
+      });
+
+      it('shows the stale hint instead of a fatal error when the stream-completion refresh fails', async () => {
+        mountMessage('m1', 'needle one');
+        mountMessage('m2', 'needle two');
+        refreshSnapshot.mockResolvedValue({ status: 'rebuilt' });
+        const instance = makeController();
+        instance.open();
+        await typeQuery(instance, 'needle');
+
+        refreshSnapshot.mockRejectedValueOnce(new Error('index build failed'));
+        instance.onStreamComplete();
+        await settle();
+
+        expect(root.querySelector('.claudian-history-search-error')).toBeNull();
+        expect(staleEl()).not.toBeNull();
+        // Results from the old snapshot stay visible and searchable.
+        expect(searchHistory).toHaveBeenCalledTimes(1);
+      });
+
+      it('re-arms the per-open auto refresh after close and reopen', async () => {
+        refreshSnapshot.mockRejectedValue(new Error('index build failed'));
+        const instance = makeController();
+        instance.open();
+        await typeQuery(instance, 'needle');
+        expect(refreshSnapshot).toHaveBeenCalledTimes(1);
+
+        instance.close({ restoreFocus: false });
+        instance.open();
+        await typeQuery(instance, 'needle');
+
+        // A fresh open must retry the rebind: the failed open's state is
+        // not allowed to stick across opens.
+        expect(refreshSnapshot).toHaveBeenCalledTimes(2);
+        expect(staleEl()).not.toBeNull();
+      });
+    });
   });
 });

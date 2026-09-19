@@ -125,7 +125,9 @@
       "locating": "Localisation…",
       "locateDeferred": "Réponse en cours — cette correspondance sera localisée une fois terminée.",
       "retryError": "Impossible de localiser ce résultat. Réessayez.",
-      "projectionMismatch": "Ce résultat ne correspond plus au message affiché."
+      "projectionMismatch": "Ce résultat ne correspond plus au message affiché.",
+      "snapshotStale": "L'instantané est peut-être obsolète",
+      "snapshotRetry": "Réessayer"
     },
     "message": {
       "timestamp": "Envoyé à {time}",

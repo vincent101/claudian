@@ -140,6 +140,18 @@
   text-align: center;
 }
 
+/* Non-fatal staleness hint: sits beside the result count and never hides results. */
+.claudian-history-search-stale {
+  flex: none;
+  color: var(--text-warning, var(--text-muted));
+  font-size: var(--font-smallest);
+}
+
+.claudian-history-search-retry {
+  flex: none;
+  font-size: var(--font-smallest);
+}
+
 .claudian-search-match {
   padding: 0;
   background: color-mix(in srgb, var(--text-highlight-bg) 55%, transparent);

@@ -125,7 +125,9 @@
       "locating": "Wird gesucht…",
       "locateDeferred": "Antwort läuft — dieser Treffer wird nach Abschluss lokalisiert.",
       "retryError": "Ergebnis konnte nicht gefunden werden. Erneut versuchen.",
-      "projectionMismatch": "Dieses Ergebnis stimmt nicht mehr mit der gerenderten Nachricht überein."
+      "projectionMismatch": "Dieses Ergebnis stimmt nicht mehr mit der gerenderten Nachricht überein.",
+      "snapshotStale": "Snapshot ist möglicherweise veraltet",
+      "snapshotRetry": "Erneut versuchen"
     },
     "message": {
       "timestamp": "Gesendet: {time}",

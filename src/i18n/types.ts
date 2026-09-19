@@ -95,6 +95,8 @@ export type TranslationKey =
   | 'chat.search.locateDeferred'
   | 'chat.search.retryError'
   | 'chat.search.projectionMismatch'
+  | 'chat.search.snapshotStale'
+  | 'chat.search.snapshotRetry'
   | 'chat.message.timestamp'
   | 'chat.message.expandFullContent'
   | 'chat.message.contentTruncatedNote'

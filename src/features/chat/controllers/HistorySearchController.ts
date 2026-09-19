@@ -101,6 +101,15 @@ interface HistorySearchControllerDeps {
 interface CloseOptions { restoreFocus?: boolean }
 interface MarkEntry { generation: number; marks: HTMLElement[] }
 
+/**
+ * Per-open snapshot binding state. `idle` rebinds once on the first
+ * non-empty query; `refreshing` covers the in-flight acquire; `fresh`
+ * (including capability branches where no refresh applies) and `stale`
+ * stop auto-refreshing for the rest of the open — keystrokes only ever
+ * search the snapshot that is already bound.
+ */
+type SnapshotRefreshState = 'idle' | 'refreshing' | 'fresh' | 'stale';
+
 export class HistorySearchController {
   private panel: HTMLElement | null = null;
   private input: HTMLInputElement | null = null;
@@ -113,12 +122,14 @@ export class HistorySearchController {
   private generation = 0;
   private openingFocus: HTMLElement | null = null;
   private locating = false;
+  private snapshotState: SnapshotRefreshState = 'idle';
   /**
-   * Whether this open already rebound to a fresh snapshot. The first
-   * non-empty query of each open refreshes once; later keystrokes reuse it so
-   * typing never rebuilds the index per key.
+   * In-flight refresh shared by every trigger (first query, stream
+   * completion, Retry) so concurrent triggers join one acquire instead of
+   * stacking rebuilds. Cleared on close: a reopened panel must never join a
+   * refresh that was aimed at the previous open's conversation.
    */
-  private snapshotRefreshed = false;
+  private refreshInFlight: Promise<HistorySearchSnapshotRefreshResult | void> | null = null;
   private readonly registry = new Map<string, MarkEntry>();
   private readonly eventDocument: Document | null;
   private readonly onDocumentKeyDown = (event: KeyboardEvent): void => {
@@ -139,7 +150,7 @@ export class HistorySearchController {
     if (this.panel) { this.input?.focus(); this.input?.select(); return; }
     // A new open must rebind: turns that completed while the panel was
     // closed are invisible to the snapshot the tab acquired earlier.
-    this.snapshotRefreshed = false;
+    this.snapshotState = 'idle';
     this.openingFocus = this.eventDocument?.activeElement instanceof HTMLElement ? this.eventDocument.activeElement : null;
     if (!this.eventDocument) return;
     const panel = this.eventDocument.createElement('div'); panel.className = 'claudian-history-search';
@@ -158,6 +169,9 @@ export class HistorySearchController {
   close(options: CloseOptions = {}): void {
     const focusTarget = this.openingFocus; this.generation += 1;
     if (this.timer) clearTimeout(this.timer);
+    // Detach from any still-running refresh: the next open rebinds from
+    // scratch and must not inherit this open's in-flight acquire.
+    this.refreshInFlight = null;
     this.timer = null; this.clearHighlights(); this.panel?.remove();
     this.panel = null; this.input = null; this.statusEl = null; this.previousButton = null; this.nextButton = null;
     this.results = []; this.selectedIndex = -1; this.openingFocus = null;
@@ -168,16 +182,48 @@ export class HistorySearchController {
   onMessageContentRendered(projectionKey: string): void { if (this.panel && this.input?.value.trim()) this.applyMarks(projectionKey, this.generation); }
   onStreamComplete(): void {
     if (!this.panel || !this.input?.value.trim()) return;
+    this.refreshSnapshotAndRerun();
+  }
+
+  /**
+   * Joins the in-flight refresh or starts one. Concurrent triggers (the
+   * first query racing stream completion or the Retry button) share a single
+   * acquire; a settled refresh is never reused by a later trigger. The
+   * original promise is handed out untouched — the side `.then` only clears
+   * the slot and adds no microtask hops for awaiting callers.
+   */
+  private refreshSnapshotOnce(): Promise<HistorySearchSnapshotRefreshResult | void> {
+    const existing = this.refreshInFlight;
+    if (existing) return existing;
+    const request = this.deps.refreshSearchSnapshot?.() ?? Promise.resolve();
+    this.refreshInFlight = request;
+    const clear = (): void => {
+      if (this.refreshInFlight === request) this.refreshInFlight = null;
+    };
+    void request.then(clear, clear);
+    return request;
+  }
+
+  /**
+   * Explicit refresh (stream completion or the Retry affordance). Unlike the
+   * per-open auto refresh this runs regardless of the current state — new
+   * content just landed or the user asked for it — and only a successful
+   * rebind re-runs the active query; a failure marks the open stale while
+   * the old snapshot results stay visible.
+   */
+  private refreshSnapshotAndRerun(): void {
+    if (!this.panel) return;
     const generation = ++this.generation;
     void (async () => {
       try {
-        await this.deps.refreshSearchSnapshot?.();
-        // The stream-completion refresh already rebound this open.
-        this.snapshotRefreshed = true;
-        if (generation === this.generation) await this.runSearch(generation, true);
+        await this.refreshSnapshotOnce();
+        this.snapshotState = 'fresh';
       } catch {
-        if (generation === this.generation && this.panel) this.renderError(t('chat.search.error'));
+        this.snapshotState = 'stale';
+        if (generation === this.generation && this.panel) this.renderStatus();
+        return;
       }
+      if (generation === this.generation && this.panel) await this.runSearch(generation, true);
     })();
   }
 
@@ -199,13 +245,17 @@ export class HistorySearchController {
     if (!conversationId || !query) { this.results = []; this.selectedIndex = -1; this.renderStatus(); return; }
     // Rebind once per open before the first real query: the tab's fixed
     // snapshot predates the panel and may miss turns that finished while the
-    // panel was closed. A failed refresh keeps the old snapshot usable; this
-    // open still stops retrying so keystrokes never rebuild the index.
-    if (!this.snapshotRefreshed) {
-      this.snapshotRefreshed = true;
+    // panel was closed. A failed refresh keeps the old snapshot searchable
+    // and marks this open stale (only Retry or a reopen rebinds); later
+    // keystrokes reuse the bound snapshot so typing never rebuilds per key.
+    if (this.snapshotState === 'idle') {
+      this.snapshotState = 'refreshing';
       try {
-        await this.deps.refreshSearchSnapshot?.();
-      } catch { /* stale snapshot stays searchable */ }
+        await this.refreshSnapshotOnce();
+        this.snapshotState = 'fresh';
+      } catch {
+        this.snapshotState = 'stale';
+      }
       if (generation !== this.generation || !this.panel) return;
     }
     this.setBusy(t('chat.search.indexing'));
@@ -283,6 +333,37 @@ export class HistorySearchController {
     if (this.previousButton) this.previousButton.disabled = this.selectedIndex <= 0 || this.locating;
     if (this.nextButton) this.nextButton.disabled = this.selectedIndex < 0 || this.selectedIndex >= this.results.length - 1 || this.locating;
     this.panel?.querySelector('.claudian-history-search-error')?.remove();
+    this.syncStaleIndicator();
+  }
+
+  /**
+   * The stale hint and its Retry sit next to the result count: a lagging
+   * snapshot must not hide results that are still truthfully searchable.
+   * This is presentation only — `results` stays the single truth for marks,
+   * counts and navigation.
+   */
+  private syncStaleIndicator(): void {
+    if (!this.panel) return;
+    const stale = this.panel.querySelector<HTMLElement>('.claudian-history-search-stale');
+    const retry = this.panel.querySelector<HTMLButtonElement>('.claudian-history-search-retry');
+    if (this.snapshotState !== 'stale') {
+      stale?.remove();
+      retry?.remove();
+      return;
+    }
+    if (stale && retry) return;
+    const warning = this.deps.rootEl.ownerDocument.createElement('span');
+    warning.className = 'claudian-history-search-stale';
+    warning.textContent = t('chat.search.snapshotStale');
+    const button = this.deps.rootEl.ownerDocument.createElement('button');
+    button.type = 'button';
+    button.className = 'claudian-history-search-retry';
+    button.textContent = t('chat.search.snapshotRetry');
+    button.setAttribute('aria-label', t('chat.search.snapshotRetry'));
+    button.title = t('chat.search.snapshotRetry');
+    button.addEventListener('click', () => this.refreshSnapshotAndRerun());
+    if (this.previousButton) this.previousButton.before(warning, button);
+    else this.panel.append(warning, button);
   }
   private renderError(message: string): void {
     if (!this.panel) return;

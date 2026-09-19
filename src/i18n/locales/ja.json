@@ -125,7 +125,9 @@
       "locating": "移動中…",
       "locateDeferred": "応答が進行中のため、完了後にこの検索結果へ移動します。",
       "retryError": "結果を表示できません。再試行してください。",
-      "projectionMismatch": "この結果は表示されたメッセージと一致しなくなりました。"
+      "projectionMismatch": "この結果は表示されたメッセージと一致しなくなりました。",
+      "snapshotStale": "スナップショットが最新でない可能性があります",
+      "snapshotRetry": "再試行"
     },
     "message": {
       "timestamp": "送信日時: {time}",

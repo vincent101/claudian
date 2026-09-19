@@ -125,7 +125,9 @@
       "locating": "定位中…",
       "locateDeferred": "回應進行中，將在回應完成後定位該結果。",
       "retryError": "無法定位此結果，請重試。",
-      "projectionMismatch": "此結果與目前顯示內容不再相符。"
+      "projectionMismatch": "此結果與目前顯示內容不再相符。",
+      "snapshotStale": "快照可能過時",
+      "snapshotRetry": "重試"
     },
     "message": {
       "timestamp": "傳送於 {time}",

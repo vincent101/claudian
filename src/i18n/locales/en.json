@@ -125,7 +125,9 @@
       "locating": "Locating…",
       "locateDeferred": "Response in progress — this match will be located when it completes.",
       "retryError": "Unable to locate this result. Try again.",
-      "projectionMismatch": "This result no longer matches the rendered message."
+      "projectionMismatch": "This result no longer matches the rendered message.",
+      "snapshotStale": "Snapshot may be out of date",
+      "snapshotRetry": "Retry"
     },
     "message": {
       "timestamp": "Sent {time}",
