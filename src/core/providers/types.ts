@@ -460,6 +460,12 @@ export interface HistoryIndexLease {
   conversationId: string;
   /** Fixed total from the index snapshot acquired for this lease. */
   totalTurns: number;
+  /**
+   * Provenance of the acquired snapshot — 'rebuilt' (at least one segment
+   * rescanned) or 'cache_hit' (identical snapshot already indexed). Undefined
+   * until `ready` settles, and only set by services that can report it.
+   */
+  acquireOutcome?: 'rebuilt' | 'cache_hit';
   ready: Promise<void>;
   search(query: string): Promise<HistorySearchResult[]>;
   loadMessageDetail(

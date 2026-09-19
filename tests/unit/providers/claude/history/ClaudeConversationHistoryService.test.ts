@@ -134,6 +134,27 @@ describe('ClaudeConversationHistoryService M1 fuse', () => {
     second.release();
   });
 
+  it('reports the lease acquire outcome from the segment builds', async () => {
+    const turns = [{ turnId: 'u0', startEntry: 0, endEntry: 0, sourceBytes: 8 }];
+    const index = { filePath: '/current', dev: 1, ino: 1, snapshotSize: 10, mtimeMs: 1, committedSize: 10, entries: [], turns, searchCorpus: [], searchText: '', skippedLines: 0, buildDurationMs: 1, peakWorkerHeapBytes: 1 };
+    mockSdkSessionExists.mockImplementation((_vault, session) => session === 'current-session');
+    const service = new ClaudeConversationHistoryService();
+    const conversation = createConversation();
+
+    mockBuildTranscriptIndex.mockResolvedValueOnce({ status: 'complete', index });
+    const rebuilt = service.acquireHistoryIndex(conversation, '/vault', undefined, true);
+    // The outcome is only knowable once the build settles.
+    expect(rebuilt.acquireOutcome).toBeUndefined();
+    await rebuilt.ready;
+    expect(rebuilt.acquireOutcome).toBe('rebuilt');
+
+    mockBuildTranscriptIndex.mockResolvedValueOnce({ status: 'complete', index, fromCache: true });
+    const cached = service.acquireHistoryIndex(conversation, '/vault', undefined, true);
+    await cached.ready;
+    expect(cached.acquireOutcome).toBe('cache_hit');
+    rebuilt.release(); cached.release();
+  });
+
   it('enumerates every non-overlapping match with stable projection ordinals', async () => {
     const searchText = 'needle needle needleneedle';
     const searchCorpus = [

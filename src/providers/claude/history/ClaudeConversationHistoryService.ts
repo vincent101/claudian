@@ -84,6 +84,8 @@ interface ConversationIndexState {
   vaultPath: string;
   segments: IndexedSegment[];
   flattenedTurns: Array<{ segment: IndexedSegment; turnIndex: number }>;
+  /** Provenance of this state: any segment rescanned ('rebuilt') or every segment served from the completed index cache ('cache_hit'). */
+  acquireOutcome: 'rebuilt' | 'cache_hit';
 }
 
 interface SharedHistoryIndex {
@@ -238,10 +240,17 @@ export class ClaudeConversationHistoryService implements ProviderConversationHis
     shared.refs += 1;
     const fixed = shared;
     let released = false;
-    const ready = fixed.ready.then(() => undefined);
+    let acquireOutcome: 'rebuilt' | 'cache_hit' | undefined;
+    const ready = fixed.ready.then(state => {
+      acquireOutcome = state.acquireOutcome;
+    });
     return {
       conversationId: conversation.id,
       get totalTurns() { return fixed.state?.flattenedTurns.length ?? 0; },
+      // Defined once ready settles: tells refresh callers whether the acquire
+      // actually rescanned or the completed index cache already had this
+      // exact snapshot (nothing new to pick up).
+      get acquireOutcome() { return acquireOutcome; },
       ready,
       search: async query => this.searchIndex(await fixed.ready, query),
       loadMessageDetail: async (projectionKey, options) =>
@@ -281,6 +290,7 @@ export class ClaudeConversationHistoryService implements ProviderConversationHis
     if (!currentSessionId) throw new Error('Conversation has no Claude session');
     const sessionIds = [...(providerState.previousProviderSessionIds ?? []), currentSessionId];
     const segments: IndexedSegment[] = [];
+    let anySegmentRescanned = false;
     onProgress?.({ phase: 'queued' });
     for (let segmentOrdinal = 0; segmentOrdinal < sessionIds.length; segmentOrdinal += 1) {
       const sessionId = sessionIds[segmentOrdinal];
@@ -297,6 +307,7 @@ export class ClaudeConversationHistoryService implements ProviderConversationHis
         onFinalize: () => onProgress?.({ phase: 'finalizing' }),
       });
       if (result.status === 'failed') throw new Error(result.error);
+      if (!result.fromCache) anySegmentRescanned = true;
       if (result.status === 'partial') {
         // A partial snapshot still serves its committed prefix: search,
         // paging, titles and windows all operate on complete lines only. The
@@ -313,7 +324,7 @@ export class ClaudeConversationHistoryService implements ProviderConversationHis
     const flattenedTurns = segments.flatMap(segment =>
       segment.index.turns.map((_, turnIndex) => ({ segment, turnIndex }))
     );
-    return { conversationId: conversation.id, vaultPath, segments, flattenedTurns };
+    return { conversationId: conversation.id, vaultPath, segments, flattenedTurns, acquireOutcome: anySegmentRescanned ? 'rebuilt' : 'cache_hit' };
   }
 
   private searchIndex(state: ConversationIndexState, query: string): HistorySearchResult[] {

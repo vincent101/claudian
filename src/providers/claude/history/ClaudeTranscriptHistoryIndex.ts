@@ -95,8 +95,8 @@ export interface TranscriptHistoryIndex {
 }
 
 export type TranscriptIndexResult =
-  | { status: 'complete'; index: TranscriptHistoryIndex }
-  | { status: 'partial'; index: TranscriptHistoryIndex; error: string }
+  | { status: 'complete'; index: TranscriptHistoryIndex; fromCache?: true }
+  | { status: 'partial'; index: TranscriptHistoryIndex; error: string; fromCache?: true }
   | { status: 'failed'; error: string };
 
 export interface TranscriptLineSkipEvent {
@@ -763,25 +763,26 @@ async function buildDirect(filePath: string, options: BuildOptions): Promise<Tra
 
 const MAX_COMPLETED_INDEXES = 8;
 const MAX_COMPLETED_INDEX_METADATA_BYTES = 128 * 1024 * 1024;
-const completed = new Map<string, TranscriptIndexResult>();
+/** Only successful builds enter the completed cache; failed results are never cached. */
+type CompletedCacheEntry = Exclude<TranscriptIndexResult, { status: 'failed' }>;
+const completed = new Map<string, CompletedCacheEntry>();
 const inFlight = new Map<string, Promise<TranscriptIndexResult>>();
 const protectedPaths = new Map<string, number>();
 
-function touchCompleted(key: string, result: TranscriptIndexResult): void {
+function touchCompleted(key: string, result: CompletedCacheEntry): void {
   completed.delete(key);
   completed.set(key, result);
 }
 
-function isProtectedCompletedKey(key: string, result: TranscriptIndexResult): boolean {
-  if (result.status === 'failed' || !protectedPaths.has(result.index.filePath)) return false;
+function isProtectedCompletedKey(key: string, result: CompletedCacheEntry): boolean {
+  if (!protectedPaths.has(result.index.filePath)) return false;
   const keys = [...completed.entries()]
-    .filter(([, candidate]) => candidate.status !== 'failed' && candidate.index.filePath === result.index.filePath)
+    .filter(([, candidate]) => candidate.index.filePath === result.index.filePath)
     .map(([candidateKey]) => candidateKey);
   return keys[keys.length - 1] === key;
 }
 
-function estimateIndexMetadataBytes(result: TranscriptIndexResult): number {
-  if (result.status === 'failed') return 0;
+function estimateIndexMetadataBytes(result: CompletedCacheEntry): number {
   const index = result.index;
   return index.searchText.length * 2
     + index.entries.length * 192
@@ -1116,7 +1117,11 @@ export function buildTranscriptIndex(filePath: string, options: BuildOptions = {
     if (cached) {
       touchCompleted(key, cached);
       diagnosticSink?.({ phase: 'cache_hit' });
-      return cached;
+      // Mark on a copy: the stored object stays pristine so this caller's
+      // "served without a rescan" flag never leaks into other consumers of
+      // the same completed entry.
+      const served: TranscriptIndexResult = { ...cached, fromCache: true };
+      return served;
     }
     const existing = inFlight.get(key);
     if (existing) return existing;
@@ -1258,7 +1263,7 @@ export function releaseTranscriptIndex(filePath: string): void {
 /** Evicts only unprotected completed indexes; active and in-flight indexes survive. */
 export function clearTranscriptIndexCache(): void {
   for (const [key, result] of completed) {
-    if (result.status === 'failed' || !isProtectedCompletedKey(key, result)) completed.delete(key);
+    if (!isProtectedCompletedKey(key, result)) completed.delete(key);
   }
   evictCompleted();
 }

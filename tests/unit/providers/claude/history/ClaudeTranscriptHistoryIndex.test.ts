@@ -272,10 +272,35 @@ describe('ClaudeTranscriptHistoryIndex', () => {
     await writeFile(path, `${JSON.stringify({ type: 'user', uuid: 'u1', message: { content: 'x' } })}\n`);
     const first = await buildTranscriptIndex(path, { useWorker: false });
     expect(first.status).toBe('complete');
+    if (first.status !== 'complete') return;
     // A released lease must not wipe the completed cache; the same snapshot
-    // rebuild resolves to the cached result object without a second scan.
+    // rebuild resolves without a second scan (the index object is shared).
     const second = await buildTranscriptIndex(path, { useWorker: false });
-    expect(second).toBe(first);
+    expect(second.status).toBe('complete');
+    if (second.status !== 'complete') return;
+    expect(second.index).toBe(first.index);
+  });
+
+  it('marks completed-cache results as fromCache and rescans changed transcripts', async () => {
+    clearTranscriptIndexCache();
+    const path = join(process.env.TMPDIR ?? '/tmp', `claudian-from-cache-${process.pid}.jsonl`);
+    await writeFile(path, `${JSON.stringify({ type: 'user', uuid: 'u1', message: { content: 'x' } })}\n`);
+    const first = await buildTranscriptIndex(path, { useWorker: false });
+    expect(first.status).toBe('complete');
+    if (first.status !== 'complete') return;
+    expect(first.fromCache).toBeUndefined();
+    const second = await buildTranscriptIndex(path, { useWorker: false });
+    expect(second.status).toBe('complete');
+    if (second.status !== 'complete') return;
+    // Same snapshot: served from the completed cache and marked so callers
+    // can tell "nothing new" from a real rescan; the index object is shared.
+    expect(second.fromCache).toBe(true);
+    expect(second.index).toBe(first.index);
+    await writeFile(path, `${JSON.stringify({ type: 'user', uuid: 'u2', message: { content: 'y' } })}\n`);
+    const third = await buildTranscriptIndex(path, { useWorker: false });
+    expect(third.status).toBe('complete');
+    if (third.status !== 'complete') return;
+    expect(third.fromCache).toBeUndefined();
   });
 
   it('keeps at most eight unprotected completed indexes', async () => {
