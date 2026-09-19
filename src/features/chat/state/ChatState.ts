@@ -1,5 +1,5 @@
 import type { UsageInfo } from '../../../core/types';
-import { recordHistoryRenderEvent } from '../history/HistoryDiagnostics';
+import { recordHistoryDiagnosticEvent } from '../history/HistoryDiagnostics';
 import { HistoryPageStore } from '../history/HistoryPageStore';
 import type {
   ChatMessage,
@@ -21,7 +21,7 @@ function createInitialState(): ChatStateData {
     historyLoading: false,
     historyError: null,
     historySnapshotOffset: null,
-    historyPageStore: new HistoryPageStore({ onDiagnostic: recordHistoryRenderEvent }),
+    historyPageStore: new HistoryPageStore({ onDiagnostic: recordHistoryDiagnosticEvent }),
     isStreaming: false,
     cancelRequested: false,
     streamGeneration: 0,

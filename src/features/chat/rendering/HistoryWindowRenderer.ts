@@ -1,6 +1,6 @@
 import type { HistoryWindowPage } from '../../../core/providers/types';
 import type { ChatMessage } from '../../../core/types';
-import { recordHistoryRenderEvent } from '../history/HistoryDiagnostics';
+import { recordHistoryDiagnosticEvent } from '../history/HistoryDiagnostics';
 import type { HistoryPageRecord, HistoryPageStore } from '../history/HistoryPageStore';
 import type { ProjectionWriteCoordinator, StoredIntentDirection } from './ProjectionWriteCoordinator';
 
@@ -343,7 +343,7 @@ export class HistoryWindowRenderer {
     const overLimitVisible = mounted.find(page => this.visiblePages.has(page.pageKey)
       && page.range.end - page.range.start > HISTORY_WINDOW_LIMITS.hardMountedTurns);
     if (overLimitVisible) {
-      recordHistoryRenderEvent({
+      recordHistoryDiagnosticEvent({
         kind: 'dom_overcommit',
         pageKey: overLimitVisible.pageKey,
         turns: overLimitVisible.range.end - overLimitVisible.range.start,
@@ -371,7 +371,7 @@ export class HistoryWindowRenderer {
       this.options.pageStore.recordHeight(record.pageKey, ticket, rect.height, this.options.viewport.clientWidth, 'measured');
     } else {
       this.options.pageStore.recordHeight(record.pageKey, ticket, rect.height, this.options.viewport.clientWidth, 'estimated');
-      recordHistoryRenderEvent({
+      recordHistoryDiagnosticEvent({
         kind: 'page_render_timeout',
         pageKey: record.pageKey,
         ticket,

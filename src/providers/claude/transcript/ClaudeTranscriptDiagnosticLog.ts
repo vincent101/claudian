@@ -12,7 +12,8 @@ export type TranscriptDiagnosticPhase =
   | 'window_planned' | 'window_complete'
   | 'cache_hit' | 'cache_evict' | 'cache_overcommit'
   | 'line_skipped' | 'partial_snapshot' | 'stale_partial_segment'
-  | 'page_render_timeout' | 'page_data_overcommit' | 'dom_overcommit';
+  | 'page_render_timeout' | 'page_data_overcommit' | 'dom_overcommit'
+  | 'search_snapshot_refresh';
 
 export interface TranscriptDiagnosticEvent {
   phase: TranscriptDiagnosticPhase;
@@ -28,7 +29,8 @@ export interface TranscriptDiagnosticEvent {
   errorName?: string;
   buildId?: string;
   mode?: 'worker' | 'direct';
-  reason?: 'oversized' | 'malformed';
+  reason?: 'oversized' | 'malformed' | 'no_conversation' | 'no_lease' | 'provider_without_index';
+  outcome?: 'rebuilt' | 'cache_hit' | 'not_applicable' | 'failed';
   offset?: number;
   queueMs?: number;
   bytes?: number;
@@ -86,7 +88,7 @@ export class ClaudeTranscriptDiagnosticLog {
 
   private serialize(event: TranscriptDiagnosticEvent): string {
     const clean: Record<string, unknown> = { ts: Date.now(), seq: ++this.seq, phase: event.phase };
-    for (const key of ['tabIdHash', 'turnIdHash', 'generation', 'renderTicket', 'projectedWeight', 'leaseKind', 'batchBytes', 'batchLines', 'elapsedMs', 'errorName', 'buildId', 'mode', 'queueMs', 'bytes', 'totalBytes', 'entries', 'turns', 'turnCount', 'sourceBytes', 'projectedChars', 'oversizedTurns'] as const) {
+    for (const key of ['tabIdHash', 'turnIdHash', 'generation', 'renderTicket', 'projectedWeight', 'leaseKind', 'batchBytes', 'batchLines', 'elapsedMs', 'errorName', 'buildId', 'mode', 'reason', 'outcome', 'queueMs', 'bytes', 'totalBytes', 'entries', 'turns', 'turnCount', 'sourceBytes', 'projectedChars', 'oversizedTurns'] as const) {
       const value = event[key];
       if (value !== undefined) clean[key] = typeof value === 'string' ? value.slice(0, 128) : value;
     }

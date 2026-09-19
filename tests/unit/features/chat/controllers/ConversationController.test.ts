@@ -4,6 +4,7 @@ import { Menu, Notice } from 'obsidian';
 import { ProviderRegistry } from '@/core/providers/ProviderRegistry';
 import { ConversationController, type ConversationControllerDeps } from '@/features/chat/controllers/ConversationController';
 import * as historySearchModule from '@/features/chat/controllers/HistorySearchController';
+import { type HistoryDiagnosticEvent, setHistoryDiagnosticsSink } from '@/features/chat/history/HistoryDiagnostics';
 import { ProjectionWriteCoordinator } from '@/features/chat/rendering/ProjectionWriteCoordinator';
 import { ChatState } from '@/features/chat/state/ChatState';
 import { claudeChatUIConfig } from '@/providers/claude/ui/ClaudeChatUIConfig';
@@ -476,6 +477,92 @@ describe('ConversationController', () => {
 
       expect(service.acquireHistoryIndex).toHaveBeenCalledWith(conversation, '/vault', undefined, true);
       expect(previous.release).toHaveBeenCalled();
+    });
+
+    describe('search snapshot refresh contract', () => {
+      const conversation = { id: 'large', providerId: 'claude', title: 'Large', messages: [], sessionId: 'session', createdAt: 1, updatedAt: 1 } as any;
+
+      const mountLeasedTab = (lease: unknown, service = { acquireHistoryIndex: jest.fn().mockReturnValue(lease) }): void => {
+        deps.state.currentConversationId = 'large';
+        (deps.plugin.getConversationSync as jest.Mock).mockReturnValue(conversation);
+        deps.state.historyLease = lease as any;
+        deps.getHistoryIndexCapableService = () => service as any;
+      };
+
+      it('reports rebuilt vs cache_hit from the lease acquire outcome, never by guessing', async () => {
+        const previous = makeLease(100);
+        const silentNext = makeLease(100);
+        mountLeasedTab(previous, { acquireHistoryIndex: jest.fn().mockReturnValue(silentNext) });
+
+        // A service that cannot refine the outcome still mounted a new
+        // snapshot: the honest report is rebuilt (an acquire ran).
+        await expect(controller.refreshHistorySearchSnapshot()).resolves.toEqual({ status: 'rebuilt' });
+
+        const cachedNext = { ...makeLease(100), acquireOutcome: 'cache_hit' as const };
+        const service = { acquireHistoryIndex: jest.fn().mockReturnValue(cachedNext) };
+        deps.getHistoryIndexCapableService = () => service as any;
+        await expect(controller.refreshHistorySearchSnapshot()).resolves.toEqual({ status: 'cache_hit' });
+
+        expect(previous.release).toHaveBeenCalledTimes(1);
+        expect(silentNext.release).toHaveBeenCalledTimes(1);
+      });
+
+      it('returns not_applicable with the true reason for each early return', async () => {
+        deps.getHistoryIndexCapableService = () => null;
+
+        deps.state.currentConversationId = null;
+        await expect(controller.refreshHistorySearchSnapshot()).resolves.toEqual({ status: 'not_applicable', reason: 'no_conversation' });
+
+        deps.state.currentConversationId = 'vanished';
+        (deps.plugin.getConversationSync as jest.Mock).mockReturnValue(null);
+        await expect(controller.refreshHistorySearchSnapshot()).resolves.toEqual({ status: 'not_applicable', reason: 'no_conversation' });
+
+        // Codex/OpenCode lease-less search: a capability branch, not an error.
+        const codexConversation = { id: 'codex-conv', providerId: 'codex', title: 'Codex', messages: [], createdAt: 1, updatedAt: 1 } as any;
+        deps.state.currentConversationId = 'codex-conv';
+        (deps.plugin.getConversationSync as jest.Mock).mockReturnValue(codexConversation);
+        deps.state.historyLease = null;
+        await expect(controller.refreshHistorySearchSnapshot()).resolves.toEqual({ status: 'not_applicable', reason: 'provider_without_index' });
+
+        // Index-capable provider whose lease never mounted (failed load).
+        deps.state.currentConversationId = 'large';
+        (deps.plugin.getConversationSync as jest.Mock).mockReturnValue(conversation);
+        deps.getHistoryIndexCapableService = () => ({}) as any;
+        await expect(controller.refreshHistorySearchSnapshot()).resolves.toEqual({ status: 'not_applicable', reason: 'no_lease' });
+      });
+
+      it('emits a search_snapshot_refresh diagnostic for every refresh outcome', async () => {
+        const events: HistoryDiagnosticEvent[] = [];
+        setHistoryDiagnosticsSink(event => events.push(event));
+        const refreshEvents = (): Array<Extract<HistoryDiagnosticEvent, { kind: 'search_snapshot_refresh' }>> =>
+          events.filter((event): event is Extract<HistoryDiagnosticEvent, { kind: 'search_snapshot_refresh' }> => event.kind === 'search_snapshot_refresh');
+        try {
+          deps.getHistoryIndexCapableService = () => null;
+          deps.state.currentConversationId = null;
+          await controller.refreshHistorySearchSnapshot();
+
+          const rebuiltPrevious = makeLease(100);
+          const rebuiltNext = makeLease(100);
+          mountLeasedTab(rebuiltPrevious, { acquireHistoryIndex: jest.fn().mockReturnValue(rebuiltNext) });
+          await controller.refreshHistorySearchSnapshot();
+
+          const cachedNext = { ...makeLease(100), acquireOutcome: 'cache_hit' as const };
+          const service = { acquireHistoryIndex: jest.fn().mockReturnValue(cachedNext) };
+          deps.getHistoryIndexCapableService = () => service as any;
+          await controller.refreshHistorySearchSnapshot();
+
+          const failedNext = { ...makeLease(100), ready: Promise.reject(new Error('index build failed')) };
+          const failedService = { acquireHistoryIndex: jest.fn().mockReturnValue(failedNext) };
+          deps.getHistoryIndexCapableService = () => failedService as any;
+          await expect(controller.refreshHistorySearchSnapshot()).rejects.toThrow('index build failed');
+        } finally {
+          setHistoryDiagnosticsSink(null);
+        }
+
+        expect(refreshEvents().map(event => event.outcome)).toEqual(['not_applicable', 'rebuilt', 'cache_hit', 'failed']);
+        expect(refreshEvents()[0].reason).toBe('no_conversation');
+        expect(refreshEvents().every(event => event.elapsedMs >= 0)).toBe(true);
+      });
     });
 
     // ============================================

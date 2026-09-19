@@ -72,6 +72,17 @@ export function enumerateVisibleMatches(root: HTMLElement, query: string): Visib
   return matches;
 }
 
+/**
+ * Structured outcome of a search snapshot refresh, reported by the history
+ * layer instead of guessed by callers. Early returns say why they do not
+ * apply (lease-less providers are a normal capability branch, not a
+ * failure); a real acquire/build failure still rejects.
+ */
+export type HistorySearchSnapshotRefreshResult =
+  | { status: 'rebuilt' }
+  | { status: 'cache_hit' }
+  | { status: 'not_applicable'; reason: 'no_conversation' | 'no_lease' | 'provider_without_index' };
+
 interface HistorySearchControllerDeps {
   rootEl: HTMLElement;
   messagesEl: HTMLElement;
@@ -84,7 +95,7 @@ interface HistorySearchControllerDeps {
   ) => Promise<HistorySearchResult[]>;
   locateResult: (result: HistorySearchResult) => Promise<HTMLElement>;
   waitForResultRender: (projectionKey: string) => Promise<void>;
-  refreshSearchSnapshot?: () => Promise<void>;
+  refreshSearchSnapshot?: () => Promise<HistorySearchSnapshotRefreshResult>;
   releaseSearchPins?: () => void;
 }
 interface CloseOptions { restoreFocus?: boolean }

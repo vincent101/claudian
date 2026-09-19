@@ -34,7 +34,7 @@ import {
 } from './core/types';
 import type { ChatViewPlacement, EnvironmentScope } from './core/types/settings';
 import { ClaudianView } from './features/chat/ClaudianView';
-import { setHistoryRenderDiagnosticsSink } from './features/chat/history/HistoryDiagnostics';
+import { setHistoryDiagnosticsSink } from './features/chat/history/HistoryDiagnostics';
 import { ConversationOpenRegistry } from './features/chat/tabs/ConversationOpenRegistry';
 import { type InlineEditContext, InlineEditModal } from './features/inline-edit/ui/InlineEditModal';
 import { ClaudianSettingTab } from './features/settings/ClaudianSettings';
@@ -67,7 +67,7 @@ export default class ClaudianPlugin extends Plugin {
     const vaultPath = getVaultPath(this.app);
     if (vaultPath) {
       const renderDiagnostics = new ClaudeTranscriptDiagnosticLog(vaultPath, () => {}, 'history-render');
-      setHistoryRenderDiagnosticsSink(event => {
+      setHistoryDiagnosticsSink(event => {
         if (event.kind === 'render_batch') {
           renderDiagnostics.record({ phase: event.kind, batchLines: event.mounted, entries: event.total, elapsedMs: event.elapsedMs });
         } else if (event.kind === 'render_complete') {
@@ -76,6 +76,8 @@ export default class ClaudianPlugin extends Plugin {
           renderDiagnostics.record({ phase: event.kind, renderTicket: event.ticket, elapsedMs: event.timeoutMs });
         } else if (event.kind === 'page_data_overcommit') {
           renderDiagnostics.record({ phase: event.kind, entries: event.pages, projectedWeight: event.projectedWeight });
+        } else if (event.kind === 'search_snapshot_refresh') {
+          renderDiagnostics.record({ phase: event.kind, outcome: event.outcome, reason: event.reason, elapsedMs: event.elapsedMs });
         } else {
           renderDiagnostics.record({ phase: event.kind, turns: event.turns });
         }

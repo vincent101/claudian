@@ -21,6 +21,7 @@ import { t } from '../../../i18n/i18n';
 import type ClaudianPlugin from '../../../main';
 import { confirm } from '../../../shared/modals/ConfirmModal';
 import { getVaultPath } from '../../../utils/path';
+import { recordHistoryDiagnosticEvent } from '../history/HistoryDiagnostics';
 import { HISTORY_RESOURCE_POLICY } from '../history/HistoryResourcePolicy';
 import type { HistoryPageInput, HistoryWindowRenderer } from '../rendering/HistoryWindowRenderer';
 import type { MessageRenderer } from '../rendering/MessageRenderer';
@@ -34,7 +35,7 @@ import type { ImageContextManager } from '../ui/ImageContext';
 import type { ExternalContextSelector, McpServerSelector } from '../ui/InputToolbar';
 import type { StatusPanel } from '../ui/StatusPanel';
 import { refreshUsageContextWindow } from '../utils/usageInfo';
-import { enumerateVisibleMatches } from './HistorySearchController';
+import { enumerateVisibleMatches, type HistorySearchSnapshotRefreshResult } from './HistorySearchController';
 
 export interface ConversationCallbacks {
   onNewConversation?: () => void;
@@ -593,14 +594,28 @@ export class ConversationController {
     return (hash >>> 0).toString(36);
   }
 
-  async refreshHistorySearchSnapshot(): Promise<void> {
+  async refreshHistorySearchSnapshot(): Promise<HistorySearchSnapshotRefreshResult> {
     const { plugin, state } = this.deps;
+    const startedAt = performance.now();
     const conversationId = state.currentConversationId;
-    if (!conversationId || !state.historyLease) return;
+    // Early returns are capability/state branches, not failures: the caller
+    // keeps searching whatever the tab already has. Providers without an
+    // index (Codex/OpenCode lease-less search) must never be reported as a
+    // staleness problem.
+    if (!conversationId) {
+      return this.reportRefreshNotApplicable('no_conversation', startedAt);
+    }
     const conversation = plugin.getConversationSync(conversationId);
-    if (!conversation) return;
+    if (!conversation) {
+      return this.reportRefreshNotApplicable('no_conversation', startedAt);
+    }
     const service = this.deps.getHistoryIndexCapableService(conversation);
-    if (!service) return;
+    if (!service) {
+      return this.reportRefreshNotApplicable('provider_without_index', startedAt);
+    }
+    if (!state.historyLease) {
+      return this.reportRefreshNotApplicable('no_lease', startedAt);
+    }
     const previous = state.historyLease;
     // Rollback path: the old lease stays live until the new snapshot is ready,
     // so a failed refresh keeps pagination and search usable on stale data.
@@ -621,11 +636,25 @@ export class ConversationController {
         // exchange cannot leak a protected index.
         previous.release();
       }
+      recordHistoryDiagnosticEvent({ kind: 'search_snapshot_refresh', outcome: 'failed', elapsedMs: performance.now() - startedAt });
       throw error;
     }
     // Exchange completed (or raced with a switch): `previous` ends its
     // reference here either way; the mounted state is never rewritten.
     previous.release();
+    // The lease reports what actually happened; without a service-provided
+    // outcome the honest report is rebuilt (a fresh acquire did run).
+    const outcome = next.acquireOutcome === 'cache_hit' ? 'cache_hit' : 'rebuilt';
+    recordHistoryDiagnosticEvent({ kind: 'search_snapshot_refresh', outcome, elapsedMs: performance.now() - startedAt });
+    return outcome === 'cache_hit' ? { status: 'cache_hit' } : { status: 'rebuilt' };
+  }
+
+  private reportRefreshNotApplicable(
+    reason: 'no_conversation' | 'no_lease' | 'provider_without_index',
+    startedAt: number,
+  ): HistorySearchSnapshotRefreshResult {
+    recordHistoryDiagnosticEvent({ kind: 'search_snapshot_refresh', outcome: 'not_applicable', reason, elapsedMs: performance.now() - startedAt });
+    return { status: 'not_applicable', reason };
   }
 
   async locateHistorySearchResult(result: HistorySearchResult): Promise<HTMLElement> {

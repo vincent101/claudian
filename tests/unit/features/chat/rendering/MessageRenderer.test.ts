@@ -10,8 +10,8 @@ import {
 } from '@/core/tools/toolNames';
 import type { ChatMessage, ImageAttachment } from '@/core/types';
 import {
-  type HistoryRenderDiagnosticEvent,
-  setHistoryRenderDiagnosticsSink,
+  type HistoryDiagnosticEvent,
+  setHistoryDiagnosticsSink,
 } from '@/features/chat/history/HistoryDiagnostics';
 import { MessageRenderer } from '@/features/chat/rendering/MessageRenderer';
 import { renderStoredAsyncSubagent, renderStoredSubagent } from '@/features/chat/rendering/SubagentRenderer';
@@ -2305,8 +2305,8 @@ describe('MessageRenderer', () => {
     });
 
     it('emits render batch and completion diagnostics', async () => {
-      const events: HistoryRenderDiagnosticEvent[] = [];
-      setHistoryRenderDiagnosticsSink(event => events.push(event));
+      const events: HistoryDiagnosticEvent[] = [];
+      setHistoryDiagnosticsSink(event => events.push(event));
       try {
         const { renderer } = createRenderer();
         jest.spyOn(renderer, 'renderContent').mockResolvedValue(undefined);
@@ -2323,13 +2323,13 @@ describe('MessageRenderer', () => {
         const complete = events.find(event => event.kind === 'render_complete');
         expect(complete).toMatchObject({ kind: 'render_complete', messages: 45 });
       } finally {
-        setHistoryRenderDiagnosticsSink(null);
+        setHistoryDiagnosticsSink(null);
       }
     });
 
     it('still settles render idle when a frame step throws mid-render', async () => {
       let batches = 0;
-      setHistoryRenderDiagnosticsSink(() => {
+      setHistoryDiagnosticsSink(() => {
         batches += 1;
         // The sink throws after the first frame mounts (e.g. a failing
         // diagnostics log write) — idle must still settle or hydration
@@ -2351,7 +2351,7 @@ describe('MessageRenderer', () => {
 
         await expect(renderer.waitForRenderedMessages()).resolves.toBeUndefined();
       } finally {
-        setHistoryRenderDiagnosticsSink(null);
+        setHistoryDiagnosticsSink(null);
       }
     });
 
