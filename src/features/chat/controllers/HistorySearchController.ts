@@ -213,14 +213,22 @@ export class HistorySearchController {
    */
   private refreshSnapshotAndRerun(): void {
     if (!this.panel) return;
+    // The panel element is this open's identity. Generation alone cannot
+    // guard the state write: keystrokes bump it within the same open, and a
+    // refresh settling after such a bump must still record its outcome —
+    // only a different open (closed and possibly reopened) must not be
+    // written to.
+    const openPanel = this.panel;
     const generation = ++this.generation;
     void (async () => {
       try {
         await this.refreshSnapshotOnce();
-        this.snapshotState = 'fresh';
+        if (this.panel === openPanel) this.snapshotState = 'fresh';
       } catch {
-        this.snapshotState = 'stale';
-        if (generation === this.generation && this.panel) this.renderStatus();
+        if (this.panel === openPanel) {
+          this.snapshotState = 'stale';
+          this.renderStatus();
+        }
         return;
       }
       if (generation === this.generation && this.panel) await this.runSearch(generation, true);
@@ -248,13 +256,17 @@ export class HistorySearchController {
     // panel was closed. A failed refresh keeps the old snapshot searchable
     // and marks this open stale (only Retry or a reopen rebinds); later
     // keystrokes reuse the bound snapshot so typing never rebuilds per key.
+    // State writes are guarded by the panel identity, not generation: a
+    // refresh settling after this open closed must not write the state
+    // machine of whichever open is active now (see refreshSnapshotAndRerun).
     if (this.snapshotState === 'idle') {
+      const openPanel = this.panel;
       this.snapshotState = 'refreshing';
       try {
         await this.refreshSnapshotOnce();
-        this.snapshotState = 'fresh';
+        if (this.panel === openPanel) this.snapshotState = 'fresh';
       } catch {
-        this.snapshotState = 'stale';
+        if (this.panel === openPanel) this.snapshotState = 'stale';
       }
       if (generation !== this.generation || !this.panel) return;
     }

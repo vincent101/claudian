@@ -591,6 +591,40 @@ describe('HistorySearchController', () => {
         expect(refreshSnapshot).toHaveBeenCalledTimes(2);
         expect(staleEl()).not.toBeNull();
       });
+
+      it('does not let an in-flight refresh from a closed open pollute the reopened panel', async () => {
+        let rejectRefresh!: (error: Error) => void;
+        refreshSnapshot.mockImplementationOnce(() => new Promise((_resolve, reject) => { rejectRefresh = reject; }));
+        const instance = makeController();
+        instance.open();
+        const input = root.querySelector('input') as HTMLInputElement;
+        input.value = 'needle';
+        input.dispatchEvent(new Event('input'));
+        jest.advanceTimersByTime(300);
+        await Promise.resolve();
+        // The first query's refresh is still in flight when the panel closes
+        // and immediately reopens.
+        instance.close({ restoreFocus: false });
+        instance.open();
+
+        rejectRefresh(new Error('index build failed'));
+        await settle();
+
+        // The old open's late rejection must not flip the new open's state:
+        // no phantom stale hint, and the state machine is still armed.
+        expect(staleEl()).toBeNull();
+        expect(retryEl()).toBeNull();
+
+        refreshSnapshot.mockResolvedValue({ status: 'rebuilt' });
+        await typeQuery(instance, 'needle');
+        // The reopened open performed its own auto refresh (its first query
+        // plus the abandoned one from the closed open = 2 refreshes), and
+        // only the reopened open's query searched (the closed open's search
+        // aborted with its generation).
+        expect(refreshSnapshot).toHaveBeenCalledTimes(2);
+        expect(searchHistory).toHaveBeenCalledTimes(1);
+        expect(staleEl()).toBeNull();
+      });
     });
   });
 });
