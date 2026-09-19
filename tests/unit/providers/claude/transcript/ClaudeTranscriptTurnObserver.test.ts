@@ -86,6 +86,31 @@ describe('ClaudeTranscriptTurnObserver', () => {
     expect(callbacks.chunk).not.toHaveBeenCalled();
   });
 
+  it('clears a pending quiet timer when settled directly instead of orphaning it', async () => {
+    await writeFile(file, '');
+    const { observer } = setup();
+    const clearSpy = jest.spyOn(globalThis, 'clearTimeout');
+    try {
+      await observer.start(file);
+      const generation = (observer as any).generation;
+      // A terminal candidate schedules the quiet-settle timer.
+      await (observer as any).consumeBatch({ lines: peerTurn('peer-x', 'x').slice(0, -1), lineOffsets: [0, 100, 200], reset: false }, generation);
+      const pending = (observer as any).quietTimer as ReturnType<typeof setTimeout> | null;
+      expect(pending).not.toBeNull();
+
+      // Direct settlement (as tests and future callers do) must drop the
+      // still-pending timeout: an orphaned 2s timer fires long after the
+      // observer is done and keeps the worker alive.
+      await (observer as any).settleQuietCandidate(generation);
+      expect(clearSpy).toHaveBeenCalledWith(pending);
+    } finally {
+      // Always stop the observer: the reader poll loop and any leaked timer
+      // would otherwise keep the Jest worker from exiting.
+      clearSpy.mockRestore();
+      observer.stop();
+    }
+  });
+
   it('marks a delayed auto completion superseded when a later host user row exists', async () => {
     await writeFile(file, '');
     const { observer, callbacks } = setup();

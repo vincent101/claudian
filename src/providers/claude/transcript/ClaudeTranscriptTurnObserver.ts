@@ -312,6 +312,11 @@ export class ClaudeTranscriptTurnObserver {
 
   private async settleQuietCandidate(generation: number): Promise<void> {
     if (generation !== this.generation || this.stopped) return;
+    // This settle may be the timer callback itself, but also a direct call
+    // (tests, future callers) while the timer is still pending: drop the
+    // handle instead of orphaning it — an orphaned timeout fires long after
+    // the observer is done and keeps the process alive.
+    if (this.quietTimer) clearTimeout(this.quietTimer);
     this.quietTimer = null;
     for (const event of this.mapper.settleTerminalCandidate()) this.enqueue(event);
     await this.promote();
