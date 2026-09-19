@@ -103,6 +103,13 @@
         "retry": "Retry recovery",
         "stale": "This recovery request is no longer current.",
         "failed": "History recovery failed."
+      },
+      "omission": {
+        "charactersMiddle": "[… {count} caracteres omitidos …]",
+        "charactersTail": "[… {count} caracteres omitidos …]",
+        "arrayItems": "[… {count} elementos más omitidos …]",
+        "entryBytes": "[… entrada de transcripción de {bytes} bytes omitida …]",
+        "turnEntries": "[… {count} entradas de transcripción ({bytes} bytes) omitidas de este turno sobredimensionado …]"
       }
     },
     "search": {

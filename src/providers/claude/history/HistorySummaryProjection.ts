@@ -1,4 +1,5 @@
 import type { ChatMessage, ToolCallInfo } from '../../../core/types';
+import { t } from '../../../i18n/i18n';
 import type { TranscriptIndexEntry } from './ClaudeTranscriptHistoryIndex';
 import type { SDKNativeMessage } from './sdkHistoryTypes';
 
@@ -24,12 +25,14 @@ export function excerptHeadTail(text: string, limit = HISTORY_SUMMARY_LIMITS.tex
   if (text.length <= limit) return text;
   const half = Math.floor(limit / 2);
   const omitted = text.length - half * 2;
-  return `${text.slice(0, half)}\n\n[… ${omitted} characters omitted …]\n\n${text.slice(text.length - half)}`;
+  // Rendered at materialization time so a locale switch applies to newly
+  // materialized pages; markers never enter the search index.
+  return `${text.slice(0, half)}\n\n${t('chat.history.omission.charactersMiddle', { count: omitted })}\n\n${text.slice(text.length - half)}`;
 }
 
 function excerptHead(text: string, limit: number): string {
   if (text.length <= limit) return text;
-  return `${text.slice(0, limit)}\n[… ${text.length - limit} characters omitted …]`;
+  return `${text.slice(0, limit)}\n${t('chat.history.omission.charactersTail', { count: text.length - limit })}`;
 }
 
 function shrinkJsonish(value: unknown, limit: number, depth: number): unknown {
@@ -38,7 +41,7 @@ function shrinkJsonish(value: unknown, limit: number, depth: number): unknown {
     const capped = value.slice(0, HISTORY_SUMMARY_LIMITS.toolInputArrayItems)
       .map(item => shrinkJsonish(item, limit, depth + 1));
     if (value.length > HISTORY_SUMMARY_LIMITS.toolInputArrayItems) {
-      capped.push(`[… ${value.length - HISTORY_SUMMARY_LIMITS.toolInputArrayItems} more items omitted …]`);
+      capped.push(t('chat.history.omission.arrayItems', { count: value.length - HISTORY_SUMMARY_LIMITS.toolInputArrayItems }));
     }
     return capped;
   }
@@ -221,7 +224,7 @@ export function measureChatProjectionChars(messages: ReadonlyArray<ChatMessage>)
   return total;
 }
 
-const OMITTED_ENTRY_BYTES_TEXT = (bytes: number): string => `[… transcript entry of ${bytes} bytes omitted …]`;
+const OMITTED_ENTRY_BYTES_TEXT = (bytes: number): string => t('chat.history.omission.entryBytes', { bytes });
 
 /**
  * Placeholder for an oversized entry skipped during summary materialization.
@@ -264,7 +267,7 @@ export function buildOversizedTurnMarker(
     message: {
       content: [{
         type: 'text',
-        text: `[… ${skippedEntries.length} transcript entries (${omittedBytes} bytes) omitted from this oversized turn …]`,
+        text: t('chat.history.omission.turnEntries', { count: skippedEntries.length, bytes: omittedBytes }),
       }],
     },
   };

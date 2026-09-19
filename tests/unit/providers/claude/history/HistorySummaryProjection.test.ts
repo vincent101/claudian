@@ -1,5 +1,8 @@
 import type { ChatMessage } from '@/core/types';
+import { getAvailableLocales, setLocale, t } from '@/i18n/i18n';
+import type { TranslationKey } from '@/i18n/types';
 import {
+  buildOpaqueOversizedPlaceholders,
   buildOversizedEntryPlaceholder,
   buildOversizedTurnMarker,
   excerptHeadTail,
@@ -296,6 +299,106 @@ describe('HistorySummaryProjection', () => {
       expect(toolCall.result).toBeUndefined();
       expect(toolCall.name).toBe('Read');
       expect(result.messages[0].content).toBe('keep me');
+    });
+  });
+
+  // ============================================
+  // Omission marker i18n
+  // ============================================
+
+  describe('omission marker i18n', () => {
+    afterEach(() => {
+      setLocale('en');
+    });
+
+    it('renders every omission surface through the active locale', () => {
+      setLocale('zh-CN');
+      // charactersMiddle (excerptHeadTail)
+      expect(excerptHeadTail(`${'a'.repeat(1500)}MIDDLE${'b'.repeat(1500)}`)).toContain('已省略 958 个字符');
+      // charactersTail + arrayItems via summary shrinking
+      const message = assistantMessage({
+        toolCalls: [{
+          id: 't1',
+          name: 'Read',
+          input: { list: Array.from({ length: 40 }, (_, i) => `item-${i}`) },
+          status: 'completed',
+          result: 'r'.repeat(4000),
+        }],
+      });
+      summarizeChatMessages([message]);
+      const toolCall = message.toolCalls![0];
+      expect(toolCall.result).toContain('已省略 3744 个字符');
+      expect((toolCall.input.list as unknown[])[32]).toContain('已省略 8 项');
+      // entryBytes (single skipped entry)
+      const placeholder = buildOversizedEntryPlaceholder({
+        offset: 1, length: 10 * 1024 * 1024, type: 'user', messageKey: 'r1', uuid: 'r1',
+        realUser: false, displayable: false, isMeta: false, toolUseIds: [], toolResultIds: ['toolu_1'],
+      });
+      const blocks = placeholder!.message!.content as Array<{ content: string }>;
+      expect(blocks[0].content).toContain('已省略 10485760 字节的会话记录条目');
+      // turnEntries (aggregate turn marker)
+      const marker = buildOversizedTurnMarker('u1', [
+        { offset: 0, length: 300, type: 'user', messageKey: 'x', realUser: false, displayable: false, isMeta: false, toolUseIds: [], toolResultIds: [] },
+      ]);
+      const text = (marker.message!.content as Array<{ text: string }>)[0].text;
+      expect(text).toContain('已从此超大轮次省略 1 条会话记录');
+      expect(text).toContain('300 字节');
+    });
+
+    it('resolves the five omission keys with parameters in every locale', () => {
+      const keys: TranslationKey[] = [
+        'chat.history.omission.charactersMiddle',
+        'chat.history.omission.charactersTail',
+        'chat.history.omission.arrayItems',
+        'chat.history.omission.entryBytes',
+        'chat.history.omission.turnEntries',
+      ];
+      for (const locale of getAvailableLocales()) {
+        expect(setLocale(locale)).toBe(true);
+        for (const key of keys) {
+          const rendered = t(key, { count: 5, bytes: 7 });
+          // A missing entry would echo the key back; a broken one would leak
+          // the placeholder.
+          expect(rendered).not.toBe(key);
+          expect(rendered).not.toMatch(/\{count\}|\{bytes\}/);
+        }
+        expect(t('chat.history.omission.arrayItems', { count: 5 })).toContain('5');
+        expect(t('chat.history.omission.entryBytes', { bytes: 7 })).toContain('7');
+      }
+      setLocale('en');
+    });
+  });
+
+  describe('buildOpaqueOversizedPlaceholders', () => {
+    const baseEntry = {
+      offset: 5,
+      length: 20 * 1024 * 1024,
+      type: 'user',
+      realUser: false,
+      displayable: false,
+      isMeta: false,
+      toolUseIds: [] as string[],
+    };
+
+    it('always yields a visible marker and only fakes completion with reliable ids', () => {
+      const withIds = buildOpaqueOversizedPlaceholders({
+        ...baseEntry, messageKey: 'tr1', uuid: 'tr1', parentUuid: 'tu1', timestamp: '2026-01-01T00:00:00Z',
+        toolResultIds: ['toolu_1'],
+      });
+      // Tool-result pairing row plus the visible omission marker.
+      expect(withIds.map(row => row.type)).toEqual(['user', 'assistant']);
+      expect(withIds[0]).toMatchObject({ sourceToolUseID: 'toolu_1' });
+      const markerText = (withIds[1].message!.content as Array<{ text: string }>)[0].text;
+      expect(markerText).toContain('bytes omitted');
+
+      const withoutIds = buildOpaqueOversizedPlaceholders({
+        ...baseEntry, messageKey: 'line:3', toolResultIds: [],
+      });
+      // No reliable id: only the visible marker, never a synthetic completion.
+      expect(withoutIds).toHaveLength(1);
+      expect(withoutIds[0].type).toBe('assistant');
+      expect(withoutIds[0].uuid).toBe('oversized-opaque-line:3');
+      expect((withoutIds[0].message!.content as Array<{ text: string }>)[0].text).toContain('bytes omitted');
     });
   });
 });

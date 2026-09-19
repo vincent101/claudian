@@ -103,6 +103,13 @@
         "retry": "Retry recovery",
         "stale": "This recovery request is no longer current.",
         "failed": "History recovery failed."
+      },
+      "omission": {
+        "charactersMiddle": "[… {count} 文字を省略 …]",
+        "charactersTail": "[… {count} 文字を省略 …]",
+        "arrayItems": "[… 他 {count} 項目を省略 …]",
+        "entryBytes": "[… {bytes} バイトのトランスクリプトエントリを省略 …]",
+        "turnEntries": "[… この特大ターンから {count} 件のトランスクリプトエントリ（{bytes} バイト）を省略 …]"
       }
     },
     "search": {

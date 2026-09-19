@@ -103,6 +103,13 @@
         "retry": "重試恢復",
         "stale": "此恢復請求已過期。",
         "failed": "歷史恢復失敗。"
+      },
+      "omission": {
+        "charactersMiddle": "[… 已省略 {count} 個字元 …]",
+        "charactersTail": "[… 已省略 {count} 個字元 …]",
+        "arrayItems": "[… 已省略 {count} 項 …]",
+        "entryBytes": "[… 已省略 {bytes} 位元組的會話記錄條目 …]",
+        "turnEntries": "[… 已自此超大輪次省略 {count} 條會話記錄（{bytes} 位元組）…]"
       }
     },
     "search": {

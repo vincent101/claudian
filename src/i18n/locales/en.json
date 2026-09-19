@@ -103,6 +103,13 @@
         "retry": "Retry recovery",
         "stale": "This recovery request is no longer current.",
         "failed": "History recovery failed."
+      },
+      "omission": {
+        "charactersMiddle": "[… {count} characters omitted …]",
+        "charactersTail": "[… {count} characters omitted …]",
+        "arrayItems": "[… {count} more items omitted …]",
+        "entryBytes": "[… transcript entry of {bytes} bytes omitted …]",
+        "turnEntries": "[… {count} transcript entries ({bytes} bytes) omitted from this oversized turn …]"
       }
     },
     "search": {

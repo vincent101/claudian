@@ -103,6 +103,13 @@
         "retry": "Retry recovery",
         "stale": "This recovery request is no longer current.",
         "failed": "History recovery failed."
+      },
+      "omission": {
+        "charactersMiddle": "[… пропущено символов: {count} …]",
+        "charactersTail": "[… пропущено символов: {count} …]",
+        "arrayItems": "[… пропущено ещё элементов: {count} …]",
+        "entryBytes": "[… пропущена запись транскрипта размером {bytes} байт …]",
+        "turnEntries": "[… из этого сверхбольшого хода пропущено записей транскрипта: {count} ({bytes} байт) …]"
       }
     },
     "search": {
