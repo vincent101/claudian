@@ -34,13 +34,13 @@ import {
 } from './core/types';
 import type { ChatViewPlacement, EnvironmentScope } from './core/types/settings';
 import { ClaudianView } from './features/chat/ClaudianView';
-import { setHistoryDiagnosticsSink } from './features/chat/history/HistoryDiagnostics';
+import { type HistoryDiagnosticEvent, setHistoryDiagnosticsSink } from './features/chat/history/HistoryDiagnostics';
 import { ConversationOpenRegistry } from './features/chat/tabs/ConversationOpenRegistry';
 import { type InlineEditContext, InlineEditModal } from './features/inline-edit/ui/InlineEditModal';
 import { ClaudianSettingTab } from './features/settings/ClaudianSettings';
 import { setLocale } from './i18n/i18n';
 import type { Locale } from './i18n/types';
-import { ClaudeTranscriptDiagnosticLog } from './providers/claude/transcript/ClaudeTranscriptDiagnosticLog';
+import { ClaudeTranscriptDiagnosticLog,type TranscriptDiagnosticEvent } from './providers/claude/transcript/ClaudeTranscriptDiagnosticLog';
 import { OPENCODE_PLAN_MODE_ID, OPENCODE_SAFE_MODE_ID } from './providers/opencode/modes';
 import { buildCursorContext } from './utils/editor';
 import { getVaultPath } from './utils/path';
@@ -49,6 +49,38 @@ function isClaudianView(value: unknown): value is ClaudianView {
   return !!value
     && typeof value === 'object'
     && typeof (value as { getTabManager?: unknown }).getTabManager === 'function';
+}
+
+/**
+ * Maps feature history diagnostics onto the persisted transcript diagnostic
+ * shape. Page keys embed local transcript paths, so they are salted-hashed
+ * before landing on disk. Exhaustive over HistoryDiagnosticEvent: adding a
+ * new kind fails compilation here instead of silently dropping fields.
+ */
+export function mapHistoryDiagnosticEvent(
+  event: HistoryDiagnosticEvent,
+  hashId: (id: string) => string,
+): TranscriptDiagnosticEvent {
+  switch (event.kind) {
+    case 'render_batch':
+      return { phase: event.kind, batchLines: event.mounted, entries: event.total, elapsedMs: event.elapsedMs };
+    case 'render_complete':
+      return { phase: event.kind, entries: event.messages, turns: event.batches, elapsedMs: event.elapsedMs };
+    case 'page_render_timeout':
+      return { phase: event.kind, pageKeyHash: hashId(event.pageKey), renderTicket: event.ticket, elapsedMs: event.timeoutMs };
+    case 'page_data_overcommit':
+      return { phase: event.kind, entries: event.pages, projectedWeight: event.projectedWeight };
+    case 'search_snapshot_refresh':
+      return { phase: event.kind, outcome: event.outcome, reason: event.reason, elapsedMs: event.elapsedMs };
+    case 'memory_only_rematerialize':
+      return { phase: event.kind, pageKeyHash: hashId(event.pageKey) };
+    case 'dom_overcommit':
+      return { phase: event.kind, pageKeyHash: hashId(event.pageKey), turns: event.turns };
+    default: {
+      const unhandled: never = event;
+      throw new Error(`Unhandled history diagnostic kind: ${unhandled}`);
+    }
+  }
 }
 
 export default class ClaudianPlugin extends Plugin {
@@ -68,21 +100,7 @@ export default class ClaudianPlugin extends Plugin {
     if (vaultPath) {
       const renderDiagnostics = new ClaudeTranscriptDiagnosticLog(vaultPath, () => {}, 'history-render');
       setHistoryDiagnosticsSink(event => {
-        if (event.kind === 'render_batch') {
-          renderDiagnostics.record({ phase: event.kind, batchLines: event.mounted, entries: event.total, elapsedMs: event.elapsedMs });
-        } else if (event.kind === 'render_complete') {
-          renderDiagnostics.record({ phase: event.kind, entries: event.messages, turns: event.batches, elapsedMs: event.elapsedMs });
-        } else if (event.kind === 'page_render_timeout') {
-          renderDiagnostics.record({ phase: event.kind, renderTicket: event.ticket, elapsedMs: event.timeoutMs });
-        } else if (event.kind === 'page_data_overcommit') {
-          renderDiagnostics.record({ phase: event.kind, entries: event.pages, projectedWeight: event.projectedWeight });
-        } else if (event.kind === 'search_snapshot_refresh') {
-          renderDiagnostics.record({ phase: event.kind, outcome: event.outcome, reason: event.reason, elapsedMs: event.elapsedMs });
-        } else if (event.kind === 'memory_only_rematerialize') {
-          renderDiagnostics.record({ phase: event.kind });
-        } else {
-          renderDiagnostics.record({ phase: event.kind, turns: event.turns });
-        }
+        renderDiagnostics.record(mapHistoryDiagnosticEvent(event, id => renderDiagnostics.hashId(id)));
       });
     }
 

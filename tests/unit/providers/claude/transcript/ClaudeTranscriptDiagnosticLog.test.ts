@@ -46,6 +46,15 @@ describe('ClaudeTranscriptDiagnosticLog', () => {
     expect(content).toContain('"recoveredIdentityFields":["uuid","timestamp"]');
   });
 
+  it('persists hashed page keys without leaking raw paths', async () => {
+    const log = new ClaudeTranscriptDiagnosticLog(vault);
+    const pageKey = '/Users/me/.claude/projects/vault/transcript.jsonl:1200:1700000000';
+    log.record({ phase: 'page_render_timeout', pageKeyHash: log.hashId(pageKey), renderTicket: 7, elapsedMs: 5000 });
+    const content = await readFile(join(vault, '.claudian/diagnostics/transcript-tail.current.jsonl'), 'utf8');
+    expect(content).toContain('"pageKeyHash":');
+    expect(content).not.toContain(pageKey);
+  });
+
   it('keeps each serialized event within one kilobyte', async () => {
     const log = new ClaudeTranscriptDiagnosticLog(vault);
     log.record({ phase: 'callback_error', errorName: 'X'.repeat(10_000) });

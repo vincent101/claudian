@@ -8,6 +8,47 @@ jest.mock('fs');
 
 // Now import the plugin after mocking
 import ClaudianPlugin from '@/main';
+import { mapHistoryDiagnosticEvent } from '@/main';
+
+describe('mapHistoryDiagnosticEvent', () => {
+  const hashId = (id: string) => `hash:${id.length}:${id.slice(-4)}`;
+
+  it('maps page_render_timeout with a hashed page key', () => {
+    const pageKey = '/Users/me/.claude/projects/vault/transcript.jsonl:1200:1700000000';
+    const mapped = mapHistoryDiagnosticEvent(
+      { kind: 'page_render_timeout', pageKey, ticket: 7, timeoutMs: 5000 },
+      hashId,
+    );
+    expect(mapped).toEqual({
+      phase: 'page_render_timeout',
+      pageKeyHash: hashId(pageKey),
+      renderTicket: 7,
+      elapsedMs: 5000,
+    });
+    expect(JSON.stringify(mapped)).not.toContain(pageKey);
+  });
+
+  it('maps dom_overcommit with a hashed page key', () => {
+    const pageKey = '/Users/me/.claude/projects/vault/transcript.jsonl:42:1700000001';
+    const mapped = mapHistoryDiagnosticEvent({ kind: 'dom_overcommit', pageKey, turns: 12 }, hashId);
+    expect(mapped).toEqual({ phase: 'dom_overcommit', pageKeyHash: hashId(pageKey), turns: 12 });
+    expect(JSON.stringify(mapped)).not.toContain(pageKey);
+  });
+
+  it('maps memory_only_rematerialize with a hashed page key', () => {
+    const pageKey = '/Users/me/.claude/projects/vault/transcript.jsonl:99:1700000002';
+    const mapped = mapHistoryDiagnosticEvent({ kind: 'memory_only_rematerialize', pageKey }, hashId);
+    expect(mapped).toEqual({ phase: 'memory_only_rematerialize', pageKeyHash: hashId(pageKey) });
+    expect(JSON.stringify(mapped)).not.toContain(pageKey);
+  });
+
+  it('maps events without a page key unchanged', () => {
+    expect(
+      mapHistoryDiagnosticEvent({ kind: 'render_batch', mounted: 3, total: 10, elapsedMs: 5 }, hashId),
+    ).toEqual({ phase: 'render_batch', batchLines: 3, entries: 10, elapsedMs: 5 });
+  });
+});
+
 
 describe('ClaudianPlugin', () => {
   let plugin: ClaudianPlugin;
