@@ -3487,40 +3487,63 @@ describe('TabManager - switchToTab Session Sync', () => {
     expect(mockSyncConversationState).not.toHaveBeenCalled();
   });
 
-  it('should not sync service session when local conversation state is pending save', async () => {
+  it('skips passive sync but still refreshes the usage denominator when local state is pending save', async () => {
     jest.clearAllMocks();
 
     const mockSyncConversationState = jest.fn();
     const mockService = {
+      providerId: 'claude',
       syncConversationState: mockSyncConversationState,
+      cleanup: jest.fn(),
+      ensureReady: jest.fn().mockResolvedValue(true),
+      onReadyStateChange: jest.fn(() => () => {}),
+      isReady: jest.fn().mockReturnValue(true),
     };
-
-    let tabCounter = 0;
-    mockCreateTab.mockImplementation(() => {
-      tabCounter++;
-
-      if (tabCounter === 1) {
-        return createMockTabData({ id: 'tab-1' });
-      }
-
-      return createMockTabData({
-        id: 'tab-2',
-        conversationId: 'conv-pending-save',
-        service: mockService,
-        serviceInitialized: true,
-        state: {
-          hasPendingConversationSave: true,
-          messages: [{ id: 'msg-1', role: 'user', content: 'test' }],
-        },
-      });
-    });
 
     const plugin = createMockPlugin();
     plugin.getConversationSync = jest.fn().mockReturnValue({
       id: 'conv-pending-save',
+      providerId: 'claude',
       messages: [],
       sessionId: null,
       externalContextPaths: [],
+    });
+
+    // The refresh entry resolves the denominator through the provider
+    // snapshot + chat UI config seams this suite mocks.
+    mockGetProviderSettingsSnapshot.mockImplementation(() => ({
+      model: 'sonnet[1m]',
+      customContextLimits: { 'sonnet[1m]': 1_000_000 },
+    }));
+    mockGetChatUIConfig.mockReturnValue(claudeChatUIConfig);
+
+    const harness = createRealConversationControllerHarness(plugin);
+    harness.state.usage = {
+      model: 'sonnet',
+      inputTokens: 400_000,
+      cacheCreationInputTokens: 30_000,
+      cacheReadInputTokens: 20_000,
+      contextWindow: 200_000,
+      contextWindowIsAuthoritative: false,
+      contextTokens: 450_000,
+      percentage: 100,
+    };
+    harness.state.messages = [{ id: 'msg-1', role: 'user', content: 'test' }] as any;
+    harness.state.hasPendingConversationSave = true;
+
+    const pendingSaveTab = createMockTabData({
+      id: 'tab-2',
+      conversationId: 'conv-pending-save',
+      service: mockService,
+      serviceInitialized: true,
+    });
+    pendingSaveTab.state = harness.state;
+    pendingSaveTab.controllers = { conversationController: harness.controller };
+
+    let tabCounter = 0;
+    mockCreateTab.mockImplementation(() => {
+      tabCounter++;
+      return tabCounter === 2 ? pendingSaveTab : createMockTabData({ id: 'tab-1' });
     });
 
     const manager = new TabManager(
@@ -3531,14 +3554,23 @@ describe('TabManager - switchToTab Session Sync', () => {
     );
 
     await manager.createTab();
-    const pendingSaveTab = await manager.createTab(undefined, undefined, { activate: false });
+    await manager.createTab(undefined, undefined, { activate: false });
 
-    jest.clearAllMocks();
+    try {
+      await manager.switchToTab('tab-2');
 
-    await manager.switchToTab(pendingSaveTab!.id);
-
-    expect(plugin.getConversationSync).not.toHaveBeenCalled();
-    expect(mockSyncConversationState).not.toHaveBeenCalled();
+      // A pending save must keep blocking the passive runtime sync...
+      expect(mockSyncConversationState).not.toHaveBeenCalled();
+      // ...but the read-only denominator refresh must not be postponed by a
+      // save that keeps failing — the stale stored window is re-derived.
+      expect(plugin.getConversationSync).toHaveBeenCalledWith('conv-pending-save');
+      expect(harness.state.usage?.model).toBe('sonnet[1m]');
+      expect(harness.state.usage?.contextWindow).toBe(1_000_000);
+      expect(harness.state.usage?.percentage).toBe(45);
+    } finally {
+      mockGetProviderSettingsSnapshot.mockImplementation(() => ({}));
+      mockGetChatUIConfig.mockReset();
+    }
   });
 
   it('should initialize welcome for new tab without conversation', async () => {

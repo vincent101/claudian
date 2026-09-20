@@ -353,24 +353,27 @@ export class TabManager implements TabManagerInterface {
         tab.conversationId
         && tab.hydrationState === 'READY'
         && tab.state.messages.length > 0
-        && tab.service
         && !tab.state.isStreaming
-        && !tab.state.hasPendingConversationSave
       ) {
-        // Passive sync is only safe once local tab state has been persisted.
         const conversation = this.plugin.getConversationSync(tab.conversationId);
         if (conversation) {
-          const hasMessages = conversation.hasHistory === true
-            || (conversation.messageCount ?? conversation.messages.length) > 0;
-          const externalContextPaths = hasMessages
-            ? conversation.externalContextPaths || []
-            : (this.plugin.settings.persistentExternalContextPaths || []);
+          // Passive sync is only safe once local tab state has been
+          // persisted.
+          if (tab.service && !tab.state.hasPendingConversationSave) {
+            const hasMessages = conversation.hasHistory === true
+              || (conversation.messageCount ?? conversation.messages.length) > 0;
+            const externalContextPaths = hasMessages
+              ? conversation.externalContextPaths || []
+              : (this.plugin.settings.persistentExternalContextPaths || []);
 
-          tab.service.syncConversationState(conversation, externalContextPaths);
-          // A READY tab skipped full hydration, so a stale stored usage
-          // denominator (e.g. 200k persisted before a preset change) must
-          // not survive the switch back — re-derive through the same
-          // refresh entry hydration uses.
+            tab.service.syncConversationState(conversation, externalContextPaths);
+          }
+          // The denominator refresh is read-only (provider settings plus
+          // in-memory usage) and must not be postponed by a pending save
+          // that keeps failing: a READY tab skipped full hydration, so a
+          // stale stored usage denominator (e.g. 200k persisted before a
+          // preset change) must not survive the switch back — re-derive
+          // through the same refresh entry hydration uses.
           tab.controllers.conversationController?.refreshUsageWindow?.(conversation);
         }
       } else if (!tab.conversationId && tab.state.messages.length === 0) {
