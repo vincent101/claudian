@@ -153,11 +153,67 @@ describe('usageInfo', () => {
       expect(refreshed.contextWindowIsAuthoritative).toBe(false);
     });
 
-    it('returns the usage unchanged when no selector model exists', () => {
-      const usage = createClaudeUsage({ model: undefined });
+    it('falls back to the provider settings model when no selector model is given', () => {
+      // 3.0.2 hotfix: an empty selector model must not silently preserve a
+      // stale stored denominator — re-derive from the provider's current
+      // settings model instead.
+      const usage = createClaudeUsage();
+      const refreshed = refreshUsageContextWindow(usage, {
+        uiConfig: claudeChatUIConfig,
+        settings: {
+          ...createClaudeSettings(presets, { 'sonnet': 1_000_000 }),
+          model: 'sonnet',
+        },
+      });
+
+      expect(refreshed.model).toBe('sonnet');
+      expect(refreshed.contextWindow).toBe(1_000_000);
+      expect(refreshed.percentage).toBe(45);
+    });
+
+    it('falls back to the first offered preset when the settings model is absent', () => {
+      const usage = createClaudeUsage();
       const refreshed = refreshUsageContextWindow(usage, {
         uiConfig: claudeChatUIConfig,
         settings: createClaudeSettings(presets, {}),
+      });
+
+      expect(refreshed.model).toBe('haiku');
+      expect(refreshed.contextWindow).toBe(200_000);
+      expect(refreshed.percentage).toBe(100);
+    });
+
+    it('ignores a settings model the provider does not own', () => {
+      // A raw settings bag may carry another provider's model: the fallback
+      // must not denominate a Claude usage from it.
+      const usage = createClaudeUsage();
+      const refreshed = refreshUsageContextWindow(usage, {
+        uiConfig: claudeChatUIConfig,
+        settings: {
+          ...createClaudeSettings(presets, { 'sonnet': 1_000_000 }),
+          model: 'gpt-5.4',
+        },
+      });
+
+      expect(refreshed.model).toBe('haiku');
+      expect(refreshed.contextWindow).toBe(200_000);
+    });
+
+    it('returns the usage unchanged when no model resolves at all', () => {
+      // A provider that offers no models and has no settings model: nothing
+      // to denominate from, so the stored snapshot survives. (Claude's
+      // settings layer always migrates to default presets, so this contract
+      // needs a stub config.)
+      const usage = createClaudeUsage({ model: undefined });
+      const emptyUiConfig = {
+        normalizeModelVariant: (model: string) => model,
+        getContextWindowSize: () => 200_000,
+        ownsModel: () => false,
+        getModelOptions: () => [],
+      };
+      const refreshed = refreshUsageContextWindow(usage, {
+        uiConfig: emptyUiConfig,
+        settings: {},
       });
 
       expect(refreshed).toBe(usage);

@@ -1717,7 +1717,7 @@ describe('ConversationController', () => {
       expect(deps.state.usage?.percentage).toBe(45);
     });
 
-    it('keeps the stored usage as-is when no selector model projection exists', async () => {
+    it('re-denominates from the provider fallback model when no selector model projection exists', async () => {
       seedClaudeSettings({ 'sonnet': 1_000_000 });
       deps.state.currentConversationId = 'conv-usage';
       (deps.plugin.getConversationById as jest.Mock).mockResolvedValue(
@@ -1726,8 +1726,12 @@ describe('ConversationController', () => {
 
       await controller.loadActive();
 
-      // No selector model to denominate from: the stored snapshot survives.
-      expect(deps.state.usage).toEqual(storedUsage());
+      // No projection to denominate from: the provider's fallback model (the
+      // first preset) denominates instead — the stale stored 200k snapshot
+      // must not silently survive (3.0.2 hotfix).
+      expect(deps.state.usage?.model).toBe('haiku');
+      expect(deps.state.usage?.contextWindow).toBe(200_000);
+      expect(deps.state.usage?.percentage).toBe(100);
     });
 
     it('drops a stale authoritative window when the selector model differs from the usage model', async () => {
