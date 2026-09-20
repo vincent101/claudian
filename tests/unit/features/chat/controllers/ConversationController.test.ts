@@ -2,6 +2,7 @@ import { createMockEl } from '@test/helpers/mockElement';
 import { Menu, Notice } from 'obsidian';
 
 import { ProviderRegistry } from '@/core/providers/ProviderRegistry';
+import type { ChatMessage } from '@/core/types';
 import { ConversationController, type ConversationControllerDeps } from '@/features/chat/controllers/ConversationController';
 import * as historySearchModule from '@/features/chat/controllers/HistorySearchController';
 import { type HistoryDiagnosticEvent, setHistoryDiagnosticsSink } from '@/features/chat/history/HistoryDiagnostics';
@@ -3879,6 +3880,128 @@ describe('ConversationController - Rewind', () => {
     expect(mockAgentService.rewind).toHaveBeenCalledWith('user-uuid', 'prev-a');
     const msg = mockNotice.mock.calls[0][0] as string;
     expect(msg).toContain('Save failed');
+  });
+
+  describe('windowed rewind (F1)', () => {
+    const detail = (id: string, role: 'user' | 'assistant', extra: Record<string, unknown> = {}): ChatMessage => ({
+      id, role, content: `content-${id}`, timestamp: 1, projectionLevel: 'detail', ...extra,
+    } as ChatMessage);
+    const makeWindowedDeps = () => {
+      deps.state.currentConversationId = 'conv-1';
+      deps.state.messages = [
+        detail('m1', 'assistant', { assistantMessageId: 'prev-a' }),
+        detail('m2', 'user', { userMessageId: 'user-uuid' }),
+        detail('m3', 'assistant', { assistantMessageId: 'resp-a' }),
+      ];
+      deps.state.loadedRanges = [{ start: 110, end: 120 }];
+      deps.state.historyHasMore = true;
+      const lease = {
+        conversationId: 'conv-1',
+        totalTurns: 120,
+        ready: Promise.resolve(),
+        release: jest.fn(),
+        search: jest.fn().mockResolvedValue([]),
+        loadMessageDetail: jest.fn(),
+        loadWindow: jest.fn(),
+        planWindow: jest.fn(),
+      };
+      deps.state.historyLease = lease as any;
+      deps.state.historyPageStore.upsertPage({
+        pageKey: 'w:110:120',
+        range: { start: 110, end: 120 },
+        messages: [...deps.state.messages],
+        projectedWeight: 100,
+      });
+      const windowRenderer = { reset: jest.fn(), addPage: jest.fn(), sampleIntent: jest.fn() };
+      deps.getHistoryWindowRenderer = () => windowRenderer as any;
+      return { lease, windowRenderer };
+    };
+
+    it('resets the window renderer and remounts the surviving projection as one synthetic page', async () => {
+      const { windowRenderer } = makeWindowedDeps();
+
+      await controller.rewind('m2');
+
+      expect(deps.state.messages.map(message => message.id)).toEqual(['m1']);
+      expect(windowRenderer.reset).toHaveBeenCalledTimes(1);
+      expect(windowRenderer.addPage).toHaveBeenCalledTimes(1);
+      expect(windowRenderer.addPage).toHaveBeenCalledWith(
+        expect.objectContaining({
+          pageKey: 'rewind:110:120',
+          range: { start: 110, end: 120 },
+          messages: [expect.objectContaining({ id: 'm1' })],
+        }),
+        120,
+      );
+      // The clear-rebuild legacy path must not run: it orphans every page wrapper.
+      expect(deps.renderer.renderMessages).not.toHaveBeenCalled();
+      expect(deps.state.loadedRanges).toEqual([{ start: 110, end: 120 }]);
+      expect(deps.state.historyHasMore).toBe(true);
+      expect(deps.renderer.renderHistoryPager).toHaveBeenCalledWith(true, false, null, expect.any(Function));
+    });
+
+    it('keeps the load-older anchor at the surviving window start instead of the stale snapshot total', async () => {
+      const { lease } = makeWindowedDeps();
+      lease.loadWindow.mockResolvedValue({
+        messages: [detail('m0', 'user', { userMessageId: 'u0' })],
+        range: { start: 100, end: 110 },
+        sourceBytes: 10, projectedChars: 20, oversizedTurnCount: 0,
+        pageKey: 'w:100:110', hasMoreBefore: true, hasMoreAfter: false,
+      });
+
+      await controller.rewind('m2');
+      await controller.loadOlderHistory();
+
+      expect(lease.loadWindow).toHaveBeenCalledWith(expect.objectContaining({
+        anchorTurn: 110,
+        direction: 'older',
+        minTurn: 0,
+      }));
+    });
+
+    it('hides the pager when the surviving projection already covers the whole history', async () => {
+      const { windowRenderer } = makeWindowedDeps();
+      // Fully loaded history in one page; rewinding deep inside it leaves
+      // nothing older to load, so the pager must disappear.
+      deps.state.historyPageStore.clear();
+      deps.state.loadedRanges = [{ start: 0, end: 120 }];
+      deps.state.historyPageStore.upsertPage({
+        pageKey: 'w:0:120',
+        range: { start: 0, end: 120 },
+        messages: [...deps.state.messages],
+        projectedWeight: 100,
+      });
+
+      await controller.rewind('m2');
+
+      expect(deps.state.loadedRanges).toEqual([{ start: 0, end: 120 }]);
+      expect(deps.state.historyHasMore).toBe(false);
+      expect(deps.renderer.renderHistoryPager).toHaveBeenCalledWith(false, false, null, expect.any(Function));
+      expect(windowRenderer.addPage).toHaveBeenCalledWith(
+        expect.objectContaining({ pageKey: 'rewind:0:120', range: { start: 0, end: 120 } }),
+        120,
+      );
+    });
+
+    it('stays on the legacy renderer when the window renderer exists but no lease does', async () => {
+      deps.state.currentConversationId = 'conv-1';
+      deps.state.messages = [
+        detail('m1', 'assistant', { assistantMessageId: 'prev-a' }),
+        detail('m2', 'user', { userMessageId: 'user-uuid' }),
+        detail('m3', 'assistant', { assistantMessageId: 'resp-a' }),
+      ];
+      const windowRenderer = { reset: jest.fn(), addPage: jest.fn(), sampleIntent: jest.fn() };
+      deps.getHistoryWindowRenderer = () => windowRenderer as any;
+
+      await controller.rewind('m2');
+
+      expect(windowRenderer.reset).not.toHaveBeenCalled();
+      expect(windowRenderer.addPage).not.toHaveBeenCalled();
+      expect(deps.renderer.renderMessages).toHaveBeenCalledWith(
+        expect.any(Array),
+        expect.any(Function),
+      );
+    });
   });
 
   describe('Inline prompt dismissal', () => {

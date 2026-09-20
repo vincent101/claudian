@@ -971,9 +971,54 @@ export class ConversationController {
     inputEl.value = userMsg.displayContent ?? userMsg.content;
     inputEl.focus();
 
-    const welcomeEl = renderer.renderMessages(state.messages, () => this.getGreeting());
-    this.deps.setWelcomeEl(welcomeEl);
-    this.updateWelcomeVisibility();
+    const windowRenderer = this.deps.getHistoryWindowRenderer?.() ?? null;
+    if (windowRenderer && state.historyLease) {
+      // F1: a windowed rewind must re-enter the window pipeline, not the
+      // clear-rebuild legacy path — renderMessages bumps the DOM epoch and
+      // empties messagesEl, orphaning every page wrapper while the page
+      // store keeps the stale records (upsertPage then hands back detached
+      // wrappers). Mirror switchTo: reset, then remount the surviving
+      // projection as one synthetic page.
+      const lease = state.historyLease;
+      const rewindRecord = this.deps.state.historyPageStore.findByMessageId(userMessageId);
+      const keepStart = rewindRecord?.range.start;
+      const keepEnd = rewindRecord?.range.end ?? lease.totalTurns;
+      await this.runStoredTransaction(async isStale => {
+        if (isStale()) return;
+        // Loaded ranges keep their union through the rewind page's end: turns
+        // past the rewind point were loaded once and the stale index snapshot
+        // must never re-materialize them, while the load-older anchor stays
+        // at the surviving window start. Ranges beyond the rewind page are
+        // dropped with their truncated messages.
+        const kept = keepStart === undefined
+          ? this.mergeRanges(state.loadedRanges)
+          : this.mergeRanges([
+            ...state.loadedRanges.filter(range => range.end <= keepStart),
+            { start: keepStart, end: keepEnd },
+          ]);
+        windowRenderer.reset();
+        const messagesEl = this.deps.getMessagesEl();
+        messagesEl.empty();
+        const welcomeEl = messagesEl.createDiv({ cls: 'claudian-welcome' });
+        welcomeEl.createDiv({ cls: 'claudian-welcome-greeting', text: this.getGreeting() });
+        this.deps.setWelcomeEl(welcomeEl);
+        const pageStart = kept.length > 0 ? kept[0].start : (keepStart ?? lease.totalTurns);
+        windowRenderer.addPage({
+          pageKey: `rewind:${pageStart}:${keepEnd}`,
+          range: { start: pageStart, end: keepEnd },
+          messages: state.messages,
+          projectedWeight: state.messages.reduce((sum, message) => sum + JSON.stringify(message).length * 2, 0),
+        }, lease.totalTurns);
+        state.loadedRanges = kept;
+        state.historyHasMore = !this.coversAll(kept, keepEnd);
+      });
+      this.updateWelcomeVisibility();
+      this.renderHistoryPager();
+    } else {
+      const welcomeEl = renderer.renderMessages(state.messages, () => this.getGreeting());
+      this.deps.setWelcomeEl(welcomeEl);
+      this.updateWelcomeVisibility();
+    }
 
     const filesChanged = result.filesChanged?.length ?? 0;
     let saveError: string | null = null;

@@ -195,6 +195,29 @@ describe('HistoryWindowRenderer', () => {
     expect(root.querySelector('[data-message-id="hit-0"]')).not.toBeNull();
   });
 
+  it('rebuilds cleanly after a rewind-style reset without detached wrappers, then reveals search hits (F1)', async () => {
+    const { renderer, root, store } = createHarness(400);
+    renderer.addPage({ pageKey: 'w:200:300', range: { start: 200, end: 300 }, messages: messages(100, 'old'), projectedWeight: 1 }, 400);
+    renderer.addPage({ pageKey: 'w:300:400', range: { start: 300, end: 400 }, messages: messages(100, 'new'), projectedWeight: 1 }, 400);
+    expect(root.querySelectorAll('[data-page-key]').length).toBe(2);
+
+    // Rewind: reset, clear the container (the rewind rebuild), remount the
+    // surviving projection as one synthetic page.
+    renderer.reset();
+    root.innerHTML = '';
+    store.clear();
+    renderer.addPage({ pageKey: 'rewind:300:400', range: { start: 300, end: 400 }, messages: messages(100, 'new'), projectedWeight: 1 }, 400);
+
+    const wrappers = (renderer as any).wrappers as Map<string, HTMLElement>;
+    expect(wrappers.size).toBe(1);
+    for (const wrapper of wrappers.values()) expect(wrapper.isConnected).toBe(true);
+    expect(root.querySelectorAll('[data-page-key]').length).toBe(1);
+    expect(store.values().length).toBe(1);
+    // Search locate must still resolve through the rebuilt page.
+    await expect(renderer.revealMessage('new-42')).resolves.toBe(true);
+    expect(root.querySelector('[data-message-id="new-42"]')).not.toBeNull();
+  });
+
   it.each(['mounted', 'spacer', 'evicted'] as const)('reveals search hits from %s pages', async renderState => {
     const rematerializePage = jest.fn(async (record: any) => ({
       pageKey: record.pageKey,
