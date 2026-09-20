@@ -1,7 +1,11 @@
-import { appendFile, mkdtemp, rm, stat, writeFile } from 'fs/promises';
+import { appendFile, mkdtemp, readFile, rm, stat, writeFile } from 'fs/promises';
 import { tmpdir } from 'os';
 import { join } from 'path';
 
+import type { Conversation } from '@/core/types';
+import { ClaudeConversationHistoryService } from '@/providers/claude/history/ClaudeConversationHistoryService';
+import { buildTranscriptIndex } from '@/providers/claude/history/ClaudeTranscriptHistoryIndex';
+import * as sdkSessionPaths from '@/providers/claude/history/sdkSessionPaths';
 import { ClaudeTranscriptTailReader } from '@/providers/claude/transcript/ClaudeTranscriptTailReader';
 import { ClaudeTranscriptTurnObserver } from '@/providers/claude/transcript/ClaudeTranscriptTurnObserver';
 
@@ -560,5 +564,71 @@ describe('ClaudeTranscriptTurnObserver', () => {
       observer.stop();
     }
     expect(callbacks.started).not.toHaveBeenCalled();
+  });
+
+  it('primes at the index committed boundary across service and observer layers (F2 contract)', async () => {
+    // Locks the cross-layer contract behind fromOffset: the index reports a
+    // committed boundary pinned to the last complete newline, the service
+    // hands that exact boundary out as the page snapshotOffset, and an
+    // observer primed there consumes the completed half line plus the next
+    // line exactly once without re-reading committed rows. If a future
+    // producer ever feeds a non-boundary offset, this contract — not an
+    // unconditional recover inside the observer — is the seam that must hold.
+    const done = `${peerTurn('peer-done', 'old').join('\n')}\n`;
+    const openUserRow = JSON.stringify({ type: 'user', uuid: 'peer-open', origin: { kind: 'peer', body: 'hi' }, message: { role: 'user', content: 'hi' } });
+    const openResultRow = JSON.stringify({ type: 'result', subtype: 'success', isSidechain: false, total_cost_usd: 0.01, duration_ms: 100, turn_uuid: 'peer-open' });
+    await writeFile(file, `${done}${openUserRow.slice(0, 40)}`);
+
+    // Layer 1 (index): partial snapshot, committedSize sits one byte past a
+    // real newline and before the half line.
+    const indexResult = await buildTranscriptIndex(file, { useWorker: false });
+    expect(indexResult.status).toBe('partial');
+    if (indexResult.status !== 'partial') return;
+    const committed = indexResult.index.committedSize;
+    expect(committed).toBe(Buffer.byteLength(done));
+    const raw = await readFile(file);
+    expect(raw[committed - 1]).toBe(0x0a);
+    expect(committed).toBeLessThan(raw.length);
+
+    // Layer 2 (service): the page handoff offset equals the committed
+    // boundary; this is the value Tab.ts forwards to the runtime's
+    // setTranscriptObserverStartOffset.
+    const sessionPathSpy = jest.spyOn(sdkSessionPaths, 'getSDKSessionPath').mockReturnValue(file);
+    const existsSpy = jest.spyOn(sdkSessionPaths, 'sdkSessionExists').mockReturnValue(true);
+    const conversation: Conversation = {
+      id: 'f2-contract', providerId: 'claude', title: 'F2', createdAt: 1, updatedAt: 1,
+      sessionId: 'f2-contract', providerState: { providerSessionId: 'f2-contract' }, messages: [],
+    };
+    const service = new ClaudeConversationHistoryService();
+    const lease = service.acquireHistoryIndex(conversation, dir);
+    await lease.ready;
+    const page = await lease.loadWindow({
+      anchorTurn: 1, direction: 'older',
+      budget: { maxTurns: 25, maxSourceBytes: 8 * 1024 * 1024, maxProjectedChars: 2_000_000, timeSliceMs: 8 },
+      projectionLevel: 'detail',
+    });
+    expect(page.snapshotOffset).toBe(committed);
+    lease.release();
+    sessionPathSpy.mockRestore();
+    existsSpy.mockRestore();
+
+    // Layer 3 (observer): primed at that boundary, the completed half line
+    // and the line after it are each consumed once; nothing replays.
+    const { observer, callbacks } = setup();
+    try {
+      await observer.start(file, page.snapshotOffset);
+      await appendFile(file, `${openUserRow.slice(40)}\n${openResultRow}\n`);
+      const reader = (observer as any).reader as ClaudeTranscriptTailReader;
+      const batch = await reader.readAvailable();
+      expect(batch.lines).toEqual([openUserRow, openResultRow]);
+      await (observer as any).consumeBatch(batch, (observer as any).generation);
+
+      expect(callbacks.started).toHaveBeenCalledTimes(1);
+      expect(callbacks.started).toHaveBeenCalledWith(expect.objectContaining({ turnId: 'peer-open' }));
+      expect(callbacks.finished).toHaveBeenCalledTimes(1);
+      expect(callbacks.finished).toHaveBeenCalledWith(expect.objectContaining({ turnId: 'peer-open' }));
+    } finally {
+      observer.stop();
+    }
   });
 });
