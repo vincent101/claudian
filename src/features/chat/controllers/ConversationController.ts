@@ -843,6 +843,11 @@ export class ConversationController {
         state.loadedRanges = [firstScreen.range];
         state.historyHasMore = firstScreen.hasMoreBefore;
         state.historySnapshotOffset = firstScreen.snapshotOffset ?? null;
+      } else {
+        // Non-index conversations have no pager: stale pagination flags from
+        // the outgoing conversation must not leak a dead button.
+        state.historyHasMore = false;
+        state.historySnapshotOffset = null;
       }
       await this.restoreConversation(conversation, firstScreen);
       // Release while the tab still carries the outgoing claim; commit replaces it.
@@ -851,6 +856,10 @@ export class ConversationController {
 
       this.deps.getHistoryDropdown()?.removeClass('visible');
       this.updateWelcomeVisibility();
+      // The restored projection owns the pager: switching in through the
+      // dropdown bypasses loadActive, so the pager must be rendered here too
+      // or a paged conversation shows no "Load earlier messages" button.
+      this.renderHistoryPager();
 
       // P6: READY must mean the first-screen DOM is settled, not just that
       // the data arrived — the restored render queue drains first (the real

@@ -191,6 +191,20 @@ describe('ConversationController', () => {
       expect(lease.release).not.toHaveBeenCalled();
     });
 
+    it('renders the history pager after the indexed first screen', async () => {
+      const conversation = { id: 'large', providerId: 'claude', title: 'Large', messages: [], sessionId: 'session', createdAt: 1, updatedAt: 1 } as any;
+      deps.state.currentConversationId = 'large';
+      (deps.plugin.getConversationById as jest.Mock).mockResolvedValue(conversation);
+      (deps.plugin.getConversationSync as jest.Mock).mockReturnValue(conversation);
+      const lease = makeLease();
+      lease.loadWindow.mockResolvedValue({ messages: [{ id: 'latest', role: 'user', content: 'latest', timestamp: 1 }], range: { start: 110, end: 120 }, snapshotOffset: 123, sourceBytes: 1024, projectedChars: 7, oversizedTurnCount: 0, pageKey: 'w:110:120', hasMoreBefore: true, hasMoreAfter: false });
+      deps.getHistoryIndexCapableService = () => ({ acquireHistoryIndex: () => lease } as any);
+
+      await controller.loadActive();
+
+      expect(deps.renderer.renderHistoryPager).toHaveBeenCalledWith(true, false, null, expect.any(Function));
+    });
+
     it('backfills legacy metadata before runtime initialization', async () => {
       const conversation = { id: 'legacy', providerId: 'claude', title: 'Legacy', messages: [], sessionId: 'session', createdAt: 1, updatedAt: 1 } as any;
       deps.state.currentConversationId = 'legacy';
@@ -2669,6 +2683,46 @@ describe('ConversationController - MCP Server Persistence', () => {
 
       expect(historyWindowRenderer.addPage).not.toHaveBeenCalled();
       expect(deps.renderer.renderMessages).toHaveBeenCalledWith(switchedConversation.messages, expect.any(Function));
+    });
+
+    it('renders the history pager after a paged first-screen restore', async () => {
+      deps.state.currentConversationId = 'old-conv';
+      const switched = { id: 'large', providerId: 'claude', title: 'Large', messages: [], sessionId: 'session', createdAt: 1, updatedAt: 1 } as any;
+      (deps.plugin.switchConversation as jest.Mock).mockResolvedValue(switched);
+      (deps.plugin.getConversationSync as jest.Mock).mockImplementation((id: string) => (id === 'large' ? switched : null));
+      const lease = {
+        conversationId: 'large', totalTurns: 120, ready: Promise.resolve(), release: jest.fn(),
+        planWindow: jest.fn().mockImplementation(({ anchorTurn, budget }: any) => ({ start: anchorTurn - budget.maxTurns, end: anchorTurn })),
+        loadWindow: jest.fn().mockResolvedValue({
+          messages: [{ id: 'latest', role: 'user', content: 'latest', timestamp: 1 }],
+          range: { start: 110, end: 120 }, sourceBytes: 10, projectedChars: 20,
+          oversizedTurnCount: 0, pageKey: 'w:110:120', hasMoreBefore: true, hasMoreAfter: false,
+        }),
+      };
+      deps.getHistoryIndexCapableService = () => ({ acquireHistoryIndex: () => lease } as any);
+      const historyWindowRenderer = { addPage: jest.fn(), reset: jest.fn(), sampleIntent: jest.fn() };
+      deps.getHistoryWindowRenderer = () => historyWindowRenderer as any;
+
+      await controller.switchTo('large');
+
+      expect(historyWindowRenderer.addPage).toHaveBeenCalled();
+      expect(deps.renderer.renderHistoryPager).toHaveBeenCalledWith(true, false, null, expect.any(Function));
+    });
+
+    it('clears stale pager state when switching to a conversation without paged history', async () => {
+      deps.state.currentConversationId = 'old-conv';
+      // Stale pagination flags from the outgoing conversation must not leak a
+      // dead "Load earlier" button into the incoming conversation.
+      deps.state.historyHasMore = true;
+      const switched = { id: 'codex-conv', providerId: 'codex', title: 'Codex', messages: [{ id: 'm', role: 'user', content: 'hello', timestamp: 1 }], sessionId: 'session-codex', createdAt: 1, updatedAt: 1 } as any;
+      (deps.plugin.switchConversation as jest.Mock).mockResolvedValue(switched);
+      (deps.plugin.getConversationSync as jest.Mock).mockImplementation((id: string) => (id === 'codex-conv' ? switched : null));
+      deps.getHistoryIndexCapableService = () => null;
+
+      await controller.switchTo('codex-conv');
+
+      expect(deps.state.historyHasMore).toBe(false);
+      expect(deps.renderer.renderHistoryPager).toHaveBeenCalledWith(false, false, null, expect.any(Function));
     });
 
     it('should ensure the tab service matches the switched conversation provider', async () => {
