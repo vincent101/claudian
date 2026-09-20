@@ -552,6 +552,85 @@ describe('ClaudeTranscriptHistoryIndex oversized line degradation', () => {
   });
 });
 
+describe('ClaudeTranscriptHistoryIndex resume cache identity', () => {
+  // The completed/in-flight cache identity must include the resume projection
+  // variant: finalizeIndex applies anchor truncation and the oversized-ancestry
+  // fail-close only on the resume path, so a plain entry of the same snapshot
+  // must never serve a fork's resume build, and a truncated resume entry must
+  // never serve a later plain build.
+  const forkLines = [
+    JSON.stringify({ type: 'user', uuid: 'u1', message: { content: 'question' } }),
+    JSON.stringify({ type: 'assistant', uuid: 'a1', parentUuid: 'u1', message: { content: 'answer' } }),
+    JSON.stringify({ type: 'user', uuid: 'u2', parentUuid: 'a1', message: { content: 'after checkpoint' } }),
+    JSON.stringify({ type: 'assistant', uuid: 'a2', parentUuid: 'u2', message: { content: 'later answer' } }),
+  ];
+
+  beforeEach(() => {
+    clearTranscriptIndexCache();
+  });
+
+  async function writeForkTranscript(name: string): Promise<string> {
+    const path = join(process.env.TMPDIR ?? '/tmp', `claudian-resume-cache-${name}-${process.pid}.jsonl`);
+    await writeFile(path, `${forkLines.join('\n')}\n`);
+    return path;
+  }
+
+  it('rebuilds a resume build instead of reusing the plain completed entry of the same snapshot', async () => {
+    const path = await writeForkTranscript('plain-first');
+    const plain = await buildTranscriptIndex(path, { useWorker: false });
+    expect(plain.status).toBe('complete');
+    if (plain.status !== 'complete') return;
+    expect(plain.index.entries.map(entry => entry.messageKey)).toEqual(['u1', 'a1', 'u2', 'a2']);
+
+    const resume = await buildTranscriptIndex(path, { useWorker: false, resumeAtMessageId: 'a1' });
+    expect(resume.status).toBe('complete');
+    if (resume.status !== 'complete') return;
+    expect(resume.fromCache).toBeUndefined();
+    expect(resume.index.entries.map(entry => entry.messageKey)).toEqual(['u1', 'a1']);
+  });
+
+  it('does not serve a truncated resume entry to a later plain build', async () => {
+    const path = await writeForkTranscript('resume-first');
+    const resume = await buildTranscriptIndex(path, { useWorker: false, resumeAtMessageId: 'a1' });
+    expect(resume.status).toBe('complete');
+    if (resume.status !== 'complete') return;
+    expect(resume.index.entries.map(entry => entry.messageKey)).toEqual(['u1', 'a1']);
+
+    const plain = await buildTranscriptIndex(path, { useWorker: false });
+    expect(plain.status).toBe('complete');
+    if (plain.status !== 'complete') return;
+    expect(plain.fromCache).toBeUndefined();
+    expect(plain.index.entries.map(entry => entry.messageKey)).toEqual(['u1', 'a1', 'u2', 'a2']);
+  });
+
+  it('serves the same snapshot and same resume anchor from the completed cache', async () => {
+    const path = await writeForkTranscript('resume-hit');
+    const first = await buildTranscriptIndex(path, { useWorker: false, resumeAtMessageId: 'a1' });
+    expect(first.status).toBe('complete');
+    if (first.status !== 'complete') return;
+    const second = await buildTranscriptIndex(path, { useWorker: false, resumeAtMessageId: 'a1' });
+    expect(second.status).toBe('complete');
+    if (second.status !== 'complete') return;
+    expect(second.fromCache).toBe(true);
+    expect(second.index).toBe(first.index);
+  });
+
+  it('does not share an in-flight build between plain and resume variants of the same snapshot', async () => {
+    const path = await writeForkTranscript('concurrent');
+    const plain = buildTranscriptIndex(path, { useWorker: false });
+    const resume = buildTranscriptIndex(path, { useWorker: false, resumeAtMessageId: 'a1' });
+    expect(resume).not.toBe(plain);
+    const [plainResult, resumeResult] = await Promise.all([plain, resume]);
+    expect(plainResult.status).toBe('complete');
+    if (plainResult.status !== 'complete') return;
+    expect(plainResult.index.entries.map(entry => entry.messageKey)).toEqual(['u1', 'a1', 'u2', 'a2']);
+    expect(resumeResult.status).toBe('complete');
+    if (resumeResult.status !== 'complete') return;
+    expect(resumeResult.index).not.toBe(plainResult.index);
+    expect(resumeResult.index.entries.map(entry => entry.messageKey)).toEqual(['u1', 'a1']);
+  });
+});
+
 describe('ClaudeTranscriptHistoryIndex oversized identity recovery (dual bounded scans)', () => {
   const KIB = 1024;
   const userRow = JSON.stringify({ type: 'user', uuid: 'u1', parentUuid: null, message: { content: 'question' } });
@@ -631,12 +710,10 @@ describe('ClaudeTranscriptHistoryIndex oversized identity recovery (dual bounded
     expect(opaque.parentUuid).toBe('u1');
     expect(opaque.type).toBe('user');
     // Session-level fail-close: an unverifiable ancestry must fail the resume
-    // build explicitly instead of silently guessing a branch. A separate file
-    // avoids the completed cache, whose snapshot key does not distinguish a
-    // resume build from the plain one that just ran on the same snapshot.
-    const resumePath = tempPath('both-occluded-resume');
-    await writeFile(resumePath, `${[userRow, row, answerRow].join('\n')}\n`);
-    const resume = await buildTranscriptIndex(resumePath, { useWorker: false, chunkSize: 64, maxLineBytes: 100, resumeAtMessageId: 'a2' });
+    // build explicitly instead of silently guessing a branch — including when
+    // the plain entry for the same snapshot already sits in the completed
+    // cache, which is exactly the fork-after-source-hydration shape.
+    const resume = await buildTranscriptIndex(path, { useWorker: false, chunkSize: 64, maxLineBytes: 100, resumeAtMessageId: 'a2' });
     expect(resume.status).toBe('failed');
     if (resume.status !== 'failed') return;
     expect(resume.error).toMatch(/oversized/i);
@@ -984,6 +1061,65 @@ describe('partial snapshot handling through the history service', () => {
     expect(toolCalls[0].status).not.toBe('completed');
     expect(page.messages.map(message => message.content).join('\n')).toContain('bytes omitted');
     lease.release();
+  });
+});
+
+describe('fork resume through the history service', () => {
+  const budget = {
+    maxTurns: 25,
+    maxSourceBytes: 8 * 1024 * 1024,
+    maxProjectedChars: 2_000_000,
+    timeSliceMs: 8,
+  };
+  const fixtureDir = join(process.env.TMPDIR ?? '/tmp', `claudian-fork-resume-${process.pid}`);
+
+  beforeEach(async () => {
+    clearTranscriptIndexCache();
+    await (await import('fs/promises')).rm(fixtureDir, { recursive: true, force: true });
+    await (await import('fs/promises')).mkdir(fixtureDir, { recursive: true });
+  });
+
+  afterAll(async () => {
+    await (await import('fs/promises')).rm(fixtureDir, { recursive: true, force: true });
+  });
+
+  it('truncates a fork conversation at its checkpoint after the source already hydrated plainly', async () => {
+    const lines = [
+      JSON.stringify({ type: 'user', uuid: 'u1', parentUuid: null, message: { content: 'question' } }),
+      JSON.stringify({ type: 'assistant', uuid: 'a1', parentUuid: 'u1', message: { content: 'answer' } }),
+      JSON.stringify({ type: 'user', uuid: 'u2', parentUuid: 'a1', message: { content: 'after checkpoint' } }),
+      JSON.stringify({ type: 'assistant', uuid: 'a2', parentUuid: 'u2', message: { content: 'later answer' } }),
+    ];
+    const path = join(fixtureDir, 'fork-source.jsonl');
+    await writeFile(path, `${lines.join('\n')}\n`);
+    jest.spyOn(sdkSessionPaths, 'getSDKSessionPath').mockReturnValue(path);
+    jest.spyOn(sdkSessionPaths, 'sdkSessionExists').mockReturnValue(true);
+
+    const service = new ClaudeConversationHistoryService();
+    const source: Conversation = {
+      id: 'fork-source', providerId: 'claude', title: 'Source', createdAt: 1, updatedAt: 1,
+      sessionId: 'source-session', providerState: { providerSessionId: 'source-session' }, messages: [],
+    };
+    // The source conversation hydrates plainly first; its completed cache entry
+    // stays protected by the active lease — exactly the shape of a real fork
+    // created while the source tab is open.
+    const sourceLease = service.acquireHistoryIndex(source, fixtureDir);
+    await sourceLease.ready;
+    expect(sourceLease.totalTurns).toBe(2);
+
+    const fork: Conversation = {
+      id: 'fork-child', providerId: 'claude', title: 'Fork', createdAt: 2, updatedAt: 2,
+      sessionId: null,
+      providerState: { forkSource: { sessionId: 'source-session', resumeAt: 'a1' } }, messages: [],
+    };
+    const forkLease = service.acquireHistoryIndex(fork, fixtureDir);
+    await forkLease.ready;
+    expect(forkLease.totalTurns).toBe(1);
+    const page = await forkLease.loadWindow({ anchorTurn: 1, direction: 'older', budget, projectionLevel: 'detail' });
+    expect(page.messages.map(message => message.content)).toEqual(['question', 'answer']);
+
+    sourceLease.release();
+    forkLease.release();
   });
 });
 

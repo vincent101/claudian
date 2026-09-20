@@ -1059,6 +1059,20 @@ async function snapshotKey(filePath: string): Promise<string> {
   return `${filePath}:${info.dev}:${info.ino}:${info.size}:${info.mtimeMs}`;
 }
 
+/** Resume projection variant of a build. Truthiness matches finalizeIndex's
+ * resume handling, so an empty anchor encodes as plain, never a third variant. */
+function resumeVariantKey(resumeAtMessageId: string | undefined): string {
+  return resumeAtMessageId ? `resume=${resumeAtMessageId}` : 'plain';
+}
+
+/** Cache identity of a built index: snapshot identity plus projection variant.
+ * finalizeIndex applies anchor truncation and the oversized-ancestry fail-close
+ * only on the resume path, so plain and resume builds of the same snapshot
+ * must never share a completed or in-flight entry. */
+function indexCacheKey(snapshot: string, resumeAtMessageId: string | undefined): string {
+  return `${snapshot}:${resumeVariantKey(resumeAtMessageId)}`;
+}
+
 function serializeWorkerFunction(fn: (...args: never[]) => unknown): string {
   // ts-jest/esbuild may namespace imported helpers before Function#toString;
   // the worker source defines those helpers as locals, so normalize qualifiers.
@@ -1364,10 +1378,13 @@ export function resetTranscriptIndexWorkerProbe(): void {
 }
 
 export function buildTranscriptIndex(filePath: string, options: BuildOptions = {}): Promise<TranscriptIndexResult> {
-  const requestKey = `${filePath}:${options.chunkSize ?? DEFAULT_CHUNK_SIZE}:${options.maxLineBytes ?? DEFAULT_MAX_LINE_BYTES}:${options.useWorker !== false}:${options.resumeAtMessageId ?? ''}`;
+  // The request key reuses the same variant encoding as the snapshot cache
+  // identity below so the layers can never drift into separate rule sets.
+  const requestKey = `${filePath}:${options.chunkSize ?? DEFAULT_CHUNK_SIZE}:${options.maxLineBytes ?? DEFAULT_MAX_LINE_BYTES}:${options.useWorker !== false}:${resumeVariantKey(options.resumeAtMessageId)}`;
   const existingRequest = requests.get(requestKey);
   if (existingRequest) return existingRequest;
-  const request = snapshotKey(filePath).then(key => {
+  const request = snapshotKey(filePath).then(snapshot => {
+    const key = indexCacheKey(snapshot, options.resumeAtMessageId);
     const cached = completed.get(key);
     if (cached) {
       touchCompleted(key, cached);
