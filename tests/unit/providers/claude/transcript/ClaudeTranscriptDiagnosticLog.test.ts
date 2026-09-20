@@ -30,6 +30,22 @@ describe('ClaudeTranscriptDiagnosticLog', () => {
     expect(content).toContain('"offset":1234');
   });
 
+  it('persists oversized identity-recovery provenance without values', async () => {
+    // Real-machine acceptance for the dual-scan fix depends on the recovery
+    // source being visible in the on-disk log, not just in the sink event.
+    const log = new ClaudeTranscriptDiagnosticLog(vault);
+    log.record({
+      phase: 'line_skipped',
+      reason: 'oversized',
+      offset: 1234,
+      identityRecovery: 'suffix',
+      recoveredIdentityFields: ['uuid', 'timestamp'],
+    });
+    const content = await readFile(join(vault, '.claudian/diagnostics/transcript-tail.current.jsonl'), 'utf8');
+    expect(content).toContain('"identityRecovery":"suffix"');
+    expect(content).toContain('"recoveredIdentityFields":["uuid","timestamp"]');
+  });
+
   it('keeps each serialized event within one kilobyte', async () => {
     const log = new ClaudeTranscriptDiagnosticLog(vault);
     log.record({ phase: 'callback_error', errorName: 'X'.repeat(10_000) });

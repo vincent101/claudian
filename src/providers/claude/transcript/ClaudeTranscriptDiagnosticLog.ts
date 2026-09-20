@@ -31,6 +31,9 @@ export interface TranscriptDiagnosticEvent {
   mode?: 'worker' | 'direct';
   reason?: 'oversized' | 'malformed' | 'no_conversation' | 'no_lease' | 'provider_without_index' | 'stale';
   outcome?: 'rebuilt' | 'cache_hit' | 'not_applicable' | 'failed';
+  /** How the oversized-row identity was recovered (field names only, never values). */
+  identityRecovery?: string;
+  recoveredIdentityFields?: string[];
   offset?: number;
   queueMs?: number;
   bytes?: number;
@@ -88,7 +91,7 @@ export class ClaudeTranscriptDiagnosticLog {
 
   private serialize(event: TranscriptDiagnosticEvent): string {
     const clean: Record<string, unknown> = { ts: Date.now(), seq: ++this.seq, phase: event.phase };
-    for (const key of ['tabIdHash', 'turnIdHash', 'generation', 'renderTicket', 'projectedWeight', 'leaseKind', 'batchBytes', 'batchLines', 'elapsedMs', 'errorName', 'buildId', 'mode', 'reason', 'outcome', 'offset', 'queueMs', 'bytes', 'totalBytes', 'entries', 'turns', 'turnCount', 'sourceBytes', 'projectedChars', 'oversizedTurns'] as const) {
+    for (const key of ['tabIdHash', 'turnIdHash', 'generation', 'renderTicket', 'projectedWeight', 'leaseKind', 'batchBytes', 'batchLines', 'elapsedMs', 'errorName', 'buildId', 'mode', 'reason', 'outcome', 'identityRecovery', 'recoveredIdentityFields', 'offset', 'queueMs', 'bytes', 'totalBytes', 'entries', 'turns', 'turnCount', 'sourceBytes', 'projectedChars', 'oversizedTurns'] as const) {
       const value = event[key];
       if (value !== undefined) clean[key] = typeof value === 'string' ? value.slice(0, 128) : value;
     }

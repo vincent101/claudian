@@ -525,11 +525,15 @@ export class HistoryWindowRenderer {
       const current = this.options.pageStore.peek(record.pageKey);
       // Revalidate at write time: the record must still be the store's
       // current page, still hold its data, and still be worth mounting
-      // (search pin or viewport adjacency survived the queue wait).
+      // (search pin or viewport adjacency survived the queue wait). An
+      // earlier FIFO neighbour (scroll reconcile) may have mounted it
+      // already — remounting would swap the wrapper and orphan the old
+      // subtree in the resize observer.
       if (
         !current
         || current !== record
         || current.messages === null
+        || current.renderState === 'mounted'
         || (!this.visiblePages.has(record.pageKey) && !this.adjacentPages.has(record.pageKey) && !current.pins.has('search'))
       ) return;
       this.mount(current);

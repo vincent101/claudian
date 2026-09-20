@@ -269,6 +269,32 @@ describe('HistoryWindowRenderer', () => {
     expect(mount).toHaveBeenCalledTimes(1);
   });
 
+  it('does not remount an already-mounted page when its queued reveal grant arrives (F6 guard)', async () => {
+    const { renderer, store, coordinator } = createHarness();
+    renderer.addPage({ pageKey: 'hit-page', range: { start: 0, end: 20 }, messages: messages(20, 'hit'), projectedWeight: 1 }, 300);
+    const record = store.peek('hit-page')!;
+    record.renderState = 'spacer';
+    const mount = jest.spyOn(renderer as any, 'mount');
+
+    // The reveal queues behind a live lease; while it waits, a scroll
+    // reconcile (same FIFO, earlier grant) mounts the page first.
+    const live = await coordinator.acquireLive();
+    const reveal = renderer.revealMessage('hit-0');
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(mount).not.toHaveBeenCalled();
+
+    record.renderState = 'mounted';
+    live?.release();
+
+    // The queued grant must see the page already mounted and skip the
+    // redundant remount (a remount would replace the wrapper and leak the
+    // old subtree into the resize observer).
+    expect(await reveal).toBe(true);
+    expect(mount).not.toHaveBeenCalled();
+    expect(store.peek('hit-page')?.renderState).toBe('mounted');
+  });
+
   it('drops a queued resident reveal mount after the conversation switches (F6)', async () => {
     const { renderer, store, coordinator, setConversationId } = createHarness();
     renderer.addPage({ pageKey: 'hit-page', range: { start: 0, end: 20 }, messages: messages(20, 'hit'), projectedWeight: 1 }, 300);
