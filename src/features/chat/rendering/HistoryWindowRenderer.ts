@@ -1,7 +1,7 @@
 import type { HistoryWindowPage } from '../../../core/providers/types';
 import type { ChatMessage } from '../../../core/types';
 import { recordHistoryDiagnosticEvent } from '../history/HistoryDiagnostics';
-import type { HistoryPageRecord, HistoryPageStore } from '../history/HistoryPageStore';
+import type { HistoryPageRecord, HistoryPageRetention, HistoryPageStore } from '../history/HistoryPageStore';
 import type { ProjectionWriteCoordinator, StoredIntentDirection } from './ProjectionWriteCoordinator';
 
 export const HISTORY_WINDOWING_ENABLED = true;
@@ -15,6 +15,8 @@ export const HISTORY_WINDOW_LIMITS = {
 
 export interface HistoryPageInput extends Pick<HistoryWindowPage, 'pageKey' | 'range' | 'messages'> {
   projectedWeight: number;
+  /** Data-source semantics passed through to the page store (F1). */
+  retention?: HistoryPageRetention;
 }
 
 type WindowIntent = {

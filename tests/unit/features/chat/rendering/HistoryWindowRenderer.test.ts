@@ -218,6 +218,34 @@ describe('HistoryWindowRenderer', () => {
     expect(root.querySelector('[data-message-id="new-42"]')).not.toBeNull();
   });
 
+  it('keeps memory-only rewind pages under eviction pressure and reveals them without disk loads (F1)', async () => {
+    const rematerializePage = jest.fn(async () => null);
+    const { renderer, store } = createHarness(400, { rematerializePage });
+    renderer.addPage({
+      pageKey: 'rewind:300:400', range: { start: 300, end: 400 },
+      messages: messages(100, 'rw'), projectedWeight: 1, retention: 'memory-only',
+    }, 400);
+    expect(store.peek('rewind:300:400')?.retention).toBe('memory-only');
+    store.peek('rewind:300:400')!.renderState = 'spacer';
+
+    // Page-data pressure: twelve newer reloadable pages push past maxPages
+    // (default 12), making the unpinned synthetic page the LRU victim.
+    for (let page = 0; page < 12; page += 1) {
+      renderer.addPage({
+        pageKey: `w:${page * 20}:${page * 20 + 20}`,
+        range: { start: page * 20, end: page * 20 + 20 },
+        messages: messages(20, `p${page}`),
+        projectedWeight: 1,
+      }, 400);
+    }
+
+    // The synthetic page kept its memory-only data despite the pressure.
+    expect(store.peek('rewind:300:400')?.messages).not.toBeNull();
+    await expect(renderer.revealMessage('rw-42')).resolves.toBe(true);
+    expect(rematerializePage).not.toHaveBeenCalled();
+    expect(store.peek('rewind:300:400')?.renderState).toBe('mounted');
+  });
+
   it.each(['mounted', 'spacer', 'evicted'] as const)('reveals search hits from %s pages', async renderState => {
     const rematerializePage = jest.fn(async (record: any) => ({
       pageKey: record.pageKey,

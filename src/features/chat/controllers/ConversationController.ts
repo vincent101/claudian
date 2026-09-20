@@ -24,6 +24,7 @@ import { confirm } from '../../../shared/modals/ConfirmModal';
 import { getVaultPath } from '../../../utils/path';
 import { recordHistoryDiagnosticEvent } from '../history/HistoryDiagnostics';
 import { HISTORY_RESOURCE_POLICY } from '../history/HistoryResourcePolicy';
+import type { HistoryPageRetention } from '../history/HistoryPageStore';
 import type { HistoryPageInput, HistoryWindowRenderer } from '../rendering/HistoryWindowRenderer';
 import type { MessageRenderer } from '../rendering/MessageRenderer';
 import type { ProjectionWriteCoordinator } from '../rendering/ProjectionWriteCoordinator';
@@ -336,7 +337,14 @@ export class ConversationController {
     await this.loadOlderWindow(lease);
   }
 
-  async rematerializeHistoryPage(record: { pageKey: string; range: LoadedTurnRange; uiState: Map<string, { detailLoaded?: boolean }> }): Promise<HistoryPageInput | null> {
+  async rematerializeHistoryPage(record: { pageKey: string; range: LoadedTurnRange; retention?: HistoryPageRetention; uiState: Map<string, { detailLoaded?: boolean }> }): Promise<HistoryPageInput | null> {
+    if (record.retention === 'memory-only') {
+      // Unreachable while eviction exempts memory-only pages; if the
+      // invariant breaks, refuse loudly instead of reading the stale index —
+      // the snapshot still contains the branches the rewind discarded (F1).
+      recordHistoryDiagnosticEvent({ kind: 'memory_only_rematerialize', pageKey: record.pageKey });
+      return null;
+    }
     const lease = this.deps.state.historyLease;
     const conversationId = this.deps.state.currentConversationId;
     if (!lease || !conversationId) return null;
@@ -1008,6 +1016,10 @@ export class ConversationController {
           range: { start: pageStart, end: keepEnd },
           messages: state.messages,
           projectedWeight: state.messages.reduce((sum, message) => sum + JSON.stringify(message).length * 2, 0),
+          // The synthetic page IS the memory truth: the disk snapshot still
+          // contains the discarded branches, so it is exempt from eviction
+          // (explicit overcommit) and must never be rematerialized (F1).
+          retention: 'memory-only',
         }, lease.totalTurns);
         state.loadedRanges = kept;
         state.historyHasMore = !this.coversAll(kept, keepEnd);

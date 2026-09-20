@@ -795,6 +795,27 @@ describe('ConversationController', () => {
       expect(result?.messages[0]).toMatchObject({ content: 'full detail body', projectionLevel: 'detail' });
     });
 
+    it('refuses rematerialization of a memory-only page with a diagnostic, never reading the stale index (F1)', async () => {
+      const events: HistoryDiagnosticEvent[] = [];
+      setHistoryDiagnosticsSink(event => events.push(event));
+      try {
+        const lease = makeLease(10);
+        deps.state.currentConversationId = 'conv';
+        deps.state.historyLease = lease as any;
+        const result = await controller.rematerializeHistoryPage({
+          pageKey: 'rewind:0:5',
+          range: { start: 0, end: 5 },
+          retention: 'memory-only',
+          uiState: new Map(),
+        });
+        expect(result).toBeNull();
+        expect(lease.loadWindow).not.toHaveBeenCalled();
+        expect(events).toContainEqual(expect.objectContaining({ kind: 'memory_only_rematerialize', pageKey: 'rewind:0:5' }));
+      } finally {
+        setHistoryDiagnosticsSink(null);
+      }
+    });
+
     it('searches fully-hydrated loaded messages without a lease (Codex/OpenCode fallback)', async () => {
       deps.state.currentConversationId = 'codex-conv';
       deps.state.messages = [
@@ -3930,6 +3951,9 @@ describe('ConversationController - Rewind', () => {
           pageKey: 'rewind:110:120',
           range: { start: 110, end: 120 },
           messages: [expect.objectContaining({ id: 'm1' })],
+          // The synthetic page is the memory truth: the stale disk snapshot
+          // still contains the discarded branches and must never reload it.
+          retention: 'memory-only',
         }),
         120,
       );

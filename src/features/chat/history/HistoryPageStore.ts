@@ -4,6 +4,14 @@ import type { ChatMessage } from '../../../core/types';
 export type HistoryPagePin = 'visible' | 'adjacent' | 'live' | 'search' | 'transaction';
 export type HistoryPageRenderState = 'mounted' | 'spacer' | 'evicted';
 export type HistoryHeightQuality = 'measured' | 'estimated';
+/**
+ * Where a page's data may be reloaded from. `memory-only` marks synthetic
+ * pages whose only valid source is the retained projection itself (rewind
+ * rebuilds): the disk snapshot still contains the discarded branches, so
+ * eviction would destroy the truth — these pages overcommit explicitly
+ * under budget pressure instead of being reloaded from a stale index.
+ */
+export type HistoryPageRetention = 'reloadable' | 'memory-only';
 
 export interface MessageUiState {
   expanded?: boolean;
@@ -21,6 +29,7 @@ export interface HistoryPageRecord {
   range: LoadedTurnRange;
   messages: ChatMessage[] | null;
   projectedWeight: number;
+  retention: HistoryPageRetention;
   measuredHeight: number | null;
   measuredWidth: number | null;
   renderState: HistoryPageRenderState;
@@ -64,13 +73,16 @@ export class HistoryPageStore {
     this.onDiagnostic = options.onDiagnostic;
   }
 
-  upsertPage(input: Pick<HistoryPageRecord, 'pageKey' | 'range' | 'messages' | 'projectedWeight'> & { pins?: Iterable<HistoryPagePin> }): HistoryPageRecord {
+  upsertPage(input: Pick<HistoryPageRecord, 'pageKey' | 'range' | 'messages' | 'projectedWeight'> & { retention?: HistoryPageRetention; pins?: Iterable<HistoryPagePin> }): HistoryPageRecord {
     const existing = this.records.get(input.pageKey);
     if (existing) {
       existing.range = { ...input.range };
       existing.messages = input.messages;
       if (input.messages) existing.messageIds = new Set(input.messages.map(message => message.id));
       existing.projectedWeight = input.projectedWeight;
+      // Absent retention preserves the record's data-source semantics — a
+      // memory-only page must never be silently downgraded to evictable.
+      if (input.retention) existing.retention = input.retention;
       for (const pin of input.pins ?? []) existing.pins.add(pin);
       existing.lastAccess = ++this.clock;
       this.enforceLimits();
@@ -78,6 +90,7 @@ export class HistoryPageStore {
     }
     const record: HistoryPageRecord = {
       ...input,
+      retention: input.retention ?? 'reloadable',
       range: { ...input.range },
       measuredHeight: null,
       measuredWidth: null,
@@ -262,7 +275,10 @@ export class HistoryPageStore {
     };
     while (overweight()) {
       const victim = resident()
-        .filter(record => record.pins.size === 0 && record.renderState !== 'mounted' && !record.pageKey.startsWith('live:'))
+        .filter(record => record.pins.size === 0
+          && record.renderState !== 'mounted'
+          && !record.pageKey.startsWith('live:')
+          && record.retention !== 'memory-only')
         .sort((a, b) => a.lastAccess - b.lastAccess)[0];
       if (!victim) {
         const pages = resident().filter(page => !page.pageKey.startsWith('live:'));

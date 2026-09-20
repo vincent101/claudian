@@ -15,6 +15,12 @@ export type HistoryDiagnosticEvent =
   | { kind: 'page_render_timeout'; pageKey: string; ticket: number; timeoutMs: number }
   | { kind: 'page_data_overcommit'; pages: number; projectedWeight: number }
   | { kind: 'dom_overcommit'; pageKey: string; turns: number }
+  /**
+   * A memory-only page was asked to rematerialize. Unreachable while eviction
+   * exempts those pages; the event proves the invariant broke — the page must
+   * never be reloaded from its stale disk source (F1).
+   */
+  | { kind: 'memory_only_rematerialize'; pageKey: string }
   | {
     kind: 'search_snapshot_refresh';
     outcome: HistorySearchSnapshotRefreshOutcome;

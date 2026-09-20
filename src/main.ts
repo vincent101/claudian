@@ -78,6 +78,8 @@ export default class ClaudianPlugin extends Plugin {
           renderDiagnostics.record({ phase: event.kind, entries: event.pages, projectedWeight: event.projectedWeight });
         } else if (event.kind === 'search_snapshot_refresh') {
           renderDiagnostics.record({ phase: event.kind, outcome: event.outcome, reason: event.reason, elapsedMs: event.elapsedMs });
+        } else if (event.kind === 'memory_only_rematerialize') {
+          renderDiagnostics.record({ phase: event.kind });
         } else {
           renderDiagnostics.record({ phase: event.kind, turns: event.turns });
         }

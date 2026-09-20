@@ -13,7 +13,7 @@ export type TranscriptDiagnosticPhase =
   | 'cache_hit' | 'cache_evict' | 'cache_overcommit'
   | 'line_skipped' | 'partial_snapshot' | 'stale_partial_segment'
   | 'page_render_timeout' | 'page_data_overcommit' | 'dom_overcommit'
-  | 'search_snapshot_refresh';
+  | 'search_snapshot_refresh' | 'memory_only_rematerialize';
 
 export interface TranscriptDiagnosticEvent {
   phase: TranscriptDiagnosticPhase;

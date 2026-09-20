@@ -51,6 +51,37 @@ describe('HistoryPageStore', () => {
     expect(store.replaceMessage('a', message('a'))).toBe(false);
   });
 
+  it('exempts memory-only pages from eviction and reports the explicit overcommit (F1)', () => {
+    const diagnostics: string[] = [];
+    const store = new HistoryPageStore({ maxPages: 1, onDiagnostic: event => diagnostics.push(event.kind) });
+    const rewind = store.upsertPage({
+      pageKey: 'rewind:110:120', range: { start: 110, end: 120 },
+      messages: [message('r')], projectedWeight: 40, retention: 'memory-only',
+    });
+    // Unmounted and unpinned: a reloadable page here would be the victim.
+    rewind.renderState = 'spacer';
+    store.upsertPage({
+      pageKey: 'w:120:130', range: { start: 120, end: 130 },
+      messages: [message('w')], projectedWeight: 40, pins: ['visible'],
+    });
+
+    // The rewind page's disk source is stale by construction, so budget
+    // pressure overcommits explicitly instead of destroying the memory truth.
+    expect(rewind.messages).not.toBeNull();
+    expect(store.peek('w:120:130')?.messages).not.toBeNull();
+    expect(diagnostics).toContain('page_data_overcommit');
+  });
+
+  it('defaults retention to reloadable and never downgrades a memory-only record', () => {
+    const store = new HistoryPageStore({ maxPages: 1 });
+    expect(store.upsertPage({ pageKey: 'w:0:1', range: { start: 0, end: 1 }, messages: [message('a')], projectedWeight: 1 }).retention).toBe('reloadable');
+
+    store.upsertPage({ pageKey: 'rewind:0:1', range: { start: 0, end: 1 }, messages: [message('r')], projectedWeight: 1, retention: 'memory-only' });
+    // A retention-less re-upsert of the same page must not make it evictable.
+    store.upsertPage({ pageKey: 'rewind:0:1', range: { start: 0, end: 1 }, messages: [message('r')], projectedWeight: 1 });
+    expect(store.peek('rewind:0:1')?.retention).toBe('memory-only');
+  });
+
   it('allows diagnosed overcommit when every resident page is pinned', () => {
     const diagnostics: string[] = [];
     const store = new HistoryPageStore({ maxPages: 1, maxProjectedWeight: 50, onDiagnostic: event => diagnostics.push(event.kind) });
