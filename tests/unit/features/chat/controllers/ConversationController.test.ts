@@ -583,10 +583,88 @@ describe('ConversationController', () => {
     });
 
     // ============================================
-    // Search snapshot refresh vs paging serialization (F5)
+    // Search snapshot refresh: build off-grant (P1) + exchange serialization (F5)
     // ============================================
 
-    it('queues the search snapshot refresh behind an in-flight older-window load and releases the previous lease only after it (F5)', async () => {
+    it('leaves the projection queue free while the snapshot build hangs: a new live lease acquires and releases immediately (P1)', async () => {
+      const coordinator = new ProjectionWriteCoordinator();
+      deps.getProjectionCoordinator = () => coordinator;
+      deps.state.currentConversationId = 'large';
+      const conversation = { id: 'large', providerId: 'claude', title: 'Large', messages: [], sessionId: 'session', createdAt: 1, updatedAt: 1 } as any;
+      (deps.plugin.getConversationSync as jest.Mock).mockReturnValue(conversation);
+      const previous = makeLease(100);
+      deps.state.historyLease = previous as any;
+      let resolveReady!: () => void;
+      const next = makeLease(100);
+      next.ready = new Promise<void>(resolve => { resolveReady = resolve; });
+      const service = { acquireHistoryIndex: jest.fn().mockReturnValue(next) };
+      deps.getHistoryIndexCapableService = () => service as any;
+
+      const refreshing = controller.refreshHistorySearchSnapshot();
+      await Promise.resolve();
+      await Promise.resolve();
+
+      // The build hangs, but the FIFO is free: the head-of-line block a
+      // grant-held build caused is gone.
+      const live = await coordinator.acquireLive();
+      expect(live).not.toBeNull();
+      live!.release();
+      expect(deps.state.historyLease).toBe(previous);
+      expect(previous.release).not.toHaveBeenCalled();
+
+      // The build completes while another live turn streams: the exchange
+      // queues behind it (necessary serialization, not a build-length
+      // block) and swaps once the turn ends.
+      const liveTwo = await coordinator.acquireLive();
+      resolveReady();
+      await Promise.resolve();
+      await Promise.resolve();
+      expect(deps.state.historyLease).toBe(previous);
+      liveTwo!.release();
+      await refreshing;
+      expect(deps.state.historyLease).toBe(next);
+      expect(previous.release).toHaveBeenCalledTimes(1);
+    });
+
+    it('starts the refresh build without waiting for an in-flight live turn (P1)', async () => {
+      const coordinator = new ProjectionWriteCoordinator();
+      deps.getProjectionCoordinator = () => coordinator;
+      deps.state.currentConversationId = 'large';
+      const conversation = { id: 'large', providerId: 'claude', title: 'Large', messages: [], sessionId: 'session', createdAt: 1, updatedAt: 1 } as any;
+      (deps.plugin.getConversationSync as jest.Mock).mockReturnValue(conversation);
+      const previous = makeLease(100);
+      deps.state.historyLease = previous as any;
+      let resolveReady!: () => void;
+      const next = makeLease(100);
+      next.ready = new Promise<void>(resolve => { resolveReady = resolve; });
+      const service = { acquireHistoryIndex: jest.fn().mockReturnValue(next) };
+      deps.getHistoryIndexCapableService = () => service as any;
+
+      const live = await coordinator.acquireLive();
+      const refreshing = controller.refreshHistorySearchSnapshot();
+      await Promise.resolve();
+      await Promise.resolve();
+
+      // The rescan starts even while the live turn streams: the refresh
+      // never waits for a live result, so it can never head-of-line block
+      // (or cycle with) the projection queue. The build holds no grant.
+      expect(service.acquireHistoryIndex).toHaveBeenCalledTimes(1);
+      expect(deps.state.historyLease).toBe(previous);
+
+      resolveReady();
+      await Promise.resolve();
+      await Promise.resolve();
+      // The exchange defers to the still-streaming turn — the necessary
+      // serialization, not the old build-length block.
+      expect(deps.state.historyLease).toBe(previous);
+      live!.release();
+      await refreshing;
+      expect(deps.state.historyLease).toBe(next);
+      expect(previous.release).toHaveBeenCalledTimes(1);
+      expect(next.release).not.toHaveBeenCalled();
+    });
+
+    it('builds the next snapshot while an older-window load is in flight and exchanges only after it lands (F5)', async () => {
       const coordinator = new ProjectionWriteCoordinator();
       deps.getProjectionCoordinator = () => coordinator;
       deps.state.currentConversationId = 'large';
@@ -610,10 +688,12 @@ describe('ConversationController', () => {
       await Promise.resolve();
       await Promise.resolve();
 
-      // While the load is in flight: the previous lease keeps its index
-      // protection, and the exchange has not acquired or swapped anything.
+      // While the load is in flight (P1): the refresh build already started
+      // without taking the projection grant, so the page load keeps
+      // streaming through the still-mounted previous lease; only the
+      // exchange waits for the FIFO.
       expect(previous.release).not.toHaveBeenCalled();
-      expect(service.acquireHistoryIndex).not.toHaveBeenCalled();
+      expect(service.acquireHistoryIndex).toHaveBeenCalledTimes(1);
       expect(deps.state.historyLease).toBe(previous);
 
       resolveOlder({ messages: [{ id: 'older', role: 'user', content: 'older', timestamp: 50 }], range: { start: 100, end: 150 }, snapshotOffset: 5, sourceBytes: 1, projectedChars: 1, oversizedTurnCount: 0, pageKey: 'w:100:150', hasMoreBefore: true, hasMoreAfter: false });
@@ -627,7 +707,7 @@ describe('ConversationController', () => {
       expect(service.acquireHistoryIndex).toHaveBeenCalledWith(conversation, '/vault', undefined, true);
     });
 
-    it('re-captures the mounted lease under the paging grant after a refresh swap, never materializing through the released one (F5)', async () => {
+    it('serves paging from the previous lease while the snapshot builds and exchanges only after the page load lands (F5)', async () => {
       const coordinator = new ProjectionWriteCoordinator();
       deps.getProjectionCoordinator = () => coordinator;
       deps.state.currentConversationId = 'large';
@@ -638,30 +718,72 @@ describe('ConversationController', () => {
       deps.state.messages = [{ id: 'latest', role: 'user', content: 'latest', timestamp: 100 }] as any;
       deps.state.loadedRanges = [{ start: 150, end: 200 }];
       let resolveReady!: () => void;
+      let resolveOlder!: (page: unknown) => void;
       const next = makeLease(200);
       next.ready = new Promise<void>(resolve => { resolveReady = resolve; });
-      next.loadWindow.mockResolvedValue({ messages: [{ id: 'older', role: 'user', content: 'older', timestamp: 50 }], range: { start: 100, end: 150 }, snapshotOffset: 5, sourceBytes: 1, projectedChars: 1, oversizedTurnCount: 0, pageKey: 'w:100:150', hasMoreBefore: true, hasMoreAfter: false });
+      previous.loadWindow.mockImplementationOnce(() => new Promise(resolve => { resolveOlder = resolve; }));
       const service = { acquireHistoryIndex: jest.fn().mockReturnValue(next) };
       deps.getHistoryIndexCapableService = () => service as any;
 
       const refreshing = controller.refreshHistorySearchSnapshot();
       await Promise.resolve();
       await Promise.resolve();
-      // The user pages while the refresh builds: the load queues behind it.
+      // The user pages while the refresh builds (P1): the load is granted
+      // immediately and materializes through the still-mounted previous
+      // lease — the old structure queued it behind the whole build.
       const paging = controller.loadOlderHistory();
       await Promise.resolve();
       await Promise.resolve();
-      expect(previous.loadWindow).not.toHaveBeenCalled();
+      expect(previous.loadWindow).toHaveBeenCalledTimes(1);
       expect(next.loadWindow).not.toHaveBeenCalled();
 
+      // The build completes mid-load: the exchange queues behind the
+      // in-flight page load, so `previous` is never released under a window
+      // task that captured it (F5).
       resolveReady();
-      await refreshing;
-      await paging;
+      await Promise.resolve();
+      await Promise.resolve();
+      expect(deps.state.historyLease).toBe(previous);
+      expect(previous.release).not.toHaveBeenCalled();
 
-      // The granted load used the freshly swapped lease; the released
-      // previous lease never served an unprotected materialization.
-      expect(previous.loadWindow).not.toHaveBeenCalled();
+      resolveOlder({ messages: [{ id: 'older', role: 'user', content: 'older', timestamp: 50 }], range: { start: 100, end: 150 }, snapshotOffset: 5, sourceBytes: 1, projectedChars: 1, oversizedTurnCount: 0, pageKey: 'w:100:150', hasMoreBefore: true, hasMoreAfter: false });
+      await paging;
+      await refreshing;
+
+      // The page load used the previous lease while it was still protected;
+      // only then did the swap mount `next` and end the previous reference
+      // exactly once. The released lease never served another load.
+      expect(previous.loadWindow).toHaveBeenCalledTimes(1);
+      expect(next.loadWindow).not.toHaveBeenCalled();
+      expect(deps.state.historyLease).toBe(next);
+      expect(previous.release).toHaveBeenCalledTimes(1);
+    });
+
+    it('captures only the swapped-in lease when paging obtains the grant after the exchange (F5)', async () => {
+      const coordinator = new ProjectionWriteCoordinator();
+      deps.getProjectionCoordinator = () => coordinator;
+      deps.state.currentConversationId = 'large';
+      const conversation = { id: 'large', providerId: 'claude', title: 'Large', messages: [], sessionId: 'session', createdAt: 1, updatedAt: 1 } as any;
+      (deps.plugin.getConversationSync as jest.Mock).mockReturnValue(conversation);
+      const previous = makeLease(200);
+      deps.state.historyLease = previous as any;
+      deps.state.messages = [{ id: 'latest', role: 'user', content: 'latest', timestamp: 100 }] as any;
+      deps.state.loadedRanges = [{ start: 150, end: 200 }];
+      const next = makeLease(200);
+      next.loadWindow.mockResolvedValue({ messages: [{ id: 'older', role: 'user', content: 'older', timestamp: 50 }], range: { start: 100, end: 150 }, snapshotOffset: 5, sourceBytes: 1, projectedChars: 1, oversizedTurnCount: 0, pageKey: 'w:100:150', hasMoreBefore: true, hasMoreAfter: false });
+      const service = { acquireHistoryIndex: jest.fn().mockReturnValue(next) };
+      deps.getHistoryIndexCapableService = () => service as any;
+
+      // The snapshot build resolves immediately and the exchange runs first.
+      await controller.refreshHistorySearchSnapshot();
+      expect(deps.state.historyLease).toBe(next);
+
+      // Paging queued after the exchange captures only `next`; the released
+      // previous lease never serves another window load.
+      await controller.loadOlderHistory();
+
       expect(next.loadWindow).toHaveBeenCalledTimes(1);
+      expect(previous.loadWindow).not.toHaveBeenCalled();
       expect(previous.release).toHaveBeenCalledTimes(1);
       expect(deps.state.historyLease).toBe(next);
     });
@@ -702,7 +824,7 @@ describe('ConversationController', () => {
       expect(deps.state.historyLease).toBeNull();
     });
 
-    it('skips the exchange when the conversation switches while the refresh queues behind a live turn (F5)', async () => {
+    it('releases the unbuilt-for next lease when the conversation switches while the exchange waits behind a live turn (F5)', async () => {
       const coordinator = new ProjectionWriteCoordinator();
       deps.getProjectionCoordinator = () => coordinator;
       deps.state.currentConversationId = 'large';
@@ -717,12 +839,21 @@ describe('ConversationController', () => {
       const live = await coordinator.acquireLive();
       const refreshing = controller.refreshHistorySearchSnapshot();
       await Promise.resolve();
-      // The conversation switched while the refresh waits for the live turn.
+      await Promise.resolve();
+      // P1: the build already started under the live turn (it takes no
+      // projection grant), so the switch below lands while only the
+      // exchange waits on the FIFO.
+      expect(service.acquireHistoryIndex).toHaveBeenCalledTimes(1);
+
+      // The conversation switched while the exchange waits for the live turn.
       deps.state.currentConversationId = 'switched';
       live!.release();
 
       await expect(refreshing).resolves.toEqual({ status: 'not_applicable', reason: 'stale' });
-      expect(service.acquireHistoryIndex).not.toHaveBeenCalled();
+      // The never-mounted next lease ends its reference exactly once; the
+      // mounted lease of the switched-away conversation is untouched here
+      // (the switch owns its release).
+      expect(next.release).toHaveBeenCalledTimes(1);
       expect(previous.release).not.toHaveBeenCalled();
       expect(deps.state.historyLease).toBe(previous);
     });
