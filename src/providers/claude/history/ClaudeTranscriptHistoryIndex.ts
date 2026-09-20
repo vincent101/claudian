@@ -29,6 +29,12 @@ const DEFAULT_MAX_LINE_BYTES = 16 * 1024 * 1024;
 // Bounded prefix read used to extract reliable identity facts from an
 // oversized line; anything past this bound stays unknown rather than guessed.
 const OVERSIZED_FACTS_READ_BYTES = 256 * 1024;
+// Bounded tail read, symmetric with the prefix budget: CC rows keep uuid/
+// timestamp after the message payload and a short structural tail, so a giant
+// message.content hides identity from the prefix while the tail still sees it.
+// Worst-case dual reads stay at 512 KiB per oversized row. A row occluded at
+// both bounds stays unresolved — recovery must be provable, not guessed.
+const OVERSIZED_FACTS_TAIL_READ_BYTES = 256 * 1024;
 const OVERSIZED_FACTS_STRING_CAP = 4096;
 
 export interface TranscriptIndexEntry {
@@ -99,10 +105,17 @@ export type TranscriptIndexResult =
   | { status: 'partial'; index: TranscriptHistoryIndex; error: string; fromCache?: true }
   | { status: 'failed'; error: string };
 
+export type OversizedIdentityRecovery = 'prefix' | 'suffix' | 'both' | 'unresolved' | 'conflict';
+export type OversizedIdentityField = 'uuid' | 'parentUuid' | 'type' | 'timestamp';
+
 export interface TranscriptLineSkipEvent {
   reason: 'oversized' | 'malformed';
   offset: number;
   bytes: number;
+  /** Oversized-row identity provenance; absent for malformed lines. */
+  identityRecovery?: OversizedIdentityRecovery;
+  /** Recovered identity field names only — never values. */
+  recoveredIdentityFields?: OversizedIdentityField[];
 }
 
 interface BuildOptions {
@@ -198,6 +211,16 @@ interface OversizedLineFacts {
   toolResultIds: string[];
 }
 
+/** Decodes a bounded raw string token; null when over cap or unparseable. */
+function decodeBoundedJsonString(raw: string): string | null {
+  if (raw.length > OVERSIZED_FACTS_STRING_CAP) return null;
+  try {
+    return JSON.parse(`"${raw}"`) as string;
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Structure-aware scanner over the bounded prefix of an oversized JSONL row.
  * Walks object/array nesting and string-token boundaries so keys that merely
@@ -231,12 +254,7 @@ function parseOversizedLineFacts(buffer: Buffer): OversizedLineFacts | null {
       }
       if (byte === 0x22) {
         const raw = buffer.toString('utf8', pos + 1, cursor);
-        if (raw.length > OVERSIZED_FACTS_STRING_CAP) return { value: null, next: cursor + 1 };
-        try {
-          return { value: JSON.parse(`"${raw}"`) as string, next: cursor + 1 };
-        } catch {
-          return { value: null, next: cursor + 1 };
-        }
+        return { value: decodeBoundedJsonString(raw), next: cursor + 1 };
       }
       cursor += 1;
     }
@@ -443,17 +461,226 @@ function parseOversizedLineFacts(buffer: Buffer): OversizedLineFacts | null {
   return facts;
 }
 
+/**
+ * Structure-aware scanner over the bounded tail of an oversized JSONL row,
+ * mirroring parseOversizedLineFacts from the real end of the row backwards.
+ * Only top-level identity fields (uuid/parentUuid/timestamp/type/
+ * sourceToolUseID, plus a literal null parentUuid) are accepted; strings are
+ * skipped as whole tokens by tracking escapes through backslash parity, so
+ * keys occurring inside message/toolUseResult text can never masquerade as
+ * fields. Anything the tail bound cuts off stays unknown.
+ */
+function parseOversizedLineFactsSuffix(buffer: Buffer): OversizedLineFacts | null {
+  const facts: OversizedLineFacts = { toolResultIds: [] };
+  let pos = buffer.length - 1;
+
+  const skipWhitespaceBackward = (): void => {
+    while (pos >= 0) {
+      const byte = buffer[pos];
+      if (byte === 0x20 || byte === 0x09 || byte === 0x0d || byte === 0x0a) pos -= 1;
+      else break;
+    }
+  };
+
+  // pos sits on a string token's closing quote; returns the opening quote
+  // position, or -1 when the window cuts the token (escape parity decides
+  // which quotes are real terminators while walking left).
+  const scanStringBackward = (): number => {
+    let cursor = pos - 1;
+    while (cursor >= 0) {
+      if (buffer[cursor] === 0x22) {
+        let slashes = 0;
+        let probe = cursor - 1;
+        while (probe >= 0 && buffer[probe] === 0x5c) { slashes += 1; probe -= 1; }
+        if (slashes % 2 === 0) return cursor;
+      }
+      cursor -= 1;
+    }
+    return -1;
+  };
+
+  // pos sits on `}`/`]`; returns the matching opener position, or -1 when the
+  // window cuts the container. Strings inside are skipped whole so brackets
+  // in string values never disturb the depth count.
+  const skipContainerBackward = (): number => {
+    const closer = buffer[pos];
+    const opener = closer === 0x7d ? 0x7b : 0x5b;
+    let depth = 0;
+    let cursor = pos;
+    while (cursor >= 0) {
+      const byte = buffer[cursor];
+      if (byte === 0x22) {
+        pos = cursor;
+        const open = scanStringBackward();
+        if (open < 0) return -1;
+        cursor = open - 1;
+        continue;
+      }
+      if (byte === 0x7d || byte === 0x5d) depth += 1;
+      else if (byte === 0x7b || byte === 0x5b) {
+        depth -= 1;
+        if (depth === 0) return byte === opener ? cursor : -1;
+      }
+      cursor -= 1;
+    }
+    return -1;
+  };
+
+  skipWhitespaceBackward();
+  if (pos < 0 || buffer[pos] !== 0x7d) return null;
+  pos -= 1;
+  // Like the forward scanner, a cut structure keeps every fact collected so
+  // far: each of them was verified at its own structural position in the
+  // real bytes, and the tail bound cutting mid-payload is the normal case.
+  for (;;) {
+    skipWhitespaceBackward();
+    if (pos < 0) return facts;
+    if (buffer[pos] === 0x7b) return facts;
+    // Value: walking right-to-left the value's right edge comes first.
+    let stringValue: string | null | undefined;
+    let literalText: string | undefined;
+    const byte = buffer[pos];
+    if (byte === 0x22) {
+      const open = scanStringBackward();
+      if (open < 0) return facts;
+      stringValue = decodeBoundedJsonString(buffer.toString('utf8', open + 1, pos));
+      pos = open - 1;
+    } else if (byte === 0x7d || byte === 0x5d) {
+      const open = skipContainerBackward();
+      if (open < 0) return facts;
+      pos = open - 1;
+    } else {
+      let cursor = pos;
+      while (cursor >= 0) {
+        const b = buffer[cursor];
+        if (b === 0x2c || b === 0x3a || b === 0x7b || b === 0x20 || b === 0x09 || b === 0x0d || b === 0x0a) break;
+        cursor -= 1;
+      }
+      if (cursor < 0) return facts;
+      literalText = buffer.toString('utf8', cursor + 1, pos + 1);
+      pos = cursor;
+    }
+    skipWhitespaceBackward();
+    if (pos < 0 || buffer[pos] !== 0x3a) return facts;
+    pos -= 1;
+    skipWhitespaceBackward();
+    if (pos < 0 || buffer[pos] !== 0x22) return facts;
+    const keyOpen = scanStringBackward();
+    if (keyOpen < 0) return facts;
+    const key = buffer.toString('utf8', keyOpen + 1, pos);
+    if (key.length <= OVERSIZED_FACTS_STRING_CAP) {
+      // First occurrence seen wins from the right (JSON.parse semantics for
+      // duplicate keys); the forward scanner keeps the leftmost, so a real
+      // duplicate surfaces as a merge conflict instead of a silent pick.
+      if (stringValue !== undefined && stringValue !== null) {
+        if (key === 'type' && facts.type === undefined) facts.type = stringValue;
+        else if (key === 'uuid' && facts.uuid === undefined) facts.uuid = stringValue;
+        else if (key === 'parentUuid' && facts.parentUuid === undefined) facts.parentUuid = stringValue;
+        else if (key === 'timestamp' && facts.timestamp === undefined) facts.timestamp = stringValue;
+        else if (key === 'sourceToolUseID' && facts.sourceToolUseID === undefined) facts.sourceToolUseID = stringValue;
+      } else if (key === 'parentUuid' && literalText === 'null' && facts.parentUuid === undefined) {
+        facts.parentUuid = null;
+      }
+    }
+    pos = keyOpen - 1;
+    skipWhitespaceBackward();
+    if (pos < 0) return facts;
+    if (buffer[pos] === 0x2c) { pos -= 1; continue; }
+    if (buffer[pos] === 0x7b) return facts;
+    return facts;
+  }
+}
+
+function listOversizedIdentityFields(facts: OversizedLineFacts | null): OversizedIdentityField[] {
+  if (!facts) return [];
+  const fields: OversizedIdentityField[] = [];
+  if (facts.uuid !== undefined) fields.push('uuid');
+  if (facts.parentUuid !== undefined) fields.push('parentUuid');
+  if (facts.type !== undefined) fields.push('type');
+  if (facts.timestamp !== undefined) fields.push('timestamp');
+  return fields;
+}
+
+interface OversizedLineRecovery {
+  facts: OversizedLineFacts | null;
+  identityRecovery: OversizedIdentityRecovery;
+  recoveredIdentityFields: OversizedIdentityField[];
+}
+
+/**
+ * Conservative per-field merge of the two bounded scans: one-sided values are
+ * adopted, agreeing values kept, and conflicts dropped to unknown — never
+ * guessed. toolResultIds stay prefix-sourced because their structure lives
+ * inside the message payload the tail scan deliberately never enters.
+ */
+function mergeOversizedLineFacts(
+  prefix: OversizedLineFacts | null,
+  suffix: OversizedLineFacts | null,
+): OversizedLineRecovery {
+  const facts: OversizedLineFacts = { toolResultIds: prefix?.toolResultIds ?? [] };
+  let conflict = false;
+  const mergeString = (key: 'type' | 'uuid' | 'timestamp' | 'sourceToolUseID'): void => {
+    const fromPrefix = prefix?.[key];
+    const fromSuffix = suffix?.[key];
+    if (fromPrefix !== undefined && fromSuffix !== undefined && fromPrefix !== fromSuffix) {
+      conflict = true;
+      return;
+    }
+    if (fromPrefix !== undefined) facts[key] = fromPrefix;
+    else if (fromSuffix !== undefined) facts[key] = fromSuffix;
+  };
+  const prefixParent = prefix?.parentUuid;
+  const suffixParent = suffix?.parentUuid;
+  if (prefixParent !== undefined && suffixParent !== undefined && prefixParent !== suffixParent) conflict = true;
+  else if (prefixParent !== undefined) facts.parentUuid = prefixParent;
+  else if (suffixParent !== undefined) facts.parentUuid = suffixParent;
+  mergeString('type');
+  mergeString('uuid');
+  mergeString('timestamp');
+  mergeString('sourceToolUseID');
+  let identityRecovery: OversizedIdentityRecovery;
+  if (conflict) identityRecovery = 'conflict';
+  else if (facts.uuid === undefined) identityRecovery = 'unresolved';
+  else if (prefix?.uuid !== undefined && suffix?.uuid !== undefined) identityRecovery = 'both';
+  else if (prefix?.uuid !== undefined) identityRecovery = 'prefix';
+  else identityRecovery = 'suffix';
+  return { facts, identityRecovery, recoveredIdentityFields: listOversizedIdentityFields(facts) };
+}
+
 async function extractOversizedLineFacts(
   handle: FileHandle,
   offset: number,
   length: number,
-): Promise<OversizedLineFacts | null> {
-  const readLength = Math.min(OVERSIZED_FACTS_READ_BYTES, length);
-  if (readLength <= 0) return null;
-  const buffer = Buffer.allocUnsafe(readLength);
-  const { bytesRead } = await handle.read(buffer, 0, readLength, offset);
-  if (bytesRead <= 0) return null;
-  return parseOversizedLineFacts(buffer.subarray(0, bytesRead));
+): Promise<OversizedLineRecovery> {
+  const unresolved: OversizedLineRecovery = { facts: null, identityRecovery: 'unresolved', recoveredIdentityFields: [] };
+  const prefixLength = Math.min(OVERSIZED_FACTS_READ_BYTES, length);
+  if (prefixLength <= 0) return unresolved;
+  const prefixBuffer = Buffer.allocUnsafe(prefixLength);
+  const { bytesRead: prefixRead } = await handle.read(prefixBuffer, 0, prefixLength, offset);
+  if (prefixRead <= 0) return unresolved;
+  const tailLength = Math.min(OVERSIZED_FACTS_TAIL_READ_BYTES, length);
+  const tailStart = offset + length - tailLength;
+  if (tailStart <= offset + prefixRead) {
+    // The windows overlap: scan the merged coverage (bounded by both
+    // budgets) once with the forward scanner instead of interpreting
+    // the row twice.
+    const mergedLength = Math.min(length, prefixRead + tailLength);
+    const mergedBuffer = Buffer.allocUnsafe(mergedLength);
+    const { bytesRead } = await handle.read(mergedBuffer, 0, mergedLength, offset);
+    if (bytesRead <= 0) return unresolved;
+    const facts = parseOversizedLineFacts(mergedBuffer.subarray(0, bytesRead));
+    return {
+      facts,
+      identityRecovery: facts?.uuid !== undefined ? 'prefix' : 'unresolved',
+      recoveredIdentityFields: listOversizedIdentityFields(facts),
+    };
+  }
+  const tailBuffer = Buffer.allocUnsafe(tailLength);
+  const { bytesRead: tailRead } = await handle.read(tailBuffer, 0, tailLength, tailStart);
+  const prefixFacts = parseOversizedLineFacts(prefixBuffer.subarray(0, prefixRead));
+  if (tailRead <= 0) return mergeOversizedLineFacts(prefixFacts, null);
+  const suffixFacts = parseOversizedLineFactsSuffix(tailBuffer.subarray(0, tailRead));
+  return mergeOversizedLineFacts(prefixFacts, suffixFacts);
 }
 
 async function appendOversizedEntry(
@@ -462,12 +689,13 @@ async function appendOversizedEntry(
   offset: number,
   length: number,
   lineNumber: number,
-): Promise<void> {
-  const facts = await extractOversizedLineFacts(handle, offset, length);
+): Promise<OversizedLineRecovery> {
+  const recovery = await extractOversizedLineFacts(handle, offset, length);
+  const facts = recovery.facts;
   entries.push({
     offset,
     length,
-    // Facts the bounded prefix could not reliably read stay unknown; the
+    // Facts the bounded scans could not reliably read stay unknown; the
     // opaque entry must not guess a type/uuid it never saw.
     type: facts?.type ?? 'unknown',
     messageKey: facts?.uuid ?? `line:${lineNumber}`,
@@ -484,6 +712,7 @@ async function appendOversizedEntry(
     projectionKind: 'skip',
     oversized: true,
   });
+  return recovery;
 }
 
 async function finalizeIndex(
@@ -614,7 +843,7 @@ async function scanSnapshot(
   filePath: string,
   chunkSize: number,
   maxLineBytes: number,
-  onLineSkipped?: (event: { reason: 'oversized' | 'malformed'; offset: number; bytes: number }) => void,
+  onLineSkipped?: (event: TranscriptLineSkipEvent) => void,
   onProgress?: (bytesRead: number, snapshotSize: number) => void,
   signal?: AbortSignal,
 ): Promise<{
@@ -654,8 +883,14 @@ async function scanSnapshot(
       const lineOffset = dataOffset + start;
       const line = data.subarray(start, cursor);
       if (line.length > maxLineBytes) {
-        await appendOversizedEntry(handle, entries, lineOffset, line.length, lineNumber);
-        onLineSkipped?.({ reason: 'oversized', offset: lineOffset, bytes: line.length });
+        const recovery = await appendOversizedEntry(handle, entries, lineOffset, line.length, lineNumber);
+        onLineSkipped?.({
+          reason: 'oversized',
+          offset: lineOffset,
+          bytes: line.length,
+          identityRecovery: recovery.identityRecovery,
+          recoveredIdentityFields: recovery.recoveredIdentityFields,
+        });
       } else if (line.toString('utf8').trim()) {
         try {
           const message = JSON.parse(line.toString('utf8').replace(/\r$/, '')) as SDKNativeMessage;
@@ -696,8 +931,14 @@ async function scanSnapshot(
           oversizedLineBytes += chunkData.length;
         } else {
           oversizedLineBytes += newlineIndex;
-          await appendOversizedEntry(handle, entries, oversizedLineOffset, oversizedLineBytes, lineNumber);
-          onLineSkipped?.({ reason: 'oversized', offset: oversizedLineOffset, bytes: oversizedLineBytes });
+          const recovery = await appendOversizedEntry(handle, entries, oversizedLineOffset, oversizedLineBytes, lineNumber);
+          onLineSkipped?.({
+            reason: 'oversized',
+            offset: oversizedLineOffset,
+            bytes: oversizedLineBytes,
+            identityRecovery: recovery.identityRecovery,
+            recoveredIdentityFields: recovery.recoveredIdentityFields,
+          });
           lineNumber += 1;
           committedSize = position + newlineIndex + 1;
           discardingOversizedLine = false;
@@ -716,7 +957,10 @@ async function scanSnapshot(
     if (discardingOversizedLine) {
       // EOF closed the file inside the oversized line: no committed entry and
       // the committed boundary stays at the line start for the tail reader.
-      onLineSkipped?.({ reason: 'oversized', offset: oversizedLineOffset, bytes: oversizedLineBytes });
+      // No line_skipped here — the line is not yet closed, so no opaque entry
+      // exists; the rebuild that observes the closing newline reports it, and
+      // reporting now would double-count the same line across snapshots.
+      // Partial state is already expressed by status 'partial'.
     }
   } finally {
     await handle.close();
@@ -835,6 +1079,7 @@ function buildInWorker(filePath: string, options: BuildOptions): Promise<Transcr
     const DEFAULT_MAX_LINE_BYTES = ${DEFAULT_MAX_LINE_BYTES};
     const FINALIZE_BATCH_SIZE = ${FINALIZE_BATCH_SIZE};
     const OVERSIZED_FACTS_READ_BYTES = ${OVERSIZED_FACTS_READ_BYTES};
+    const OVERSIZED_FACTS_TAIL_READ_BYTES = ${OVERSIZED_FACTS_TAIL_READ_BYTES};
     const OVERSIZED_FACTS_STRING_CAP = ${OVERSIZED_FACTS_STRING_CAP};
     // Mirrors HISTORY_OMISSION_MARKER from runtime/HistoryContextAccumulator —
     // the eval'd worker source has no imports, so keep the two in sync.
@@ -869,7 +1114,11 @@ function buildInWorker(filePath: string, options: BuildOptions): Promise<Transcr
     })});
     const isRebuiltContextMessage = (${serializeWorkerFunction(isRebuiltContextMessage)});
     const toRawEntry = (${serializeWorkerFunction(toRawEntry)});
+    const decodeBoundedJsonString = (${serializeWorkerFunction(decodeBoundedJsonString)});
     const parseOversizedLineFacts = (${serializeWorkerFunction(parseOversizedLineFacts)});
+    const parseOversizedLineFactsSuffix = (${serializeWorkerFunction(parseOversizedLineFactsSuffix)});
+    const listOversizedIdentityFields = (${serializeWorkerFunction(listOversizedIdentityFields)});
+    const mergeOversizedLineFacts = (${serializeWorkerFunction(mergeOversizedLineFacts)});
     const extractOversizedLineFacts = (${serializeWorkerFunction(extractOversizedLineFacts)});
     const appendOversizedEntry = (${serializeWorkerFunction(appendOversizedEntry)});
     const filterActiveBranchEntries = (${serializeWorkerFunction(filterActiveBranchEntries)});
@@ -939,6 +1188,9 @@ export interface TranscriptIndexDiagnosticEvent {
   buildId?: string;
   mode?: 'worker' | 'direct';
   reason?: 'oversized' | 'malformed';
+  /** Oversized-row identity provenance; field names only, never values. */
+  identityRecovery?: OversizedIdentityRecovery;
+  recoveredIdentityFields?: OversizedIdentityField[];
   offset?: number;
   queueMs?: number;
   elapsedMs?: number;
@@ -1014,7 +1266,10 @@ function observeBuild(
     // worker-serializable and free of module-level timing assumptions.
     onLineSkipped: event => {
       options.onLineSkipped?.(event);
-      diagnosticSink?.({ phase: 'line_skipped', buildId, mode, reason: event.reason, offset: event.offset, bytes: event.bytes });
+      diagnosticSink?.({
+        phase: 'line_skipped', buildId, mode, reason: event.reason, offset: event.offset, bytes: event.bytes,
+        identityRecovery: event.identityRecovery, recoveredIdentityFields: event.recoveredIdentityFields,
+      });
     },
   };
   return run(observedOptions).then(result => {

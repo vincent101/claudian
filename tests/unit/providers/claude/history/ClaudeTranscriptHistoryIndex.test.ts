@@ -552,6 +552,258 @@ describe('ClaudeTranscriptHistoryIndex oversized line degradation', () => {
   });
 });
 
+describe('ClaudeTranscriptHistoryIndex oversized identity recovery (dual bounded scans)', () => {
+  const KIB = 1024;
+  const userRow = JSON.stringify({ type: 'user', uuid: 'u1', parentUuid: null, message: { content: 'question' } });
+  const answerRow = JSON.stringify({ type: 'assistant', uuid: 'a2', parentUuid: 'tr1', message: { content: 'answer' } });
+
+  // CC row order: identity prefixes first, the message payload mid-row, uuid/
+  // timestamp after the message, then the long structural tail (toolUseResult,
+  // cwd, sessionId, version). A giant message.content hides the trailing
+  // identity from the 256 KiB prefix scan; only the tail scan can recover it.
+  function messageHugeRow(content: string, extra: Record<string, unknown> = {}): string {
+    return JSON.stringify({
+      parentUuid: 'u1',
+      isSidechain: false,
+      promptId: 'p1',
+      type: 'user',
+      message: { role: 'user', content },
+      uuid: 'tr1',
+      timestamp: '2026-01-01T00:00:00Z',
+      toolUseResult: 'tail-result',
+      cwd: '/vault',
+      sessionId: 's1',
+      version: '1.0.0',
+      ...extra,
+    });
+  }
+
+  function tempPath(name: string): string {
+    return join(process.env.TMPDIR ?? '/tmp', `claudian-dual-${name}-${process.pid}.jsonl`);
+  }
+
+  it('recovers uuid/timestamp from the tail window when a huge message.content hides them from the prefix scan', async () => {
+    const path = tempPath('message-huge');
+    const huge = messageHugeRow(`SECRET-PAYLOAD ${'x'.repeat(600 * KIB)}`);
+    await writeFile(path, `${[userRow, huge, answerRow].join('\n')}\n`);
+    const result = await buildTranscriptIndex(path, { useWorker: false, chunkSize: 64, maxLineBytes: 100 });
+    expect(result.status).toBe('complete');
+    if (result.status !== 'complete') return;
+    const opaque = result.index.entries[1];
+    expect(opaque).toMatchObject({
+      oversized: true,
+      type: 'user',
+      uuid: 'tr1',
+      parentUuid: 'u1',
+      timestamp: '2026-01-01T00:00:00Z',
+      messageKey: 'tr1',
+    });
+    // With uuid/parentUuid restored the ancestry chain is whole, so the
+    // branch filter keeps the history before the oversized row instead of
+    // silently dropping it.
+    expect(result.index.entries.map(entry => entry.messageKey)).toEqual(['u1', 'tr1', 'a2']);
+    expect(result.index.searchText).not.toContain('SECRET-PAYLOAD');
+  });
+
+  it('honors a resume anchor through a suffix-recovered oversized row (fork/rewind hydration shape)', async () => {
+    const path = tempPath('resume-suffix');
+    const huge = messageHugeRow('resume payload '.repeat(40 * KIB));
+    await writeFile(path, `${[userRow, huge, answerRow].join('\n')}\n`);
+    const result = await buildTranscriptIndex(path, { useWorker: false, chunkSize: 64, maxLineBytes: 100, resumeAtMessageId: 'a2' });
+    expect(result.status).toBe('complete');
+    if (result.status !== 'complete') return;
+    // The resume walk must pass through the opaque row via the tail-recovered
+    // uuid/parentUuid and land on the requested anchor with history intact.
+    expect(result.index.entries.map(entry => entry.messageKey)).toEqual(['u1', 'tr1', 'a2']);
+  });
+
+  it('keeps identity unresolved when giant fields occlude both windows and refuses resume explicitly', async () => {
+    const path = tempPath('both-occluded');
+    const row = messageHugeRow('x'.repeat(400 * KIB), { toolUseResult: 'y'.repeat(400 * KIB) });
+    await writeFile(path, `${[userRow, row, answerRow].join('\n')}\n`);
+    const plain = await buildTranscriptIndex(path, { useWorker: false, chunkSize: 64, maxLineBytes: 100 });
+    expect(plain.status).toBe('complete');
+    if (plain.status !== 'complete') return;
+    const opaque = plain.index.entries[1];
+    expect(opaque.oversized).toBe(true);
+    expect(opaque.uuid).toBeUndefined();
+    // The prefix still proves the row-start identity fields it can see.
+    expect(opaque.parentUuid).toBe('u1');
+    expect(opaque.type).toBe('user');
+    // Session-level fail-close: an unverifiable ancestry must fail the resume
+    // build explicitly instead of silently guessing a branch. A separate file
+    // avoids the completed cache, whose snapshot key does not distinguish a
+    // resume build from the plain one that just ran on the same snapshot.
+    const resumePath = tempPath('both-occluded-resume');
+    await writeFile(resumePath, `${[userRow, row, answerRow].join('\n')}\n`);
+    const resume = await buildTranscriptIndex(resumePath, { useWorker: false, chunkSize: 64, maxLineBytes: 100, resumeAtMessageId: 'a2' });
+    expect(resume.status).toBe('failed');
+    if (resume.status !== 'failed') return;
+    expect(resume.error).toMatch(/oversized/i);
+  });
+
+  it('drops a conflicting duplicate uuid to unknown instead of guessing', async () => {
+    const path = tempPath('conflict');
+    // Duplicate top-level uuid never round-trips JSON.stringify; build the
+    // row by hand so the prefix and tail windows see different values.
+    const row = `{"type":"user","uuid":"prefix-id","message":{"content":"${'x'.repeat(600 * KIB)}"},"uuid":"suffix-id","timestamp":"2026-01-01T00:00:00Z"}`;
+    await writeFile(path, `${[userRow, row, answerRow].join('\n')}\n`);
+    const result = await buildTranscriptIndex(path, { useWorker: false, chunkSize: 64, maxLineBytes: 100 });
+    expect(result.status).toBe('complete');
+    if (result.status !== 'complete') return;
+    const opaque = result.index.entries[1];
+    expect(opaque.oversized).toBe(true);
+    expect(opaque.uuid).toBeUndefined();
+    expect(opaque.messageKey).toBe('line:1');
+    // Non-conflicting fields keep their proven values.
+    expect(opaque.type).toBe('user');
+    expect(opaque.timestamp).toBe('2026-01-01T00:00:00Z');
+  });
+
+  it('never mistakes keys inside string content for identity fields', async () => {
+    const path = tempPath('fake-key');
+    const content = `${'x'.repeat(600 * KIB)} before "uuid":"fake-inside" after`;
+    const row = messageHugeRow(content);
+    await writeFile(path, `${[userRow, row, answerRow].join('\n')}\n`);
+    const result = await buildTranscriptIndex(path, { useWorker: false, chunkSize: 64, maxLineBytes: 100 });
+    expect(result.status).toBe('complete');
+    if (result.status !== 'complete') return;
+    const opaque = result.index.entries[1];
+    expect(opaque.uuid).toBe('tr1');
+    expect(opaque.uuid).not.toBe('fake-inside');
+  });
+
+  it('leaves identity unknown when the tail window is cut inside a giant string holding fake keys', async () => {
+    const path = tempPath('fake-tail');
+    const row = messageHugeRow('z'.repeat(400 * KIB), { toolUseResult: `fake "uuid":"fake-tail" head ${'y'.repeat(400 * KIB)}` });
+    await writeFile(path, `${[userRow, row, answerRow].join('\n')}\n`);
+    const result = await buildTranscriptIndex(path, { useWorker: false, chunkSize: 64, maxLineBytes: 100 });
+    expect(result.status).toBe('complete');
+    if (result.status !== 'complete') return;
+    const opaque = result.index.entries[1];
+    expect(opaque.oversized).toBe(true);
+    // The tail scan fails inside the giant toolUseResult string; the fake key
+    // it contains must never surface as a recovered identity.
+    expect(opaque.uuid).toBeUndefined();
+    expect(opaque.parentUuid).toBe('u1');
+  });
+
+  it('uses a single forward scan over the merged coverage when the bounded windows overlap', async () => {
+    const path = tempPath('overlap');
+    const row = messageHugeRow('w'.repeat(280 * KIB));
+    await writeFile(path, `${[userRow, row, answerRow].join('\n')}\n`);
+    const result = await buildTranscriptIndex(path, { useWorker: false, chunkSize: 64, maxLineBytes: 100 });
+    expect(result.status).toBe('complete');
+    if (result.status !== 'complete') return;
+    const opaque = result.index.entries[1];
+    expect(opaque.uuid).toBe('tr1');
+    expect(opaque.parentUuid).toBe('u1');
+  });
+
+  it('handles multi-byte content and escaped quotes/backslashes around the tail window', async () => {
+    const path = tempPath('utf8-escape');
+    const content = `开头 ${'多字节🎉尾部'.repeat(32 * KIB)} quote:\\" backslash:\\\\ end`;
+    const row = messageHugeRow(content);
+    await writeFile(path, `${[userRow, row, answerRow].join('\n')}\n`);
+    const result = await buildTranscriptIndex(path, { useWorker: false, chunkSize: 64, maxLineBytes: 100 });
+    expect(result.status).toBe('complete');
+    if (result.status !== 'complete') return;
+    const opaque = result.index.entries[1];
+    expect(opaque.uuid).toBe('tr1');
+    expect(opaque.timestamp).toBe('2026-01-01T00:00:00Z');
+    expect(opaque.type).toBe('user');
+    expect(opaque.parentUuid).toBe('u1');
+  });
+
+  it('still recovers a giant toolUseResult row through the prefix window alone', async () => {
+    const path = tempPath('toolresult-huge');
+    const row = messageHugeRow('normal body', { toolUseResult: 'r'.repeat(600 * KIB) });
+    await writeFile(path, `${[userRow, row, answerRow].join('\n')}\n`);
+    const result = await buildTranscriptIndex(path, { useWorker: false, chunkSize: 64, maxLineBytes: 100 });
+    expect(result.status).toBe('complete');
+    if (result.status !== 'complete') return;
+    const opaque = result.index.entries[1];
+    expect(opaque).toMatchObject({
+      oversized: true,
+      type: 'user',
+      uuid: 'tr1',
+      parentUuid: 'u1',
+      timestamp: '2026-01-01T00:00:00Z',
+    });
+  });
+
+  it('reports identity recovery provenance in line_skipped diagnostics without leaking values', async () => {
+    const events: TranscriptIndexDiagnosticEvent[] = [];
+    setTranscriptIndexDiagnosticSink(event => events.push(event));
+    try {
+      const messageHugePath = tempPath('diag-message');
+      await writeFile(messageHugePath, `${[userRow, messageHugeRow(`SECRET ${'x'.repeat(600 * KIB)}`), answerRow].join('\n')}\n`);
+      const suffixResult = await buildTranscriptIndex(messageHugePath, { useWorker: false, chunkSize: 64, maxLineBytes: 100 });
+      expect(suffixResult.status).toBe('complete');
+
+      const occludedPath = tempPath('diag-occluded');
+      await writeFile(occludedPath, `${[userRow, messageHugeRow('x'.repeat(400 * KIB), { toolUseResult: 'y'.repeat(400 * KIB) }), answerRow].join('\n')}\n`);
+      const unresolvedResult = await buildTranscriptIndex(occludedPath, { useWorker: false, chunkSize: 64, maxLineBytes: 100 });
+      expect(unresolvedResult.status).toBe('complete');
+
+      const conflictPath = tempPath('diag-conflict');
+      const conflictRow = `{"type":"user","uuid":"prefix-id","message":{"content":"${'x'.repeat(600 * KIB)}"},"uuid":"suffix-id","timestamp":"2026-01-01T00:00:00Z"}`;
+      await writeFile(conflictPath, `${[userRow, conflictRow, answerRow].join('\n')}\n`);
+      const conflictResult = await buildTranscriptIndex(conflictPath, { useWorker: false, chunkSize: 64, maxLineBytes: 100 });
+      expect(conflictResult.status).toBe('complete');
+
+      const toolResultPath = tempPath('diag-toolresult');
+      await writeFile(toolResultPath, `${[userRow, messageHugeRow('normal', { toolUseResult: 'r'.repeat(600 * KIB) }), answerRow].join('\n')}\n`);
+      const prefixResult = await buildTranscriptIndex(toolResultPath, { useWorker: false, chunkSize: 64, maxLineBytes: 100 });
+      expect(prefixResult.status).toBe('complete');
+
+      const skipped = events.filter(event => event.phase === 'line_skipped');
+      expect(skipped).toEqual(expect.arrayContaining([
+        expect.objectContaining({ reason: 'oversized', identityRecovery: 'suffix', recoveredIdentityFields: ['uuid', 'parentUuid', 'type', 'timestamp'] }),
+        expect.objectContaining({ reason: 'oversized', identityRecovery: 'unresolved' }),
+        expect.objectContaining({ reason: 'oversized', identityRecovery: 'conflict' }),
+        expect.objectContaining({ reason: 'oversized', identityRecovery: 'prefix' }),
+      ]));
+      // Diagnostics carry provenance enums and field names only — never
+      // identity values or line content.
+      const serialized = JSON.stringify(events);
+      expect(serialized).not.toContain('tr1');
+      expect(serialized).not.toContain('SECRET');
+      expect(serialized).not.toContain('prefix-id');
+      expect(serialized).not.toContain('suffix-id');
+    } finally {
+      setTranscriptIndexDiagnosticSink(null);
+    }
+  });
+
+  it('does not report line_skipped for an oversized line still open at EOF, then reports it exactly once after it closes', async () => {
+    const events: TranscriptIndexDiagnosticEvent[] = [];
+    setTranscriptIndexDiagnosticSink(event => events.push(event));
+    try {
+      const path = tempPath('eof-discard');
+      const fullRow = messageHugeRow('e'.repeat(400 * KIB));
+      // First snapshot: EOF arrives while the oversized line is still open —
+      // no opaque entry exists yet, so no line_skipped may be reported.
+      await writeFile(path, `${userRow}\n${fullRow.slice(0, 300 * KIB)}`);
+      const first = await buildTranscriptIndex(path, { useWorker: false, chunkSize: 64, maxLineBytes: 100 });
+      expect(first.status).toBe('partial');
+      expect(events.filter(event => event.phase === 'line_skipped')).toHaveLength(0);
+
+      // The writer closes the line; the rebuild reports it exactly once.
+      await writeFile(path, `${userRow}\n${fullRow}\n${answerRow}\n`);
+      const second = await buildTranscriptIndex(path, { useWorker: false, chunkSize: 64, maxLineBytes: 100 });
+      expect(second.status).toBe('complete');
+      if (second.status !== 'complete') return;
+      const oversizedEvents = events.filter(event => event.phase === 'line_skipped');
+      expect(oversizedEvents).toHaveLength(1);
+      expect(oversizedEvents[0]).toMatchObject({ reason: 'oversized', identityRecovery: expect.any(String) });
+      expect(second.index.entries.map(entry => entry.messageKey)).toEqual(['u1', 'tr1', 'a2']);
+    } finally {
+      setTranscriptIndexDiagnosticSink(null);
+    }
+  });
+});
+
 describe('partial snapshot handling through the history service', () => {
   const budget = {
     maxTurns: 25,
@@ -901,6 +1153,47 @@ describe('ClaudeTranscriptHistoryIndex worker fallback', () => {
     // injection silently diverges the worker path from direct.
     const buildSource = mockWorkerSources[1] ?? '';
     for (const helper of ['parseOversizedLineFacts', 'extractOversizedLineFacts', 'appendOversizedEntry', 'onLineSkipped']) {
+      expect(buildSource).toContain(helper);
+    }
+  });
+
+  it('produces identical suffix-recovery output through the worker and direct paths', async () => {
+    mockWorkerConstructorMode = 'record';
+    // CC row order with a giant message.content: the prefix scan cannot see
+    // uuid/timestamp, so both paths must agree on the tail-window recovery.
+    const huge = JSON.stringify({
+      parentUuid: 'u1', isSidechain: false, promptId: 'p1', type: 'user',
+      message: { role: 'user', content: `PARITY ${'x'.repeat(600 * 1024)}` },
+      uuid: 'tr1', timestamp: '2026-01-01T00:00:00Z',
+      toolUseResult: 'tail-result', cwd: '/vault', sessionId: 's1', version: '1.0.0',
+    });
+    const small = JSON.stringify({ type: 'user', uuid: 'u1', message: { content: 'question' } });
+    const tail = JSON.stringify({ type: 'assistant', uuid: 'a2', parentUuid: 'tr1', message: { content: 'answer' } });
+    const directPath = join(process.env.TMPDIR ?? '/tmp', `claudian-parity-suffix-direct-${process.pid}.jsonl`);
+    const workerPath = join(process.env.TMPDIR ?? '/tmp', `claudian-parity-suffix-worker-${process.pid}.jsonl`);
+    const content = `${[small, huge, tail].join('\n')}\n`;
+    await writeFile(directPath, content);
+    await writeFile(workerPath, content);
+
+    const direct = await buildTranscriptIndex(directPath, { useWorker: false, chunkSize: 64, maxLineBytes: 100 });
+    const viaWorker = await buildTranscriptIndex(workerPath, { chunkSize: 64, maxLineBytes: 100 });
+    expect(direct.status).toBe('complete');
+    expect(viaWorker.status).toBe('complete');
+    if (direct.status !== 'complete' || viaWorker.status !== 'complete') return;
+
+    const stable = (index: TranscriptHistoryIndex): object => {
+      const { entries, turns, searchCorpus, searchText, skippedLines, committedSize, snapshotSize, projectionDescriptors } = index;
+      return { entries, turns, searchCorpus, searchText, skippedLines, committedSize, snapshotSize, projectionDescriptors };
+    };
+    expect(stable(viaWorker.index)).toEqual(stable(direct.index));
+    const opaque = viaWorker.index.entries[1];
+    expect(opaque.oversized).toBe(true);
+    expect(opaque.uuid).toBe('tr1');
+    expect(opaque.parentUuid).toBe('u1');
+    // The suffix scanner and merger must exist in the eval source; a missing
+    // injection would silently drop tail recovery in the worker path only.
+    const buildSource = mockWorkerSources[1] ?? '';
+    for (const helper of ['OVERSIZED_FACTS_TAIL_READ_BYTES', 'parseOversizedLineFactsSuffix', 'mergeOversizedLineFacts', 'listOversizedIdentityFields']) {
       expect(buildSource).toContain(helper);
     }
   });
