@@ -1814,6 +1814,21 @@ describe('ConversationController', () => {
       expect(deps.state.usage).toBeNull();
     });
 
+    it('re-derives the denominator through the public refresh entry (tab passive sync)', () => {
+      // TabManager's passive-sync branch (switching back to a READY tab)
+      // reuses this entry so a stale stored denominator cannot survive the
+      // switch without a full re-hydration.
+      seedClaudeSettings({ 'sonnet': 1_000_000 }, { claude: 'sonnet' });
+      deps.state.usage = storedUsage() as any;
+      const conversation = storedConversation(storedUsage()) as any;
+
+      controller.refreshUsageWindow(conversation);
+
+      expect(deps.state.usage?.model).toBe('sonnet');
+      expect(deps.state.usage?.contextWindow).toBe(1_000_000);
+      expect(deps.state.usage?.percentage).toBe(45);
+    });
+
     it('restores the stored usage as-is when the conversation carries no provider id', async () => {
       seedClaudeSettings({ 'sonnet': 1_000_000 });
       deps.state.currentConversationId = 'conv-usage';

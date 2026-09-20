@@ -1090,7 +1090,7 @@ export class ConversationController {
     state.currentConversationId = conversation.id;
     state.messages = page ? [...page.messages] : [...conversation.messages];
     state.usage = conversation.usage ?? null;
-    this.refreshRestoredUsageWindow(conversation);
+    this.refreshUsageWindow(conversation);
     state.autoScrollEnabled = plugin.settings.enableAutoScroll ?? true;
     state.hasPendingConversationSave = false;
 
@@ -1146,16 +1146,15 @@ export class ConversationController {
   }
 
   /**
-   * Re-derives the restored usage denominator from the model the tab's
-   * selector will show for this conversation's provider: the provider
-   * settings snapshot (same source as the re-selection and settings-refresh
-   * chains), with the persisted projection as fallback. The persisted
-   * usage.model is a runtime label, never a denominator source (2.3.2 ②,
-   * user ruling 2026-09-17), and settings may have changed since the
-   * snapshot was written, so hydration must not trust the stored
-   * denominator either.
+   * Re-derives the usage denominator from the model the tab's selector will
+   * show for this conversation's provider: the provider settings snapshot
+   * (same source as the re-selection and settings-refresh chains), with the
+   * persisted projection as fallback. The persisted usage.model is a runtime
+   * label, never a denominator source (2.3.2 ②, user ruling 2026-09-17), and
+   * settings may have changed since the snapshot was written, so neither
+   * hydration nor tab-switch passive sync may trust the stored denominator.
    */
-  private refreshRestoredUsageWindow(conversation: Conversation): void {
+  refreshUsageWindow(conversation: Conversation): void {
     const usage = this.deps.state.usage;
     if (!usage || !conversation.providerId) {
       return;

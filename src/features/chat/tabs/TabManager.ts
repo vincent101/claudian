@@ -367,6 +367,11 @@ export class TabManager implements TabManagerInterface {
             : (this.plugin.settings.persistentExternalContextPaths || []);
 
           tab.service.syncConversationState(conversation, externalContextPaths);
+          // A READY tab skipped full hydration, so a stale stored usage
+          // denominator (e.g. 200k persisted before a preset change) must
+          // not survive the switch back — re-derive through the same
+          // refresh entry hydration uses.
+          tab.controllers.conversationController?.refreshUsageWindow?.(conversation);
         }
       } else if (!tab.conversationId && tab.state.messages.length === 0) {
         // New tab with no conversation - initialize welcome greeting

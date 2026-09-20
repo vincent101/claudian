@@ -11,6 +11,7 @@ import {
   type PersistedTabManagerState,
   type TabManagerCallbacks,
 } from '@/features/chat/tabs/types';
+import { claudeChatUIConfig } from '@/providers/claude/ui/ClaudeChatUIConfig';
 import { DEFAULT_CODEX_PRIMARY_MODEL } from '@/providers/codex/types/models';
 
 // Mock Tab module functions
@@ -87,6 +88,7 @@ const mockGetCapabilities = jest.fn().mockReturnValue({
   supportsMcpTools: true,
   reasoningControl: 'effort',
 });
+const mockGetChatUIConfig = jest.fn();
 const mockCommandCatalogs: Record<string, any> = {};
 const mockRuntimeCommandLoaders: Record<string, any> = {};
 const mockTabWarmupPolicies: Record<string, any> = {};
@@ -97,6 +99,7 @@ jest.mock('@/core/providers/ProviderRegistry', () => ({
       buildForkProviderState: mockBuildForkProviderState,
     }),
     getCapabilities: (...args: any[]) => mockGetCapabilities(...args),
+    getChatUIConfig: (...args: any[]) => mockGetChatUIConfig(...args),
     resolveProviderForModel: (model: string) => (
       model.startsWith('opencode:') ? 'opencode'
         : model.startsWith('gpt-') || /^o\d/.test(model) ? 'codex' : 'claude'
@@ -3348,8 +3351,90 @@ describe('TabManager - switchToTab Session Sync', () => {
     );
   });
 
-  it('should not sync service session for an already-loaded streaming tab', async () => {
+  it('re-derives a stale usage denominator when switching back to a READY tab', async () => {
     jest.clearAllMocks();
+
+    const mockSyncConversationState = jest.fn();
+    const mockService = {
+      providerId: 'claude',
+      syncConversationState: mockSyncConversationState,
+      cleanup: jest.fn(),
+      ensureReady: jest.fn().mockResolvedValue(true),
+      onReadyStateChange: jest.fn(() => () => {}),
+      isReady: jest.fn().mockReturnValue(true),
+    };
+
+    const plugin = createMockPlugin();
+    plugin.getConversationSync = jest.fn().mockReturnValue({
+      id: 'conv-stale',
+      providerId: 'claude',
+      messages: [{ id: 'msg-1', role: 'user', content: 'test' }],
+      sessionId: 'session-stale',
+      externalContextPaths: [],
+    });
+
+    // The refresh entry resolves the denominator through the provider
+    // snapshot + chat UI config seams this suite mocks.
+    mockGetProviderSettingsSnapshot.mockImplementation(() => ({
+      model: 'sonnet[1m]',
+      customContextLimits: { 'sonnet[1m]': 1_000_000 },
+    }));
+    mockGetChatUIConfig.mockReturnValue(claudeChatUIConfig);
+
+    const harness = createRealConversationControllerHarness(plugin);
+    harness.state.usage = {
+      model: 'sonnet',
+      inputTokens: 400_000,
+      cacheCreationInputTokens: 30_000,
+      cacheReadInputTokens: 20_000,
+      contextWindow: 200_000,
+      contextWindowIsAuthoritative: false,
+      contextTokens: 450_000,
+      percentage: 100,
+    };
+    harness.state.messages = [{ id: 'msg-1', role: 'user', content: 'test' }] as any;
+
+    const backgroundTab = createMockTabData({
+      id: 'tab-2',
+      conversationId: 'conv-stale',
+      service: mockService,
+      serviceInitialized: true,
+    });
+    backgroundTab.state = harness.state;
+    backgroundTab.controllers = { conversationController: harness.controller };
+
+    let tabCounter = 0;
+    mockCreateTab.mockImplementation(() => {
+      tabCounter++;
+      return tabCounter === 2 ? backgroundTab : createMockTabData({ id: 'tab-1' });
+    });
+
+    const manager = new TabManager(
+      plugin,
+      createMockMcpManager(),
+      createMockEl(),
+      createMockView()
+    );
+
+    await manager.createTab();
+    await manager.createTab(undefined, undefined, { activate: false });
+
+    try {
+      await manager.switchToTab('tab-2');
+
+      expect(mockSyncConversationState).toHaveBeenCalled();
+      // The stale stored 200k denominator was re-derived to the snapshot
+      // model's preset window on re-entry (no full re-hydration).
+      expect(harness.state.usage?.model).toBe('sonnet[1m]');
+      expect(harness.state.usage?.contextWindow).toBe(1_000_000);
+      expect(harness.state.usage?.percentage).toBe(45);
+    } finally {
+      mockGetProviderSettingsSnapshot.mockImplementation(() => ({}));
+      mockGetChatUIConfig.mockReset();
+    }
+  });
+
+  it('should not sync service session for an already-loaded streaming tab', async () => {    jest.clearAllMocks();
 
     const mockSyncConversationState = jest.fn();
     const mockService = {
