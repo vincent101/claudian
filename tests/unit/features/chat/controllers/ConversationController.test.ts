@@ -11,12 +11,14 @@ import { claudeChatUIConfig } from '@/providers/claude/ui/ClaudeChatUIConfig';
 import { confirm } from '@/shared/modals/ConfirmModal';
 
 // Hydration usage re-derivation needs a real chat UI config behind the
-// provider registry; only the config seam is registered. The empty
-// historyService keeps bindHistoryLease on its legacy reset path instead of
-// throwing on a missing registration.
+// provider registry; only the config seam is registered. isEnabled feeds the
+// settings-provider resolution inside the provider settings snapshot; the
+// empty historyService keeps bindHistoryLease on its legacy reset path
+// instead of throwing on a missing registration.
 ProviderRegistry.register('claude', {
   chatUIConfig: claudeChatUIConfig,
   historyService: {},
+  isEnabled: () => true,
 } as never);
 
 jest.mock('@/shared/modals/ConfirmModal', () => ({
@@ -1660,15 +1662,18 @@ describe('ConversationController', () => {
     function seedClaudeSettings(
       customContextLimits: Record<string, number>,
       savedProviderModel?: Record<string, string>,
+      presets: Array<{ label: string; model: string }> = usagePresets,
+      model?: string,
     ): void {
       deps.plugin.settings = {
         userName: '',
         enableAutoTitleGeneration: true,
         permissionConfigs: {},
         providerConfigs: {
-          claude: { modelPresets: usagePresets },
+          claude: { modelPresets: presets },
         },
         customContextLimits,
+        ...(model !== undefined ? { model } : {}),
         ...(savedProviderModel ? { savedProviderModel } : {}),
       } as unknown as typeof deps.plugin.settings;
     }
@@ -1732,6 +1737,53 @@ describe('ConversationController', () => {
       expect(deps.state.usage?.model).toBe('haiku');
       expect(deps.state.usage?.contextWindow).toBe(200_000);
       expect(deps.state.usage?.percentage).toBe(100);
+    });
+
+    it('re-denominates from the snapshot model when the projection lacks the provider key (3.0.2)', async () => {
+      // Real-machine shape: presets all carry 1M windows and the settings
+      // model is current, but the persisted savedProviderModel projection is
+      // missing the provider key — the stale stored 200k denominator must
+      // still be re-derived to the displayed model's window.
+      seedClaudeSettings(
+        { 'sonnet[1m]': 1_000_000, 'opus[1m]': 1_000_000 },
+        undefined,
+        [
+          { label: 'Sonnet 1M', model: 'sonnet[1m]' },
+          { label: 'Opus 1M', model: 'opus[1m]' },
+        ],
+        'sonnet[1m]',
+      );
+      deps.state.currentConversationId = 'conv-usage';
+      (deps.plugin.getConversationById as jest.Mock).mockResolvedValue(
+        storedConversation(storedUsage({ model: 'claude-sonnet[1m]' })),
+      );
+
+      await controller.loadActive();
+
+      expect(deps.state.usage?.model).toBe('sonnet[1m]');
+      expect(deps.state.usage?.contextWindow).toBe(1_000_000);
+      expect(deps.state.usage?.percentage).toBe(45);
+    });
+
+    it('denominates from the snapshot fallback when the persisted projection is stale', async () => {
+      // The saved projection points at a preset that is no longer offered:
+      // the tab's selector shows the snapshot's fallback model, and the
+      // denominator must follow what is displayed, not the stale projection.
+      seedClaudeSettings(
+        { 'sonnet[1m]': 1_000_000 },
+        { claude: 'fable' },
+        [{ label: 'Sonnet 1M', model: 'sonnet[1m]' }],
+      );
+      deps.state.currentConversationId = 'conv-usage';
+      (deps.plugin.getConversationById as jest.Mock).mockResolvedValue(
+        storedConversation(storedUsage()),
+      );
+
+      await controller.loadActive();
+
+      expect(deps.state.usage?.model).toBe('sonnet[1m]');
+      expect(deps.state.usage?.contextWindow).toBe(1_000_000);
+      expect(deps.state.usage?.percentage).toBe(45);
     });
 
     it('drops a stale authoritative window when the selector model differs from the usage model', async () => {

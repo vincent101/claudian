@@ -2,6 +2,7 @@ import { Menu, Notice, setIcon } from 'obsidian';
 
 import { consumeHistoryText } from '../../../core/providers/consumeHistoryText';
 import { ProviderRegistry } from '../../../core/providers/ProviderRegistry';
+import { ProviderSettingsCoordinator } from '../../../core/providers/ProviderSettingsCoordinator';
 import {
   type FullHistoryIterable,
   type HistoryIndexLease,
@@ -1145,11 +1146,13 @@ export class ConversationController {
   }
 
   /**
-   * Re-derives the restored usage denominator from the tab's restored selector
-   * model (the provider-model projection) through the provider preset chain.
-   * The persisted usage.model is a runtime label, never a denominator source
-   * (2.3.2 ②, user ruling 2026-09-17), and settings may have changed since
-   * the snapshot was written, so hydration must not trust the stored
+   * Re-derives the restored usage denominator from the model the tab's
+   * selector will show for this conversation's provider: the provider
+   * settings snapshot (same source as the re-selection and settings-refresh
+   * chains), with the persisted projection as fallback. The persisted
+   * usage.model is a runtime label, never a denominator source (2.3.2 ②,
+   * user ruling 2026-09-17), and settings may have changed since the
+   * snapshot was written, so hydration must not trust the stored
    * denominator either.
    */
   private refreshRestoredUsageWindow(conversation: Conversation): void {
@@ -1158,10 +1161,19 @@ export class ConversationController {
       return;
     }
 
-    const selectorModel = this.deps.plugin.settings.savedProviderModel?.[conversation.providerId];
+    const providerSettings = ProviderSettingsCoordinator.getProviderSettingsSnapshot(
+      this.deps.plugin.settings as unknown as Record<string, unknown>,
+      conversation.providerId,
+    );
+    const snapshotModel = typeof providerSettings.model === 'string'
+      ? providerSettings.model.trim()
+      : '';
+    const selectorModel = snapshotModel
+      || this.deps.plugin.settings.savedProviderModel?.[conversation.providerId]
+      || '';
     this.deps.state.usage = refreshUsageContextWindow(usage, {
       uiConfig: ProviderRegistry.getChatUIConfig(conversation.providerId),
-      settings: this.deps.plugin.settings as unknown as Record<string, unknown>,
+      settings: providerSettings,
       selectorModel,
     });
   }
