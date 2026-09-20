@@ -482,6 +482,28 @@ describe('CodexChatRuntime', () => {
       expect(chunks).toContainEqual({ type: 'done' });
     });
 
+    it('stamps the queryOptions model override onto live-notification usage chunks', async () => {
+      const chunks = await collectChunks(
+        runtime.query(createTurn('hi'), undefined, { model: 'gpt-5.3-codex' }),
+      );
+
+      const usageChunk = chunks.find(c => c.type === 'usage') as
+        | { usage: { model?: string } }
+        | undefined;
+      expect(usageChunk).toBeDefined();
+      expect(usageChunk?.usage.model).toBe('gpt-5.3-codex');
+    });
+
+    it('stamps the resolved default model onto live-notification usage chunks', async () => {
+      const chunks = await collectChunks(runtime.query(createTurn('hi')));
+
+      const usageChunk = chunks.find(c => c.type === 'usage') as
+        | { usage: { model?: string } }
+        | undefined;
+      expect(usageChunk).toBeDefined();
+      expect(usageChunk?.usage.model).toBe(DEFAULT_CODEX_PRIMARY_MODEL);
+    });
+
     it('handles host-native initialize responses that omit codexHome', async () => {
       mockTransportRequest.mockImplementation(async (method: string) => {
         switch (method) {

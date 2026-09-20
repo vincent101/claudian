@@ -436,6 +436,45 @@ describe('CodexNotificationRouter', () => {
         },
       });
     });
+
+    it('stamps the turn model onto the usage chunk', () => {
+      const modelRouter = new CodexNotificationRouter(
+        (chunk) => chunks.push(chunk),
+        (update) => turnMetadata.push(update),
+        'gpt-5.3-codex',
+      );
+
+      modelRouter.handleNotification('thread/tokenUsage/updated', {
+        threadId: 't1',
+        turnId: 'turn1',
+        tokenUsage: {
+          total: { totalTokens: 100, inputTokens: 90, cachedInputTokens: 0, outputTokens: 10, reasoningOutputTokens: 0 },
+          last: { totalTokens: 100, inputTokens: 90, cachedInputTokens: 0, outputTokens: 10, reasoningOutputTokens: 0 },
+          modelContextWindow: 400000,
+        },
+      });
+
+      expect(chunks).toHaveLength(1);
+      expect(chunks[0]).toMatchObject({
+        type: 'usage',
+        usage: { model: 'gpt-5.3-codex' },
+      });
+    });
+
+    it('leaves usage.model unset when no model was injected (provider contract)', () => {
+      router.handleNotification('thread/tokenUsage/updated', {
+        threadId: 't1',
+        turnId: 'turn1',
+        tokenUsage: {
+          total: { totalTokens: 100, inputTokens: 90, cachedInputTokens: 0, outputTokens: 10, reasoningOutputTokens: 0 },
+          last: { totalTokens: 100, inputTokens: 90, cachedInputTokens: 0, outputTokens: 10, reasoningOutputTokens: 0 },
+          modelContextWindow: 200000,
+        },
+      });
+
+      expect(chunks).toHaveLength(1);
+      expect((chunks[0] as { usage: { model?: string } }).usage.model).toBeUndefined();
+    });
   });
 
   describe('turn completion', () => {

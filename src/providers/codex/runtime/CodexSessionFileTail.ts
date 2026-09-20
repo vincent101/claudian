@@ -111,6 +111,9 @@ export interface SessionTailState {
   syntheticTurnCounter: number;
   modelContextWindow: number;
   modelContextWindowIsAuthoritative: boolean;
+  // Turn-resolved model injected by the runtime — the tail must label its
+  // usage itself so chunks stay correct without the StreamController backfill.
+  model?: string;
   lastTextByTurn: Map<string, string>;
   lastThinkingByTurn: Map<string, string>;
   pendingUsageByTurn: Map<string, {
@@ -125,6 +128,7 @@ export interface SessionTailState {
 
 export function createSessionTailState(
   fallbackContextWindow: number = DEFAULT_CONTEXT_WINDOW,
+  model?: string,
 ): SessionTailState {
   return {
     responseItemState: {
@@ -136,6 +140,7 @@ export function createSessionTailState(
     syntheticTurnCounter: 0,
     modelContextWindow: fallbackContextWindow,
     modelContextWindowIsAuthoritative: false,
+    model,
     lastTextByTurn: new Map(),
     lastThinkingByTurn: new Map(),
     pendingUsageByTurn: new Map(),
@@ -252,6 +257,7 @@ export function mapEventMsgEvent(
             pending.contextTokens,
             pending.contextWindow,
             pending.contextWindowIsAuthoritative,
+            state.model,
           );
           chunks.push({ type: 'usage', usage, sessionId });
           state.emittedUsageByTurn.add(turnId);
@@ -544,6 +550,7 @@ function buildUsageInfo(
   contextTokens: number,
   contextWindow: number,
   contextWindowIsAuthoritative: boolean,
+  model?: string,
 ): UsageInfo {
   return {
     inputTokens: contextTokens,
@@ -552,6 +559,7 @@ function buildUsageInfo(
     contextWindow,
     contextWindowIsAuthoritative,
     contextTokens,
+    model,
     percentage: contextWindow > 0 ? Math.min(100, Math.max(0, Math.round((contextTokens / contextWindow) * 100))) : 0,
   };
 }
@@ -582,8 +590,11 @@ export class CodexFileTailEngine {
   constructor(
     private sessionsDir: string,
     private defaultContextWindow: number,
+    // Turn-resolved model — kept on the engine so resetForNewTurn preserves
+    // it while rebuilding per-turn bookkeeping.
+    private model?: string,
   ) {
-    this.tailState = createSessionTailState(defaultContextWindow);
+    this.tailState = createSessionTailState(defaultContextWindow, model);
   }
 
   get turnCompleteEmitted(): boolean {
@@ -657,7 +668,7 @@ export class CodexFileTailEngine {
   }
 
   resetForNewTurn(): void {
-    this.tailState = createSessionTailState(this.defaultContextWindow);
+    this.tailState = createSessionTailState(this.defaultContextWindow, this.model);
     this.pendingEvents = [];
     this._turnCompleteEmitted = false;
     this._usageEmitted = false;

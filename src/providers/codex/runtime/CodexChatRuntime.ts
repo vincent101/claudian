@@ -264,6 +264,9 @@ export class CodexChatRuntime implements ChatRuntime {
     let transcriptSessionFilePath: string | null | undefined;
 
     const model = this.resolveModel(queryOptions);
+    // Resolve once per turn: every RPC, the notification router, and the tail
+    // engine must agree on the same fallback instead of re-deriving it.
+    const resolvedModel = model ?? DEFAULT_CODEX_PRIMARY_MODEL;
     const promptSettings = this.getSystemPromptSettings();
     const promptText = buildSystemPrompt(promptSettings);
 
@@ -369,6 +372,7 @@ export class CodexChatRuntime implements ChatRuntime {
         enqueueChunk(chunk);
       },
       (update) => this.recordTurnMetadata(update),
+      resolvedModel,
     );
 
     this.wireTransportHandlers();
@@ -411,10 +415,10 @@ export class CodexChatRuntime implements ChatRuntime {
         const permissionMode = this.resolveSandboxConfig();
         await this.transport!.request<ThreadResumeResult>('thread/resume', {
           threadId,
-          model: model ?? DEFAULT_CODEX_PRIMARY_MODEL,
+          model: resolvedModel,
           approvalPolicy: permissionMode.approvalPolicy,
           sandbox: permissionMode.sandbox,
-          serviceTier: resolveCodexServiceTier(this.getProviderSettings().serviceTier, model ?? DEFAULT_CODEX_PRIMARY_MODEL),
+          serviceTier: resolveCodexServiceTier(this.getProviderSettings().serviceTier, resolvedModel),
           baseInstructions: promptText,
           persistExtendedHistory: true,
         });
@@ -450,10 +454,10 @@ export class CodexChatRuntime implements ChatRuntime {
         const permissionMode = this.resolveSandboxConfig();
         const resumeResult = await this.transport!.request<ThreadResumeResult>('thread/resume', {
           threadId: existingThreadId,
-          model: model ?? DEFAULT_CODEX_PRIMARY_MODEL,
+          model: resolvedModel,
           approvalPolicy: permissionMode.approvalPolicy,
           sandbox: permissionMode.sandbox,
-          serviceTier: resolveCodexServiceTier(this.getProviderSettings().serviceTier, model ?? DEFAULT_CODEX_PRIMARY_MODEL),
+          serviceTier: resolveCodexServiceTier(this.getProviderSettings().serviceTier, resolvedModel),
           baseInstructions: promptText,
           persistExtendedHistory: true,
         });
@@ -468,11 +472,11 @@ export class CodexChatRuntime implements ChatRuntime {
         // New thread
         const permissionMode = this.resolveSandboxConfig();
         const startResult = await this.transport!.request<ThreadStartResult>('thread/start', {
-          model: model ?? DEFAULT_CODEX_PRIMARY_MODEL,
+          model: resolvedModel,
           cwd: this.launchSpec?.targetCwd ?? getVaultPath(this.plugin.app) ?? undefined,
           approvalPolicy: permissionMode.approvalPolicy,
           sandbox: permissionMode.sandbox,
-          serviceTier: resolveCodexServiceTier(this.getProviderSettings().serviceTier, model ?? DEFAULT_CODEX_PRIMARY_MODEL),
+          serviceTier: resolveCodexServiceTier(this.getProviderSettings().serviceTier, resolvedModel),
           baseInstructions: promptText,
           experimentalRawEvents: false,
           persistExtendedHistory: true,
@@ -506,6 +510,7 @@ export class CodexChatRuntime implements ChatRuntime {
         tailEngine = new CodexFileTailEngine(
           this.resolveTranscriptRootHost(threadPath) ?? path.join(os.homedir(), '.codex', 'sessions'),
           200_000,
+          resolvedModel,
         );
         tailEngine.resetForNewTurn();
         transcriptSessionFilePath = threadPath ?? this.session.getSessionFilePath() ?? null;
@@ -525,7 +530,6 @@ export class CodexChatRuntime implements ChatRuntime {
         // Start turn
         const providerSettings = this.getProviderSettings();
         const effort = EFFORT_MAP[providerSettings.effortLevel as string] ?? 'medium';
-        const resolvedModel = model ?? DEFAULT_CODEX_PRIMARY_MODEL;
         const isPlanMode = providerSettings.permissionMode === 'plan';
         const externalContextPaths = this.resolveExternalContextPaths(turn, queryOptions);
         const permissionMode = this.resolveSandboxConfig();

@@ -51,6 +51,9 @@ export class CodexNotificationRouter {
   constructor(
     private readonly emit: ChunkEmitter,
     private readonly onTurnMetadata?: TurnMetadataListener,
+    // Turn-resolved model — the runtime must provide it so usage chunks stay
+    // labeled even on paths that bypass the StreamController backfill.
+    private readonly model?: string,
   ) {}
 
   beginTurn(params: { isPlanTurn: boolean }): void {
@@ -449,6 +452,7 @@ export class CodexNotificationRouter {
       contextWindow,
       contextWindowIsAuthoritative: contextWindow > 0,
       contextTokens,
+      model: this.model,
       percentage: contextWindow > 0 ? Math.min(100, Math.max(0, Math.round((contextTokens / contextWindow) * 100))) : 0,
     };
 

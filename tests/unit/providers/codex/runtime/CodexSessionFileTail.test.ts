@@ -16,6 +16,7 @@ import {
   type SessionTailState,
   stringifyPayloadValue,
 } from '@/providers/codex/runtime/CodexSessionFileTail';
+import { DEFAULT_CODEX_PRIMARY_MODEL } from '@/providers/codex/types/models';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -207,6 +208,42 @@ describe('mapEventMsgEvent', () => {
       const chunks2 = mapEventMsgEvent({ type: 'task_complete' }, 'sess-1', state);
       const doneChunks = chunks2.filter(c => c.type === 'done');
       expect(doneChunks).toHaveLength(0);
+    });
+
+    it('stamps the turn model from tail state onto the emitted usage', () => {
+      const state = makeState({ currentTurnId: 'turn-1', model: 'gpt-5.3-codex' });
+      state.pendingUsageByTurn.set('turn-1', {
+        contextTokens: 500,
+        contextWindow: 400_000,
+        contextWindowIsAuthoritative: true,
+      });
+
+      const chunks = mapEventMsgEvent({ type: 'task_complete' }, 'sess-1', state);
+      const usageChunk = chunks.find(c => c.type === 'usage');
+
+      expect(usageChunk).toEqual({
+        type: 'usage',
+        sessionId: 'sess-1',
+        usage: expect.objectContaining({ model: 'gpt-5.3-codex' }),
+      });
+    });
+
+    it('stamps the runtime-resolved default model onto the emitted usage', () => {
+      const state = makeState({ currentTurnId: 'turn-1', model: DEFAULT_CODEX_PRIMARY_MODEL });
+      state.pendingUsageByTurn.set('turn-1', {
+        contextTokens: 500,
+        contextWindow: 200_000,
+        contextWindowIsAuthoritative: false,
+      });
+
+      const chunks = mapEventMsgEvent({ type: 'task_complete' }, 'sess-1', state);
+      const usageChunk = chunks.find(c => c.type === 'usage');
+
+      expect(usageChunk).toEqual({
+        type: 'usage',
+        sessionId: 'sess-1',
+        usage: expect.objectContaining({ model: DEFAULT_CODEX_PRIMARY_MODEL }),
+      });
     });
   });
 
@@ -1173,6 +1210,48 @@ describe('CodexFileTailEngine', () => {
     engine.collectPendingEvents();
 
     expect(engine.usageEmitted).toBe(true);
+  });
+
+  it('stamps the injected turn model onto the file-tail usage chunk', async () => {
+    const filePath = writeSessionFile('thread-model', [
+      { type: 'event_msg', payload: { type: 'task_started', info: { id: 'turn-1' } } },
+    ]);
+
+    const engine = new CodexFileTailEngine(tmpDir, 400_000, 'gpt-5.3-codex');
+    // The runtime resets the engine right after construction; the injected
+    // model must survive the per-turn state rebuild.
+    engine.resetForNewTurn();
+    await engine.primeCursor('thread-model');
+
+    // task_started must appear after prime so the tail state has a current turn
+    fs.appendFileSync(filePath, JSON.stringify({
+      type: 'event_msg',
+      payload: { type: 'task_started', info: { id: 'turn-model-1' } },
+    }) + '\n');
+    fs.appendFileSync(filePath, JSON.stringify({
+      type: 'event_msg',
+      payload: {
+        type: 'token_count',
+        info: { last_token_usage: { input: 500, output: 100 } },
+      },
+    }) + '\n');
+    fs.appendFileSync(filePath, JSON.stringify({
+      type: 'event_msg',
+      payload: { type: 'task_complete' },
+    }) + '\n');
+
+    engine.startPolling('thread-model');
+    await new Promise(resolve => setTimeout(resolve, 300));
+    await engine.stopPolling();
+
+    const events = engine.collectPendingEvents();
+    const usageChunk = events.find(c => c.type === 'usage') as
+      | { usage: { model?: string; contextWindow: number } }
+      | undefined;
+
+    expect(usageChunk).toBeDefined();
+    expect(usageChunk?.usage.model).toBe('gpt-5.3-codex');
+    expect(usageChunk?.usage.contextWindow).toBe(400_000);
   });
 
   it('resetForNewTurn clears state', async () => {
