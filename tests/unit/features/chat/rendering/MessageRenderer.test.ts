@@ -443,6 +443,46 @@ describe('MessageRenderer', () => {
     expect(rewindCallback).toHaveBeenCalledWith('u1');
   });
 
+  // L1 behavior lock: rows without a transcript user uuid (e.g. opaque
+  // oversized projections) must never render rewind/fork affordances — the
+  // explicit refusal lives in the click validation path, not in silent
+  // buttons on unactionable targets.
+  it('adds no rewind or fork button when the user message has no userMessageId', () => {
+    const messagesEl = createMockEl();
+    const rewindCallback = jest.fn().mockResolvedValue(undefined);
+    const forkCallback = jest.fn().mockResolvedValue(undefined);
+    const renderer = new MessageRenderer({ app: {}, settings: { mediaFolder: '' } } as any, createMockComponent() as any, messagesEl, rewindCallback, forkCallback, mockCapabilities());
+    jest.spyOn(renderer, 'renderContent').mockResolvedValue(undefined);
+
+    const allMessages: ChatMessage[] = [
+      { id: 'a1', role: 'assistant', content: '', timestamp: 1, assistantMessageId: 'prev-a' },
+      { id: 'u1', role: 'user', content: 'hello', timestamp: 2 },
+      { id: 'a2', role: 'assistant', content: '', timestamp: 3, assistantMessageId: 'resp-a' },
+    ];
+
+    renderer.renderStoredMessage(allMessages[1], allMessages, 1);
+
+    expect(messagesEl.querySelector('.claudian-message-rewind-btn')).toBeNull();
+    expect(messagesEl.querySelector('.claudian-message-fork-btn')).toBeNull();
+  });
+
+  it('adds no rewind or fork button without a preceding assistant and a following response', () => {
+    const messagesEl = createMockEl();
+    const rewindCallback = jest.fn().mockResolvedValue(undefined);
+    const forkCallback = jest.fn().mockResolvedValue(undefined);
+    const renderer = new MessageRenderer({ app: {}, settings: { mediaFolder: '' } } as any, createMockComponent() as any, messagesEl, rewindCallback, forkCallback, mockCapabilities());
+    jest.spyOn(renderer, 'renderContent').mockResolvedValue(undefined);
+
+    const allMessages: ChatMessage[] = [
+      { id: 'u1', role: 'user', content: 'orphan question', timestamp: 2, userMessageId: 'user-u' },
+    ];
+
+    renderer.renderStoredMessage(allMessages[0], allMessages, 0);
+
+    expect(messagesEl.querySelector('.claudian-message-rewind-btn')).toBeNull();
+    expect(messagesEl.querySelector('.claudian-message-fork-btn')).toBeNull();
+  });
+
   describe('message-level toolbar sync (assistant/user alignment)', () => {
     const timestamp = new Date(2026, 8, 14, 20, 35, 3).getTime();
 
