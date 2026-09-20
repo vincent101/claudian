@@ -66,8 +66,14 @@
   overflow-wrap: anywhere;
 }
 
+/* Page wrapper mirrors the messages container's flex context: page messages
+   lost their flex-column parent when the container's direct children became
+   wrappers, which broke user-bubble alignment (align-self:flex-end) and
+   message spacing. */
 .claudian-history-page {
-  display: flow-root;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
   min-width: 0;
 }
 

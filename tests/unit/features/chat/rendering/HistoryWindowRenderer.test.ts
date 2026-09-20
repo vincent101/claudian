@@ -1,4 +1,7 @@
 /** @jest-environment jsdom */
+import { readFileSync } from 'fs';
+import { resolve } from 'path';
+
 import type { ChatMessage } from '@/core/types';
 import { HistoryPageStore } from '@/features/chat/history/HistoryPageStore';
 import { HistoryWindowRenderer } from '@/features/chat/rendering/HistoryWindowRenderer';
@@ -338,6 +341,53 @@ describe('HistoryWindowRenderer', () => {
     release();
     await new Promise(resolve => setTimeout(resolve, 0));
     expect(viewport.scrollTop).toBe(120);
+  });
+
+  describe('history page wrapper layout context', () => {
+    // The wrapper replaced the messages container as the direct parent of
+    // page messages (DOM windowing). User bubbles rely on `align-self:
+    // flex-end` + `max-width: 95%` against a flex-column parent, so the
+    // wrapper must mirror the container's flex context or every message
+    // stretches to full width.
+    const cssPath = resolve(__dirname, '../../../../../src/style/components/messages.css');
+
+    const readRule = (css: string, selector: string): string => {
+      const match = css.match(new RegExp(`${selector.replace('.', '\\.')}\\s*\\{[^}]*\\}`));
+      return match?.[0] ?? '';
+    };
+
+    it('mounts the wrapper as a flex column mirroring the messages container', () => {
+      const css = readFileSync(cssPath, 'utf8');
+      const style = document.createElement('style');
+      style.textContent = css;
+      document.head.appendChild(style);
+      try {
+        const container = document.createElement('div');
+        container.className = 'claudian-messages';
+        document.body.appendChild(container);
+        // Guard the probe itself: if the injected cascade is inert the
+        // display assertions below prove nothing.
+        expect(getComputedStyle(container).display).toBe('flex');
+
+        const { renderer, root } = createHarness(250);
+        renderer.addPage({ pageKey: 'p', range: { start: 0, end: 10 }, messages: messages(10), projectedWeight: 1 }, 10);
+        const wrapper = root.querySelector<HTMLElement>('.claudian-history-page');
+        expect(wrapper).not.toBeNull();
+        expect(getComputedStyle(wrapper!).display).toBe('flex');
+
+        const containerRule = readRule(css, '.claudian-messages');
+        const wrapperRule = readRule(css, '.claudian-history-page');
+        // jsdom cannot compute flex-direction/gap, so the mirror contract is
+        // asserted against the stylesheet text: the wrapper must repeat the
+        // container's column direction and message spacing.
+        expect(wrapperRule).toContain('flex-direction: column');
+        expect(wrapperRule).toContain('gap: 12px');
+        expect(wrapperRule).toContain(containerRule.match(/flex-direction:[^;]+/)?.[0] ?? '__missing__');
+        expect(wrapperRule).toContain(containerRule.match(/gap:[^;]+/)?.[0] ?? '__missing__');
+      } finally {
+        style.remove();
+      }
+    });
   });
 
   it('drops search pins explicitly when search closes', () => {
