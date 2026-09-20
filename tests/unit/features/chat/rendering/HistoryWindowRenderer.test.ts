@@ -246,6 +246,60 @@ describe('HistoryWindowRenderer', () => {
     expect(store.peek('rewind:300:400')?.renderState).toBe('mounted');
   });
 
+  it('defers a resident-page reveal mount behind a live lease instead of mounting directly (F6)', async () => {
+    const { renderer, store, coordinator } = createHarness();
+    renderer.addPage({ pageKey: 'hit-page', range: { start: 0, end: 20 }, messages: messages(20, 'hit'), projectedWeight: 1 }, 300);
+    const record = store.peek('hit-page')!;
+    record.renderState = 'spacer';
+    const mount = jest.spyOn(renderer as any, 'mount');
+
+    const live = await coordinator.acquireLive();
+    const reveal = renderer.revealMessage('hit-0');
+    await Promise.resolve();
+    await Promise.resolve();
+
+    // The live turn holds the projection write lease: a resident page must
+    // not bypass the stored protocol with a direct DOM mount.
+    expect(store.peek('hit-page')?.renderState).toBe('spacer');
+    expect(mount).not.toHaveBeenCalled();
+
+    live?.release();
+    expect(await reveal).toBe(true);
+    expect(store.peek('hit-page')?.renderState).toBe('mounted');
+    expect(mount).toHaveBeenCalledTimes(1);
+  });
+
+  it('drops a queued resident reveal mount after the conversation switches (F6)', async () => {
+    const { renderer, store, coordinator, setConversationId } = createHarness();
+    renderer.addPage({ pageKey: 'hit-page', range: { start: 0, end: 20 }, messages: messages(20, 'hit'), projectedWeight: 1 }, 300);
+    store.peek('hit-page')!.renderState = 'spacer';
+
+    const live = await coordinator.acquireLive();
+    const reveal = renderer.revealMessage('hit-0');
+    await Promise.resolve();
+    setConversationId('other');
+    live?.release();
+
+    expect(await reveal).toBe(false);
+    expect(store.peek('hit-page')?.renderState).toBe('spacer');
+  });
+
+  it('drops a queued resident reveal mount after the DOM epoch moves (F6)', async () => {
+    let domEpoch = 1;
+    const { renderer, store, coordinator } = createHarness(300, { getDomEpoch: () => domEpoch });
+    renderer.addPage({ pageKey: 'hit-page', range: { start: 0, end: 20 }, messages: messages(20, 'hit'), projectedWeight: 1 }, 300);
+    store.peek('hit-page')!.renderState = 'spacer';
+
+    const live = await coordinator.acquireLive();
+    const reveal = renderer.revealMessage('hit-0');
+    await Promise.resolve();
+    domEpoch = 2;
+    live?.release();
+
+    expect(await reveal).toBe(false);
+    expect(store.peek('hit-page')?.renderState).toBe('spacer');
+  });
+
   it.each(['mounted', 'spacer', 'evicted'] as const)('reveals search hits from %s pages', async renderState => {
     const rematerializePage = jest.fn(async (record: any) => ({
       pageKey: record.pageKey,

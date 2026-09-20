@@ -482,41 +482,58 @@ export class HistoryWindowRenderer {
 
   private async ensureMounted(record: HistoryPageRecord): Promise<void> {
     this.options.pageStore.get(record.pageKey);
-    if (record.messages !== null) {
-      this.mount(record);
-      return;
-    }
-    const rematerialize = this.options.rematerializePage;
-    if (!rematerialize || this.rematerializations.has(record.pageKey)) return;
     const conversationId = this.options.getConversationId();
     const domEpoch = this.options.getDomEpoch();
-    this.options.pageStore.pin(record.pageKey, 'transaction');
-    const pending = rematerialize(record).then(page => {
+    if (record.messages === null) {
+      // Data rematerialization stays outside the stored grant so a slow disk
+      // load never occupies the projection write lease.
+      const rematerialize = this.options.rematerializePage;
+      if (!rematerialize || this.rematerializations.has(record.pageKey)) return;
+      this.options.pageStore.pin(record.pageKey, 'transaction');
+      const pending = rematerialize(record).then(page => {
+        if (
+          !page
+          || this.disposed
+          || conversationId !== this.options.getConversationId()
+          || domEpoch !== this.options.getDomEpoch()
+          || page.pageKey !== record.pageKey
+        ) return false;
+        this.options.pageStore.upsertPage(page);
+        return true;
+      }).finally(() => {
+        this.options.pageStore.unpin(record.pageKey, 'transaction');
+        this.rematerializations.delete(record.pageKey);
+      });
+      this.rematerializations.set(record.pageKey, pending);
+      if (!await pending) return;
+    }
+    // F6: whether resident or just rematerialized, the DOM mount itself goes
+    // through the stored write protocol — queued behind a live streaming
+    // turn like the re-locate path — with the same staleness checks.
+    await this.mountIfCurrent(record, { conversationId, domEpoch });
+  }
+
+  private async mountIfCurrent(
+    record: HistoryPageRecord,
+    context: { conversationId: string | null; domEpoch: number },
+  ): Promise<void> {
+    const isStale = (): boolean => this.disposed
+      || context.conversationId !== this.options.getConversationId()
+      || context.domEpoch !== this.options.getDomEpoch();
+    await this.options.coordinator.runStored(isStale, async () => {
+      if (isStale()) return;
+      const current = this.options.pageStore.peek(record.pageKey);
+      // Revalidate at write time: the record must still be the store's
+      // current page, still hold its data, and still be worth mounting
+      // (search pin or viewport adjacency survived the queue wait).
       if (
-        !page
-        || this.disposed
-        || conversationId !== this.options.getConversationId()
-        || domEpoch !== this.options.getDomEpoch()
-        || page.pageKey !== record.pageKey
-      ) return false;
-      this.options.pageStore.upsertPage(page);
-      return true;
-    }).finally(() => {
-      this.options.pageStore.unpin(record.pageKey, 'transaction');
-      this.rematerializations.delete(record.pageKey);
+        !current
+        || current !== record
+        || current.messages === null
+        || (!this.visiblePages.has(record.pageKey) && !this.adjacentPages.has(record.pageKey) && !current.pins.has('search'))
+      ) return;
+      this.mount(current);
     });
-    this.rematerializations.set(record.pageKey, pending);
-    if (!await pending) return;
-    const current = this.options.pageStore.peek(record.pageKey);
-    if (
-      !current
-      || current.messages === null
-      || (!this.visiblePages.has(record.pageKey) && !this.adjacentPages.has(record.pageKey) && !current.pins.has('search'))
-    ) return;
-    await this.options.coordinator.runStored(
-      () => this.disposed || conversationId !== this.options.getConversationId() || domEpoch !== this.options.getDomEpoch(),
-      async () => { this.mount(current); },
-    );
   }
 
   private estimateWeight(messages: ChatMessage[]): number {
