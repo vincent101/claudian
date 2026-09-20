@@ -72,7 +72,8 @@ export class ClaudeTranscriptTurnObserver {
       : fromOffset;
     if (this.stopped || generation !== this.generation || !this.reader) return;
     // A supplied boundary is the index snapshot EOF; otherwise retain the
-    // recovery scan's observed EOF so neither path races a second stat.
+    // recovery scan's last-complete-newline offset so neither path races a
+    // second stat.
     await this.reader.prime(recoverEof ?? undefined);
     this.reader.start(batch => this.enqueueConsume(() => this.consumeBatch(batch, generation)));
   }
@@ -339,9 +340,14 @@ export class ClaudeTranscriptTurnObserver {
   }
 
   /**
-   * Bounded recovery scan (v6 §4.3). Returns the EOF offset the scan observed,
-   * so the caller can prime the tail reader from it without a second stat
-   * racing past it; null when the file could not be read.
+   * Bounded recovery scan (v6 §4.3). Returns the offset just past the last
+   * complete newline the scan observed, so the caller can prime the tail
+   * reader from it without a second stat racing past it; null when the file
+   * could not be read. Priming at the observed EOF instead would orphan the
+   * bytes of a mid-write tail line (flushed without its newline yet): the
+   * writer's completion bytes would then parse as a standalone line and the
+   * whole line's events would be lost. Newline search stays on the Buffer so
+   * the offset is a byte offset even with multi-byte content.
    */
   private async recover(filePath: string, generation: number): Promise<number | null> {
     let info;
@@ -352,15 +358,28 @@ export class ClaudeTranscriptTurnObserver {
     }
     const start = Math.max(0, info.size - RECOVERY_BYTES);
     const handle = await open(filePath, 'r');
-    let text: string;
+    let buffer: Buffer;
     try {
-      const buffer = Buffer.alloc(info.size - start);
-      const { bytesRead } = await handle.read(buffer, 0, buffer.length, start);
-      text = buffer.subarray(0, bytesRead).toString('utf8');
+      const allocated = Buffer.alloc(info.size - start);
+      const { bytesRead } = await handle.read(allocated, 0, allocated.length, start);
+      buffer = allocated.subarray(0, bytesRead);
     } finally {
       await handle.close();
     }
-    if (start > 0) text = text.slice(text.indexOf('\n') + 1);
+    let textStart = start;
+    if (start > 0) {
+      const headNewline = buffer.indexOf(0x0a);
+      if (headNewline >= 0) {
+        textStart = start + headNewline + 1;
+        buffer = buffer.subarray(headNewline + 1);
+      }
+    }
+    const lastNewline = buffer.lastIndexOf(0x0a);
+    const tailOffset = lastNewline >= 0 ? textStart + lastNewline + 1 : textStart;
+    // Only complete lines feed the shadow scan: a tail line without its
+    // newline may still be mid-write, so it is left to the tail reader to
+    // re-read as a partial buffer once the writer finishes it.
+    const text = (lastNewline >= 0 ? buffer.subarray(0, lastNewline) : buffer).toString('utf8');
     const lines = text.split('\n').filter(Boolean);
     let boundary = -1;
     for (let index = lines.length - 1; index >= 0; index -= 1) {
@@ -374,14 +393,20 @@ export class ClaudeTranscriptTurnObserver {
         // Ignore malformed recovery lines.
       }
     }
-    if (boundary < 0 || generation !== this.generation) return info.size;
-    const shadow = new ClaudeTranscriptTurnMapper(generation);
+    if (boundary < 0 || generation !== this.generation) return tailOffset;
+    // Replay maps onto this.mapper (reset to this generation by the caller),
+    // not a throwaway instance: the tail line left unprimed belongs to the
+    // replayed open turn, so when the writer finishes it the live mapper must
+    // still hold that turn's context to attach its events. The synchronous
+    // map block runs after the generation check, so a concurrent stop() can
+    // never observe a half-mapped mapper.
+    const shadow = this.mapper;
     const events = lines.slice(boundary).flatMap(line => shadow.mapLine(line, true));
     events.push(...shadow.settleTerminalCandidate(true));
     if (shadow.hasOpenTurn()) {
       for (const event of events) this.enqueue(event);
       await this.promote();
     }
-    return info.size;
+    return tailOffset;
   }
 }

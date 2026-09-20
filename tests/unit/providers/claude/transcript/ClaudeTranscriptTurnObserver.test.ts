@@ -437,6 +437,96 @@ describe('ClaudeTranscriptTurnObserver', () => {
     }
   });
 
+  it('recovers a mid-write tail user line: the writer finishes it and the turn still starts (F2)', async () => {
+    // The writer flushed only the first half of the boundary user line —
+    // no trailing newline yet. Recovery must prime at the last complete
+    // newline so those bytes survive as the reader's partial buffer;
+    // priming at the observed EOF would orphan them forever.
+    const lines = peerTurn('peer-half', 'half-written', false);
+    const userLine = lines[0];
+    const splitAt = Math.floor(userLine.length / 2);
+    await writeFile(file, userLine.slice(0, splitAt));
+    const { observer, callbacks } = setup();
+    try {
+      await observer.start(file);
+      expect(callbacks.started).not.toHaveBeenCalled();
+
+      await appendFile(file, `${userLine.slice(splitAt)}\n`);
+      const reader = (observer as any).reader as ClaudeTranscriptTailReader;
+      const batch = await reader.readAvailable();
+      expect(batch.lines).toEqual([userLine]);
+      await (observer as any).consumeBatch(batch, (observer as any).generation);
+
+      expect(callbacks.started).toHaveBeenCalledWith(
+        expect.objectContaining({ turnId: 'peer-half' }),
+      );
+    } finally {
+      observer.stop();
+    }
+  });
+
+  it('recovers a mid-write tail assistant line so its chunk is not lost (F2)', async () => {
+    const lines = peerTurn('peer-tail', 'tail', false);
+    const assistantLine = lines[1];
+    const splitAt = Math.floor(assistantLine.length / 2);
+    await writeFile(file, `${lines[0]}\n${assistantLine.slice(0, splitAt)}`);
+    const { observer, callbacks } = setup();
+    try {
+      await observer.start(file);
+      // The complete user line replays as the open turn's start.
+      expect(callbacks.started).toHaveBeenCalledWith(
+        expect.objectContaining({ turnId: 'peer-tail', replay: true }),
+      );
+      expect(callbacks.chunk).not.toHaveBeenCalled();
+
+      await appendFile(file, `${assistantLine.slice(splitAt)}\n`);
+      const reader = (observer as any).reader as ClaudeTranscriptTailReader;
+      const batch = await reader.readAvailable();
+      expect(batch.lines).toEqual([assistantLine]);
+      await (observer as any).consumeBatch(batch, (observer as any).generation);
+
+      expect(callbacks.chunk).toHaveBeenCalledWith(
+        expect.objectContaining({ turnId: 'peer-tail' }),
+      );
+    } finally {
+      observer.stop();
+    }
+  });
+
+  it('recovers a mid-write tail result line so the replayed turn finishes and releases (F2)', async () => {
+    // Open turn with a half-written terminal result row: recovery replays
+    // the turn (started + chunks), and the finished row must still land once
+    // the writer completes it — losing it would hang the feature auto lease.
+    const lines = peerTurn('peer-result', 'result-tail', false);
+    const resultLine = JSON.stringify({
+      type: 'result', subtype: 'success', isSidechain: false,
+      total_cost_usd: 0.01, duration_ms: 100, turn_uuid: 'peer-result',
+    });
+    const splitAt = Math.floor(resultLine.length / 2);
+    await writeFile(file, `${lines.slice(0, 2).join('\n')}\n${resultLine.slice(0, splitAt)}`);
+    const { observer, callbacks } = setup();
+    try {
+      await observer.start(file);
+      expect(callbacks.started).toHaveBeenCalledWith(
+        expect.objectContaining({ turnId: 'peer-result', replay: true }),
+      );
+      expect(callbacks.finished).not.toHaveBeenCalled();
+
+      await appendFile(file, `${resultLine.slice(splitAt)}\n`);
+      const reader = (observer as any).reader as ClaudeTranscriptTailReader;
+      const batch = await reader.readAvailable();
+      expect(batch.lines).toEqual([resultLine]);
+      await (observer as any).consumeBatch(batch, (observer as any).generation);
+
+      expect(callbacks.finished).toHaveBeenCalledWith(
+        expect.objectContaining({ turnId: 'peer-result' }),
+      );
+      expect(callbacks.released).toHaveBeenCalledWith('peer-result');
+    } finally {
+      observer.stop();
+    }
+  });
+
   it('does not skip lines appended between the recovery scan and prime (recovery→prime race)', async () => {
     // Completed history: recovery observes the EOF but replays nothing.
     await writeFile(file, `${peerTurn('peer-done', 'hello').join('\n')}\n`);
