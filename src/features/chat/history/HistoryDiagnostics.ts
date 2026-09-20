@@ -24,7 +24,7 @@ export type HistoryDiagnosticEvent =
   | {
     kind: 'search_snapshot_refresh';
     outcome: HistorySearchSnapshotRefreshOutcome;
-    reason?: 'no_conversation' | 'no_lease' | 'provider_without_index';
+    reason?: 'no_conversation' | 'no_lease' | 'provider_without_index' | 'stale';
     elapsedMs: number;
   };
 

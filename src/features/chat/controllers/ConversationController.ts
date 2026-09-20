@@ -332,9 +332,8 @@ export class ConversationController {
 
   async loadOlderHistory(): Promise<void> {
     const { state } = this.deps;
-    const lease = state.historyLease;
-    if (!lease || state.historyLoading) return;
-    await this.loadOlderWindow(lease);
+    if (!state.historyLease || state.historyLoading) return;
+    await this.loadOlderWindow();
   }
 
   async rematerializeHistoryPage(record: { pageKey: string; range: LoadedTurnRange; retention?: HistoryPageRetention; uiState: Map<string, { detailLoaded?: boolean }> }): Promise<HistoryPageInput | null> {
@@ -445,21 +444,26 @@ export class ConversationController {
   /**
    * "Load earlier" through a budget window anchored at the newest loaded
    * range start, floored at the adjacent older range so already-loaded turns
-   * are never re-materialized.
+   * are never re-materialized. The lease and anchor are captured under the
+   * stored grant (F5): a search snapshot refresh that swapped the mounted
+   * lease while this load queued must never materialize through the
+   * released previous lease.
    */
-  private async loadOlderWindow(lease: HistoryIndexLease): Promise<void> {
+  private async loadOlderWindow(): Promise<void> {
     const { state } = this.deps;
-    const total = lease.totalTurns;
-    const merged = this.mergeRanges(state.loadedRanges);
-    const newest = merged.find(range => range.start <= total - 1 && range.end >= total);
-    const anchor = newest ? newest.start : total;
-    if (anchor <= 0) return;
-    const older = [...merged].reverse().find(range => range.end <= anchor);
     state.historyLoading = true;
     state.historyError = null;
     this.renderHistoryPager();
     try {
       await this.runStoredTransaction(async isStale => {
+        const lease = state.historyLease;
+        if (!lease) return;
+        const total = lease.totalTurns;
+        const merged = this.mergeRanges(state.loadedRanges);
+        const newest = merged.find(range => range.start <= total - 1 && range.end >= total);
+        const anchor = newest ? newest.start : total;
+        if (anchor <= 0) return;
+        const older = [...merged].reverse().find(range => range.end <= anchor);
         const page = await lease.loadWindow({
           anchorTurn: anchor,
           direction: 'older',
@@ -625,41 +629,58 @@ export class ConversationController {
     if (!state.historyLease) {
       return this.reportRefreshNotApplicable('no_lease', startedAt);
     }
-    const previous = state.historyLease;
-    // Rollback path: the old lease stays live until the new snapshot is ready,
-    // so a failed refresh keeps pagination and search usable on stale data.
-    // Silent acquire: the refresh runs after stream completion with the tab
-    // already READY, so index progress must not touch the rendered messages.
-    const next = this.acquireLease(conversation, service, true, false);
-    state.historyLease = next;
-    try {
-      await next.ready;
-    } catch (error) {
-      next.release();
-      if (state.historyLease === next) {
-        // Still the mounted lease: restore the still-live previous one.
-        state.historyLease = previous;
-      } else {
-        // A conversation switch (or takeover) already released and unmounted
-        // `next`; `previous` lost its last reference — release it so the
-        // exchange cannot leak a protected index.
-        previous.release();
+    // F5: the whole lease exchange is one stored transaction, FIFO-serialized
+    // with loadOlderWindow and search re-locate, so the previous lease's
+    // index protection can never be revoked under an in-flight window load
+    // that captured it. A conversation switch does not queue on the
+    // coordinator, so the exchange revalidates staleness inside the grant —
+    // both on entry and after the new snapshot is ready.
+    const exchange = await this.runStoredTransaction<HistorySearchSnapshotRefreshResult>(async isStale => {
+      if (isStale()) return this.reportRefreshNotApplicable('stale', startedAt);
+      const previous = state.historyLease;
+      if (!previous) return this.reportRefreshNotApplicable('no_lease', startedAt);
+      // Rollback path: the old lease stays mounted until the new snapshot is
+      // ready, so a failed refresh keeps pagination and search usable on
+      // stale data. Silent acquire: the refresh runs after stream completion
+      // with the tab already READY, so index progress must not touch the
+      // rendered messages.
+      const next = this.acquireLease(conversation, service, true, false);
+      try {
+        await next.ready;
+      } catch (error) {
+        // The mounted lease was never touched; `next` ends its reference
+        // here (a switch that released `previous` already rewrote state).
+        next.release();
+        recordHistoryDiagnosticEvent({ kind: 'search_snapshot_refresh', outcome: 'failed', elapsedMs: performance.now() - startedAt });
+        throw error;
       }
-      recordHistoryDiagnosticEvent({ kind: 'search_snapshot_refresh', outcome: 'failed', elapsedMs: performance.now() - startedAt });
-      throw error;
-    }
-    // Exchange completed (or raced with a switch): `previous` ends its
-    // reference here either way; the mounted state is never rewritten.
-    previous.release();
-    // The lease reports what actually happened; without a service-provided
-    // outcome the honest report is rebuilt (a fresh acquire did run).
-    const outcome = next.acquireOutcome === 'cache_hit' ? 'cache_hit' : 'rebuilt';
-    recordHistoryDiagnosticEvent({ kind: 'search_snapshot_refresh', outcome, elapsedMs: performance.now() - startedAt });
-    return outcome === 'cache_hit' ? { status: 'cache_hit' } : { status: 'rebuilt' };
+      if (isStale() || state.historyLease !== previous) {
+        // The conversation switched (the switch released `previous` and
+        // rewrote the tab state) or another same-conversation path already
+        // exchanged the mounted lease: `next` was never mounted, so it ends
+        // its reference here; no lease is resurrected onto the tab.
+        next.release();
+        return this.reportRefreshNotApplicable('stale', startedAt);
+      }
+      // Exchange completed: swap the mounted lease, then end the previous
+      // reference — in that order, so no window load ever observes a
+      // mounted-but-released lease.
+      state.historyLease = next;
+      previous.release();
+      // The lease reports what actually happened; without a service-provided
+      // outcome the honest report is rebuilt (a fresh acquire did run).
+      const outcome = next.acquireOutcome === 'cache_hit' ? 'cache_hit' : 'rebuilt';
+      recordHistoryDiagnosticEvent({ kind: 'search_snapshot_refresh', outcome, elapsedMs: performance.now() - startedAt });
+      return outcome === 'cache_hit' ? { status: 'cache_hit' } : { status: 'rebuilt' };
+    });
+    // A cancelled transaction (conversation switched while queued behind a
+    // live turn or stored work, or the coordinator disposed) never ran the
+    // exchange: that is staleness, not a failure.
+    return exchange ?? this.reportRefreshNotApplicable('stale', startedAt);
   }
 
   private reportRefreshNotApplicable(
-    reason: 'no_conversation' | 'no_lease' | 'provider_without_index',
+    reason: 'no_conversation' | 'no_lease' | 'provider_without_index' | 'stale',
     startedAt: number,
   ): HistorySearchSnapshotRefreshResult {
     recordHistoryDiagnosticEvent({ kind: 'search_snapshot_refresh', outcome: 'not_applicable', reason, elapsedMs: performance.now() - startedAt });

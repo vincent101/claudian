@@ -583,6 +583,151 @@ describe('ConversationController', () => {
     });
 
     // ============================================
+    // Search snapshot refresh vs paging serialization (F5)
+    // ============================================
+
+    it('queues the search snapshot refresh behind an in-flight older-window load and releases the previous lease only after it (F5)', async () => {
+      const coordinator = new ProjectionWriteCoordinator();
+      deps.getProjectionCoordinator = () => coordinator;
+      deps.state.currentConversationId = 'large';
+      const conversation = { id: 'large', providerId: 'claude', title: 'Large', messages: [], sessionId: 'session', createdAt: 1, updatedAt: 1 } as any;
+      (deps.plugin.getConversationSync as jest.Mock).mockReturnValue(conversation);
+      const previous = makeLease(200);
+      deps.state.historyLease = previous as any;
+      deps.state.messages = [{ id: 'latest', role: 'user', content: 'latest', timestamp: 100 }] as any;
+      deps.state.loadedRanges = [{ start: 150, end: 200 }];
+      let resolveOlder!: (page: unknown) => void;
+      previous.loadWindow.mockImplementationOnce(() => new Promise(resolve => { resolveOlder = resolve; }));
+      const next = makeLease(200);
+      const service = { acquireHistoryIndex: jest.fn().mockReturnValue(next) };
+      deps.getHistoryIndexCapableService = () => service as any;
+
+      const paging = controller.loadOlderHistory();
+      await Promise.resolve();
+      await Promise.resolve();
+      // The older window is mid-load when the snapshot refresh fires.
+      const refreshing = controller.refreshHistorySearchSnapshot();
+      await Promise.resolve();
+      await Promise.resolve();
+
+      // While the load is in flight: the previous lease keeps its index
+      // protection, and the exchange has not acquired or swapped anything.
+      expect(previous.release).not.toHaveBeenCalled();
+      expect(service.acquireHistoryIndex).not.toHaveBeenCalled();
+      expect(deps.state.historyLease).toBe(previous);
+
+      resolveOlder({ messages: [{ id: 'older', role: 'user', content: 'older', timestamp: 50 }], range: { start: 100, end: 150 }, snapshotOffset: 5, sourceBytes: 1, projectedChars: 1, oversizedTurnCount: 0, pageKey: 'w:100:150', hasMoreBefore: true, hasMoreAfter: false });
+      await paging;
+      await refreshing;
+
+      // The exchange ran only after the load completed: swap first, then
+      // release the previous reference — never the reverse.
+      expect(deps.state.historyLease).toBe(next);
+      expect(previous.release).toHaveBeenCalledTimes(1);
+      expect(service.acquireHistoryIndex).toHaveBeenCalledWith(conversation, '/vault', undefined, true);
+    });
+
+    it('re-captures the mounted lease under the paging grant after a refresh swap, never materializing through the released one (F5)', async () => {
+      const coordinator = new ProjectionWriteCoordinator();
+      deps.getProjectionCoordinator = () => coordinator;
+      deps.state.currentConversationId = 'large';
+      const conversation = { id: 'large', providerId: 'claude', title: 'Large', messages: [], sessionId: 'session', createdAt: 1, updatedAt: 1 } as any;
+      (deps.plugin.getConversationSync as jest.Mock).mockReturnValue(conversation);
+      const previous = makeLease(200);
+      deps.state.historyLease = previous as any;
+      deps.state.messages = [{ id: 'latest', role: 'user', content: 'latest', timestamp: 100 }] as any;
+      deps.state.loadedRanges = [{ start: 150, end: 200 }];
+      let resolveReady!: () => void;
+      const next = makeLease(200);
+      next.ready = new Promise<void>(resolve => { resolveReady = resolve; });
+      next.loadWindow.mockResolvedValue({ messages: [{ id: 'older', role: 'user', content: 'older', timestamp: 50 }], range: { start: 100, end: 150 }, snapshotOffset: 5, sourceBytes: 1, projectedChars: 1, oversizedTurnCount: 0, pageKey: 'w:100:150', hasMoreBefore: true, hasMoreAfter: false });
+      const service = { acquireHistoryIndex: jest.fn().mockReturnValue(next) };
+      deps.getHistoryIndexCapableService = () => service as any;
+
+      const refreshing = controller.refreshHistorySearchSnapshot();
+      await Promise.resolve();
+      await Promise.resolve();
+      // The user pages while the refresh builds: the load queues behind it.
+      const paging = controller.loadOlderHistory();
+      await Promise.resolve();
+      await Promise.resolve();
+      expect(previous.loadWindow).not.toHaveBeenCalled();
+      expect(next.loadWindow).not.toHaveBeenCalled();
+
+      resolveReady();
+      await refreshing;
+      await paging;
+
+      // The granted load used the freshly swapped lease; the released
+      // previous lease never served an unprotected materialization.
+      expect(previous.loadWindow).not.toHaveBeenCalled();
+      expect(next.loadWindow).toHaveBeenCalledTimes(1);
+      expect(previous.release).toHaveBeenCalledTimes(1);
+      expect(deps.state.historyLease).toBe(next);
+    });
+
+    it('releases the built next lease without resurrecting the old one when the conversation switches mid-refresh (F5)', async () => {
+      const coordinator = new ProjectionWriteCoordinator();
+      deps.getProjectionCoordinator = () => coordinator;
+      deps.state.currentConversationId = 'large';
+      const conversation = { id: 'large', providerId: 'claude', title: 'Large', messages: [], sessionId: 'session', createdAt: 1, updatedAt: 1 } as any;
+      (deps.plugin.getConversationSync as jest.Mock).mockReturnValue(conversation);
+      const previous = makeLease(100);
+      deps.state.historyLease = previous as any;
+      let resolveReady!: () => void;
+      const next = makeLease(100);
+      next.ready = new Promise<void>(resolve => { resolveReady = resolve; });
+      const service = { acquireHistoryIndex: jest.fn().mockReturnValue(next) };
+      deps.getHistoryIndexCapableService = () => service as any;
+
+      const refreshing = controller.refreshHistorySearchSnapshot();
+      await Promise.resolve();
+      await Promise.resolve();
+      expect(service.acquireHistoryIndex).toHaveBeenCalledTimes(1);
+
+      // A conversation switch runs to completion while the new snapshot
+      // builds: it released the still-mounted previous lease and rewrote the
+      // tab state.
+      deps.state.currentConversationId = 'switched';
+      previous.release();
+      deps.state.historyLease = null;
+      resolveReady();
+
+      await expect(refreshing).resolves.toEqual({ status: 'not_applicable', reason: 'stale' });
+
+      // The never-mounted next lease ends its reference exactly once; the
+      // old lease is not resurrected onto the switched-to tab.
+      expect(next.release).toHaveBeenCalledTimes(1);
+      expect(previous.release).toHaveBeenCalledTimes(1);
+      expect(deps.state.historyLease).toBeNull();
+    });
+
+    it('skips the exchange when the conversation switches while the refresh queues behind a live turn (F5)', async () => {
+      const coordinator = new ProjectionWriteCoordinator();
+      deps.getProjectionCoordinator = () => coordinator;
+      deps.state.currentConversationId = 'large';
+      const conversation = { id: 'large', providerId: 'claude', title: 'Large', messages: [], sessionId: 'session', createdAt: 1, updatedAt: 1 } as any;
+      (deps.plugin.getConversationSync as jest.Mock).mockReturnValue(conversation);
+      const previous = makeLease(100);
+      deps.state.historyLease = previous as any;
+      const next = makeLease(100);
+      const service = { acquireHistoryIndex: jest.fn().mockReturnValue(next) };
+      deps.getHistoryIndexCapableService = () => service as any;
+
+      const live = await coordinator.acquireLive();
+      const refreshing = controller.refreshHistorySearchSnapshot();
+      await Promise.resolve();
+      // The conversation switched while the refresh waits for the live turn.
+      deps.state.currentConversationId = 'switched';
+      live!.release();
+
+      await expect(refreshing).resolves.toEqual({ status: 'not_applicable', reason: 'stale' });
+      expect(service.acquireHistoryIndex).not.toHaveBeenCalled();
+      expect(previous.release).not.toHaveBeenCalled();
+      expect(deps.state.historyLease).toBe(previous);
+    });
+
+    // ============================================
     // Projection write lease (coord protocol P3)
     // ============================================
 
@@ -894,7 +1039,7 @@ describe('ConversationController', () => {
       mockEnumerate.mockRestore();
     });
 
-    it('releases the orphaned previous lease when a mid-refresh conversation switch makes the rollback impossible', async () => {
+    it('releases the built lease and keeps the switched tab untouched when a mid-refresh switch lands during the build (F5)', async () => {
       deps.state.currentConversationId = 'large';
       const conversation = { id: 'large', providerId: 'claude', title: 'Large', messages: [], sessionId: 'session', createdAt: 1, updatedAt: 1 } as any;
       (deps.plugin.getConversationSync as jest.Mock).mockReturnValue(conversation);
@@ -909,16 +1054,19 @@ describe('ConversationController', () => {
       const refreshPromise = controller.refreshHistorySearchSnapshot();
       await Promise.resolve();
       // The conversation switched while the new index build failed: the
-      // switch already released and cleared the pending lease, so restoring
-      // `previous` onto the tab would pollute the new conversation.
+      // switch released the still-mounted previous lease and rewrote the tab
+      // state, so neither lease may be restored onto the new conversation.
       deps.state.currentConversationId = 'switched';
+      previous.release();
       deps.state.historyLease = null;
       rejectReady(new Error('index build failed'));
 
       await expect(refreshPromise).rejects.toThrow('index build failed');
 
-      // The previous lease is released exactly once (no leak) and the null
-      // state of the switched-to conversation stays untouched.
+      // The half-built next lease is released exactly once (no leak),
+      // previous is never double-released, and the switched-to tab's null
+      // state stays untouched.
+      expect(next.release).toHaveBeenCalledTimes(1);
       expect(previous.release).toHaveBeenCalledTimes(1);
       expect(deps.state.historyLease).toBeNull();
     });

@@ -81,7 +81,7 @@ export function enumerateVisibleMatches(root: HTMLElement, query: string): Visib
 export type HistorySearchSnapshotRefreshResult =
   | { status: 'rebuilt' }
   | { status: 'cache_hit' }
-  | { status: 'not_applicable'; reason: 'no_conversation' | 'no_lease' | 'provider_without_index' };
+  | { status: 'not_applicable'; reason: 'no_conversation' | 'no_lease' | 'provider_without_index' | 'stale' };
 
 interface HistorySearchControllerDeps {
   rootEl: HTMLElement;

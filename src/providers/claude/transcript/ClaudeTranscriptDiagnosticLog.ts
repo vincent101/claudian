@@ -29,7 +29,7 @@ export interface TranscriptDiagnosticEvent {
   errorName?: string;
   buildId?: string;
   mode?: 'worker' | 'direct';
-  reason?: 'oversized' | 'malformed' | 'no_conversation' | 'no_lease' | 'provider_without_index';
+  reason?: 'oversized' | 'malformed' | 'no_conversation' | 'no_lease' | 'provider_without_index' | 'stale';
   outcome?: 'rebuilt' | 'cache_hit' | 'not_applicable' | 'failed';
   offset?: number;
   queueMs?: number;
