@@ -33,7 +33,7 @@ export interface TranscriptDiagnosticEvent {
   errorName?: string;
   buildId?: string;
   mode?: 'worker' | 'direct';
-  reason?: 'oversized' | 'malformed' | 'no_conversation' | 'no_lease' | 'provider_without_index' | 'stale' | 'identity_missing';
+  reason?: 'oversized' | 'malformed' | 'no_conversation' | 'no_lease' | 'provider_without_index' | 'stale' | 'identity_missing' | 'alias_remap' | 'canonical_rebind';
   outcome?: 'rebuilt' | 'cache_hit' | 'not_applicable' | 'failed';
   /** How the oversized-row identity was recovered (field names only, never values). */
   identityRecovery?: string;

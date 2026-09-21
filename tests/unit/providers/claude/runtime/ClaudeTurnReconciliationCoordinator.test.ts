@@ -126,15 +126,44 @@ describe('ClaudeTurnReconciliationCoordinator (batch 1: observe-only bypass)', (
 
     expect(coordinator.getStats().identityConflicts).toBe(1);
     expect(sink.phases()).toContain('turn_identity_conflict');
+    // An already-mapped host turn dispatching a different canonical UUID is
+    // an alias remap, not identity corruption.
+    expect(sink.events.find(event => event.phase === 'turn_identity_conflict')).toEqual(
+      expect.objectContaining({ reason: 'alias_remap' }),
+    );
   });
 
   it('flags a conflict when a canonical UUID lands on an incompatible lease group', () => {
-    const coordinator = new ClaudeTurnReconciliationCoordinator('observe', new MemorySink());
+    const sink = new MemorySink();
+    const coordinator = new ClaudeTurnReconciliationCoordinator('observe', sink);
     coordinator.recordDispatched({ leaseTurnId: 'turn-1', canonicalTurnId: 'uuid-1', hostTurnIds: ['turn-1', 'turn-2'] });
 
     coordinator.recordDispatched({ leaseTurnId: 'turn-9', canonicalTurnId: 'uuid-1', hostTurnIds: ['turn-9'] });
 
     expect(coordinator.getStats().identityConflicts).toBe(1);
+    // An already-bound canonical UUID dispatching under a different lease
+    // group is a canonical rebind.
+    expect(sink.events.find(event => event.phase === 'turn_identity_conflict')).toEqual(
+      expect.objectContaining({ reason: 'canonical_rebind' }),
+    );
+  });
+
+  it('tags merged-turn crash-replay remaps so the promotion gate can exclude them', () => {
+    // Crash recovery replays the owner-only lastSentMessage. When that
+    // message was a merged turn's later writer, the replay dispatches a
+    // fresh canonical UUID under a host turn already mapped to the merged
+    // item's canonical UUID — an expected alias remap that must not read as
+    // identity corruption in the batch-1 promotion gate.
+    const sink = new MemorySink();
+    const coordinator = new ClaudeTurnReconciliationCoordinator('observe', sink);
+    coordinator.recordDispatched({ leaseTurnId: 'turn-a', canonicalTurnId: 'uuid-a', hostTurnIds: ['turn-a', 'turn-b'] });
+
+    coordinator.recordDispatched({ leaseTurnId: 'turn-b', canonicalTurnId: 'uuid-b', hostTurnIds: ['turn-b'] });
+
+    expect(coordinator.getStats().identityConflicts).toBe(1);
+    expect(sink.events.find(event => event.phase === 'turn_identity_conflict')).toEqual(
+      expect.objectContaining({ reason: 'alias_remap' }),
+    );
   });
 
   it('treats a repeated dispatch of the identical canonical identity as idempotent', () => {

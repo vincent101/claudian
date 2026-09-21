@@ -90,6 +90,32 @@ describe('ClaudeTranscriptTurnObserver', () => {
     expect(callbacks.chunk).not.toHaveBeenCalled();
   });
 
+  it('reset recovery replays an external start as started even while a host user turn is active', async () => {
+    // Transcript-replaced recovery (batch.reset) does not clear
+    // hostUserTurnId. The replay path must keep the baseline projection:
+    // mapLine replays without a context (mapper default hostUserTurnActive
+    // = false), so the external start promotes as `started`. Diverting it
+    // into `embedded` (live hostUserTurnActive) would push the event into
+    // embeddedQueue while the mapper's active turn is already open — the
+    // buffered chunks then find no pending record and the turn's content is
+    // silently dropped without ever settling.
+    await writeFile(file, '');
+    const { observer, callbacks } = setup();
+    await observer.start(file);
+    observer.beginUserTurnProjection('host-active');
+    const generation = (observer as any).generation;
+
+    try {
+      await appendFile(file, `${peerTurn('peer-reset', 'hi', false).join('\n')}\n`);
+      await (observer as any).consumeBatch({ lines: [], reset: true }, generation);
+
+      expect(callbacks.started).toHaveBeenCalledWith(expect.objectContaining({ turnId: 'peer-reset', replay: true }));
+      expect(callbacks.projectEmbeddedExternal).not.toHaveBeenCalled();
+    } finally {
+      observer.stop();
+    }
+  });
+
   it('clears a pending quiet timer when settled directly instead of orphaning it', async () => {
     await writeFile(file, '');
     const { observer } = setup();

@@ -135,13 +135,18 @@ export class ClaudeTurnReconciliationCoordinator {
         // message object): one eligible canonical turn, no double count.
         return;
       }
-      this.recordConflict(fact.canonicalTurnId);
+      this.recordConflict(fact.canonicalTurnId, 'canonical_rebind');
       return;
     }
 
     for (const hostTurnId of fact.hostTurnIds) {
       if (this.canonicalByHostTurnId.get(hostTurnId) !== undefined) {
-        this.recordConflict(fact.canonicalTurnId);
+        // Expected shape: a merged turn's crash replay re-enqueues the
+        // owner-only lastSentMessage (the later writer's original UUID), so
+        // an already-mapped host turn dispatches a different canonical UUID.
+        // Tagged alias_remap so the promotion gate can separate it from real
+        // identity corruption; batch 2 must add superseded semantics instead.
+        this.recordConflict(fact.canonicalTurnId, 'alias_remap');
         return;
       }
     }
@@ -242,12 +247,16 @@ export class ClaudeTurnReconciliationCoordinator {
     this.canonicalByHostTurnId.clear();
   }
 
-  private recordConflict(canonicalTurnId: string): void {
+  private recordConflict(
+    canonicalTurnId: string,
+    reason: 'alias_remap' | 'canonical_rebind',
+  ): void {
     this.stats.identityConflicts += 1;
     this.diagnostics?.record({
       phase: 'turn_identity_conflict',
       turnIdHash: this.diagnostics.hashId(canonicalTurnId),
       generation: this.sessionGeneration,
+      reason,
     });
   }
 }

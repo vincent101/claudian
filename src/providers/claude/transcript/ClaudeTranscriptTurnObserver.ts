@@ -440,7 +440,13 @@ export class ClaudeTranscriptTurnObserver {
     const shadow = this.mapper;
     const facts = lines.slice(boundary).flatMap(line => shadow.mapLine(line, true));
     facts.push(...shadow.settleTerminalCandidate(true));
-    const events = adaptTranscriptFacts(facts, { hostUserTurnActive: this.hostUserTurnId !== null });
+    // Replay context must mirror the mapper default (hostUserTurnActive =
+    // false), not the live host state: transcript-replaced recovery does not
+    // clear hostUserTurnId, and a live-true context would divert the replayed
+    // external start into `embedded` while the mapper already opened its
+    // active turn — the buffered chunks would find no pending record and the
+    // turn's content would be silently dropped without ever settling.
+    const events = adaptTranscriptFacts(facts, { hostUserTurnActive: false });
     if (shadow.hasOpenTurn()) {
       for (const event of events) this.enqueue(event);
       await this.promote();
