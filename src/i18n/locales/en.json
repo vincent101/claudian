@@ -74,6 +74,9 @@
       "needsAttention": "Tab {index} \"{title}\" needs your response",
       "streamComplete": "Tab {index} \"{title}\" finished. Ready for review."
     },
+    "ask": {
+      "autoTurnTimeout": "Background turn asked a question but got no response within 5 minutes — automatically declined."
+    },
     "cancel": {
       "toolInterrupted": "Interrupted"
     },

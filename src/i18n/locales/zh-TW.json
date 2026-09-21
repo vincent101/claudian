@@ -74,6 +74,9 @@
       "needsAttention": "Tab {index}「{title}」需要你回應",
       "streamComplete": "Tab {index}「{title}」已完成，待檢查"
     },
+    "ask": {
+      "autoTurnTimeout": "後台輪提問逾時未回應，已自動拒絕"
+    },
     "cancel": {
       "toolInterrupted": "已中斷"
     },

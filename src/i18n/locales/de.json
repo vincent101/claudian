@@ -74,6 +74,9 @@
       "needsAttention": "Tab {index} \"{title}\" needs your response",
       "streamComplete": "Tab {index} \"{title}\" finished. Ready for review."
     },
+    "ask": {
+      "autoTurnTimeout": "Frage des Hintergrund-Turns wurde innerhalb von 5 Minuten nicht beantwortet — automatisch abgelehnt."
+    },
     "cancel": {
       "toolInterrupted": "Abgebrochen"
     },

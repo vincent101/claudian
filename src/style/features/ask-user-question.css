@@ -6,6 +6,15 @@
   outline: none;
 }
 
+/* Auto-turn ask fallback: visible marker once the 5-minute window lapses and
+   the card auto-declines (plan A). */
+.claudian-ask-timeout-notice {
+  font-family: var(--font-monospace);
+  font-size: 12px;
+  color: #d45d5d;
+  padding: 4px 10px;
+}
+
 .claudian-ask-inline-title {
   font-weight: 700;
   color: var(--text-muted);

@@ -54,6 +54,9 @@ export type TranslationKey =
   // Chat - Cancel settle-down
   | 'chat.cancel.toolInterrupted'
 
+  // Chat - Auto-turn ask timeout fallback (plan A)
+  | 'chat.ask.autoTurnTimeout'
+
   // Chat - History hydration
   | 'chat.history.loading'
   | 'chat.history.waitingForIndex'
