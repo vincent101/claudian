@@ -1521,7 +1521,7 @@ describe('InputController - Message Queue', () => {
     });
   });
 
-  describe('Ask-user-question cancel and background gating (2.5.1 F1/F2)', () => {
+  describe('Ask-user-question cancel and background gating (2.5.1 F1 / auto-turn ask window)', () => {
     /** Input container wired to a parent so the ask card can mount. */
     function createAskDeps(overrides: Partial<InputControllerDeps> = {}) {
       const askDeps = createMockDeps(overrides);
@@ -1567,7 +1567,8 @@ describe('InputController - Message Queue', () => {
       expect((askController as any).pendingExitPlanModeInline).toBeNull();
     });
 
-    it('F2: an auto (background) turn denies the ask without rendering any UI', async () => {
+    /** Coordinator-wired deps with a live auto/user turn on the feature lease. */
+    function createTurnWiredDeps(kind: 'user' | 'auto') {
       const askDeps = createAskDeps();
       const turnCoordinator = new TurnCoordinator({
         state: askDeps.state,
@@ -1576,35 +1577,177 @@ describe('InputController - Message Queue', () => {
       });
       askDeps.getTurnCoordinator = () => turnCoordinator;
       const askController = new InputController(askDeps);
+      if (kind === 'auto') {
+        expect(turnCoordinator.beginAutoTurn('auto-1', 2)).toBe(true);
+      } else {
+        expect(turnCoordinator.beginUserTurn('user-1', 5)).toBe(true);
+      }
+      const parentEl = (askDeps.getInputContainerEl() as any).parentElement;
+      return { askDeps, turnCoordinator, askController, parentEl };
+    }
 
-      expect(turnCoordinator.beginAutoTurn('auto-1', 2)).toBe(true);
+    /** True once the promise settles; false while it is still pending. */
+    async function isSettled(promise: Promise<unknown>): Promise<boolean> {
+      return Promise.race([promise.then(() => true), Promise.resolve(false)]);
+    }
 
-      const result = await askController.handleAskUserQuestion(askInput());
-
-      // null → ClaudeApprovalHandler deny+interrupt: the SDK canUseTool never blocks.
-      expect(result).toBeNull();
-      expect((askController as any).pendingAskInline).toBeNull();
-      expect((askDeps.streamController as any).hideThinkingIndicator).not.toHaveBeenCalled();
-    });
-
-    it('F2: a user turn still renders the ask card (existing behavior unchanged)', async () => {
-      const askDeps = createAskDeps();
-      const turnCoordinator = new TurnCoordinator({
-        state: askDeps.state,
-        getConversationId: () => askDeps.state.currentConversationId,
-        processQueuedMessage: () => {},
-      });
-      askDeps.getTurnCoordinator = () => turnCoordinator;
-      const askController = new InputController(askDeps);
-
-      expect(turnCoordinator.beginUserTurn('user-1', 5)).toBe(true);
+    it('plan A: an auto turn renders the ask card instead of denying immediately', async () => {
+      const { askDeps, askController } = createTurnWiredDeps('auto');
 
       const askPromise = askController.handleAskUserQuestion(askInput());
+
+      // The card mounted; only the deny outcome changed, not the rendering.
       expect((askController as any).pendingAskInline).not.toBeNull();
       expect((askDeps.streamController as any).hideThinkingIndicator).toHaveBeenCalled();
 
       askController.dismissPendingApproval();
       await expect(askPromise).resolves.toBeNull();
+    });
+
+    it('plan A: the auto-turn ask settles deny after the 5-minute window with a visible timeout notice', async () => {
+      jest.useFakeTimers();
+      try {
+        const { askController, parentEl } = createTurnWiredDeps('auto');
+
+        const askPromise = askController.handleAskUserQuestion(askInput());
+
+        // One millisecond before the window: still pending, card still mounted.
+        jest.advanceTimersByTime(5 * 60 * 1000 - 1);
+        expect(await isSettled(askPromise)).toBe(false);
+        expect((askController as any).pendingAskInline).not.toBeNull();
+
+        // Window lapse → deny+interrupt fallback (null) + visible notice.
+        jest.advanceTimersByTime(1);
+        await expect(askPromise).resolves.toBeNull();
+        expect((askController as any).pendingAskInline).toBeNull();
+        const notice = parentEl.querySelector('.claudian-ask-timeout-notice');
+        expect(notice).not.toBeNull();
+        expect(notice.textContent).toBe(t('chat.ask.autoTurnTimeout'));
+        expect(jest.getTimerCount()).toBe(0);
+      } finally {
+        jest.useRealTimers();
+      }
+    });
+
+    it('plan A: an answer inside the window flows through; timer cleared, no late timeout notice', async () => {
+      jest.useFakeTimers();
+      try {
+        const { askController, parentEl } = createTurnWiredDeps('auto');
+
+        const askPromise = askController.handleAskUserQuestion(askInput());
+        const inline = (askController as any).pendingAskInline;
+        expect(inline).not.toBeNull();
+
+        // User picks "Yes" (option row) → tab switches to submit → submit row.
+        inline.rootEl.querySelector('.claudian-ask-item').click();
+        inline.rootEl.querySelector('.claudian-ask-item').click();
+
+        await expect(askPromise).resolves.toEqual({ 'Proceed?': 'yes' });
+
+        // Well past the window: no late notice, timer cleared.
+        jest.advanceTimersByTime(10 * 60 * 1000);
+        expect(parentEl.querySelector('.claudian-ask-timeout-notice')).toBeNull();
+        expect(jest.getTimerCount()).toBe(0);
+      } finally {
+        jest.useRealTimers();
+      }
+    });
+
+    it('plan A: ESC on the auto-turn card resolves null; no timeout notice afterwards', async () => {
+      jest.useFakeTimers();
+      try {
+        const { askController, parentEl } = createTurnWiredDeps('auto');
+
+        const askPromise = askController.handleAskUserQuestion(askInput());
+        const inline = (askController as any).pendingAskInline;
+
+        inline.rootEl.dispatchEvent({ type: 'keydown', key: 'Escape', preventDefault: () => {}, stopPropagation: () => {} });
+
+        await expect(askPromise).resolves.toBeNull();
+        jest.advanceTimersByTime(10 * 60 * 1000);
+        expect(parentEl.querySelector('.claudian-ask-timeout-notice')).toBeNull();
+        expect(jest.getTimerCount()).toBe(0);
+      } finally {
+        jest.useRealTimers();
+      }
+    });
+
+    it('plan A: the switch-conversation dismiss family also settles an auto-turn ask card', async () => {
+      jest.useFakeTimers();
+      try {
+        const { askController, parentEl } = createTurnWiredDeps('auto');
+
+        const askPromise = askController.handleAskUserQuestion(askInput());
+        expect((askController as any).pendingAskInline).not.toBeNull();
+
+        // Conversation switch / tab close both land on this dismiss path.
+        askController.dismissPendingApprovalPrompt();
+
+        await expect(askPromise).resolves.toBeNull();
+        jest.advanceTimersByTime(10 * 60 * 1000);
+        expect(parentEl.querySelector('.claudian-ask-timeout-notice')).toBeNull();
+        expect(jest.getTimerCount()).toBe(0);
+      } finally {
+        jest.useRealTimers();
+      }
+    });
+
+    it('plan A: the Tab-wired attention pair settles exactly once on the timeout path', async () => {
+      jest.useFakeTimers();
+      try {
+        const attentionEvents: boolean[] = [];
+        const state = new ChatState({ onAttentionChanged: (v) => attentionEvents.push(v) });
+        const askDeps = createAskDeps({ state });
+        const turnCoordinator = new TurnCoordinator({
+          state,
+          getConversationId: () => state.currentConversationId,
+          processQueuedMessage: () => {},
+        });
+        askDeps.getTurnCoordinator = () => turnCoordinator;
+        const askController = new InputController(askDeps);
+        expect(turnCoordinator.beginAutoTurn('auto-1', 2)).toBe(true);
+
+        // Same wiring shape as Tab.setupServiceCallbacks: beginAttention wraps
+        // the callback, endAttention runs in the finally after it settles.
+        const askPromise = (async () => {
+          state.beginAttention();
+          try {
+            return await askController.handleAskUserQuestion(askInput());
+          } finally {
+            state.endAttention();
+          }
+        })();
+
+        // While the card is pending the background-tab notification condition holds.
+        expect(state.needsAttention).toBe(true);
+
+        jest.advanceTimersByTime(5 * 60 * 1000);
+        await expect(askPromise).resolves.toBeNull();
+        // beginAttention/endAttention paired: the attention window closed.
+        expect(state.needsAttention).toBe(false);
+        expect(attentionEvents).toEqual([true, false]);
+      } finally {
+        jest.useRealTimers();
+      }
+    });
+
+    it('plan A: a user turn keeps the unbounded ask (still pending after 5 minutes)', async () => {
+      jest.useFakeTimers();
+      try {
+        const { askController } = createTurnWiredDeps('user');
+
+        const askPromise = askController.handleAskUserQuestion(askInput());
+        expect((askController as any).pendingAskInline).not.toBeNull();
+
+        jest.advanceTimersByTime(5 * 60 * 1000);
+        expect(jest.getTimerCount()).toBe(0);
+        expect(await isSettled(askPromise)).toBe(false);
+
+        askController.dismissPendingApproval();
+        await expect(askPromise).resolves.toBeNull();
+      } finally {
+        jest.useRealTimers();
+      }
     });
   });
 

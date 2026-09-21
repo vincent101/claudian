@@ -61,6 +61,10 @@ const APPROVAL_OPTION_MAP: Record<string, ApprovalDecision> = {
   'Always allow': 'allow-always',
 };
 
+/** Plan A bound for auto-turn asks: 5 minutes for the attention notification
+ * to reach the user before falling back to the deny+interrupt protection. */
+const AUTO_TURN_ASK_TIMEOUT_MS = 5 * 60 * 1000;
+
 const DEFAULT_APPROVAL_DECISION_OPTIONS: ApprovalDecisionOption[] =
   Object.entries(APPROVAL_OPTION_MAP).map(([label, decision]) => ({
     label,
@@ -1638,30 +1642,71 @@ export class InputController {
     input: Record<string, unknown>,
     signal?: AbortSignal,
   ): Promise<Record<string, string | string[]> | null> {
-    // 2.5.1 F2: background auto turns (notification-continuation / peer) have
-    // no user attending the tab — an ask card there can never be answered and
-    // its pending canUseTool promise would block the auto turn forever. Deny
-    // immediately: null flows through ClaudeApprovalHandler as deny+interrupt,
-    // which aborts the turn; the interrupted result line then settles the auto
-    // lease. The feature lease is exclusive, so its kind attributes the ask
-    // reliably.
-    if (this.getTurnCoordinator()?.getActiveTurn()?.kind === 'auto') {
-      return null;
-    }
-
     const inputContainerEl = this.deps.getInputContainerEl();
     const parentEl = inputContainerEl.parentElement;
     if (!parentEl) {
       throw new Error('Input container is detached from DOM');
     }
 
-    return this.showInlineQuestion(
+    const askPromise = this.showInlineQuestion(
       parentEl,
       inputContainerEl,
       input,
       (inline) => { this.pendingAskInline = inline; },
       signal,
     );
+
+    // Auto turns (task-notification continuations, peer-forwarded runs) have
+    // no guaranteed attending user, so their pending canUseTool promise must
+    // stay bounded — 2.5.1 F2 bounded it to zero by denying before any UI.
+    // Plan A: render the card anyway (the attention callback notifies the
+    // background tab; on the active tab the card is directly visible), then
+    // fall back to the same deny+interrupt protection after a 5-minute
+    // window, with a visible notice. The lease is exclusive, so its kind
+    // still attributes the ask reliably; user turns keep the unbounded path.
+    if (this.getTurnCoordinator()?.getActiveTurn()?.kind !== 'auto') {
+      return askPromise;
+    }
+
+    return this.raceAutoTurnAskTimeout(askPromise, parentEl);
+  }
+
+  /**
+   * Plan A bound for auto-turn asks: settle deny (null → ClaudeApprovalHandler
+   * deny+interrupt) if the card goes unanswered past the window. The settled
+   * flag makes the race one-shot — an answer, ESC, signal abort, or dismiss
+   * that settles the ask first cancels the timer, and a late timer against an
+   * already-settled ask (turn ended by another path) is a no-op.
+   */
+  private raceAutoTurnAskTimeout(
+    askPromise: Promise<Record<string, string | string[]> | null>,
+    parentEl: HTMLElement,
+  ): Promise<Record<string, string | string[]> | null> {
+    return new Promise<Record<string, string | string[]> | null>((resolve, reject) => {
+      let settled = false;
+      const settle = (fn: () => void) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        fn();
+      };
+      const timer = setTimeout(() => {
+        settle(() => {
+          // destroy() is idempotent (InlineAskUserQuestion.resolved guard):
+          // when the ask settled in the same tick this is already a no-op.
+          this.pendingAskInline?.destroy();
+          parentEl.createDiv({
+            cls: 'claudian-ask-timeout-notice',
+            text: t('chat.ask.autoTurnTimeout'),
+          });
+          resolve(null);
+        });
+      }, AUTO_TURN_ASK_TIMEOUT_MS);
+      askPromise.then(
+        (result) => settle(() => resolve(result)),
+        (error) => settle(() => reject(error)),
+      );
+    });
   }
 
   private showInlineQuestion(
