@@ -13,7 +13,10 @@ export type TranscriptDiagnosticPhase =
   | 'cache_hit' | 'cache_evict' | 'cache_overcommit'
   | 'line_skipped' | 'partial_snapshot' | 'stale_partial_segment'
   | 'page_render_timeout' | 'page_data_overcommit' | 'dom_overcommit'
-  | 'search_snapshot_refresh' | 'memory_only_rematerialize';
+  | 'search_snapshot_refresh' | 'memory_only_rematerialize'
+  | 'turn_identity_reserved' | 'turn_identity_dispatched' | 'turn_identity_matched'
+  | 'turn_identity_host_only' | 'turn_identity_observer_only'
+  | 'turn_identity_duplicate' | 'turn_identity_conflict';
 
 export interface TranscriptDiagnosticEvent {
   phase: TranscriptDiagnosticPhase;
@@ -30,7 +33,7 @@ export interface TranscriptDiagnosticEvent {
   errorName?: string;
   buildId?: string;
   mode?: 'worker' | 'direct';
-  reason?: 'oversized' | 'malformed' | 'no_conversation' | 'no_lease' | 'provider_without_index' | 'stale';
+  reason?: 'oversized' | 'malformed' | 'no_conversation' | 'no_lease' | 'provider_without_index' | 'stale' | 'identity_missing';
   outcome?: 'rebuilt' | 'cache_hit' | 'not_applicable' | 'failed';
   /** How the oversized-row identity was recovered (field names only, never values). */
   identityRecovery?: string;
@@ -45,6 +48,10 @@ export interface TranscriptDiagnosticEvent {
   sourceBytes?: number;
   projectedChars?: number;
   oversizedTurns?: number;
+  /** Turn-identity reconciliation: number of host aliases on the dispatched queue item. */
+  hostAliases?: number;
+  /** Turn-identity reconciliation: observed external source kind (category only). */
+  sourceKind?: string;
 }
 
 const SEGMENT_BYTES = 128 * 1024;
@@ -92,7 +99,7 @@ export class ClaudeTranscriptDiagnosticLog {
 
   private serialize(event: TranscriptDiagnosticEvent): string {
     const clean: Record<string, unknown> = { ts: Date.now(), seq: ++this.seq, phase: event.phase };
-    for (const key of ['tabIdHash', 'turnIdHash', 'pageKeyHash', 'generation', 'renderTicket', 'projectedWeight', 'leaseKind', 'batchBytes', 'batchLines', 'elapsedMs', 'errorName', 'buildId', 'mode', 'reason', 'outcome', 'identityRecovery', 'recoveredIdentityFields', 'offset', 'queueMs', 'bytes', 'totalBytes', 'entries', 'turns', 'turnCount', 'sourceBytes', 'projectedChars', 'oversizedTurns'] as const) {
+    for (const key of ['tabIdHash', 'turnIdHash', 'pageKeyHash', 'generation', 'renderTicket', 'projectedWeight', 'leaseKind', 'batchBytes', 'batchLines', 'elapsedMs', 'errorName', 'buildId', 'mode', 'reason', 'outcome', 'identityRecovery', 'recoveredIdentityFields', 'offset', 'queueMs', 'bytes', 'totalBytes', 'entries', 'turns', 'turnCount', 'sourceBytes', 'projectedChars', 'oversizedTurns', 'hostAliases', 'sourceKind'] as const) {
       const value = event[key];
       if (value !== undefined) clean[key] = typeof value === 'string' ? value.slice(0, 128) : value;
     }
