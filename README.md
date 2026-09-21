@@ -26,6 +26,16 @@ Open the chat sidebar from the ribbon icon or command palette. Select text and u
 
 **Multi-Tab & Conversations** — Multiple chat tabs, conversation history, fork, resume, and compact.
 
+**Large Session Support** — Sessions of any size (GB-scale transcripts) open in sub-second first-screen time; history is browsed through a virtualized window at constant memory, with built-in full-history search and "Load earlier" paging.
+
+**Model Presets** — Configure model tiers with custom context windows; the context usage gauge is denominated by the selected model's window.
+
+**Smart Notifications** — Desktop notifications when background tasks complete, with per-turn attribution so superseded or cancelled turns stay silent.
+
+**History Tools** — Rewind or fork from any message, export the full conversation, and automatically recover sessions the provider forgot.
+
+**i18n** — Full UI localization in 10 locales (including zh-CN and zh-TW).
+
 ## Requirements
 
 - **Claude provider**: [Claude Code CLI](https://code.claude.com/docs/en/overview) installed (native install recommended). Claude subscription/API or compatible provider ([Openrouter](https://openrouter.ai/docs/guides/guides/claude-code-integration), [Kimi](https://platform.moonshot.ai/docs/guide/agent-support), etc.).
@@ -150,7 +160,7 @@ src/
 │   ├── opencode/                # Opencode adaptor
 │   └── acp/                     # Agent Client Protocol shared transport
 ├── features/
-│   ├── chat/                    # Sidebar chat: tabs, controllers, renderers
+│   ├── chat/                    # Sidebar chat: tabs, controllers, windowed history renderers
 │   ├── inline-edit/             # Inline edit modal and provider-backed edit services
 │   └── settings/                # Settings shell with provider tabs
 ├── shared/                      # Reusable UI components and modals
