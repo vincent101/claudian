@@ -37,19 +37,40 @@ export const MESSAGE_CHANNEL_CONFIG = {
   MAX_MERGED_CHARS: 12000, // ~3k tokens — batch size under context limits
 } as const;
 
-export interface PendingTextMessage {
-  type: 'text';
+/** Queue-item identity base: lease owner first, merged aliases after (batch 1 §2.3). */
+interface PendingTurnIdentity {
   turnId: string;
+  hostTurnIds: string[];
+}
+
+export interface PendingTextMessage extends PendingTurnIdentity {
+  type: 'text';
+  /**
+   * Canonical SDKUserMessage the first writer of this queue item produced.
+   * Its UUID survives merges (identity, batch 1 §2.3): only `content` below
+   * changes as later turns merge their text in.
+   */
+  message: SDKUserMessage;
   content: string;
 }
 
-export interface PendingAttachmentMessage {
+export interface PendingAttachmentMessage extends PendingTurnIdentity {
   type: 'attachment';
-  turnId: string;
   message: SDKUserMessage;
 }
 
 export type PendingMessage = PendingTextMessage | PendingAttachmentMessage;
+
+/**
+ * Turn identity reported at dequeue (batch 1 §2.3). `canonicalTurnId` is the
+ * transcript UUID of the dequeued SDK message — empty when the message carried
+ * no UUID. `hostTurnIds` lists the lease owner first, merged aliases after.
+ */
+export interface DequeuedTurnInfo {
+  leaseTurnId: string;
+  canonicalTurnId: string;
+  hostTurnIds: string[];
+}
 
 /** Channel lease operation outcome. Occupancy conflicts are reported, never thrown. */
 export type TurnChannelResult =

@@ -151,7 +151,7 @@ describe('ClaudianService - turn-lease hotfix (fix 6 + stress loops)', () => {
     expect(channel.beginExternalTurn('ghost-turn').ok).toBe(true);
     expect(coordinator.beginUserTurn('ghost-turn', 1)).toBe(true);
 
-    (service as any).handleTurnDequeued('ghost-turn');
+    (service as any).handleTurnDequeued({ leaseTurnId: 'ghost-turn', canonicalTurnId: '', hostTurnIds: ['ghost-turn'] });
 
     expect(channel.getActiveTurnId()).toBeNull();
     expect(coordinator.isBusy()).toBe(false);
@@ -162,7 +162,7 @@ describe('ClaudianService - turn-lease hotfix (fix 6 + stress loops)', () => {
     const notified: string[] = [];
     service.setOnUnregisteredTurnDequeued(turnId => notified.push(turnId));
 
-    (service as any).handleTurnDequeued('ghost-alone');
+    (service as any).handleTurnDequeued({ leaseTurnId: 'ghost-alone', canonicalTurnId: '', hostTurnIds: ['ghost-alone'] });
 
     expect(notified).toEqual(['ghost-alone']);
     expect(((service as any).messageChannel as MessageChannel).getActiveTurnId()).toBeNull();

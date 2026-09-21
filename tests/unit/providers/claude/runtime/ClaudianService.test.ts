@@ -3230,7 +3230,7 @@ describe('ClaudianService', () => {
       (service as any).persistentQuery = mockPQ;
       const channel = new MessageChannel(
         undefined,
-        (turnId: string) => (service as any).handleTurnDequeued(turnId),
+        (info) => (service as any).handleTurnDequeued(info),
       );
       (service as any).messageChannel = channel;
       (service as any).queryAbortController = { abort: jest.fn() };
@@ -3859,7 +3859,7 @@ describe('ClaudianService', () => {
         const [vaultPath, cliPath] = args as [string, string];
         const channel = new MessageChannel(
           undefined,
-          (turnId: string) => (service as any).handleTurnDequeued(turnId),
+          (info) => (service as any).handleTurnDequeued(info),
         );
         (service as any).messageChannel = channel;
         (service as any).vaultPath = vaultPath;
@@ -3980,7 +3980,7 @@ describe('ClaudianService', () => {
       it('merged query handlers join the canonical turn and all settle on its result', async () => {
         (service as any).messageChannel = new MessageChannel(
           undefined,
-          (turnId: string) => (service as any).handleTurnDequeued(turnId),
+          (info) => (service as any).handleTurnDequeued(info),
         );
         const channel = channelOf();
 
@@ -4048,7 +4048,7 @@ describe('ClaudianService', () => {
       beforeEach(() => {
         (service as any).messageChannel = new MessageChannel(
           undefined,
-          (turnId: string) => (service as any).handleTurnDequeued(turnId),
+          (info) => (service as any).handleTurnDequeued(info),
         );
         (service as any).responseHandlers = [];
         (service as any).runtimeTurns.clear();
@@ -4221,7 +4221,7 @@ describe('ClaudianService', () => {
       beforeEach(() => {
         (service as any).messageChannel = new MessageChannel(
           undefined,
-          (turnId: string) => (service as any).handleTurnDequeued(turnId),
+          (info) => (service as any).handleTurnDequeued(info),
         );
         (service as any).responseHandlers = [];
         (service as any).runtimeTurns.clear();
@@ -4348,7 +4348,7 @@ describe('ClaudianService', () => {
       beforeEach(() => {
         (service as any).messageChannel = new MessageChannel(
           undefined,
-          (turnId: string) => (service as any).handleTurnDequeued(turnId),
+          (info) => (service as any).handleTurnDequeued(info),
         );
         (service as any).responseHandlers = [];
         (service as any).runtimeTurns.clear();
@@ -4462,7 +4462,7 @@ describe('ClaudianService', () => {
     beforeEach(() => {
       (service as any).messageChannel = new MessageChannel(
         undefined,
-        (turnId: string) => (service as any).handleTurnDequeued(turnId),
+        (info) => (service as any).handleTurnDequeued(info),
       );
       (service as any).responseHandlers = [];
       (service as any).runtimeTurns.clear();
@@ -4595,7 +4595,7 @@ describe('ClaudianService', () => {
     beforeEach(() => {
       (service as any).messageChannel = new MessageChannel(
         undefined,
-        (turnId: string) => (service as any).handleTurnDequeued(turnId),
+        (info) => (service as any).handleTurnDequeued(info),
       );
       (service as any).responseHandlers = [];
       (service as any).runtimeTurns.clear();
@@ -4705,7 +4705,7 @@ describe('ClaudianService', () => {
         const [vaultPath, cliPath] = args as [string, string];
         const channel = new MessageChannel(
           undefined,
-          (turnId: string) => (service as any).handleTurnDequeued(turnId),
+          (info) => (service as any).handleTurnDequeued(info),
         );
         // Simulate an overflowed queue: the next enqueue reports a drop.
         jest.spyOn(channel, 'enqueue').mockReturnValue({ canonicalTurnId: 'user-drop', dropped: true });

@@ -113,6 +113,7 @@ import {
   type ClosePersistentQueryOptions,
   createResponseHandler,
   createRuntimeTurn,
+  type DequeuedTurnInfo,
   isTurnCompleteMessage,
   type PersistentQueryConfig,
   type ResponseHandler,
@@ -543,7 +544,7 @@ export class ClaudianService implements ChatRuntime {
 
     this.messageChannel = new MessageChannel(
       undefined,
-      (turnId) => this.handleTurnDequeued(turnId),
+      (info) => this.handleTurnDequeued(info),
     );
 
     if (resumeSessionId) {
@@ -1303,7 +1304,8 @@ export class ClaudianService implements ChatRuntime {
   }
 
   /** Channel dequeue hook: a user message left the queue and now owns the lease. */
-  private handleTurnDequeued(turnId: string): void {
+  private handleTurnDequeued(info: DequeuedTurnInfo): void {
+    const turnId = info.leaseTurnId;
     const turn = this.runtimeTurns.get(turnId);
     if (!turn) {
       // v4 §3.3 dequeue mismatch: the runtime no longer knows this turn

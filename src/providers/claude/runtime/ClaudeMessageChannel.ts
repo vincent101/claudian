@@ -13,17 +13,27 @@
  *   mismatch can be settled locally instead of killing the consumer loop.
  * - Queue items carry their turnId; text merges keep the first item's turnId
  *   as the canonical lease (later queries join that turn's waiters).
+ *
+ * Canonical identity (turn identity, batch 1 §2.3): a queue item preserves
+ * the SDKUserMessage UUID its first writer minted. Text merge only appends
+ * content; attachment replace only swaps the payload. Merged turns join
+ * hostTurnIds as aliases of the canonical lease owner, and dequeue reports
+ * {leaseTurnId, canonicalTurnId, hostTurnIds} so downstream reconciliation
+ * can bind host turns to the transcript UUID that actually hits disk.
  */
 
 import type { SDKUserMessage } from '@anthropic-ai/claude-agent-sdk';
 
 import {
+  type DequeuedTurnInfo,
   type EnqueueResult,
   MESSAGE_CHANNEL_CONFIG,
   type PendingMessage,
   type PendingTextMessage,
   type TurnChannelResult,
 } from './types';
+
+export type { DequeuedTurnInfo };
 
 /**
  * MessageChannel - Queue-based async iterable for persistent queries.
@@ -41,11 +51,11 @@ export class MessageChannel implements AsyncIterable<SDKUserMessage> {
   private resolveNext: ((value: IteratorResult<SDKUserMessage>) => void) | null = null;
   private currentSessionId: string | null = null;
   private onWarning: (message: string) => void;
-  private onTurnDequeued: (turnId: string) => void;
+  private onTurnDequeued: (info: DequeuedTurnInfo) => void;
 
   constructor(
     onWarning: (message: string) => void = () => {},
-    onTurnDequeued: (turnId: string) => void = () => {},
+    onTurnDequeued: (info: DequeuedTurnInfo) => void = () => {},
   ) {
     this.onWarning = onWarning;
     this.onTurnDequeued = onTurnDequeued;
@@ -143,7 +153,7 @@ export class MessageChannel implements AsyncIterable<SDKUserMessage> {
         const resolve = this.resolveNext;
         this.resolveNext = null;
         resolve({ value: message, done: false });
-        this.onTurnDequeued(turnId);
+        this.onTurnDequeued(this.describeDequeued(turnId, message, [turnId]));
       } else {
         // No consumer waiting yet - queue for later pickup by next()
         // Don't set activeTurnId here; next() will set it when it dequeues
@@ -152,9 +162,15 @@ export class MessageChannel implements AsyncIterable<SDKUserMessage> {
           return { canonicalTurnId: turnId, dropped: true };
         }
         if (hasAttachments) {
-          this.queue.push({ type: 'attachment', turnId, message });
+          this.queue.push({ type: 'attachment', turnId, hostTurnIds: [turnId], message });
         } else {
-          this.queue.push({ type: 'text', turnId, content: this.extractTextContent(message) });
+          this.queue.push({
+            type: 'text',
+            turnId,
+            hostTurnIds: [turnId],
+            message,
+            content: this.extractTextContent(message),
+          });
         }
       }
       return { canonicalTurnId: turnId };
@@ -166,14 +182,20 @@ export class MessageChannel implements AsyncIterable<SDKUserMessage> {
       // Find existing attachment message or add new one
       const existingIdx = this.queue.findIndex(m => m.type === 'attachment');
       if (existingIdx >= 0) {
-        // Replace existing (newer takes precedence for attachments), but the
-        // queue item keeps the first turnId as the canonical lease.
+        // Replace the payload (newer takes precedence for attachments), but
+        // the queue item keeps the first turnId as the canonical lease and
+        // the first message's UUID as the canonical identity.
         const existing = this.queue[existingIdx];
-        this.queue[existingIdx] = { type: 'attachment', turnId: existing.turnId, message };
+        this.queue[existingIdx] = {
+          type: 'attachment',
+          turnId: existing.turnId,
+          hostTurnIds: [...existing.hostTurnIds, turnId],
+          message: this.replacePayloadKeepIdentity(existing.message, message),
+        };
         this.onWarning('[MessageChannel] Attachment message replaced (only one can be queued)');
         return { canonicalTurnId: existing.turnId };
       }
-      this.queue.push({ type: 'attachment', turnId, message });
+      this.queue.push({ type: 'attachment', turnId, hostTurnIds: [turnId], message });
       return { canonicalTurnId: turnId };
     }
 
@@ -192,6 +214,9 @@ export class MessageChannel implements AsyncIterable<SDKUserMessage> {
       }
 
       existing.content = mergedContent;
+      if (!existing.hostTurnIds.includes(turnId)) {
+        existing.hostTurnIds.push(turnId);
+      }
       return { canonicalTurnId: existing.turnId };
     }
 
@@ -200,7 +225,13 @@ export class MessageChannel implements AsyncIterable<SDKUserMessage> {
       this.onWarning(`[MessageChannel] Queue full (${MESSAGE_CHANNEL_CONFIG.MAX_QUEUED_MESSAGES}), dropping newest`);
       return { canonicalTurnId: turnId, dropped: true };
     }
-    this.queue.push({ type: 'text', turnId, content: textContent });
+    this.queue.push({
+      type: 'text',
+      turnId,
+      hostTurnIds: [turnId],
+      message,
+      content: textContent,
+    });
     return { canonicalTurnId: turnId };
   }
 
@@ -255,7 +286,7 @@ export class MessageChannel implements AsyncIterable<SDKUserMessage> {
         if (this.queue.length > 0 && this.activeTurnId === null) {
           const pending = this.queue.shift()!;
           this.activeTurnId = pending.turnId;
-          this.onTurnDequeued(pending.turnId);
+          this.onTurnDequeued(this.describePending(pending));
           return Promise.resolve({ value: this.pendingToMessage(pending), done: false });
         }
 
@@ -276,7 +307,7 @@ export class MessageChannel implements AsyncIterable<SDKUserMessage> {
     const resolve = this.resolveNext;
     this.resolveNext = null;
     resolve({ value: this.pendingToMessage(pending), done: false });
-    this.onTurnDequeued(pending.turnId);
+    this.onTurnDequeued(this.describePending(pending));
   }
 
   private messageHasAttachments(message: SDKUserMessage): boolean {
@@ -294,11 +325,44 @@ export class MessageChannel implements AsyncIterable<SDKUserMessage> {
       .join('\n\n');
   }
 
+  /** Swaps the message payload while keeping the queue item's canonical UUID. */
+  private replacePayloadKeepIdentity(
+    canonical: SDKUserMessage,
+    replacement: SDKUserMessage,
+  ): SDKUserMessage {
+    if (canonical.uuid === undefined) {
+      return replacement;
+    }
+    return { ...replacement, uuid: canonical.uuid };
+  }
+
+  private describeDequeued(
+    leaseTurnId: string,
+    message: SDKUserMessage,
+    hostTurnIds: string[],
+  ): DequeuedTurnInfo {
+    return {
+      leaseTurnId,
+      canonicalTurnId: message.uuid ?? '',
+      hostTurnIds,
+    };
+  }
+
+  private describePending(pending: PendingMessage): DequeuedTurnInfo {
+    return {
+      leaseTurnId: pending.turnId,
+      canonicalTurnId: pending.message.uuid ?? '',
+      hostTurnIds: pending.hostTurnIds,
+    };
+  }
+
   private pendingToMessage(pending: PendingMessage): SDKUserMessage {
     if (pending.type === 'attachment') {
       return pending.message;
     }
 
+    // Byte-for-byte the legacy dequeued shape, plus the queue item's
+    // canonical UUID so the dispatched identity survives (batch 1 §2.3).
     return {
       type: 'user',
       message: {
@@ -307,6 +371,7 @@ export class MessageChannel implements AsyncIterable<SDKUserMessage> {
       },
       parent_tool_use_id: null,
       session_id: this.currentSessionId || '',
+      ...(pending.message.uuid !== undefined ? { uuid: pending.message.uuid } : {}),
     };
   }
 }

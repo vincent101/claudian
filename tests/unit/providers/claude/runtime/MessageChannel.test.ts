@@ -1,9 +1,9 @@
 import type { SDKUserMessage } from '@anthropic-ai/claude-agent-sdk';
 
-import { MessageChannel } from '@/providers/claude/runtime/ClaudeMessageChannel';
+import { type DequeuedTurnInfo,MessageChannel } from '@/providers/claude/runtime/ClaudeMessageChannel';
 
 // Helper to create SDK-format text user message
-function createTextUserMessage(content: string): SDKUserMessage {
+function createTextUserMessage(content: string, uuid?: string): SDKUserMessage {
   return {
     type: 'user',
     message: {
@@ -12,11 +12,12 @@ function createTextUserMessage(content: string): SDKUserMessage {
     },
     parent_tool_use_id: null,
     session_id: '',
+    ...(uuid ? { uuid: uuid as SDKUserMessage['uuid'] } : {}),
   };
 }
 
 // Helper to create SDK-format image user message
-function createImageUserMessage(data = 'image-data'): SDKUserMessage {
+function createImageUserMessage(data = 'image-data', uuid?: string): SDKUserMessage {
   return {
     type: 'user',
     message: {
@@ -34,6 +35,7 @@ function createImageUserMessage(data = 'image-data'): SDKUserMessage {
     },
     parent_tool_use_id: null,
     session_id: '',
+    ...(uuid ? { uuid: uuid as SDKUserMessage['uuid'] } : {}),
   };
 }
 
@@ -41,13 +43,18 @@ describe('MessageChannel', () => {
   let channel: MessageChannel;
   let warnings: string[];
   let dequeuedTurnIds: string[];
+  let dequeuedPayloads: DequeuedTurnInfo[];
 
   beforeEach(() => {
     warnings = [];
     dequeuedTurnIds = [];
+    dequeuedPayloads = [];
     channel = new MessageChannel(
       (message) => warnings.push(message),
-      (turnId) => dequeuedTurnIds.push(turnId),
+      (info) => {
+        dequeuedTurnIds.push(info.leaseTurnId);
+        dequeuedPayloads.push(info);
+      },
     );
   });
 
@@ -602,6 +609,109 @@ describe('MessageChannel', () => {
       channel.enqueue('user-1', createTextUserMessage('one'));
       channel.enqueue('user-2', createTextUserMessage('two'));
       expect(channel.getQueuedTurnIds()).toEqual(['user-1', 'user-2']);
+    });
+  });
+
+  // ============================================
+  // Canonical UUID preservation (turn identity, batch 1 §2.3)
+  // ============================================
+  describe('canonical UUID preservation', () => {
+    it('keeps the queued text item UUID through merge and dequeue', async () => {
+      const iterator = channel[Symbol.asyncIterator]();
+      const firstPromise = iterator.next();
+      channel.enqueue('user-1', createTextUserMessage('first', 'uuid-first'));
+      await firstPromise;
+
+      channel.enqueue('user-2', createTextUserMessage('second', 'uuid-second'));
+      channel.enqueue('user-3', createTextUserMessage('third', 'uuid-third'));
+
+      channel.completeTurn('user-1');
+      const merged = await iterator.next();
+      expect(merged.value.uuid).toBe('uuid-second');
+      expect(merged.value.message.content).toBe('second\n\nthird');
+    });
+
+    it('keeps the queue item UUID when an attachment replaces the payload', async () => {
+      const iterator = channel[Symbol.asyncIterator]();
+      const firstPromise = iterator.next();
+      channel.enqueue('user-1', createTextUserMessage('first', 'uuid-first'));
+      await firstPromise;
+
+      channel.enqueue('user-2', createImageUserMessage('img-1', 'uuid-att-one'));
+      channel.enqueue('user-3', createImageUserMessage('img-2', 'uuid-att-two'));
+
+      channel.completeTurn('user-1');
+      const result = await iterator.next();
+      expect(result.value.uuid).toBe('uuid-att-one');
+      expect(result.value.message.content).toEqual(createImageUserMessage('img-2').message.content);
+    });
+
+    it('reports canonical identity and aliases on dequeue (queued text merge)', async () => {
+      const iterator = channel[Symbol.asyncIterator]();
+      const firstPromise = iterator.next();
+      channel.enqueue('user-1', createTextUserMessage('first', 'uuid-first'));
+      await firstPromise;
+
+      channel.enqueue('user-2', createTextUserMessage('second', 'uuid-second'));
+      channel.enqueue('user-3', createTextUserMessage('third', 'uuid-third'));
+
+      channel.completeTurn('user-1');
+      await iterator.next();
+
+      expect(dequeuedPayloads[1]).toEqual({
+        leaseTurnId: 'user-2',
+        canonicalTurnId: 'uuid-second',
+        hostTurnIds: ['user-2', 'user-3'],
+      });
+    });
+
+    it('reports canonical identity on immediate delivery to a waiting consumer', async () => {
+      const iterator = channel[Symbol.asyncIterator]();
+      const pending = iterator.next();
+      channel.enqueue('user-1', createTextUserMessage('hello', 'uuid-live'));
+      await pending;
+
+      expect(dequeuedPayloads[0]).toEqual({
+        leaseTurnId: 'user-1',
+        canonicalTurnId: 'uuid-live',
+        hostTurnIds: ['user-1'],
+      });
+    });
+
+    it('reports attachment replace aliases with the first lease owner canonical', async () => {
+      const iterator = channel[Symbol.asyncIterator]();
+      const firstPromise = iterator.next();
+      channel.enqueue('user-1', createTextUserMessage('first', 'uuid-first'));
+      await firstPromise;
+
+      channel.enqueue('user-2', createImageUserMessage('img-1', 'uuid-att-one'));
+      channel.enqueue('user-3', createImageUserMessage('img-2', 'uuid-att-two'));
+
+      channel.completeTurn('user-1');
+      await iterator.next();
+
+      expect(dequeuedPayloads[1]).toEqual({
+        leaseTurnId: 'user-2',
+        canonicalTurnId: 'uuid-att-one',
+        hostTurnIds: ['user-2', 'user-3'],
+      });
+    });
+
+    it('degrades the canonicalTurnId to the lease owner when the message carries no UUID', async () => {
+      const iterator = channel[Symbol.asyncIterator]();
+      const firstPromise = iterator.next();
+      channel.enqueue('user-1', createTextUserMessage('first'));
+      await firstPromise;
+
+      channel.enqueue('user-2', createTextUserMessage('second'));
+      channel.completeTurn('user-1');
+      await iterator.next();
+
+      expect(dequeuedPayloads[1]).toEqual({
+        leaseTurnId: 'user-2',
+        canonicalTurnId: '',
+        hostTurnIds: ['user-2'],
+      });
     });
   });
 
