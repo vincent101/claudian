@@ -103,6 +103,7 @@ import {
 } from './ClaudeQueryOptionsBuilder';
 import { executeClaudeRewind } from './ClaudeRewindService';
 import { SessionManager } from './ClaudeSessionManager';
+import { ClaudeTurnReconciliationCoordinator } from './ClaudeTurnReconciliationCoordinator';
 import {
   buildClaudePromptWithImages,
   buildClaudeSDKUserMessage,
@@ -254,6 +255,12 @@ export class ClaudianService implements ChatRuntime {
   private transcriptObserverStartOffset: number | null = null;
   private historyRecoverySource: (() => FullHistoryIterable) | null = null;
   private transcriptDiagnosticLog: ClaudeTranscriptDiagnosticLog | null = null;
+  /**
+   * Turn-identity reconciliation (batch 1, observe mode): read-only bypass
+   * recording host/observer facts and rate diagnostics. Never consulted by
+   * settlement, promotion, or notification paths.
+   */
+  private readonly turnReconciliation = new ClaudeTurnReconciliationCoordinator();
 
   // S1 turn-lease base: live turn registry keyed by turnId. All transform,
   // usage, metadata and dedup state lives on the turn, never on the runtime.
@@ -1190,6 +1197,7 @@ export class ClaudianService implements ChatRuntime {
    * the released signal that lets the UI queue proceed.
    */
   private async settleTurnAtResult(turn: RuntimeTurn): Promise<void> {
+    this.noteTurnIdentitySettled(turn.id);
     // Defensive only: terminal cleanup cannot prove attribution when the
     // notification result itself never arrives; the dual-track state machine
     // must close that remaining gap.
@@ -1305,6 +1313,15 @@ export class ClaudianService implements ChatRuntime {
 
   /** Channel dequeue hook: a user message left the queue and now owns the lease. */
   private handleTurnDequeued(info: DequeuedTurnInfo): void {
+    try {
+      this.turnReconciliation.recordDispatched({
+        leaseTurnId: info.leaseTurnId,
+        canonicalTurnId: info.canonicalTurnId,
+        hostTurnIds: info.hostTurnIds,
+      });
+    } catch {
+      // Reconciliation is a read-only bypass; lease handling must not depend on it.
+    }
     const turnId = info.leaseTurnId;
     const turn = this.runtimeTurns.get(turnId);
     if (!turn) {
@@ -1322,6 +1339,15 @@ export class ClaudianService implements ChatRuntime {
     }
     if (turn.phase === 'queued') {
       turn.phase = 'collecting';
+    }
+  }
+
+  /** Reconciliation bypass: a host turn reached terminal state (settle or cancel). */
+  private noteTurnIdentitySettled(turnId: string): void {
+    try {
+      this.turnReconciliation.noteHostTurnSettled(turnId);
+    } catch {
+      // The bypass never gates settlement or cancellation.
     }
   }
 
@@ -1400,6 +1426,7 @@ export class ClaudianService implements ChatRuntime {
     if (!turn) {
       return;
     }
+    this.noteTurnIdentitySettled(turnId);
     // Clear before branching so every cancellation exit drops stale defensive
     // attribution state. This cannot fix a missing notification result while
     // the turn remains live.
@@ -2003,6 +2030,15 @@ export class ClaudianService implements ChatRuntime {
     }
 
     const message = this.buildSDKUserMessage(prompt, images);
+    try {
+      // reserved (batch 1 §2.2): the factory minted a candidate UUID; the
+      // binding itself is only established when the channel dequeues it.
+      if (message.uuid) {
+        this.turnReconciliation.recordReserved(turn.id, message.uuid);
+      }
+    } catch {
+      // Reconciliation bypass must never break the send path.
+    }
 
     // Create a promise-based handler to yield chunks
     // Use a mutable state object to work around TypeScript's control flow analysis
@@ -2412,6 +2448,7 @@ export class ClaudianService implements ChatRuntime {
   resetSession() {
     // Close persistent query (new session will use cold-start resume)
     this.closePersistentQuery('session reset');
+    this.turnReconciliation.advanceSessionGeneration();
 
     // Reset crash recovery for fresh start
     this.crashRecoveryAttempted = false;
@@ -2496,6 +2533,9 @@ export class ClaudianService implements ChatRuntime {
     if (sessionChanged) {
       this.closePersistentQuery('session switch');
       this.crashRecoveryAttempted = false;
+      // Bindings are scoped to the session generation: late events from the
+      // old session must never hit the new session's map (batch 1 §2.4).
+      this.turnReconciliation.advanceSessionGeneration();
     }
 
     this.sessionManager.setSessionId(id, this.getScopedSettings().model);
@@ -2543,6 +2583,7 @@ export class ClaudianService implements ChatRuntime {
       this.transcriptObserver = null;
       if (!target || !vaultPath) return;
       this.transcriptDiagnosticLog ??= new ClaudeTranscriptDiagnosticLog(vaultPath, message => { new Notice(message); });
+      this.turnReconciliation.attachDiagnostics(this.transcriptDiagnosticLog);
       const observer = new ClaudeTranscriptTurnObserver({
         started: event => this._onAutoTurnStarted?.(event) !== false,
         chunk: event => this._onAutoTurnChunk?.(event) ?? Promise.resolve(),
@@ -2550,7 +2591,10 @@ export class ClaudianService implements ChatRuntime {
         released: turnId => this._onAutoTurnReleased?.(turnId),
         cancelled: event => this._onAutoTurnCancelled?.(event),
         projectEmbeddedExternal: event => this._onEmbeddedExternal?.(event) ?? Promise.resolve(),
-      }, () => true, this.transcriptDiagnosticLog);
+      }, () => true, this.transcriptDiagnosticLog, {
+        // Observe-mode bypass: verdicts are recorded as diagnostics only.
+        recordObservedStart: fact => this.turnReconciliation.recordObservedStart(fact),
+      });
       this.transcriptObserver = observer;
       try {
         const fromOffset = this.transcriptObserverStartOffset ?? undefined;
@@ -2577,6 +2621,7 @@ export class ClaudianService implements ChatRuntime {
     this.transcriptObserverTarget = null;
     this.transcriptObserver?.stop('plugin_cleanup');
     this.transcriptObserver = null;
+    this.turnReconciliation.advanceSessionGeneration();
     // Close persistent query
     this.closePersistentQuery('plugin cleanup');
 

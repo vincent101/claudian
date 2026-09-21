@@ -632,3 +632,104 @@ describe('ClaudeTranscriptTurnObserver', () => {
     }
   });
 });
+
+describe('ClaudeTranscriptTurnObserver — reconciliation bypass (batch 1)', () => {
+  let dir: string;
+  let file: string;
+
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), 'claudian-observer-recon-'));
+    file = join(dir, 'session.jsonl');
+    await writeFile(file, '');
+  });
+
+  afterEach(async () => {
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  function setupWithReconciliation(canAcquire = () => true) {
+    const order: string[] = [];
+    const callbacks = {
+      started: jest.fn(event => { order.push(`start:${event.turnId}`); return canAcquire(); }),
+      chunk: jest.fn(async event => { order.push(`chunk:${event.turnId}:${event.chunk.type}`); }),
+      finished: jest.fn(async event => { order.push(`finish:${event.turnId}`); }),
+      released: jest.fn(turnId => { order.push(`release:${turnId}`); }),
+      cancelled: jest.fn(),
+      projectEmbeddedExternal: jest.fn(async event => { order.push(`embedded:${event.turnId}`); }),
+    };
+    const observedStarts: Array<{ canonicalTurnId: string; lineOffset?: number; sourceKind?: string }> = [];
+    const reconciliation = {
+      recordObservedStart: jest.fn((fact: { canonicalTurnId: string; lineOffset?: number; sourceKind?: string }) => {
+        observedStarts.push(fact);
+      }),
+    };
+    const observer = new ClaudeTranscriptTurnObserver(callbacks, canAcquire, undefined, reconciliation);
+    return { observer, callbacks, order, observedStarts, reconciliation };
+  }
+
+  it('forwards host-row and external observed_start facts to the reconciliation sink', async () => {
+    const { observer, observedStarts } = setupWithReconciliation();
+    await observer.start(file);
+    const generation = (observer as any).generation;
+    const lines = [
+      JSON.stringify({ type: 'user', uuid: 'host-uuid-a', message: { role: 'user', content: 'host prompt' } }),
+      JSON.stringify({ type: 'user', uuid: 'peer-uuid-a', origin: { kind: 'peer', body: 'hi' }, message: { role: 'user', content: 'hi' } }),
+    ];
+    await (observer as any).consumeBatch({ lines, lineOffsets: [10, 60], reset: false }, generation);
+
+    expect(observedStarts).toEqual([
+      { canonicalTurnId: 'host-uuid-a', lineOffset: 10 },
+      { canonicalTurnId: 'peer-uuid-a', lineOffset: 60, sourceKind: 'peer' },
+    ]);
+    observer.stop();
+  });
+
+  it('does not forward replay/recovery observed starts, and a throwing sink never breaks the consume chain', async () => {
+    const callbacks = {
+      started: jest.fn(() => true),
+      chunk: jest.fn(async () => {}),
+      finished: jest.fn(async () => {}),
+      released: jest.fn(),
+      cancelled: jest.fn(),
+      projectEmbeddedExternal: jest.fn(async () => {}),
+    };
+    const reconciliation = {
+      recordObservedStart: jest.fn(() => { throw new Error('sink failure'); }),
+    };
+    const observer = new ClaudeTranscriptTurnObserver(callbacks, () => true, undefined, reconciliation);
+    await observer.start(file);
+    const generation = (observer as any).generation;
+    const lines = peerTurn('peer-x', 'x').slice(0, -1);
+
+    await expect((observer as any).consumeBatch({ lines, lineOffsets: [0, 100, 200], reset: false }, generation)).resolves.toBeUndefined();
+
+    expect(reconciliation.recordObservedStart).toHaveBeenCalledTimes(1);
+    expect(callbacks.started).toHaveBeenCalledWith(expect.objectContaining({ turnId: 'peer-x' }));
+    observer.stop();
+  });
+
+  it('keeps legacy projection identical whether or not a sink is attached', async () => {
+    const withSink = setupWithReconciliation();
+    // No-sink baseline: the same callbacks shape, no reconciliation parameter.
+    const plainOrder: string[] = [];
+    const plainObserver = new ClaudeTranscriptTurnObserver({
+      started: event => { plainOrder.push(`start:${event.turnId}`); return true; },
+      chunk: async event => { plainOrder.push(`chunk:${event.turnId}:${event.chunk.type}`); },
+      finished: async event => { plainOrder.push(`finish:${event.turnId}`); },
+      released: turnId => { plainOrder.push(`release:${turnId}`); },
+      cancelled: () => {},
+      projectEmbeddedExternal: async () => {},
+    }, () => true);
+
+    await withSink.observer.start(file);
+    await plainObserver.start(file);
+    const lines = peerTurn('peer-same', 'same');
+
+    await (withSink.observer as any).consumeBatch({ lines, lineOffsets: [0, 10, 20, 30], reset: false }, (withSink.observer as any).generation);
+    await (plainObserver as any).consumeBatch({ lines, lineOffsets: [0, 10, 20, 30], reset: false }, (plainObserver as any).generation);
+
+    expect(withSink.order).toEqual(plainOrder);
+    withSink.observer.stop();
+    plainObserver.stop();
+  });
+});

@@ -6,6 +6,7 @@ import type {
   AutoTurnFinishedEvent,
   AutoTurnStartedEvent,
 } from '../../../core/runtime/types';
+import type { ObservedTurnStartFact } from '../runtime/ClaudeTurnReconciliationCoordinator';
 import type { ClaudeTranscriptDiagnosticLog } from './ClaudeTranscriptDiagnosticLog';
 import { adaptTranscriptFacts, type TranscriptTurnEvent } from './ClaudeTranscriptFactAdapter';
 import { ClaudeTranscriptTailReader, type TranscriptTailBatch } from './ClaudeTranscriptTailReader';
@@ -23,6 +24,16 @@ export interface ClaudeTranscriptObserverCallbacks {
   released: (turnId: string) => void;
   cancelled: (event: AutoTurnCancelledEvent) => void;
   projectEmbeddedExternal: (event: AutoTurnStartedEvent) => Promise<void>;
+}
+
+/**
+ * Read-only reconciliation bypass (turn identity, batch 1): the observer
+ * forwards observed_start facts so the coordinator can match them against
+ * dispatched host bindings. Verdicts flow back nowhere yet — observe mode
+ * never changes observer behavior.
+ */
+export interface ClaudeTurnReconciliationSink {
+  recordObservedStart(fact: ObservedTurnStartFact): unknown;
 }
 
 interface PendingTurn {
@@ -53,6 +64,7 @@ export class ClaudeTranscriptTurnObserver {
     private readonly callbacks: ClaudeTranscriptObserverCallbacks,
     private readonly canAcquire: () => boolean,
     private readonly diagnostics?: ClaudeTranscriptDiagnosticLog,
+    private readonly reconciliation?: ClaudeTurnReconciliationSink,
   ) {}
 
   async start(filePath: string, fromOffset?: number): Promise<void> {
@@ -156,6 +168,7 @@ export class ClaudeTranscriptTurnObserver {
         hostUserTurnActive: this.hostUserTurnId !== null,
         lineOffset,
       });
+      this.reportObservedStarts(facts);
       for (const event of adaptTranscriptFacts(facts, { hostUserTurnActive: this.hostUserTurnId !== null })) {
         this.diagnostics?.record({ phase: 'map', generation, turnIdHash: this.diagnostics.hashId(event.event.turnId) });
         this.enqueue(event);
@@ -179,6 +192,27 @@ export class ClaudeTranscriptTurnObserver {
       this.lastHostUserOffset = lineOffset;
     } catch {
       // Malformed transcript rows cannot establish causal ownership.
+    }
+  }
+
+  /**
+   * Read-only bypass: live (non-replay) observed_start facts feed the
+   * reconciliation coordinator. Recovery replays stay out — cross-generation
+   * re-binding is a batch-2 concern and must never happen silently here.
+   */
+  private reportObservedStarts(facts: ReturnType<ClaudeTranscriptTurnMapper['mapLine']>): void {
+    if (!this.reconciliation) return;
+    for (const fact of facts) {
+      if (fact.type !== 'observed_start' || fact.replay) continue;
+      try {
+        this.reconciliation.recordObservedStart({
+          canonicalTurnId: fact.identity.canonicalTurnId,
+          ...(fact.lineOffset !== undefined ? { lineOffset: fact.lineOffset } : {}),
+          ...(fact.source ? { sourceKind: fact.source.kind } : {}),
+        });
+      } catch {
+        // The bypass must never disturb the consume chain.
+      }
     }
   }
 

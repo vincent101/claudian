@@ -78,8 +78,13 @@ export class ClaudeTurnReconciliationCoordinator {
 
   constructor(
     private readonly mode: ClaudeTurnReconciliationMode = 'observe',
-    private readonly diagnostics: ReconciliationDiagnosticsSink | null = null,
+    private diagnostics: ReconciliationDiagnosticsSink | null = null,
   ) {}
+
+  /** Late sink attachment: the runtime owns the diagnostic log's lifetime (vault path arrives lazily). */
+  attachDiagnostics(diagnostics: ReconciliationDiagnosticsSink): void {
+    this.diagnostics = diagnostics;
+  }
 
   getMode(): ClaudeTurnReconciliationMode {
     return this.mode;
