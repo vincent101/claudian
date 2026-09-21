@@ -19,11 +19,13 @@ Core modules stay provider-neutral. Features depend on `core/`; providers implem
 | `prompt/` | Shared prompt templates | `mainAgent`, `inlineEdit`, `titleGeneration`, `instructionRefine` |
 | `providers/` | Registry, capability, environment, and workspace-service contracts | `ProviderRegistry`, `ProviderWorkspaceRegistry`, `ProviderSettingsCoordinator`, `providerEnvironment`, `providerConfig`, `modelRouting`, `types` |
 | `providers/commands/` | Shared command catalog contracts | `ProviderCommandCatalog`, `ProviderCommandEntry`, `hiddenCommands` |
-| `runtime/` | Provider-neutral runtime contracts | `ChatRuntime`, `ChatTurnRequest`, `PreparedChatTurn`, `SessionUpdateResult`, approval/query types |
+| `runtime/` | Provider-neutral runtime contracts | `ChatRuntime`, `ChatTurnRequest`, `PreparedChatTurn`, `SessionUpdateResult`, approval/query types, optional history-recovery subscription (`onHistoryRecoveryStateChange`, `retryHistoryRecovery`) |
 | `security/` | Permission and approval helpers | `ApprovalManager` |
 | `storage/` | Generic filesystem adapters | `VaultFileAdapter`, `HomeFileAdapter` |
 | `tools/` | Shared tool constants and formatting helpers | `toolNames`, `toolIcons`, `toolInput`, `todo` |
 | `types/` | Shared type definitions | `settings`, `mcp`, `chat`, `tools`, `diff`, `agent`, `plugins` |
+
+`providers/types` also carries the B4 history contracts: `HistoryIndexLease` (budgeted `loadWindow`/`loadMessageDetail`/`search` over a fixed snapshot), `iterateFullHistory` (bounded chunked iteration for export/amnesia recovery — consumers must write chunk-by-chunk, never collect `ChatMessage[]`), and `WritableLike`. `hydrateConversationHistory` is optional and only implemented by non-index providers (Codex/OpenCode); index-capable providers (Claude) window instead.
 
 ## Dependency Rules
 

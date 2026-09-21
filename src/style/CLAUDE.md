@@ -33,6 +33,7 @@ CSS is built into root `styles.css` via `npm run build:css`. It is invoked by bo
 |---------|----------|
 | Layout | `-container`, `-header`, `-messages`, `-input` |
 | Messages | `-message`, `-message-user`, `-message-assistant` |
+| History windowing | `-history-page` (flex column + gap replicating `.claudian-messages`), `-history-page-spacer`, `-history-pager`, `-history-search` |
 | Tool calls | `-tool-call`, `-tool-header`, `-tool-content`, `-tool-status` |
 | Thinking | `-thinking-block`, `-thinking-header`, `-thinking-content` |
 | Panels | `-todo-list`, `-todo-item`, `-subagent-list`, `-subagent-header` |

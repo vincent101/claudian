@@ -61,6 +61,12 @@ Images are written to a temp directory (`os.tmpdir()/claudian-codex-images-{rand
 
 The server can resolve approval/ask-user requests without waiting for client input (e.g., timeout). The `serverRequest/resolved` notification auto-dismisses the pending approval/ask-user UI.
 
+### Usage Model Stamping
+
+The runtime resolves the turn model once and injects it into both usage producers (notification router and transcript tail engine, 3.1.0) — previously both left `UsageInfo.model` unset and relied on the StreamController backfill, so any consumer bypassing StreamController lost the authoritative label. The provider-neutral backfill stays as a defensive fallback. The context-window denominator flows through the shared `refreshUsageContextWindow` preset chain (same as Claude, 2.3.2 ②).
+
+Codex implements no history index (`acquireHistoryIndex`): restored tabs fully hydrate through `hydrateConversationHistory` and the feature layer's lease-less fallbacks (loaded-message search, full-array fork prefix). Feature-layer history changes are capability-routed — never add provider-id branches for Codex.
+
 ## Gotchas
 
 - `CodexAuxQueryRunner` uses its own separate process + transport + thread — completely independent from the chat runtime

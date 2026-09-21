@@ -29,8 +29,15 @@ ClaudianView (lifecycle + assembly)
 ├── Services
 │   ├── SubagentManager
 │   └── BangBashService
+├── History (windowed)
+│   ├── HistoryPageStore
+│   ├── HistoryWindowRenderer
+│   ├── HistoryPageUiState
+│   ├── HistoryResourcePolicy
+│   └── HistoryDiagnostics
 ├── Rendering
 │   ├── MessageRenderer
+│   ├── HistoryWindowRenderer
 │   ├── ToolCallRenderer
 │   ├── ThinkingBlockRenderer
 │   ├── WriteEditRenderer
@@ -72,7 +79,7 @@ The feature layer consumes provider-neutral `StreamChunk` values. Providers own 
 
 | Controller | Responsibility |
 |------------|----------------|
-| `ConversationController` | Session switching, history reload, save, and rewind |
+| `ConversationController` | Session switching, windowed history (lease lifecycle, paging, search snapshot refresh, rewind detail loading), save, and rewind |
 | `StreamController` | Consume stream chunks, update streaming state, auto-scroll, abort handling |
 | `InputController` | Text input, mentions, images, resume dispatch, command dispatch, and post-plan approval flow |
 | `SelectionController` | Editor selection polling and CM6 decorations |
@@ -84,7 +91,8 @@ The feature layer consumes provider-neutral `StreamChunk` values. Providers own 
 
 | Renderer | Handles |
 |----------|---------|
-| `MessageRenderer` | Main message orchestration, rewind/fork affordances, interrupt markers |
+| `MessageRenderer` | Single-message rendering inside a page; rewind/fork affordances, interrupt markers |
+| `HistoryWindowRenderer` | Page containers, spacers, mount/unmount, anchor correction — DOM windowing above the single-message renderers |
 | `ToolCallRenderer` | Tool blocks and tool state |
 | `ThinkingBlockRenderer` | Thinking / reasoning summaries |
 | `WriteEditRenderer` | File writes and edits with diff previews |
@@ -128,11 +136,33 @@ attaches one later and renders the current state in a single pass).
 - Scroll-to-bottom re-enables it
 - Resets to the saved setting on a new query
 
+### History Windowing (Paged Transcripts)
+
+Two load paths, two entry points, capability-routed — never by provider id:
+
+- `getHistoryIndexCapableService` (deps-injected, adapted in `Tab.ts` from `typeof service.acquireHistoryIndex === 'function'`) decides the path. Index-capable providers (Claude) window through `acquireHistoryIndex`; others (Codex/OpenCode) keep full hydration — `ChatState.messages = [...conversation.messages]`.
+- `loadActive` (tab restore / app open): acquire lease → `ready` → first-screen window (anchor = totalTurns, direction `older`, `HISTORY_RESOURCE_POLICY.firstScreen`) → bind lease → `restoreConversation(page)`. Transcriptless drafts (no session id, not a pending fork) skip the index.
+- `switchTo` (dropdown/history switch): `reserveConversation` CAS claim → release the outgoing tab's lease (same release point as closeTab, or the protected index stays pinned out of the LRU forever) → `windowRenderer.reset()` → acquire fresh. The restored projection owns the pager: the dropdown entry bypasses `loadActive`, so `renderHistoryPager()` runs in both entry points.
+- `ChatState.messages` is the only per-tab materialized view (loaded pages + live page). For Claude, `Conversation.messages` holds only a not-yet-persisted draft tail or `[]` — never a window. Feature code must not treat a loaded window as the complete history (fork/rewind go through `loadMessageDetail`).
+
+DOM windowing invariants (`HistoryWindowRenderer` + `HistoryPageStore`):
+
+- Unmounting only activates past `250` total turns or `16 MiB` mounted projected weight (`HISTORY_WINDOW_LIMITS`); below that, pages mount permanently and no spacer is ever created. Target soft window `180` mounted turns, hard cap `200`; a single visible page above the cap is the sole exception (`dom_overcommit` diagnostic) — turns are never split.
+- Every `messagesEl` structure change (page mount, unmount, replace) goes through the `ProjectionWriteCoordinator` stored grant. Data rematerialization runs **outside** the grant (a slow disk load must never occupy the projection write lease); only the DOM commit re-acquires and revalidates conversation id + DOM epoch + page identity at write time.
+- Each page lives in a `claudian-history-page` wrapper that replicates `messagesEl`'s `flex column + gap` context: gap only applies to direct children, so without the wrapper layer the message spacing inside pages would collapse.
+- Unmount waits for the current page render ticket to settle (3 s timeout → `estimated` height + `page_render_timeout` diagnostic, never a fake settle); spacer height is measured only from settled tickets. Re-visits re-mount, then correct scroll by the stable `data-message-id` anchor delta. Width/font/theme changes mark all heights stale instead of rebuilding pages.
+- Live pages (`live:` prefix, created by `beginLivePage`) and `memory-only` pages (rewind rebuilds — the disk snapshot still contains the discarded branches, so eviction would destroy the truth) are exempt from data-LRU eviction; eviction only clears `messages` and keeps range/height/UI state. All-pinned pressure overcommits with a diagnostic rather than evicting.
+- Scroll handlers only sample positions and record one intent per direction per frame; `runLatestStoredIntent` drops superseded intents so a stale window op never replays after a live turn releases.
+
+Stored transaction protocol (`runStoredTransaction` in `ConversationController`): history load + ChatState merge + render + queue drain is one unit under the projection write lease, FIFO-queued behind any live streaming turn. The task body revalidates the conversation id captured at request time after every await — a stale page must never merge into, render into, or paginate the newly displayed conversation. The search snapshot refresh inverts this on purpose: the forced index rebuild runs **outside** the stored grant (grant-held rebuilds head-blocked the FIFO for tens of seconds), the old lease keeps serving reads, and only the revalidated exchange is a short stored transaction.
+
 ## Gotchas
 
 - `ClaudianView.onClose()` must abort active tabs and dispose runtimes
 - `ChatState` is per-tab; `TabManager` coordinates tab-level operations such as fork targets and provider-aware command catalogs
-- Title generation runs concurrently per conversation
+- Title generation runs concurrently per conversation; title material comes from the bounded `loadTitleMaterial` (first user + recent user excerpts through the index), never a full hydrate
+- Rewind on a summary-projection message must first load exact detail (`loadMessageDetail`, 16 MiB cap); failure or oversize aborts the rewind instead of writing a summary into the input box. Pages rebuilt by rewind are `memory-only` — rematerializing them from the index is refused loudly (the snapshot still contains the discarded branches)
+- Lease-less search (Codex/OpenCode) enumerates visible DOM matches only; it must never be reported as a staleness problem by the search snapshot refresh
 - `/compact`
   - Claude skips context injection so the provider recognizes the built-in command and persists the compaction boundary
   - Codex routes compact turns to `thread/compact/start` and persists the durable `context_compacted` boundary from JSONL history
