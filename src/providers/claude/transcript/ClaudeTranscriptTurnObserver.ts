@@ -7,8 +7,9 @@ import type {
   AutoTurnStartedEvent,
 } from '../../../core/runtime/types';
 import type { ClaudeTranscriptDiagnosticLog } from './ClaudeTranscriptDiagnosticLog';
+import { adaptTranscriptFacts, type TranscriptTurnEvent } from './ClaudeTranscriptFactAdapter';
 import { ClaudeTranscriptTailReader, type TranscriptTailBatch } from './ClaudeTranscriptTailReader';
-import { ClaudeTranscriptTurnMapper, type TranscriptTurnEvent } from './ClaudeTranscriptTurnMapper';
+import { ClaudeTranscriptTurnMapper } from './ClaudeTranscriptTurnMapper';
 
 const RECOVERY_BYTES = 4 * 1024 * 1024;
 // Initial values conservatively exceed measured 1–16 ms callback ticks; calibrate from smoke-test percentiles.
@@ -151,10 +152,11 @@ export class ClaudeTranscriptTurnObserver {
       const line = batch.lines[index];
       const lineOffset = batch.lineOffsets?.[index];
       this.observeHostUserRow(line, lineOffset);
-      for (const event of this.mapper.mapLine(line, false, {
+      const facts = this.mapper.mapLine(line, false, {
         hostUserTurnActive: this.hostUserTurnId !== null,
         lineOffset,
-      })) {
+      });
+      for (const event of adaptTranscriptFacts(facts, { hostUserTurnActive: this.hostUserTurnId !== null })) {
         this.diagnostics?.record({ phase: 'map', generation, turnIdHash: this.diagnostics.hashId(event.event.turnId) });
         this.enqueue(event);
       }
@@ -319,7 +321,8 @@ export class ClaudeTranscriptTurnObserver {
     // the observer is done and keeps the process alive.
     if (this.quietTimer) clearTimeout(this.quietTimer);
     this.quietTimer = null;
-    for (const event of this.mapper.settleTerminalCandidate()) this.enqueue(event);
+    const facts = this.mapper.settleTerminalCandidate();
+    for (const event of adaptTranscriptFacts(facts, { hostUserTurnActive: this.hostUserTurnId !== null })) this.enqueue(event);
     await this.promote();
     await this.drainActive();
   }
@@ -401,8 +404,9 @@ export class ClaudeTranscriptTurnObserver {
     // map block runs after the generation check, so a concurrent stop() can
     // never observe a half-mapped mapper.
     const shadow = this.mapper;
-    const events = lines.slice(boundary).flatMap(line => shadow.mapLine(line, true));
-    events.push(...shadow.settleTerminalCandidate(true));
+    const facts = lines.slice(boundary).flatMap(line => shadow.mapLine(line, true));
+    facts.push(...shadow.settleTerminalCandidate(true));
+    const events = adaptTranscriptFacts(facts, { hostUserTurnActive: this.hostUserTurnId !== null });
     if (shadow.hasOpenTurn()) {
       for (const event of events) this.enqueue(event);
       await this.promote();

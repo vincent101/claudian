@@ -7,6 +7,7 @@ import type ClaudianPlugin from '@/main';
 import { ClaudianService } from '@/providers/claude/runtime/ClaudeChatRuntime';
 import { MessageChannel } from '@/providers/claude/runtime/ClaudeMessageChannel';
 import { createResponseHandler, createRuntimeTurn } from '@/providers/claude/runtime/types';
+import { adaptTranscriptFacts } from '@/providers/claude/transcript/ClaudeTranscriptFactAdapter';
 import { ClaudeTranscriptTurnObserver } from '@/providers/claude/transcript/ClaudeTranscriptTurnObserver';
 import * as envUtils from '@/utils/env';
 import * as sessionUtils from '@/utils/session';
@@ -1212,8 +1213,8 @@ describe('ClaudianService', () => {
 
       await (service as any).routeMessage({ type: 'system', subtype: 'init', session_id: 'same-session' });
       await (service as any).transcriptObserverRestartChain;
-      const textEvents = mapper.map({ type: 'assistant', uuid: 'text-row', message: { id: 'shared-id', role: 'assistant', content: [{ type: 'text', text: 'answer' }], stop_reason: 'end_turn' } });
-      const settled = mapper.settleTerminalCandidate();
+      const textEvents = adaptTranscriptFacts(mapper.map({ type: 'assistant', uuid: 'text-row', message: { id: 'shared-id', role: 'assistant', content: [{ type: 'text', text: 'answer' }], stop_reason: 'end_turn' } }), { hostUserTurnActive: false });
+      const settled = adaptTranscriptFacts(mapper.settleTerminalCandidate(), { hostUserTurnActive: false });
 
       expect(afterFirstInit).not.toBe(first);
       expect((service as any).transcriptObserver).toBe(afterFirstInit);
