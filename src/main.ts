@@ -71,7 +71,7 @@ export function mapHistoryDiagnosticEvent(
     case 'page_data_overcommit':
       return { phase: event.kind, entries: event.pages, projectedWeight: event.projectedWeight };
     case 'search_snapshot_refresh':
-      return { phase: event.kind, outcome: event.outcome, reason: event.reason, elapsedMs: event.elapsedMs };
+      return { phase: event.kind, outcome: event.outcome, reason: event.reason, trigger: event.trigger, elapsedMs: event.elapsedMs };
     case 'memory_only_rematerialize':
       return { phase: event.kind, pageKeyHash: hashId(event.pageKey) };
     case 'dom_overcommit':

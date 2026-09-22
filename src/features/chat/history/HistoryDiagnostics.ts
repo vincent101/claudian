@@ -25,6 +25,8 @@ export type HistoryDiagnosticEvent =
     kind: 'search_snapshot_refresh';
     outcome: HistorySearchSnapshotRefreshOutcome;
     reason?: 'no_conversation' | 'no_lease' | 'provider_without_index' | 'stale';
+    /** Attribution: which surface forced the refresh (search panel default). */
+    trigger?: 'search' | 'rewind' | 'fork';
     elapsedMs: number;
   };
 

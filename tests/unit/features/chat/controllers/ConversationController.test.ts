@@ -4307,6 +4307,39 @@ describe('ConversationController - Rewind', () => {
     });
   });
 
+  describe('exact-content resolution (stale lease self-heal)', () => {
+    it('attributes search_snapshot_refresh diagnostics to the trigger (rewind vs default search)', async () => {
+      const events: HistoryDiagnosticEvent[] = [];
+      setHistoryDiagnosticsSink(event => events.push(event));
+      try {
+        deps.state.currentConversationId = 'conv-1';
+        const conversation = { id: 'conv-1', providerId: 'claude', title: 'C', messages: [], sessionId: 's', createdAt: 1, updatedAt: 1 } as any;
+        (deps.plugin.getConversationSync as jest.Mock).mockReturnValue(conversation);
+        const makeLease = () => ({
+          conversationId: 'conv-1', totalTurns: 100, ready: Promise.resolve(), release: jest.fn(),
+          search: jest.fn(), loadMessageDetail: jest.fn(), loadWindow: jest.fn(), planWindow: jest.fn(),
+        });
+        const previous = makeLease();
+        let next = makeLease();
+        const acquireHistoryIndex = jest.fn().mockImplementation(() => {
+          next = makeLease();
+          return next;
+        });
+        deps.state.historyLease = previous as any;
+        deps.getHistoryIndexCapableService = () => ({ acquireHistoryIndex }) as any;
+
+        await controller.refreshHistorySearchSnapshot('rewind');
+        // The search panel closure (Tab.ts) calls without a trigger.
+        await controller.refreshHistorySearchSnapshot();
+
+        const refreshEvents = events.filter((event): event is Extract<HistoryDiagnosticEvent, { kind: 'search_snapshot_refresh' }> => event.kind === 'search_snapshot_refresh');
+        expect(refreshEvents.map(event => event.trigger)).toEqual(['rewind', 'search']);
+      } finally {
+        setHistoryDiagnosticsSink(null);
+      }
+    });
+  });
+
   describe('Inline prompt dismissal', () => {
     it('dismisses pending inline prompts during createNew()', async () => {
       const dismissFn = jest.fn();

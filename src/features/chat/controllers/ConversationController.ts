@@ -607,7 +607,7 @@ export class ConversationController {
     return (hash >>> 0).toString(36);
   }
 
-  async refreshHistorySearchSnapshot(): Promise<HistorySearchSnapshotRefreshResult> {
+  async refreshHistorySearchSnapshot(trigger: 'search' | 'rewind' | 'fork' = 'search'): Promise<HistorySearchSnapshotRefreshResult> {
     const { plugin, state } = this.deps;
     const startedAt = performance.now();
     const conversationId = state.currentConversationId;
@@ -616,19 +616,19 @@ export class ConversationController {
     // index (Codex/OpenCode lease-less search) must never be reported as a
     // staleness problem.
     if (!conversationId) {
-      return this.reportRefreshNotApplicable('no_conversation', startedAt);
+      return this.reportRefreshNotApplicable('no_conversation', startedAt, trigger);
     }
     const conversation = plugin.getConversationSync(conversationId);
     if (!conversation) {
-      return this.reportRefreshNotApplicable('no_conversation', startedAt);
+      return this.reportRefreshNotApplicable('no_conversation', startedAt, trigger);
     }
     const service = this.deps.getHistoryIndexCapableService(conversation);
     if (!service) {
-      return this.reportRefreshNotApplicable('provider_without_index', startedAt);
+      return this.reportRefreshNotApplicable('provider_without_index', startedAt, trigger);
     }
     const previous = state.historyLease;
     if (!previous) {
-      return this.reportRefreshNotApplicable('no_lease', startedAt);
+      return this.reportRefreshNotApplicable('no_lease', startedAt, trigger);
     }
     // P1: the forced rebuild runs OUTSIDE the stored grant. A grant-held
     // build kept the shared projection FIFO exclusive for the whole rescan
@@ -648,7 +648,7 @@ export class ConversationController {
       // here; the old lease stays mounted, so a failed refresh keeps
       // pagination and search usable on stale data.
       next.release();
-      recordHistoryDiagnosticEvent({ kind: 'search_snapshot_refresh', outcome: 'failed', elapsedMs: performance.now() - startedAt });
+      recordHistoryDiagnosticEvent({ kind: 'search_snapshot_refresh', outcome: 'failed', trigger, elapsedMs: performance.now() - startedAt });
       throw error;
     }
     // Short critical section (F5): only the revalidated exchange takes the
@@ -664,14 +664,14 @@ export class ConversationController {
     const exchange = await this.runStoredTransaction<HistorySearchSnapshotRefreshResult>(async () => {
       if (state.currentConversationId !== conversationId || state.historyLease !== previous) {
         next.release();
-        return this.reportRefreshNotApplicable('stale', startedAt);
+        return this.reportRefreshNotApplicable('stale', startedAt, trigger);
       }
       state.historyLease = next;
       previous.release();
       // The lease reports what actually happened; without a service-provided
       // outcome the honest report is rebuilt (a fresh acquire did run).
       const outcome = next.acquireOutcome === 'cache_hit' ? 'cache_hit' : 'rebuilt';
-      recordHistoryDiagnosticEvent({ kind: 'search_snapshot_refresh', outcome, elapsedMs: performance.now() - startedAt });
+      recordHistoryDiagnosticEvent({ kind: 'search_snapshot_refresh', outcome, trigger, elapsedMs: performance.now() - startedAt });
       return outcome === 'cache_hit' ? { status: 'cache_hit' } : { status: 'rebuilt' };
     });
     // A cancelled transaction (the conversation switched while the exchange
@@ -680,7 +680,7 @@ export class ConversationController {
     // its reference here. That is staleness, not a failure.
     if (!exchange) {
       next.release();
-      return this.reportRefreshNotApplicable('stale', startedAt);
+      return this.reportRefreshNotApplicable('stale', startedAt, trigger);
     }
     return exchange;
   }
@@ -688,8 +688,9 @@ export class ConversationController {
   private reportRefreshNotApplicable(
     reason: 'no_conversation' | 'no_lease' | 'provider_without_index' | 'stale',
     startedAt: number,
+    trigger: 'search' | 'rewind' | 'fork',
   ): HistorySearchSnapshotRefreshResult {
-    recordHistoryDiagnosticEvent({ kind: 'search_snapshot_refresh', outcome: 'not_applicable', reason, elapsedMs: performance.now() - startedAt });
+    recordHistoryDiagnosticEvent({ kind: 'search_snapshot_refresh', outcome: 'not_applicable', reason, trigger, elapsedMs: performance.now() - startedAt });
     return { status: 'not_applicable', reason };
   }
 
