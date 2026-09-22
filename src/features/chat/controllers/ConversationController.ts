@@ -929,6 +929,52 @@ export class ConversationController {
     this.deps.state.loadedRanges = [];
   }
 
+  /**
+   * Resolves the exact content of a projected user message for rewind/fork.
+   *
+   * Only a summary projection carries trimmed content: live/detail/draft
+   * messages are already exact in memory, and live messages carry a local id
+   * that is not a transcript projection key, so loading them from the index
+   * would always miss regardless of snapshot freshness (real-world
+   * regression: rewinding a just-sent message failed). A summary miss
+   * triggers one forced snapshot refresh (the search refresh's P1 exchange
+   * semantics) and a single retry; `too_large` is a property of the message,
+   * not the snapshot, and never refreshes. A conversation switch during the
+   * refresh returns 'switched' so callers abort silently instead of writing
+   * into the newly displayed conversation.
+   */
+  async resolveExactUserMessage(
+    projected: ChatMessage,
+    trigger: 'search' | 'rewind' | 'fork',
+  ): Promise<
+    | { status: 'exact'; message: ChatMessage }
+    | { status: 'too_large' }
+    | { status: 'not_found' }
+    | { status: 'switched' }
+  > {
+    const { state } = this.deps;
+    if (projected.projectionLevel !== 'summary') return { status: 'exact', message: projected };
+    const conversationId = state.currentConversationId;
+    const lease = state.historyLease;
+    // Fail-closed: pre-filling the input from a trimmed summary would rewrite
+    // the user's message, so a lease-less summary can only abort.
+    if (!lease) return { status: 'not_found' };
+    const detail = await lease.loadMessageDetail(projected.id, { maxSourceBytes: 16 * 1024 * 1024 });
+    if (detail.status !== 'not_found') return detail;
+    if (state.currentConversationId !== conversationId) return { status: 'switched' };
+    try {
+      await this.refreshHistorySearchSnapshot(trigger);
+    } catch {
+      // A failed rebuild leaves the old lease mounted; the retry below then
+      // honestly ends not_found instead of surfacing the build error as a
+      // rewind failure.
+    }
+    if (state.currentConversationId !== conversationId) return { status: 'switched' };
+    const retryLease = state.historyLease;
+    if (!retryLease) return { status: 'not_found' };
+    return retryLease.loadMessageDetail(projected.id, { maxSourceBytes: 16 * 1024 * 1024 });
+  }
+
   async rewind(userMessageId: string): Promise<void> {
     const { plugin, state, renderer } = this.deps;
 
@@ -950,15 +996,13 @@ export class ConversationController {
       return;
     }
     const projectedUserMsg = msgs[userIdx];
-    let userMsg = projectedUserMsg;
-    if (projectedUserMsg.projectionLevel !== 'detail' && state.historyLease) {
-      const detail = await state.historyLease.loadMessageDetail(projectedUserMsg.id, { maxSourceBytes: 16 * 1024 * 1024 });
-      if (detail.status !== 'exact') {
-        new Notice(t(detail.status === 'too_large' ? 'chat.rewind.detailTooLarge' : 'chat.rewind.detailUnavailable'));
-        return;
-      }
-      userMsg = detail.message;
+    const resolved = await this.resolveExactUserMessage(projectedUserMsg, 'rewind');
+    if (resolved.status === 'switched') return;
+    if (resolved.status !== 'exact') {
+      new Notice(t(resolved.status === 'too_large' ? 'chat.rewind.detailTooLarge' : 'chat.rewind.detailUnavailable'));
+      return;
     }
+    const userMsg = resolved.message;
     if (!userMsg.userMessageId) {
       new Notice(t('chat.rewind.unavailableNoUuid'));
       return;

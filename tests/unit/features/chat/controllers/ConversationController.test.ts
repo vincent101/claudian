@@ -8,6 +8,7 @@ import * as historySearchModule from '@/features/chat/controllers/HistorySearchC
 import { type HistoryDiagnosticEvent, setHistoryDiagnosticsSink } from '@/features/chat/history/HistoryDiagnostics';
 import { ProjectionWriteCoordinator } from '@/features/chat/rendering/ProjectionWriteCoordinator';
 import { ChatState } from '@/features/chat/state/ChatState';
+import { t } from '@/i18n/i18n';
 import { claudeChatUIConfig } from '@/providers/claude/ui/ClaudeChatUIConfig';
 import { confirm } from '@/shared/modals/ConfirmModal';
 
@@ -4337,6 +4338,119 @@ describe('ConversationController - Rewind', () => {
       } finally {
         setHistoryDiagnosticsSink(null);
       }
+    });
+
+    const summaryMessages = (): ChatMessage[] => [
+      { id: 'm1', role: 'assistant', content: '', timestamp: 1, assistantMessageId: 'prev-a', projectionLevel: 'detail' },
+      { id: 'm2', role: 'user', content: 'summary', timestamp: 2, userMessageId: 'user-uuid', projectionLevel: 'summary' },
+      { id: 'm3', role: 'assistant', content: 'resp', timestamp: 3, assistantMessageId: 'resp-a', projectionLevel: 'detail' },
+    ];
+    const makeResolverLease = (loadMessageDetail: jest.Mock) => ({
+      conversationId: 'conv-1', totalTurns: 100, ready: Promise.resolve(), release: jest.fn(),
+      search: jest.fn(), loadMessageDetail, loadWindow: jest.fn(), planWindow: jest.fn(),
+    });
+
+    it('rewinds a live message from memory without consulting the history index (real-world regression)', async () => {
+      deps.state.currentConversationId = 'conv-1';
+      deps.state.messages = [
+        { id: 'm1', role: 'assistant', content: '', timestamp: 1, assistantMessageId: 'prev-a' },
+        { id: 'm2', role: 'user', content: 'live exact body', timestamp: 2, userMessageId: 'user-uuid' },
+        { id: 'm3', role: 'assistant', content: 'resp', timestamp: 3, assistantMessageId: 'resp-a' },
+      ];
+      const loadMessageDetail = jest.fn();
+      const acquireHistoryIndex = jest.fn();
+      deps.state.historyLease = { loadMessageDetail } as any;
+      deps.getHistoryIndexCapableService = () => ({ acquireHistoryIndex }) as any;
+
+      await controller.rewind('m2');
+
+      expect(loadMessageDetail).not.toHaveBeenCalled();
+      expect(acquireHistoryIndex).not.toHaveBeenCalled();
+      expect(mockAgentService.rewind).toHaveBeenCalledWith('user-uuid', 'prev-a');
+      expect(deps.getInputEl().value).toBe('live exact body');
+    });
+
+    it('self-heals a stale snapshot on a summary rewind: forced re-acquire, retry, rewind completes', async () => {
+      deps.state.currentConversationId = 'conv-1';
+      const conversation = { id: 'conv-1', providerId: 'claude', title: 'C', messages: [], sessionId: 's', createdAt: 1, updatedAt: 1 } as any;
+      (deps.plugin.getConversationSync as jest.Mock).mockReturnValue(conversation);
+      deps.state.messages = summaryMessages();
+      const stale = makeResolverLease(jest.fn().mockResolvedValue({ status: 'not_found' }));
+      const fresh = makeResolverLease(jest.fn().mockResolvedValue({
+        status: 'exact',
+        message: { id: 'm2', role: 'user', content: 'expanded exact', displayContent: 'exact input', timestamp: 2, userMessageId: 'user-uuid', projectionLevel: 'detail' },
+      }));
+      deps.state.historyLease = stale as any;
+      const acquireHistoryIndex = jest.fn().mockReturnValue(fresh);
+      deps.getHistoryIndexCapableService = () => ({ acquireHistoryIndex }) as any;
+
+      await controller.rewind('m2');
+
+      expect(acquireHistoryIndex).toHaveBeenCalledWith(conversation, '/vault', undefined, true);
+      expect(fresh.loadMessageDetail).toHaveBeenCalledWith('m2', { maxSourceBytes: 16 * 1024 * 1024 });
+      expect(mockAgentService.rewind).toHaveBeenCalledWith('user-uuid', 'prev-a');
+      expect(deps.getInputEl().value).toBe('exact input');
+      expect(mockNotice.mock.calls.map(call => call[0] as string)).not.toContain(t('chat.rewind.detailUnavailable'));
+    });
+
+    it('fails honestly when the refreshed snapshot still misses the summary', async () => {
+      deps.state.currentConversationId = 'conv-1';
+      const conversation = { id: 'conv-1', providerId: 'claude', title: 'C', messages: [], sessionId: 's', createdAt: 1, updatedAt: 1 } as any;
+      (deps.plugin.getConversationSync as jest.Mock).mockReturnValue(conversation);
+      deps.state.messages = summaryMessages();
+      const stale = makeResolverLease(jest.fn().mockResolvedValue({ status: 'not_found' }));
+      const fresh = makeResolverLease(jest.fn().mockResolvedValue({ status: 'not_found' }));
+      deps.state.historyLease = stale as any;
+      const acquireHistoryIndex = jest.fn().mockReturnValue(fresh);
+      deps.getHistoryIndexCapableService = () => ({ acquireHistoryIndex }) as any;
+
+      await controller.rewind('m2');
+
+      expect(acquireHistoryIndex).toHaveBeenCalledTimes(1);
+      expect(fresh.loadMessageDetail).toHaveBeenCalledWith('m2', { maxSourceBytes: 16 * 1024 * 1024 });
+      expect(confirm).not.toHaveBeenCalled();
+      expect(mockAgentService.rewind).not.toHaveBeenCalled();
+      expect(deps.getInputEl().value).toBe('');
+      expect(mockNotice).toHaveBeenCalledWith(t('chat.rewind.detailUnavailable'));
+    });
+
+    it('silently aborts when the conversation switches during the refresh', async () => {
+      deps.state.currentConversationId = 'conv-1';
+      const conversation = { id: 'conv-1', providerId: 'claude', title: 'C', messages: [], sessionId: 's', createdAt: 1, updatedAt: 1 } as any;
+      (deps.plugin.getConversationSync as jest.Mock).mockReturnValue(conversation);
+      deps.state.messages = summaryMessages();
+      const stale = makeResolverLease(jest.fn().mockResolvedValue({ status: 'not_found' }));
+      const fresh = makeResolverLease(jest.fn());
+      deps.state.historyLease = stale as any;
+      const acquireHistoryIndex = jest.fn().mockImplementation(() => {
+        // The conversation switched while the forced rebuild was in flight.
+        deps.state.currentConversationId = 'switched-conv';
+        return fresh;
+      });
+      deps.getHistoryIndexCapableService = () => ({ acquireHistoryIndex }) as any;
+
+      await controller.rewind('m2');
+
+      expect(mockNotice).not.toHaveBeenCalled();
+      expect(confirm).not.toHaveBeenCalled();
+      expect(mockAgentService.rewind).not.toHaveBeenCalled();
+      // The never-mounted rebuilt lease ends its reference exactly once.
+      expect(fresh.release).toHaveBeenCalledTimes(1);
+    });
+
+    it('does not refresh when the summary detail is too large', async () => {
+      deps.state.currentConversationId = 'conv-1';
+      deps.state.messages = summaryMessages();
+      const stale = makeResolverLease(jest.fn().mockResolvedValue({ status: 'too_large' }));
+      deps.state.historyLease = stale as any;
+      const acquireHistoryIndex = jest.fn();
+      deps.getHistoryIndexCapableService = () => ({ acquireHistoryIndex }) as any;
+
+      await controller.rewind('m2');
+
+      expect(acquireHistoryIndex).not.toHaveBeenCalled();
+      expect(mockAgentService.rewind).not.toHaveBeenCalled();
+      expect(mockNotice).toHaveBeenCalledWith(t('chat.rewind.detailTooLarge'));
     });
   });
 

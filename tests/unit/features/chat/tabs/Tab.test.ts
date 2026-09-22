@@ -5,6 +5,8 @@ import { Notice } from 'obsidian';
 
 import { ProviderRegistry } from '@/core/providers/ProviderRegistry';
 import { ProviderWorkspaceRegistry } from '@/core/providers/ProviderWorkspaceRegistry';
+import type { ChatMessage } from '@/core/types';
+import type { ConversationController } from '@/features/chat/controllers/ConversationController';
 import { InputController } from '@/features/chat/controllers/InputController';
 import { TurnCoordinator } from '@/features/chat/controllers/TurnCoordinator';
 import { ChatState } from '@/features/chat/state/ChatState';
@@ -27,6 +29,7 @@ import {
   type TabCreateOptions,
   wireTabInputEvents,
 } from '@/features/chat/tabs/Tab';
+import { t } from '@/i18n/i18n';
 import {
   DEFAULT_CODEX_PRIMARY_MODEL,
   DEFAULT_CODEX_PRIMARY_MODEL_LABEL,
@@ -3031,6 +3034,15 @@ describe('Tab - handleForkRequest', () => {
     initializeTabUI(tab, options.plugin);
     initializeTabControllers(tab, options.plugin, mockComponent, options.mcpManager, forkRequestCallback);
 
+    // handleForkRequest resolves exact content through the real controller
+    // method; the module-level ConversationController mock has no resolver.
+    const { ConversationController: RealConversationController } = jest.requireActual(
+      '@/features/chat/controllers/ConversationController',
+    ) as { ConversationController: typeof ConversationController };
+    tab.controllers.conversationController = new RealConversationController(
+      { state: tab.state } as never,
+    );
+
     // Extract the fork callback from the MessageRenderer constructor
     const { MessageRenderer } = jest.requireMock('@/features/chat/rendering/MessageRenderer') as { MessageRenderer: jest.Mock };
     const lastCall = MessageRenderer.mock.calls[MessageRenderer.mock.calls.length - 1];
@@ -3332,6 +3344,109 @@ describe('Tab - handleForkRequest', () => {
     const forkCallback = lastCall[4];
 
     expect(forkCallback).toBeUndefined();
+  });
+
+  describe('exact-content resolution (stale lease self-heal)', () => {
+    const summaryMessages = (): ChatMessage[] => [
+      { id: 'a8', role: 'assistant', content: 'prev', timestamp: 1, assistantMessageId: 'asst-8', projectionLevel: 'summary' },
+      { id: 'u9', role: 'user', content: 'summary', timestamp: 2, userMessageId: 'user-u9', projectionLevel: 'summary' },
+      { id: 'a9', role: 'assistant', content: 'response', timestamp: 3, assistantMessageId: 'asst-9', projectionLevel: 'summary' },
+    ];
+    const mountForkTab = () => {
+      const plugin = createMockPlugin({
+        getConversationSync: jest.fn().mockReturnValue({ title: 'Paged Conversation' }),
+      });
+      const { tab, forkCallback, forkRequestCallback } = setupForkTest({ plugin });
+      tab.state.currentConversationId = 'conv-1';
+      tab.state.messages = summaryMessages();
+      tab.service = { resolveSessionIdForFork: jest.fn().mockReturnValue('session-1') } as any;
+      return { tab, forkCallback, forkRequestCallback };
+    };
+
+    it('uses in-memory content for a live fork without consulting the history index', async () => {
+      const { tab, forkCallback, forkRequestCallback } = mountForkTab();
+      tab.state.messages = [
+        { id: 'a8', role: 'assistant', content: 'prev', timestamp: 1, assistantMessageId: 'asst-8' },
+        { id: 'u9', role: 'user', content: 'live fork body', timestamp: 2, userMessageId: 'user-u9' },
+        { id: 'a9', role: 'assistant', content: 'response', timestamp: 3, assistantMessageId: 'asst-9' },
+      ];
+      const loadMessageDetail = jest.fn();
+      tab.state.historyLease = { loadMessageDetail } as any;
+
+      await forkCallback('u9');
+
+      expect(loadMessageDetail).not.toHaveBeenCalled();
+      const ctx = forkRequestCallback.mock.calls[0][0];
+      expect(ctx.prefill).toBe('live fork body');
+    });
+
+    it('self-heals a stale snapshot on a summary fork: refresh swaps the lease and the retry resolves exact', async () => {
+      const { tab, forkCallback, forkRequestCallback } = mountForkTab();
+      const staleLease = {
+        loadMessageDetail: jest.fn().mockResolvedValue({ status: 'not_found' }),
+        release: jest.fn(),
+      };
+      const freshLease = {
+        loadMessageDetail: jest.fn().mockResolvedValue({
+          status: 'exact',
+          message: {
+            id: 'u9', role: 'user', content: 'summary', displayContent: 'exact fork input', timestamp: 2,
+            userMessageId: 'user-u9', projectionLevel: 'detail', historyTurnOrdinal: 7,
+          },
+        }),
+        release: jest.fn(),
+      };
+      tab.state.historyLease = staleLease as any;
+      const refreshSpy = jest.spyOn(tab.controllers.conversationController!, 'refreshHistorySearchSnapshot')
+        .mockImplementation(async () => {
+          tab.state.historyLease = freshLease as any;
+          return { status: 'rebuilt' };
+        });
+
+      await forkCallback('u9');
+
+      expect(refreshSpy).toHaveBeenCalledWith('fork');
+      expect(staleLease.loadMessageDetail).toHaveBeenCalledWith('u9', { maxSourceBytes: 16 * 1024 * 1024 });
+      expect(freshLease.loadMessageDetail).toHaveBeenCalledWith('u9', { maxSourceBytes: 16 * 1024 * 1024 });
+      expect(forkRequestCallback).toHaveBeenCalledWith(expect.objectContaining({
+        prefill: 'exact fork input',
+        forkAtUserMessage: 8,
+      }));
+    });
+
+    it('silently aborts the fork when the conversation switches during the refresh', async () => {
+      const { tab, forkCallback, forkRequestCallback } = mountForkTab();
+      tab.state.historyLease = {
+        loadMessageDetail: jest.fn().mockResolvedValue({ status: 'not_found' }),
+        release: jest.fn(),
+      } as any;
+      const refreshSpy = jest.spyOn(tab.controllers.conversationController!, 'refreshHistorySearchSnapshot')
+        .mockImplementation(async () => {
+          tab.state.currentConversationId = 'switched-conv';
+          return { status: 'rebuilt' };
+        });
+
+      await forkCallback('u9');
+
+      expect(refreshSpy).toHaveBeenCalledWith('fork');
+      expect(forkRequestCallback).not.toHaveBeenCalled();
+      expect(mockNotice).not.toHaveBeenCalled();
+    });
+
+    it('does not refresh when the summary detail is too large', async () => {
+      const { tab, forkCallback, forkRequestCallback } = mountForkTab();
+      tab.state.historyLease = {
+        loadMessageDetail: jest.fn().mockResolvedValue({ status: 'too_large' }),
+        release: jest.fn(),
+      } as any;
+      const refreshSpy = jest.spyOn(tab.controllers.conversationController!, 'refreshHistorySearchSnapshot');
+
+      await forkCallback('u9');
+
+      expect(refreshSpy).not.toHaveBeenCalled();
+      expect(mockNotice).toHaveBeenCalledWith(t('chat.fork.detailTooLarge'));
+      expect(forkRequestCallback).not.toHaveBeenCalled();
+    });
   });
 });
 

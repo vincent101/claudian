@@ -1110,15 +1110,13 @@ async function handleForkRequest(
   }
 
   const projectedUser = msgs[userIdx];
-  let exactUser = projectedUser;
-  if (projectedUser.projectionLevel !== 'detail' && state.historyLease) {
-    const detail = await state.historyLease.loadMessageDetail(projectedUser.id, { maxSourceBytes: 16 * 1024 * 1024 });
-    if (detail.status !== 'exact') {
-      new Notice(t(detail.status === 'too_large' ? 'chat.fork.detailTooLarge' : 'chat.fork.detailUnavailable'));
-      return;
-    }
-    exactUser = detail.message;
+  const resolved = await tab.controllers.conversationController!.resolveExactUserMessage(projectedUser, 'fork');
+  if (resolved.status === 'switched') return;
+  if (resolved.status !== 'exact') {
+    new Notice(t(resolved.status === 'too_large' ? 'chat.fork.detailTooLarge' : 'chat.fork.detailUnavailable'));
+    return;
   }
+  const exactUser = resolved.message;
 
   const source = resolveForkSource(tab, plugin);
   if (!source) return;
