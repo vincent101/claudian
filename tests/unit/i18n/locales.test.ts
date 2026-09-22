@@ -44,6 +44,7 @@ const localizedKeys = [
   'chat.bangBash.expandOutput',
   'chat.bangBash.running',
   'chat.bangBash.copyFailed',
+  'chat.save.timeoutNotice',
   'settings.subagents.name',
   'settings.subagents.desc',
   'settings.subagents.noAgents',

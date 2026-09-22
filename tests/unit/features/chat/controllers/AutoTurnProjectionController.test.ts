@@ -4,6 +4,7 @@ import { AutoTurnProjectionController } from '@/features/chat/controllers/AutoTu
 import { TurnCoordinator } from '@/features/chat/controllers/TurnCoordinator';
 import { ProjectionWriteCoordinator } from '@/features/chat/rendering/ProjectionWriteCoordinator';
 import { ChatState } from '@/features/chat/state/ChatState';
+import { t } from '@/i18n/i18n';
 
 describe('AutoTurnProjectionController', () => {
   function setup(options: { coordinator?: ProjectionWriteCoordinator; windowed?: boolean } = {}) {
@@ -243,21 +244,99 @@ describe('AutoTurnProjectionController', () => {
     expect(state.isStreaming).toBe(false);
     expect(state.hasPendingConversationSave).toBe(true);
     expect(notify).toHaveBeenCalledTimes(1);
+    expect(notify).toHaveBeenCalledWith('Background response is visible but could not be saved. It will retry on the next conversation save.');
   });
 
-  it('times out a never-settling save after five seconds and releases once', async () => {
+  it('shows no notice when the save settles within the timeout', async () => {
+    const { controller, save, notify } = setup();
+    controller.started({ turnId: 'auto-1', generation: 0, source: { kind: 'assistant-continuation' } });
+
+    await controller.finished({ turnId: 'auto-1', generation: 0, metadata: {} });
+
+    expect(save).toHaveBeenCalledTimes(1);
+    expect(notify).not.toHaveBeenCalled();
+  });
+
+  it('times out a never-settling save after thirty seconds and releases once', async () => {
     jest.useFakeTimers();
     const { controller, state, turnCoordinator, save, notify } = setup();
     save.mockImplementationOnce(() => new Promise(() => {}));
     controller.started({ turnId: 'auto-timeout', generation: 0, source: { kind: 'assistant-continuation' } });
     const finished = controller.finished({ turnId: 'auto-timeout', generation: 0, metadata: {} });
-    await jest.advanceTimersByTimeAsync(4_999);
+    await jest.advanceTimersByTimeAsync(29_999);
     expect(turnCoordinator.isBusy()).toBe(true);
     await jest.advanceTimersByTimeAsync(1);
     await finished;
     expect(turnCoordinator.isBusy()).toBe(false);
     expect(state.hasPendingConversationSave).toBe(true);
     expect(notify).toHaveBeenCalledTimes(1);
+    expect(notify).toHaveBeenCalledWith(t('chat.save.timeoutNotice'));
+    jest.useRealTimers();
+  });
+
+  it('notifies once across repeated save timeouts in the same conversation', async () => {
+    jest.useFakeTimers();
+    const { controller, save, notify } = setup();
+    save.mockImplementation(() => new Promise(() => {}));
+    controller.started({ turnId: 'auto-1', generation: 0, source: { kind: 'assistant-continuation' } });
+    const first = controller.finished({ turnId: 'auto-1', generation: 0, metadata: {} });
+    await jest.advanceTimersByTimeAsync(30_000);
+    await first;
+    expect(notify).toHaveBeenCalledTimes(1);
+    expect(notify).toHaveBeenCalledWith(t('chat.save.timeoutNotice'));
+
+    controller.started({ turnId: 'auto-2', generation: 0, source: { kind: 'assistant-continuation' } });
+    const second = controller.finished({ turnId: 'auto-2', generation: 0, metadata: {} });
+    await jest.advanceTimersByTimeAsync(30_000);
+    await second;
+    expect(notify).toHaveBeenCalledTimes(1);
+    jest.useRealTimers();
+  });
+
+  it('re-arms the save-timeout notice after a successful save', async () => {
+    jest.useFakeTimers();
+    const { controller, save, notify } = setup();
+    save.mockImplementation(() => new Promise(() => {}));
+    controller.started({ turnId: 'auto-1', generation: 0, source: { kind: 'assistant-continuation' } });
+    const first = controller.finished({ turnId: 'auto-1', generation: 0, metadata: {} });
+    await jest.advanceTimersByTimeAsync(30_000);
+    await first;
+    expect(notify).toHaveBeenCalledTimes(1);
+
+    save.mockImplementationOnce(jest.fn().mockResolvedValue(undefined));
+    controller.started({ turnId: 'auto-2', generation: 0, source: { kind: 'assistant-continuation' } });
+    await controller.finished({ turnId: 'auto-2', generation: 0, metadata: {} });
+    expect(notify).toHaveBeenCalledTimes(1);
+
+    controller.started({ turnId: 'auto-3', generation: 0, source: { kind: 'assistant-continuation' } });
+    const third = controller.finished({ turnId: 'auto-3', generation: 0, metadata: {} });
+    await jest.advanceTimersByTimeAsync(30_000);
+    await third;
+    expect(notify).toHaveBeenCalledTimes(2);
+    expect(notify).toHaveBeenLastCalledWith(t('chat.save.timeoutNotice'));
+    jest.useRealTimers();
+  });
+
+  it('re-arms the save-timeout notice when a timed-out save settles successfully later', async () => {
+    jest.useFakeTimers();
+    const { controller, save, notify } = setup();
+    let resolveFirstSave!: () => void;
+    save.mockImplementationOnce(() => new Promise<void>(resolve => { resolveFirstSave = resolve; }));
+    controller.started({ turnId: 'auto-1', generation: 0, source: { kind: 'assistant-continuation' } });
+    const first = controller.finished({ turnId: 'auto-1', generation: 0, metadata: {} });
+    await jest.advanceTimersByTimeAsync(30_000);
+    await first;
+    expect(notify).toHaveBeenCalledTimes(1);
+
+    resolveFirstSave();
+    await jest.advanceTimersByTimeAsync(0);
+
+    save.mockImplementationOnce(() => new Promise(() => {}));
+    controller.started({ turnId: 'auto-2', generation: 0, source: { kind: 'assistant-continuation' } });
+    const second = controller.finished({ turnId: 'auto-2', generation: 0, metadata: {} });
+    await jest.advanceTimersByTimeAsync(30_000);
+    await second;
+    expect(notify).toHaveBeenCalledTimes(2);
     jest.useRealTimers();
   });
 
@@ -272,7 +351,7 @@ describe('AutoTurnProjectionController', () => {
     }));
     controller.started({ turnId: 'auto-late', generation: 0, source: { kind: 'assistant-continuation' } });
     const finished = controller.finished({ turnId: 'auto-late', generation: 0, metadata: {} });
-    await jest.advanceTimersByTimeAsync(5_000);
+    await jest.advanceTimersByTimeAsync(30_000);
     await finished;
     turnCoordinator.release('auto-late');
     expect(finishSpy).toHaveBeenCalledTimes(1);

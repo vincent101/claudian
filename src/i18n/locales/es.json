@@ -36,6 +36,9 @@
       "detailUnavailable": "No se puede rebobinar: el contenido exacto del mensaje no está disponible",
       "detailTooLarge": "No se puede rebobinar: este mensaje supera el límite de detalle de 16 MiB"
     },
+    "save": {
+      "timeoutNotice": "Se agotó el tiempo de guardado de la conversación. Es posible que los mensajes recientes aún no se hayan guardado; se reintentará en el próximo guardado."
+    },
     "fork": {
       "ariaLabel": "Bifurcar conversación",
       "chooseTarget": "Bifurcar conversación",

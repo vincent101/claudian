@@ -36,6 +36,9 @@
       "detailUnavailable": "Impossible de revenir en arrière : le contenu exact du message n’est pas disponible",
       "detailTooLarge": "Impossible de revenir en arrière : ce message dépasse la limite de détail de 16 Mio"
     },
+    "save": {
+      "timeoutNotice": "L'enregistrement de la conversation a expiré. Les messages récents ne sont peut-être pas encore enregistrés ; une nouvelle tentative aura lieu au prochain enregistrement."
+    },
     "fork": {
       "ariaLabel": "Bifurquer la conversation",
       "chooseTarget": "Bifurquer la conversation",

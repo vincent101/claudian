@@ -36,6 +36,9 @@
       "detailUnavailable": "Zurückspulen nicht möglich: Der genaue Nachrichteninhalt ist nicht verfügbar",
       "detailTooLarge": "Zurückspulen nicht möglich: Diese Nachricht überschreitet das Detail-Limit von 16 MiB"
     },
+    "save": {
+      "timeoutNotice": "Das Speichern der Unterhaltung hat das Zeitlimit überschritten. Aktuelle Nachrichten sind möglicherweise noch nicht gespeichert; sie werden beim nächsten Speichern erneut versucht."
+    },
     "fork": {
       "ariaLabel": "Konversation verzweigen",
       "chooseTarget": "Konversation verzweigen",

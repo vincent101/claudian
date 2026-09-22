@@ -36,6 +36,9 @@ export type TranslationKey =
   | 'chat.rewind.unavailableNoUuid'
   | 'chat.rewind.detailUnavailable'
   | 'chat.rewind.detailTooLarge'
+
+  // Chat - Conversation save
+  | 'chat.save.timeoutNotice'
   | 'chat.bangBash.placeholder'
   | 'chat.bangBash.commandPanel'
   | 'chat.bangBash.copyAriaLabel'

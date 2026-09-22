@@ -36,6 +36,9 @@
       "detailUnavailable": "無法回退：無法讀取訊息的精確內容",
       "detailTooLarge": "無法回退：該訊息超過 16 MiB 詳情上限"
     },
+    "save": {
+      "timeoutNotice": "會話儲存逾時。最近的訊息可能尚未寫入磁碟，將在下次儲存時重試。"
+    },
     "fork": {
       "ariaLabel": "分叉對話",
       "chooseTarget": "分叉對話",

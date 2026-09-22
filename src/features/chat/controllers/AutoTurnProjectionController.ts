@@ -6,6 +6,7 @@ import type {
   AutoTurnStartedEvent,
 } from '../../../core/runtime/types';
 import type { ChatMessage } from '../../../core/types';
+import { t } from '../../../i18n/i18n';
 import type { HistoryWindowRenderer } from '../rendering/HistoryWindowRenderer';
 import type { MessageRenderer } from '../rendering/MessageRenderer';
 import type { ProjectionWriteLease } from '../rendering/ProjectionWriteCoordinator';
@@ -23,7 +24,10 @@ import type { TurnCoordinator } from './TurnCoordinator';
 // Initial values conservatively exceed measured 1–16 ms callback ticks; calibrate from smoke-test percentiles.
 const CALLBACK_CHUNK_TIMEOUT_MS = 1_000;
 const CALLBACK_FINALIZE_TIMEOUT_MS = 3_000;
-const CALLBACK_SAVE_TIMEOUT_MS = 5_000;
+// 30 s instead of a tighter bound: a slow disk or a held file lock must not
+// abort a save that would still land, and the timeout only gates the auto
+// turn's settlement — the save promise itself keeps running either way.
+const CALLBACK_SAVE_TIMEOUT_MS = 30_000;
 
 interface AutoTurnProjectionControllerDeps {
   state: ChatState;
@@ -88,6 +92,12 @@ interface AutoProjection {
 
 export class AutoTurnProjectionController {
   private active: AutoProjection | null = null;
+  /**
+   * Conversations whose save-timeout notice has already been shown, cleared
+   * by the next successful save: a persistently slow disk must re-notify at
+   * most once per conversation per failure episode, not on every message.
+   */
+  private readonly saveTimeoutNoticeShownFor = new Set<string>();
 
   constructor(private readonly deps: AutoTurnProjectionControllerDeps) {}
 
@@ -377,12 +387,18 @@ export class AutoTurnProjectionController {
             timeout = setTimeout(() => reject(new Error('save_timeout')), CALLBACK_SAVE_TIMEOUT_MS);
           }),
         ]);
+        // A successful save proves the save path works again — re-arm the
+        // timeout notice for every conversation.
+        this.saveTimeoutNoticeShownFor.clear();
         this.deps.recordDiagnostic?.({ phase: 'save_end', turnId: event.turnId, generation: event.generation, leaseKind: 'auto' });
       } catch (error) {
         completionError = error;
         timedOut = error instanceof Error && error.message === 'save_timeout';
         if (timedOut) {
           savePromise.finally(() => { this.deps.state.hasPendingConversationSave = true; }).catch(() => {});
+          // The timed-out save may still land once the disk frees up; a late
+          // success re-arms the notice just like a raced one.
+          void savePromise.then(() => { this.saveTimeoutNoticeShownFor.clear(); }).catch(() => {});
         }
         this.deps.state.hasPendingConversationSave = true;
         this.deps.recordDiagnostic?.({
@@ -428,8 +444,22 @@ export class AutoTurnProjectionController {
       }
     }
     if (completionError) {
+      const saveTimedOut = completionError instanceof Error && completionError.message === 'save_timeout';
       try {
-        this.deps.notify('Background response is visible but could not be saved. It will retry on the next conversation save.');
+        if (saveTimedOut) {
+          // Save timeout: localized one-shot notice per conversation until the
+          // next successful save re-arms it. Keyed by the projection's
+          // conversation — the one whose save timed out — not the tab's
+          // current one, so a mid-save switch cannot mute the next episode.
+          const conversationId = active.conversationId ?? '';
+          if (!this.saveTimeoutNoticeShownFor.has(conversationId)) {
+            this.deps.notify(t('chat.save.timeoutNotice'));
+            // Marked after the notice call so a throwing Notice retries next turn.
+            this.saveTimeoutNoticeShownFor.add(conversationId);
+          }
+        } else {
+          this.deps.notify('Background response is visible but could not be saved. It will retry on the next conversation save.');
+        }
       } catch {
         // Notice failures must not affect settlement.
       }

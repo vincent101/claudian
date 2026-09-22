@@ -36,6 +36,9 @@
       "detailUnavailable": "되돌릴 수 없음: 정확한 메시지 내용을 불러올 수 없습니다",
       "detailTooLarge": "되돌릴 수 없음: 이 메시지가 16 MiB 세부 정보 제한을 초과합니다"
     },
+    "save": {
+      "timeoutNotice": "대화 저장이 시간 초과되었습니다. 최근 메시지가 아직 저장되지 않았을 수 있으며 다음 저장 때 다시 시도됩니다."
+    },
     "fork": {
       "ariaLabel": "대화 분기",
       "chooseTarget": "대화 분기",

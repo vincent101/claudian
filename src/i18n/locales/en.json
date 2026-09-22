@@ -36,6 +36,9 @@
       "detailUnavailable": "Cannot rewind: exact message content is unavailable",
       "detailTooLarge": "Cannot rewind: this message exceeds the 16 MiB detail limit"
     },
+    "save": {
+      "timeoutNotice": "Saving the conversation timed out. Recent messages may not be persisted yet; they will retry on the next conversation save."
+    },
     "fork": {
       "ariaLabel": "Fork conversation",
       "chooseTarget": "Fork conversation",

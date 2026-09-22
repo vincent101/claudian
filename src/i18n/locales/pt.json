@@ -36,6 +36,9 @@
       "detailUnavailable": "Não é possível voltar: o conteúdo exato da mensagem não está disponível",
       "detailTooLarge": "Não é possível voltar: esta mensagem excede o limite de detalhes de 16 MiB"
     },
+    "save": {
+      "timeoutNotice": "O tempo limite para salvar a conversa foi excedido. As mensagens recentes podem ainda não terem sido salvas; uma nova tentativa será feita no próximo salvamento."
+    },
     "fork": {
       "ariaLabel": "Bifurcar conversa",
       "chooseTarget": "Bifurcar conversa",
