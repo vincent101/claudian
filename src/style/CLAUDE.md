@@ -39,7 +39,7 @@ CSS is built into root `styles.css` via `npm run build:css`. It is invoked by bo
 | Panels | `-todo-list`, `-todo-item`, `-subagent-list`, `-subagent-header` |
 | Context | `-file-chip`, `-image-chip`, `-mention-dropdown` |
 | Plan mode | `-plan-approval-inline`, `-plan-content-preview`, `-plan-permissions`, plus shared `-ask-*` classes for approval/revision controls |
-| Ask user | `-ask-list`, `-ask-item`, `-ask-cursor`, `-ask-hints` |
+| Ask user | `-ask-list`, `-ask-item`, `-ask-cursor`, `-ask-hints`, `-ask-timeout-notice` |
 | Command panel | `-status-panel-bash`, `-status-panel-bash-header`, `-status-panel-bash-entry`, `-status-panel-bash-actions` |
 | Modals | `-instruction-modal`, `-mcp-modal`, `-fork-target-*` |
 

@@ -50,7 +50,7 @@ npm run test -- --selectProjects integration
 npm run test:coverage -- --selectProjects unit
 ```
 
-Tests mirror the `src/` layout under `tests/unit/` and `tests/integration/` — 241 suites as of 3.1.1.
+Tests mirror the `src/` layout under `tests/unit/` and `tests/integration/` — 243 suites as of 3.1.5.
 
 ## Storage
 

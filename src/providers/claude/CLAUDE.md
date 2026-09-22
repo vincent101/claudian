@@ -52,12 +52,24 @@ The SDK can send messages without a registered handler (e.g., background subagen
 
 ### Auto-Turn Notification Attribution (transcript lineOffset)
 
-Auto-turn completion notifications are attributed by transcript causality, not wall-clock time (`src/providers/claude/transcript/` — tail reader, turn mapper, turn observer). The observer tracks `lastHostUserOffset`; a finished auto turn whose `terminalOffset` precedes a later host user line reports `supersededByHostUser: true` — the host user already replaced that turn's result in the transcript, so the late "已完成" notification is suppressed. Offsets come from the tail reader's committed boundary; ordering is byte-position causal order within one transcript file, which is why the reader must never resume at the stat-time EOF (see indexing above).
+Auto-turn completion notifications are attributed by transcript causality, not wall-clock time (`src/providers/claude/transcript/` — tail reader, turn mapper, fact adapter, turn observer). The observer tracks `lastHostUserOffset`; a finished auto turn whose `terminalOffset` precedes a later host user line reports `supersededByHostUser: true` — the host user already replaced that turn's result in the transcript, so the late "已完成" notification is suppressed. Offsets come from the tail reader's committed boundary; ordering is byte-position causal order within one transcript file, which is why the reader must never resume at the stat-time EOF (see indexing above).
+
+### Turn-Identity Reconciliation (Batch 1, Observe Mode)
+
+The host runtime and the transcript observer both describe the same logical turn; aligning them used to rely on lease/order/`lineOffset` heuristics. `ClaudeTurnReconciliationCoordinator` (3.1.2) is now the single owner of that binding, keyed on the canonical transcript UUID — but batch 1 is a read-only bypass: it records facts, computes verdicts and rate diagnostics, and is never consulted by settlement, promotion, or notifications. Every runtime call site is try-caught — the bypass must never break send, lease handling, or settlement.
+
+- Binding lifecycle: `reserved` (the factory minted a candidate UUID; never enters the eligible denominator until dequeued) → `dispatched` (the channel dequeued the item; the canonical UUID becomes the binding key, merged turns join as `hostTurnIds` aliases, idempotent re-dispatch of the same lease counts once) → `observed` (a transcript user row with that UUID arrived). A host turn still unobserved at settle is finalized `host_only` — dispatch-to-settle windows dwarf the tail-reader poll, so that is the unmatched signal.
+- The mapper no longer decides "this is a new auto turn". It emits `TranscriptTurnFact`s (`observed_start`/`observed_chunk`/`observed_terminal`/`observed_interrupted` with `terminalKind` evidence) for every queryable user row — host-dispatched rows included, which never open observer turns — and `ClaudeTranscriptFactAdapter` is the single place that projects facts back onto the legacy feature events. Whether an observed start is a host mirror, an external turn, or a duplicate is a coordinator verdict, not a mapper decision.
+- Verdicts: `host_mirror` / `external_new` / `duplicate` / `conflict` (`alias_remap` = merged-turn crash replay re-enqueues the owner-only message under a different canonical UUID, expected shape; `canonical_rebind` = same canonical UUID re-dispatched under a different lease).
+- Session generation epoch: session switch/reset/plugin cleanup drops every live binding so late events from the old session can never hit the new map; counters stay cumulative for the reconciliation window.
+- Recovery replay adapts facts with `hostUserTurnActive: false` (the mapper default), never the live host state — transcript-replaced recovery does not clear `hostUserTurnId`, and a live-true context would divert the replayed external start into `embedded` while the mapper already opened its active turn, silently dropping the turn's content. Replay facts stay out of reconciliation entirely (cross-generation re-binding is a batch-2 concern).
+- Diagnostics: `turn_identity_*` phases in the transcript diagnostic log (hashed ids, generation, alias counts, source-kind categories only).
 
 ### MessageChannel Queue
 
 - Text-only messages merge with `\n\n` up to 12000 chars while a turn is active (fast follow-up messages coalesce)
 - Attachment messages replace the previous queued attachment (one at a time)
+- Queue items keep the first writer's turnId as the canonical lease and the first writer's message UUID as the canonical identity: text merges append content only, attachment replaces swap the payload only (`replacePayloadKeepIdentity`), and dequeue reports `{leaseTurnId, canonicalTurnId, hostTurnIds}` so the reconciliation coordinator can bind host turns to the UUID that actually hits disk
 - Queue overflow beyond 8 messages drops the newest
 
 ### Branch Filtering

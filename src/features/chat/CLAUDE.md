@@ -22,6 +22,8 @@ ClaudianView (lifecycle + assembly)
 │   ├── ConversationController
 │   ├── StreamController
 │   ├── InputController
+│   ├── TurnCoordinator
+│   ├── AutoTurnProjectionController
 │   ├── SelectionController
 │   ├── BrowserSelectionController
 │   ├── CanvasSelectionController
@@ -79,9 +81,11 @@ The feature layer consumes provider-neutral `StreamChunk` values. Providers own 
 
 | Controller | Responsibility |
 |------------|----------------|
-| `ConversationController` | Session switching, windowed history (lease lifecycle, paging, search snapshot refresh, rewind detail loading), save, and rewind |
+| `ConversationController` | Session switching, windowed history (lease lifecycle, paging, search snapshot refresh, rewind/fork exact-content resolution), save, and rewind |
 | `StreamController` | Consume stream chunks, update streaming state, auto-scroll, abort handling |
-| `InputController` | Text input, mentions, images, resume dispatch, command dispatch, and post-plan approval flow |
+| `InputController` | Text input, mentions, images, resume dispatch, command dispatch, ask-user cards (auto-turn 5-minute bound), and post-plan approval flow |
+| `TurnCoordinator` | Exclusive per-tab turn lease (`user`/`auto` kinds) pinned to conversation + tab lifecycle; release drives queued-message processing |
+| `AutoTurnProjectionController` | Project observer-seen auto turns into the live page behind the projection FIFO; re-evaluate rewind affordances on the preceding user message at clean finalize |
 | `SelectionController` | Editor selection polling and CM6 decorations |
 | `BrowserSelectionController` | Browser view selection tracking |
 | `CanvasSelectionController` | Canvas selection tracking |
@@ -143,7 +147,7 @@ Two load paths, two entry points, capability-routed — never by provider id:
 - `getHistoryIndexCapableService` (deps-injected, adapted in `Tab.ts` from `typeof service.acquireHistoryIndex === 'function'`) decides the path. Index-capable providers (Claude) window through `acquireHistoryIndex`; others (Codex/OpenCode) keep full hydration — `ChatState.messages = [...conversation.messages]`.
 - `loadActive` (tab restore / app open): acquire lease → `ready` → first-screen window (anchor = totalTurns, direction `older`, `HISTORY_RESOURCE_POLICY.firstScreen`) → bind lease → `restoreConversation(page)`. Transcriptless drafts (no session id, not a pending fork) skip the index.
 - `switchTo` (dropdown/history switch): `reserveConversation` CAS claim → release the outgoing tab's lease (same release point as closeTab, or the protected index stays pinned out of the LRU forever) → `windowRenderer.reset()` → acquire fresh. The restored projection owns the pager: the dropdown entry bypasses `loadActive`, so `renderHistoryPager()` runs in both entry points.
-- `ChatState.messages` is the only per-tab materialized view (loaded pages + live page). For Claude, `Conversation.messages` holds only a not-yet-persisted draft tail or `[]` — never a window. Feature code must not treat a loaded window as the complete history (fork/rewind go through `loadMessageDetail`).
+- `ChatState.messages` is the only per-tab materialized view (loaded pages + live page). For Claude, `Conversation.messages` holds only a not-yet-persisted draft tail or `[]` — never a window. Feature code must not treat a loaded window as the complete history (fork/rewind go through `resolveExactUserMessage`).
 
 DOM windowing invariants (`HistoryWindowRenderer` + `HistoryPageStore`):
 
@@ -154,14 +158,16 @@ DOM windowing invariants (`HistoryWindowRenderer` + `HistoryPageStore`):
 - Live pages (`live:` prefix, created by `beginLivePage`) and `memory-only` pages (rewind rebuilds — the disk snapshot still contains the discarded branches, so eviction would destroy the truth) are exempt from data-LRU eviction; eviction only clears `messages` and keeps range/height/UI state. All-pinned pressure overcommits with a diagnostic rather than evicting.
 - Scroll handlers only sample positions and record one intent per direction per frame; `runLatestStoredIntent` drops superseded intents so a stale window op never replays after a live turn releases.
 
-Stored transaction protocol (`runStoredTransaction` in `ConversationController`): history load + ChatState merge + render + queue drain is one unit under the projection write lease, FIFO-queued behind any live streaming turn. The task body revalidates the conversation id captured at request time after every await — a stale page must never merge into, render into, or paginate the newly displayed conversation. The search snapshot refresh inverts this on purpose: the forced index rebuild runs **outside** the stored grant (grant-held rebuilds head-blocked the FIFO for tens of seconds), the old lease keeps serving reads, and only the revalidated exchange is a short stored transaction.
+Stored transaction protocol (`runStoredTransaction` in `ConversationController`): history load + ChatState merge + render + queue drain is one unit under the projection write lease, FIFO-queued behind any live streaming turn. The task body revalidates the conversation id captured at request time after every await — a stale page must never merge into, render into, or paginate the newly displayed conversation. The search snapshot refresh inverts this on purpose: the forced index rebuild runs **outside** the stored grant (grant-held rebuilds head-blocked the FIFO for tens of seconds), the old lease keeps serving reads, and only the revalidated exchange is a short stored transaction. `refreshHistorySearchSnapshot(trigger)` records which surface forced the refresh (`search`/`rewind`/`fork`) on every `search_snapshot_refresh` diagnostic event.
 
 ## Gotchas
 
 - `ClaudianView.onClose()` must abort active tabs and dispose runtimes
 - `ChatState` is per-tab; `TabManager` coordinates tab-level operations such as fork targets and provider-aware command catalogs
 - Title generation runs concurrently per conversation; title material comes from the bounded `loadTitleMaterial` (first user + recent user excerpts through the index), never a full hydrate
-- Rewind on a summary-projection message must first load exact detail (`loadMessageDetail`, 16 MiB cap); failure or oversize aborts the rewind instead of writing a summary into the input box. Pages rebuilt by rewind are `memory-only` — rematerializing them from the index is refused loudly (the snapshot still contains the discarded branches)
+- Rewind and fork resolve exact user content through one shared entry: `ConversationController.resolveExactUserMessage` (fork in `Tab.ts` calls the same, 3.1.4). Only a `summary` projection loads detail through the index (16 MiB cap) — live/detail/draft messages are already exact in memory, and live messages carry local ids that would always miss the index regardless of snapshot freshness (real-world regression: rewinding a just-sent message failed). A `not_found` summary triggers one forced snapshot refresh (search-refresh exchange semantics) plus a single retry — the stale-lease self-heal; `too_large` is a property of the message and never refreshes; a conversation switch mid-refresh aborts silently. A lease-less summary can only abort (fail-closed: pre-filling the input from a trimmed summary would rewrite the user's message). Pages rebuilt by rewind are `memory-only` — rematerializing them from the index is refused loudly (the snapshot still contains the discarded branches)
+- Auto turns (task-notification continuations, peer-forwarded runs) have no guaranteed attending user, but their ask cards still render (3.1.3): the pending `canUseTool` promise races a 5-minute timeout that settles deny+interrupt with a visible timeout notice; any earlier answer/abort/dismiss cancels the race one-shot. User turns keep the unbounded path. The exclusive turn lease's kind (`TurnCoordinator`) attributes the ask — never provider-id checks
+- When an auto turn finalizes cleanly, `AutoTurnProjectionController` re-evaluates the rewind buttons on the nearest user message preceding the turn's anchor: `findRewindContext` stops at the first user message, so an evaluation that ran while the auto turn's user row sat ahead of it saw no response yet and hid the button (3.1.5). Idempotent — the renderer skips messages already carrying buttons or ineligible
 - Lease-less search (Codex/OpenCode) enumerates visible DOM matches only; it must never be reported as a staleness problem by the search snapshot refresh
 - `/compact`
   - Claude skips context injection so the provider recognizes the built-in command and persists the compaction boundary
