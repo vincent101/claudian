@@ -414,6 +414,7 @@ export class AutoTurnProjectionController {
         historyWindowRenderer?.freezeLivePage(active.pageMessages);
         if (historyWindowRenderer) this.deps.renderer.setMessagesEl(historyWindowRenderer.getRoot());
         const reprojectionSettled = await this.reprojectIfDirty(active, event.turnId, event.generation);
+        if (finalizedCleanly) this.refreshRewindButtonsForPrecedingUserTurn(active);
         this.active = null;
         this.deps.turnCoordinator.finish(event.turnId);
         this.deps.recordDiagnostic?.({ phase: 'lease_finish', turnId: event.turnId, generation: event.generation, leaseKind: 'auto' });
@@ -473,6 +474,27 @@ export class AutoTurnProjectionController {
     } catch {
       // Reprojection is a DOM repair; a failure must not break lease settlement.
       return false;
+    }
+  }
+
+  /**
+   * A user message whose rewind evaluation ran while this auto turn's user row
+   * sat ahead of it loses its rewind button (findRewindContext stops at the
+   * first user message and sees no response yet). Once the turn settles,
+   * re-check the buttons on the nearest user message before this turn's
+   * anchor. Idempotent: the renderer skips messages already carrying buttons
+   * or ineligible; nothing to evaluate means no call.
+   */
+  private refreshRewindButtonsForPrecedingUserTurn(active: AutoProjection): void {
+    const anchor = active.pageMessages.find(message => message.role === 'user') ?? active.assistantMessage;
+    const anchorIndex = this.deps.state.messages.indexOf(anchor);
+    if (anchorIndex < 0) return;
+    for (let index = anchorIndex - 1; index >= 0; index -= 1) {
+      const candidate = this.deps.state.messages[index];
+      if (candidate.role === 'user') {
+        this.deps.renderer.refreshActionButtons(candidate, this.deps.state.messages, index);
+        return;
+      }
     }
   }
 

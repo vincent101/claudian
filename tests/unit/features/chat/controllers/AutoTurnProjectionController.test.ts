@@ -31,6 +31,7 @@ describe('AutoTurnProjectionController', () => {
     const setMessagesEl = jest.fn();
     const renderMessages = jest.fn().mockReturnValue(createMockEl());
     const waitForRenderedMessages = jest.fn().mockResolvedValue(undefined);
+    const refreshActionButtons = jest.fn();
     const setWelcomeEl = jest.fn();
     const rebuildMountedPages = jest.fn();
     const beginLivePage = jest.fn().mockReturnValue(null);
@@ -60,7 +61,7 @@ describe('AutoTurnProjectionController', () => {
     } as any;
     const controller = new AutoTurnProjectionController({
       state,
-      renderer: { addMessage, removeMessage, setMessagesEl, renderMessages, waitForRenderedMessages, domEpoch: 0 } as any,
+      renderer: { addMessage, removeMessage, setMessagesEl, renderMessages, waitForRenderedMessages, refreshActionButtons, domEpoch: 0 } as any,
       streamController,
       conversationController: { save } as any,
       turnCoordinator,
@@ -77,7 +78,7 @@ describe('AutoTurnProjectionController', () => {
     Object.defineProperty(contentEl, 'isConnected', { value: true, configurable: true });
     return {
       controller, state, turnCoordinator, processQueuedMessage, finishSpy,
-      addMessage, removeMessage, renderMessages, waitForRenderedMessages, setWelcomeEl, rebuildMountedPages,
+      addMessage, removeMessage, renderMessages, waitForRenderedMessages, setWelcomeEl, rebuildMountedPages, refreshActionButtons,
       streamController, handleStreamChunk, save, notify, onTurnCompleted, contentEl,
     };
   }
@@ -182,6 +183,43 @@ describe('AutoTurnProjectionController', () => {
     await controller.chunk({ turnId: 'auto-1', generation: 0, chunk: { type: 'text', content: 'late' } });
     expect(handleStreamChunk).toHaveBeenCalledTimes(1);
     expect(save).toHaveBeenCalledTimes(1);
+  });
+
+  it('finished re-evaluates rewind buttons on the user message preceding the auto turn', async () => {
+    const { controller, state, refreshActionButtons } = setup();
+    state.messages = [
+      { id: 'host-user', role: 'user', content: 'question', timestamp: 1 },
+      { id: 'host-assistant', role: 'assistant', content: 'answer', timestamp: 2 },
+    ];
+    controller.started({
+      turnId: 'auto-1',
+      generation: 0,
+      source: { kind: 'peer', label: 'researcher' },
+      displayContent: 'inspect report',
+    });
+
+    await controller.finished({ turnId: 'auto-1', generation: 0, metadata: {} });
+    expect(refreshActionButtons).toHaveBeenCalledWith(state.messages[0], state.messages, 0);
+  });
+
+  it('finished skips the rewind re-evaluation when no user message precedes the auto turn', async () => {
+    const { controller, refreshActionButtons } = setup();
+    controller.started({ turnId: 'auto-1', generation: 0, source: { kind: 'assistant-continuation' } });
+
+    await controller.finished({ turnId: 'auto-1', generation: 0, metadata: {} });
+    expect(refreshActionButtons).not.toHaveBeenCalled();
+  });
+
+  it('finished re-evaluates rewind buttons from the assistant position when the auto turn has no user row', async () => {
+    const { controller, state, refreshActionButtons } = setup();
+    state.messages = [
+      { id: 'host-user', role: 'user', content: 'question', timestamp: 1 },
+      { id: 'host-assistant', role: 'assistant', content: 'answer', timestamp: 2 },
+    ];
+    controller.started({ turnId: 'auto-1', generation: 0, source: { kind: 'assistant-continuation' } });
+
+    await controller.finished({ turnId: 'auto-1', generation: 0, metadata: {} });
+    expect(refreshActionButtons).toHaveBeenCalledWith(state.messages[0], state.messages, 0);
   });
 
   it('drops chunks after the tab DOM is detached', async () => {
