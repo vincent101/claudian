@@ -139,6 +139,29 @@ export class HistoryPageStore {
     return true;
   }
 
+  /**
+   * Re-keys a record after a snapshot-generation swap (same range, new
+   * identity). The record object survives untouched — heights, UI state,
+   * render state, pins, retention, and tickets all follow it. Returns null
+   * when the target key is already taken: the caller must keep the old
+   * record rather than merging two windows into one key.
+   */
+  renamePage(oldKey: string, newKey: string): HistoryPageRecord | null {
+    const record = this.records.get(oldKey);
+    if (!record) return null;
+    if (oldKey === newKey) return record;
+    if (this.records.has(newKey)) return null;
+    this.records.delete(oldKey);
+    record.pageKey = newKey;
+    this.records.set(newKey, record);
+    const tickets = this.tickets.get(oldKey);
+    if (tickets) {
+      this.tickets.delete(oldKey);
+      this.tickets.set(newKey, tickets);
+    }
+    return record;
+  }
+
   clear(): void {
     for (const ticketMap of this.tickets.values()) {
       for (const ticket of ticketMap.values()) this.resolveWaiters(ticket);

@@ -154,6 +154,42 @@ describe('HistoryPageStore', () => {
     expect(store.peek('a')).toMatchObject({ messages: null, renderState: 'spacer', measuredHeight: 120 });
   });
 
+  it('renames a page record in place, preserving state and migrating tickets', () => {
+    const store = new HistoryPageStore();
+    const record = store.upsertPage({ pageKey: 'w:S1:0:5', range: { start: 0, end: 5 }, messages: [message('m')], projectedWeight: 1 });
+    record.measuredHeight = 120;
+    record.renderState = 'spacer';
+    record.heightQuality = 'measured';
+    record.uiState.set('m', { detailLoaded: true });
+    record.pins.add('search');
+    const ticket = store.beginRender('w:S1:0:5', 1);
+
+    const renamed = store.renamePage('w:S1:0:5', 'w:S2:0:5');
+
+    // Same object: heights, UI state, render state, pins, retention all
+    // survive; only the key moved.
+    expect(renamed).toBe(record);
+    expect(store.peek('w:S1:0:5')).toBeUndefined();
+    expect(store.peek('w:S2:0:5')).toBe(record);
+    expect(renamed).toMatchObject({ pageKey: 'w:S2:0:5', measuredHeight: 120, renderState: 'spacer', heightQuality: 'measured' });
+    expect(renamed!.uiState.get('m')).toEqual({ detailLoaded: true });
+    expect(renamed!.pins.has('search')).toBe(true);
+    // Tickets follow the record: the old key no longer resolves them.
+    expect(() => (store as any).ticket('w:S1:0:5', ticket)).toThrow();
+    expect(() => (store as any).ticket('w:S2:0:5', ticket)).not.toThrow();
+  });
+
+  it('refuses a rename onto an occupied key without touching either record', () => {
+    const store = new HistoryPageStore();
+    const old = store.upsertPage({ pageKey: 'w:S1:0:5', range: { start: 0, end: 5 }, messages: [message('m')], projectedWeight: 1 });
+    const occupied = store.upsertPage({ pageKey: 'w:S2:0:5', range: { start: 0, end: 5 }, messages: [message('n')], projectedWeight: 1 });
+
+    expect(store.renamePage('w:S1:0:5', 'w:S2:0:5')).toBeNull();
+    expect(store.peek('w:S1:0:5')).toBe(old);
+    expect(store.peek('w:S2:0:5')).toBe(occupied);
+    expect(old.pageKey).toBe('w:S1:0:5');
+  });
+
   it('marks old measured height stale on a new ticket and never lets estimated overwrite measured at the same width', () => {
     const store = new HistoryPageStore();
     store.upsertPage({ pageKey: 'a', range: { start: 0, end: 1 }, messages: [message('a')], projectedWeight: 1 });

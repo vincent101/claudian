@@ -3,6 +3,7 @@ import { readFileSync } from 'fs';
 import { resolve } from 'path';
 
 import type { ChatMessage } from '@/core/types';
+import { type HistoryDiagnosticEvent, setHistoryDiagnosticsSink } from '@/features/chat/history/HistoryDiagnostics';
 import { HistoryPageStore } from '@/features/chat/history/HistoryPageStore';
 import { HistoryWindowRenderer } from '@/features/chat/rendering/HistoryWindowRenderer';
 import { ProjectionWriteCoordinator } from '@/features/chat/rendering/ProjectionWriteCoordinator';
@@ -363,6 +364,278 @@ describe('HistoryWindowRenderer', () => {
     resolvePage({ pageKey: 'b', range: { start: 100, end: 200 }, messages: messages(100, 'b2'), projectedWeight: 1 });
     await reconcile;
     expect(store.peek('b')?.messages).toBeNull();
+  });
+
+  it('re-keys a generation-drifted page through the viewport path and mounts it in place (#7)', async () => {
+    const events: HistoryDiagnosticEvent[] = [];
+    setHistoryDiagnosticsSink(event => events.push(event));
+    try {
+      const rematerializePage = jest.fn(async () => ({
+        pageKey: 'w:S2:100:200',
+        range: { start: 100, end: 200 },
+        messages: messages(100, 'b2'),
+        projectedWeight: 1,
+      }));
+      const { renderer, store, root } = createHarness(300, { rematerializePage });
+      renderer.addPage({ pageKey: 'a', range: { start: 0, end: 100 }, messages: messages(100, 'a'), projectedWeight: 1 }, 300);
+      renderer.addPage({ pageKey: 'w:S1:100:200', range: { start: 100, end: 200 }, messages: messages(100, 'b'), projectedWeight: 1 }, 300);
+      const record = store.peek('w:S1:100:200')!;
+      record.messages = null;
+      record.renderState = 'spacer';
+      record.measuredHeight = 400;
+
+      renderer.setVisiblePages(['a']);
+      (renderer as any).pendingVisiblePages = new Set(['a']);
+      renderer.sampleIntent('newer');
+      renderer.flushFrameForTest();
+      await new Promise(resolve => setTimeout(resolve, 20));
+
+      // The record object survives under the fresh key with its height,
+      // mounted by the reconcile pass.
+      expect(store.peek('w:S1:100:200')).toBeUndefined();
+      const rekeyed = store.peek('w:S2:100:200')!;
+      expect(rekeyed).toBe(record);
+      expect(rekeyed.renderState).toBe('mounted');
+      expect(rekeyed.measuredHeight).toBe(400);
+      const wrapper = root.querySelector<HTMLElement>('[data-page-key="w:S2:100:200"]')!;
+      expect(wrapper.className).toBe('claudian-history-page');
+      expect(root.querySelector('[data-page-key="w:S1:100:200"]')).toBeNull();
+      expect(events).toContainEqual(expect.objectContaining({
+        kind: 'page_rekeyed',
+        pageKey: 'w:S2:100:200',
+        previousPageKey: 'w:S1:100:200',
+        turns: 100,
+      }));
+    } finally {
+      setHistoryDiagnosticsSink(null);
+    }
+  });
+
+  it('keeps the spacer when a drifted page returns a different range (#7)', async () => {
+    const events: HistoryDiagnosticEvent[] = [];
+    setHistoryDiagnosticsSink(event => events.push(event));
+    try {
+      const rematerializePage = jest.fn(async () => ({
+        pageKey: 'w:S2:100:190',
+        range: { start: 100, end: 190 },
+        messages: messages(90, 'b2'),
+        projectedWeight: 1,
+      }));
+      const { renderer, store, root } = createHarness(300, { rematerializePage });
+      renderer.addPage({ pageKey: 'a', range: { start: 0, end: 100 }, messages: messages(100, 'a'), projectedWeight: 1 }, 300);
+      renderer.addPage({ pageKey: 'w:S1:100:200', range: { start: 100, end: 200 }, messages: messages(100, 'b'), projectedWeight: 1 }, 300);
+      const record = store.peek('w:S1:100:200')!;
+      record.messages = null;
+      record.renderState = 'spacer';
+
+      renderer.setVisiblePages(['a']);
+      (renderer as any).pendingVisiblePages = new Set(['a']);
+      renderer.sampleIntent('newer');
+      renderer.flushFrameForTest();
+      await new Promise(resolve => setTimeout(resolve, 20));
+
+      // Refused: the old record stays a data-less spacer and no phantom
+      // record for the mismatched window enters the store or the DOM.
+      expect(store.peek('w:S1:100:200')).toBe(record);
+      expect(record.renderState).toBe('spacer');
+      expect(record.messages).toBeNull();
+      expect(store.peek('w:S2:100:190')).toBeUndefined();
+      expect(root.querySelector('[data-page-key="w:S2:100:190"]')).toBeNull();
+      expect(events).toContainEqual(expect.objectContaining({
+        kind: 'page_rematerialize_refused',
+        reason: 'range_mismatch',
+        rangeStart: 100,
+        rangeEnd: 200,
+        actualRangeStart: 100,
+        actualRangeEnd: 190,
+      }));
+    } finally {
+      setHistoryDiagnosticsSink(null);
+    }
+  });
+
+  it('re-keys a drifted page through the reveal path and keeps the fresh key pinned as visible (#7)', async () => {
+    const rematerializePage = jest.fn(async (record: any) => ({
+      pageKey: `w:S2:${record.range.start}:${record.range.end}`,
+      range: record.range,
+      messages: messages(100, 'b2'),
+      projectedWeight: 1,
+    }));
+    const { renderer, store, root, viewport } = createHarness(300, { rematerializePage });
+    renderer.addPage({ pageKey: 'a', range: { start: 0, end: 100 }, messages: messages(100, 'a'), projectedWeight: 1 }, 300);
+    renderer.addPage({ pageKey: 'w:S1:100:200', range: { start: 100, end: 200 }, messages: messages(100, 'b'), projectedWeight: 1 }, 300);
+    const record = store.peek('w:S1:100:200')!;
+    record.messages = null;
+    record.renderState = 'spacer';
+
+    await expect(renderer.revealMessage('b-42')).resolves.toBe(true);
+    expect(store.peek('w:S1:100:200')).toBeUndefined();
+    expect(store.peek('w:S2:100:200')?.renderState).toBe('mounted');
+
+    // The visible-page sets follow the fresh key: a later viewport sample
+    // still pins the re-keyed record, never the dead one.
+    const wrapper = root.querySelector<HTMLElement>('[data-page-key="w:S2:100:200"]')!;
+    jest.spyOn(wrapper, 'getBoundingClientRect').mockReturnValue({ top: 0, bottom: 100, height: 100 } as DOMRect);
+    Object.defineProperty(viewport, 'clientHeight', { configurable: true, value: 100 });
+    renderer.sampleViewport('older');
+    renderer.flushFrameForTest();
+    await new Promise(resolve => setTimeout(resolve, 20));
+    expect((renderer as any).visiblePages.has('w:S2:100:200')).toBe(true);
+    expect(store.peek('w:S2:100:200')?.pins.has('visible')).toBe(true);
+  });
+
+  it('preserves spacer geometry and scroll position across a re-key mount (#7)', async () => {
+    const rematerializePage = jest.fn(async () => ({
+      pageKey: 'w:S2:100:200',
+      range: { start: 100, end: 200 },
+      messages: messages(100, 'b2'),
+      projectedWeight: 1,
+    }));
+    const { renderer, store, root, viewport } = createHarness(300, { rematerializePage });
+    renderer.addPage({ pageKey: 'a', range: { start: 0, end: 100 }, messages: messages(100, 'a'), projectedWeight: 1 }, 300);
+    renderer.addPage({ pageKey: 'w:S1:100:200', range: { start: 100, end: 200 }, messages: messages(100, 'b'), projectedWeight: 1 }, 300);
+    const record = store.peek('w:S1:100:200')!;
+    record.messages = null;
+    record.renderState = 'spacer';
+    record.measuredHeight = 320;
+    viewport.scrollTop = 80;
+    root.querySelector<HTMLElement>('[data-page-key="w:S1:100:200"]')!.style.height = '320px';
+
+    renderer.setVisiblePages(['a']);
+    (renderer as any).pendingVisiblePages = new Set(['a']);
+    renderer.sampleIntent('newer');
+    renderer.flushFrameForTest();
+    await new Promise(resolve => setTimeout(resolve, 20));
+
+    // The re-key kept the measured spacer height and the mount's anchor
+    // correction nets to zero — no scroll jump.
+    expect(store.peek('w:S2:100:200')?.measuredHeight).toBe(320);
+    expect(root.querySelector('[data-page-key="w:S2:100:200"]')).not.toBeNull();
+    expect(viewport.scrollTop).toBe(80);
+  });
+
+  it('clears the dedup entry and the transaction pin after a re-keyed viewport rematerialization (#7)', async () => {
+    const rematerializePage = jest.fn(async () => ({
+      pageKey: 'w:S2:100:200',
+      range: { start: 100, end: 200 },
+      messages: messages(100, 'b2'),
+      projectedWeight: 1,
+    }));
+    const { renderer, store } = createHarness(300, { rematerializePage });
+    renderer.addPage({ pageKey: 'a', range: { start: 0, end: 100 }, messages: messages(100, 'a'), projectedWeight: 1 }, 300);
+    renderer.addPage({ pageKey: 'w:S1:100:200', range: { start: 100, end: 200 }, messages: messages(100, 'b'), projectedWeight: 1 }, 300);
+    const record = store.peek('w:S1:100:200')!;
+    record.messages = null;
+    record.renderState = 'spacer';
+
+    renderer.setVisiblePages(['a']);
+    (renderer as any).pendingVisiblePages = new Set(['a']);
+    renderer.sampleIntent('newer');
+    renderer.flushFrameForTest();
+    await new Promise(resolve => setTimeout(resolve, 20));
+
+    // The finally block deletes the dedup entry by the *requested* key and
+    // unpins the transaction by the *live* (re-keyed) key — neither may leak.
+    expect((renderer as any).rematerializations.size).toBe(0);
+    expect(store.peek('w:S2:100:200')?.pins.has('transaction')).toBe(false);
+  });
+
+  it('clears the dedup entry and the transaction pin after a re-keyed reveal rematerialization (#7)', async () => {
+    const rematerializePage = jest.fn(async (record: any) => ({
+      pageKey: `w:S2:${record.range.start}:${record.range.end}`,
+      range: record.range,
+      messages: messages(100, 'b2'),
+      projectedWeight: 1,
+    }));
+    const { renderer, store } = createHarness(300, { rematerializePage });
+    renderer.addPage({ pageKey: 'w:S1:100:200', range: { start: 100, end: 200 }, messages: messages(100, 'b'), projectedWeight: 1 }, 300);
+    store.peek('w:S1:100:200')!.messages = null;
+    store.peek('w:S1:100:200')!.renderState = 'spacer';
+
+    await expect(renderer.revealMessage('b-42')).resolves.toBe(true);
+
+    expect((renderer as any).rematerializations.size).toBe(0);
+    expect(store.peek('w:S2:100:200')?.pins.has('transaction')).toBe(false);
+  });
+
+  it('drops the viewport sample taken while a drifted rematerialization was in flight (#7)', async () => {
+    let resolvePage!: (value: any) => void;
+    const rematerializePage = jest.fn(() => new Promise(resolve => { resolvePage = resolve; }));
+    const { renderer, store, root, viewport } = createHarness(300, { rematerializePage });
+    renderer.addPage({ pageKey: 'a', range: { start: 0, end: 100 }, messages: messages(100, 'a'), projectedWeight: 1 }, 300);
+    renderer.addPage({ pageKey: 'w:S1:100:200', range: { start: 100, end: 200 }, messages: messages(100, 'b'), projectedWeight: 1 }, 300);
+    const record = store.peek('w:S1:100:200')!;
+    record.messages = null;
+    record.renderState = 'spacer';
+
+    renderer.setVisiblePages(['a', 'w:S1:100:200']);
+    (renderer as any).pendingVisiblePages = new Set(['a', 'w:S1:100:200']);
+    renderer.sampleIntent('newer');
+    renderer.flushFrameForTest();
+    await new Promise(resolve => setTimeout(resolve, 0));
+    expect(rematerializePage).toHaveBeenCalledTimes(1);
+    expect((renderer as any).visiblePages.has('w:S1:100:200')).toBe(true);
+
+    // While the load is in flight, the user scrolls: the sample still
+    // records the wrapper under the old (pre-swap) key.
+    const spacer = root.querySelector<HTMLElement>('[data-page-key="w:S1:100:200"]')!;
+    jest.spyOn(spacer, 'getBoundingClientRect').mockReturnValue({ top: 0, bottom: 100, height: 100 } as DOMRect);
+    Object.defineProperty(viewport, 'clientHeight', { configurable: true, value: 100 });
+    renderer.sampleViewport('newer');
+    expect((renderer as any).pendingVisiblePages?.has('w:S1:100:200')).toBe(true);
+
+    resolvePage({ pageKey: 'w:S2:100:200', range: { start: 100, end: 200 }, messages: messages(100, 'b2'), projectedWeight: 1 });
+    await new Promise(resolve => setTimeout(resolve, 20));
+
+    // The stale sample was dropped by the re-key; the next frame never
+    // unpinned the fresh key through the dead one.
+    expect((renderer as any).pendingVisiblePages).toBeNull();
+    expect((renderer as any).visiblePages.has('w:S2:100:200')).toBe(true);
+    expect((renderer as any).visiblePages.has('w:S1:100:200')).toBe(false);
+    expect(store.peek('w:S2:100:200')?.pins.has('visible')).toBe(true);
+  });
+
+  it('keeps the spacer when the fresh-generation key already holds a record (#7)', async () => {
+    const events: HistoryDiagnosticEvent[] = [];
+    setHistoryDiagnosticsSink(event => events.push(event));
+    try {
+      const rematerializePage = jest.fn(async () => ({
+        pageKey: 'w:S2:100:200',
+        range: { start: 100, end: 200 },
+        messages: messages(100, 'b2'),
+        projectedWeight: 1,
+      }));
+      const { renderer, store } = createHarness(300, { rematerializePage });
+      renderer.addPage({ pageKey: 'a', range: { start: 0, end: 100 }, messages: messages(100, 'a'), projectedWeight: 1 }, 300);
+      renderer.addPage({ pageKey: 'w:S1:100:200', range: { start: 100, end: 200 }, messages: messages(100, 'b'), projectedWeight: 1 }, 300);
+      const record = store.peek('w:S1:100:200')!;
+      record.messages = null;
+      record.renderState = 'spacer';
+      // The search around-window already created the same range on the
+      // fresh generation — the rename target key is occupied.
+      renderer.addPage({ pageKey: 'w:S2:100:200', range: { start: 100, end: 200 }, messages: messages(100, 'b2'), projectedWeight: 1 }, 300);
+
+      renderer.setVisiblePages(['a']);
+      (renderer as any).pendingVisiblePages = new Set(['a']);
+      renderer.sampleIntent('newer');
+      renderer.flushFrameForTest();
+      await new Promise(resolve => setTimeout(resolve, 20));
+
+      // Refused with a trace: both records survive untouched and the old
+      // spacer stays a spacer instead of merging into the occupied key.
+      expect(store.peek('w:S1:100:200')).toBe(record);
+      expect(record.renderState).toBe('spacer');
+      expect(record.messages).toBeNull();
+      expect(store.peek('w:S2:100:200')).toBeDefined();
+      expect(events).toContainEqual(expect.objectContaining({
+        kind: 'page_rematerialize_refused',
+        reason: 'rekey_conflict',
+        pageKey: 'w:S1:100:200',
+      }));
+      expect((renderer as any).rematerializations.size).toBe(0);
+    } finally {
+      setHistoryDiagnosticsSink(null);
+    }
   });
 
   it('restores page UI state after spacer remount', async () => {

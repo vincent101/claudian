@@ -1072,6 +1072,21 @@ describe('ConversationController', () => {
       expect(result?.messages[0]).toMatchObject({ content: 'full detail body', projectionLevel: 'detail' });
     });
 
+    it('accepts a generation-drifted page with an equal range and returns it under the fresh key', async () => {
+      const lease = makeLease(10);
+      deps.state.currentConversationId = 'conv';
+      deps.state.historyLease = lease;
+      // Snapshot generation swapped (search snapshot refresh): same range,
+      // new identity. The data is the only truth — accept and let the
+      // renderer re-key the record.
+      lease.loadWindow.mockResolvedValue({ messages: [{ id: 'm', role: 'user', content: 'truncated', timestamp: 1, projectionLevel: 'summary' }], range: { start: 0, end: 5 }, sourceBytes: 1, projectedChars: 1, oversizedTurnCount: 0, pageKey: 'w:S2:0:5', hasMoreBefore: false, hasMoreAfter: true });
+      lease.loadMessageDetail.mockResolvedValue({ status: 'exact', message: { id: 'm', role: 'user', content: 'full detail body', timestamp: 1, projectionLevel: 'detail' } });
+      const result = await controller.rematerializeHistoryPage({ pageKey: 'w:S1:0:5', range: { start: 0, end: 5 }, uiState: new Map([['m:detail:x', { detailLoaded: true }]]) });
+      expect(result?.pageKey).toBe('w:S2:0:5');
+      expect(lease.loadMessageDetail).toHaveBeenCalledWith('m', expect.anything());
+      expect(result?.messages[0]).toMatchObject({ content: 'full detail body', projectionLevel: 'detail' });
+    });
+
     it('refuses a mismatched page key with a refusal diagnostic naming both ranges', async () => {
       const events: HistoryDiagnosticEvent[] = [];
       setHistoryDiagnosticsSink(event => events.push(event));

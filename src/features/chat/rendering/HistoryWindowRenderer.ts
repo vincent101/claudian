@@ -458,26 +458,13 @@ export class HistoryWindowRenderer {
   }
 
   private async materialize(record: HistoryPageRecord): Promise<void> {
-    const rematerialize = this.options.rematerializePage;
     const existing = this.rematerializations.get(record.pageKey);
     if (existing) {
       await existing;
       return;
     }
-    if (!rematerialize) return;
-    const conversationId = this.options.getConversationId();
-    const domEpoch = this.options.getDomEpoch();
-    this.options.pageStore.pin(record.pageKey, 'transaction');
-    const pending = rematerialize(record).then(page => {
-      if (!page || this.disposed || conversationId !== this.options.getConversationId() || domEpoch !== this.options.getDomEpoch() || page.pageKey !== record.pageKey) return false;
-      this.options.pageStore.upsertPage(page);
-      return true;
-    }).finally(() => {
-      this.options.pageStore.unpin(record.pageKey, 'transaction');
-      this.rematerializations.delete(record.pageKey);
-    });
-    this.rematerializations.set(record.pageKey, pending);
-    await pending;
+    const pending = this.startRematerialization(record);
+    if (pending) await pending;
   }
 
   private async ensureMounted(record: HistoryPageRecord): Promise<void> {
@@ -487,30 +474,122 @@ export class HistoryWindowRenderer {
     if (record.messages === null) {
       // Data rematerialization stays outside the stored grant so a slow disk
       // load never occupies the projection write lease.
-      const rematerialize = this.options.rematerializePage;
-      if (!rematerialize || this.rematerializations.has(record.pageKey)) return;
-      this.options.pageStore.pin(record.pageKey, 'transaction');
-      const pending = rematerialize(record).then(page => {
-        if (
-          !page
-          || this.disposed
-          || conversationId !== this.options.getConversationId()
-          || domEpoch !== this.options.getDomEpoch()
-          || page.pageKey !== record.pageKey
-        ) return false;
-        this.options.pageStore.upsertPage(page);
-        return true;
-      }).finally(() => {
-        this.options.pageStore.unpin(record.pageKey, 'transaction');
-        this.rematerializations.delete(record.pageKey);
-      });
-      this.rematerializations.set(record.pageKey, pending);
-      if (!await pending) return;
+      if (!this.options.rematerializePage || this.rematerializations.has(record.pageKey)) return;
+      const pending = this.startRematerialization(record);
+      if (!pending || !await pending) return;
     }
     // F6: whether resident or just rematerialized, the DOM mount itself goes
     // through the stored write protocol — queued behind a live streaming
     // turn like the re-locate path — with the same staleness checks.
     await this.mountIfCurrent(record, { conversationId, domEpoch });
+  }
+
+  /**
+   * Shared in-flight rematerialization for both entry points (viewport
+   * materialize, search/reveal ensureMounted). The pending promise lives in
+   * the dedup map under the *requested* key: the finally block must delete
+   * by that captured key (acceptance may re-key the record, mutating
+   * record.pageKey) while the transaction unpin reads the live field —
+   * rename keeps pins on the record object, so only the live key resolves
+   * them. Swapping either side leaks the dedup entry or strands the pin.
+   */
+  private startRematerialization(record: HistoryPageRecord): Promise<boolean> | null {
+    const rematerialize = this.options.rematerializePage;
+    if (!rematerialize) return null;
+    const requestedPageKey = record.pageKey;
+    const context = {
+      conversationId: this.options.getConversationId(),
+      domEpoch: this.options.getDomEpoch(),
+    };
+    this.options.pageStore.pin(requestedPageKey, 'transaction');
+    const pending = rematerialize(record)
+      .then(page => (page ? this.acceptRematerializedPage(record, page, context) : false))
+      .finally(() => {
+        this.options.pageStore.unpin(record.pageKey, 'transaction');
+        this.rematerializations.delete(requestedPageKey);
+      });
+    this.rematerializations.set(requestedPageKey, pending);
+    return pending;
+  }
+
+  /**
+   * Accepts a rematerialized window. A drifted key with an equal range is a
+   * snapshot-generation swap (search snapshot refresh exchanged the lease):
+   * the data is the only truth, so the record is re-keyed in place. A
+   * drifted key with a different range means the loaded window genuinely is
+   * not the requested one (planner shrink or snapshot fork) — refuse,
+   * keep the spacer, leave a trace.
+   */
+  private acceptRematerializedPage(
+    record: HistoryPageRecord,
+    page: HistoryPageInput,
+    context: { conversationId: string | null; domEpoch: number },
+  ): boolean {
+    if (this.disposed
+      || context.conversationId !== this.options.getConversationId()
+      || context.domEpoch !== this.options.getDomEpoch()) return false;
+    if (page.pageKey !== record.pageKey) {
+      if (page.range.start !== record.range.start || page.range.end !== record.range.end) {
+        recordHistoryDiagnosticEvent({
+          kind: 'page_rematerialize_refused',
+          pageKey: record.pageKey,
+          reason: 'range_mismatch',
+          rangeStart: record.range.start,
+          rangeEnd: record.range.end,
+          actualRangeStart: page.range.start,
+          actualRangeEnd: page.range.end,
+        });
+        return false;
+      }
+      if (!this.rekeyPage(record.pageKey, page.pageKey)) {
+        // The fresh key already holds a record (e.g. the search around-window
+        // pre-created the same range on the new generation): keep the old
+        // spacer rather than merging two windows into one key.
+        recordHistoryDiagnosticEvent({
+          kind: 'page_rematerialize_refused',
+          pageKey: record.pageKey,
+          reason: 'rekey_conflict',
+          rangeStart: record.range.start,
+          rangeEnd: record.range.end,
+          actualRangeStart: page.range.start,
+          actualRangeEnd: page.range.end,
+        });
+        return false;
+      }
+    }
+    this.options.pageStore.upsertPage(page);
+    return true;
+  }
+
+  /**
+   * Re-keys a page record after a snapshot-generation swap: same range, new
+   * identity. The wrapper element (spacer or mounted page) keeps its DOM
+   * position and height — re-keying only swaps bookkeeping keys, so there
+   * is no scroll jump. visiblePages/adjacentPages must follow the record or
+   * mountTargetPages would query the store by a dead key forever.
+   */
+  private rekeyPage(oldKey: string, newKey: string): boolean {
+    const renamed = this.options.pageStore.renamePage(oldKey, newKey);
+    if (!renamed) return false;
+    const wrapper = this.wrappers.get(oldKey);
+    if (wrapper) {
+      this.wrappers.delete(oldKey);
+      wrapper.dataset.pageKey = newKey;
+      this.wrappers.set(newKey, wrapper);
+    }
+    for (const set of [this.visiblePages, this.adjacentPages]) {
+      if (set.delete(oldKey)) set.add(newKey);
+    }
+    // Drop the in-flight viewport sample: it lists the dead key and the
+    // next frame's processIntent would unpin the re-keyed record through it.
+    this.pendingVisiblePages = null;
+    recordHistoryDiagnosticEvent({
+      kind: 'page_rekeyed',
+      pageKey: newKey,
+      previousPageKey: oldKey,
+      turns: renamed.range.end - renamed.range.start,
+    });
+    return true;
   }
 
   private async mountIfCurrent(

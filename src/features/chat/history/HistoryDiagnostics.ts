@@ -30,15 +30,14 @@ export type HistoryDiagnosticEvent =
   /**
    * A rematerialized window was refused: `range_mismatch` means the loaded
    * window does not equal the requested range (planner shrink or snapshot
-   * fork — the permanent hole, now traced); `key_drift` is a pure identity
-   * drift that the controller still refuses pre-rekey-support; `rekey_conflict`
-   * means the fresh-generation key already holds a record, so the spacer
-   * stays rather than merging two windows into one key.
+   * fork — the permanent hole, now traced); `rekey_conflict` means the
+   * fresh-generation key already holds a record, so the spacer stays
+   * rather than merging two windows into one key.
    */
   | {
     kind: 'page_rematerialize_refused';
     pageKey: string;
-    reason: 'key_drift' | 'range_mismatch' | 'rekey_conflict';
+    reason: 'range_mismatch' | 'rekey_conflict';
     rangeStart: number;
     rangeEnd: number;
     actualRangeStart: number;

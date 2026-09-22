@@ -37,7 +37,7 @@ export interface TranscriptDiagnosticEvent {
   errorName?: string;
   buildId?: string;
   mode?: 'worker' | 'direct';
-  reason?: 'oversized' | 'malformed' | 'no_conversation' | 'no_lease' | 'provider_without_index' | 'stale' | 'identity_missing' | 'alias_remap' | 'canonical_rebind' | 'key_drift' | 'range_mismatch' | 'rekey_conflict';
+  reason?: 'oversized' | 'malformed' | 'no_conversation' | 'no_lease' | 'provider_without_index' | 'stale' | 'identity_missing' | 'alias_remap' | 'canonical_rebind' | 'range_mismatch' | 'rekey_conflict';
   outcome?: 'rebuilt' | 'cache_hit' | 'not_applicable' | 'failed';
   /** Which surface forced a search snapshot refresh (search panel default). */
   trigger?: 'search' | 'rewind' | 'fork';

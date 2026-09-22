@@ -364,19 +364,22 @@ export class ConversationController {
     if (page.pageKey !== record.pageKey) {
       // The pageKey guard protects against a window that is not the window
       // we asked for. A pure identity drift (equal range, new snapshot
-      // generation after a search snapshot refresh) is still refused here —
-      // tracing first, structural acceptance follows with renderer re-key.
-      const rangeMismatch = page.range.start !== record.range.start || page.range.end !== record.range.end;
-      recordHistoryDiagnosticEvent({
-        kind: 'page_rematerialize_refused',
-        pageKey: record.pageKey,
-        reason: rangeMismatch ? 'range_mismatch' : 'key_drift',
-        rangeStart: record.range.start,
-        rangeEnd: record.range.end,
-        actualRangeStart: page.range.start,
-        actualRangeEnd: page.range.end,
-      });
-      return null;
+      // generation after a search snapshot refresh) is not an error: the
+      // exchanged lease is the only truth, so the data is accepted and the
+      // renderer re-keys the record onto the fresh key. A range mismatch
+      // (planner shrink or snapshot fork) is a real refusal, traced.
+      if (page.range.start !== record.range.start || page.range.end !== record.range.end) {
+        recordHistoryDiagnosticEvent({
+          kind: 'page_rematerialize_refused',
+          pageKey: record.pageKey,
+          reason: 'range_mismatch',
+          rangeStart: record.range.start,
+          rangeEnd: record.range.end,
+          actualRangeStart: page.range.start,
+          actualRangeEnd: page.range.end,
+        });
+        return null;
+      }
     }
     const details = new Map<string, ChatMessage>();
     for (const messageId of new Set(detailMessageIds)) {
