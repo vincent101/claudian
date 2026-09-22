@@ -360,7 +360,24 @@ export class ConversationController {
       projectionLevel: 'summary',
       maxTurn: record.range.end,
     });
-    if (conversationId !== this.deps.state.currentConversationId || page.pageKey !== record.pageKey) return null;
+    if (conversationId !== this.deps.state.currentConversationId) return null;
+    if (page.pageKey !== record.pageKey) {
+      // The pageKey guard protects against a window that is not the window
+      // we asked for. A pure identity drift (equal range, new snapshot
+      // generation after a search snapshot refresh) is still refused here —
+      // tracing first, structural acceptance follows with renderer re-key.
+      const rangeMismatch = page.range.start !== record.range.start || page.range.end !== record.range.end;
+      recordHistoryDiagnosticEvent({
+        kind: 'page_rematerialize_refused',
+        pageKey: record.pageKey,
+        reason: rangeMismatch ? 'range_mismatch' : 'key_drift',
+        rangeStart: record.range.start,
+        rangeEnd: record.range.end,
+        actualRangeStart: page.range.start,
+        actualRangeEnd: page.range.end,
+      });
+      return null;
+    }
     const details = new Map<string, ChatMessage>();
     for (const messageId of new Set(detailMessageIds)) {
       const result = await lease.loadMessageDetail(messageId, { maxSourceBytes: 16 * 1024 * 1024 });

@@ -42,6 +42,40 @@ describe('mapHistoryDiagnosticEvent', () => {
     expect(JSON.stringify(mapped)).not.toContain(pageKey);
   });
 
+  it('maps page_rekeyed with both page keys hashed', () => {
+    const pageKey = '/Users/me/.claude/projects/vault/transcript.jsonl:1200:1700000003';
+    const previousPageKey = '/Users/me/.claude/projects/vault/transcript.jsonl:1200:1600000003';
+    const mapped = mapHistoryDiagnosticEvent(
+      { kind: 'page_rekeyed', pageKey, previousPageKey, turns: 5 },
+      hashId,
+    );
+    expect(mapped).toEqual({
+      phase: 'page_rekeyed',
+      pageKeyHash: hashId(pageKey),
+      previousPageKeyHash: hashId(previousPageKey),
+      turns: 5,
+    });
+    expect(JSON.stringify(mapped)).not.toContain(pageKey);
+    expect(JSON.stringify(mapped)).not.toContain(previousPageKey);
+  });
+
+  it('maps page_rematerialize_refused with request ranges and the actual turn count', () => {
+    const pageKey = '/Users/me/.claude/projects/vault/transcript.jsonl:1200:1700000004';
+    const mapped = mapHistoryDiagnosticEvent(
+      { kind: 'page_rematerialize_refused', pageKey, reason: 'range_mismatch', rangeStart: 10, rangeEnd: 15, actualRangeStart: 10, actualRangeEnd: 13 },
+      hashId,
+    );
+    expect(mapped).toEqual({
+      phase: 'page_rematerialize_refused',
+      pageKeyHash: hashId(pageKey),
+      reason: 'range_mismatch',
+      rangeStart: 10,
+      rangeEnd: 15,
+      turnCount: 3,
+    });
+    expect(JSON.stringify(mapped)).not.toContain(pageKey);
+  });
+
   it('maps events without a page key unchanged', () => {
     expect(
       mapHistoryDiagnosticEvent({ kind: 'render_batch', mounted: 3, total: 10, elapsedMs: 5 }, hashId),

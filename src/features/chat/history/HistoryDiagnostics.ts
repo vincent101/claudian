@@ -21,6 +21,29 @@ export type HistoryDiagnosticEvent =
    * never be reloaded from its stale disk source (F1).
    */
   | { kind: 'memory_only_rematerialize'; pageKey: string }
+  /**
+   * A spacer record was re-keyed onto the current snapshot generation
+   * (same range, new identity) after a search snapshot refresh exchanged
+   * the lease. The wrapper, height, and UI state survive in place.
+   */
+  | { kind: 'page_rekeyed'; pageKey: string; previousPageKey: string; turns: number }
+  /**
+   * A rematerialized window was refused: `range_mismatch` means the loaded
+   * window does not equal the requested range (planner shrink or snapshot
+   * fork — the permanent hole, now traced); `key_drift` is a pure identity
+   * drift that the controller still refuses pre-rekey-support; `rekey_conflict`
+   * means the fresh-generation key already holds a record, so the spacer
+   * stays rather than merging two windows into one key.
+   */
+  | {
+    kind: 'page_rematerialize_refused';
+    pageKey: string;
+    reason: 'key_drift' | 'range_mismatch' | 'rekey_conflict';
+    rangeStart: number;
+    rangeEnd: number;
+    actualRangeStart: number;
+    actualRangeEnd: number;
+  }
   | {
     kind: 'search_snapshot_refresh';
     outcome: HistorySearchSnapshotRefreshOutcome;

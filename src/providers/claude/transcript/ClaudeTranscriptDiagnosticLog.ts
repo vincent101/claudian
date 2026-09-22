@@ -14,6 +14,7 @@ export type TranscriptDiagnosticPhase =
   | 'line_skipped' | 'partial_snapshot' | 'stale_partial_segment'
   | 'page_render_timeout' | 'page_data_overcommit' | 'dom_overcommit'
   | 'search_snapshot_refresh' | 'memory_only_rematerialize'
+  | 'page_rekeyed' | 'page_rematerialize_refused'
   | 'turn_identity_reserved' | 'turn_identity_dispatched' | 'turn_identity_matched'
   | 'turn_identity_host_only' | 'turn_identity_observer_only'
   | 'turn_identity_duplicate' | 'turn_identity_conflict';
@@ -23,6 +24,9 @@ export interface TranscriptDiagnosticEvent {
   tabIdHash?: string;
   turnIdHash?: string;
   pageKeyHash?: string;
+  previousPageKeyHash?: string;
+  rangeStart?: number;
+  rangeEnd?: number;
   generation?: number;
   renderTicket?: number;
   projectedWeight?: number;
@@ -33,7 +37,7 @@ export interface TranscriptDiagnosticEvent {
   errorName?: string;
   buildId?: string;
   mode?: 'worker' | 'direct';
-  reason?: 'oversized' | 'malformed' | 'no_conversation' | 'no_lease' | 'provider_without_index' | 'stale' | 'identity_missing' | 'alias_remap' | 'canonical_rebind';
+  reason?: 'oversized' | 'malformed' | 'no_conversation' | 'no_lease' | 'provider_without_index' | 'stale' | 'identity_missing' | 'alias_remap' | 'canonical_rebind' | 'key_drift' | 'range_mismatch' | 'rekey_conflict';
   outcome?: 'rebuilt' | 'cache_hit' | 'not_applicable' | 'failed';
   /** Which surface forced a search snapshot refresh (search panel default). */
   trigger?: 'search' | 'rewind' | 'fork';
@@ -101,7 +105,7 @@ export class ClaudeTranscriptDiagnosticLog {
 
   private serialize(event: TranscriptDiagnosticEvent): string {
     const clean: Record<string, unknown> = { ts: Date.now(), seq: ++this.seq, phase: event.phase };
-    for (const key of ['tabIdHash', 'turnIdHash', 'pageKeyHash', 'generation', 'renderTicket', 'projectedWeight', 'leaseKind', 'batchBytes', 'batchLines', 'elapsedMs', 'errorName', 'buildId', 'mode', 'reason', 'outcome', 'trigger', 'identityRecovery', 'recoveredIdentityFields', 'offset', 'queueMs', 'bytes', 'totalBytes', 'entries', 'turns', 'turnCount', 'sourceBytes', 'projectedChars', 'oversizedTurns', 'hostAliases', 'sourceKind'] as const) {
+    for (const key of ['tabIdHash', 'turnIdHash', 'pageKeyHash', 'previousPageKeyHash', 'rangeStart', 'rangeEnd', 'generation', 'renderTicket', 'projectedWeight', 'leaseKind', 'batchBytes', 'batchLines', 'elapsedMs', 'errorName', 'buildId', 'mode', 'reason', 'outcome', 'trigger', 'identityRecovery', 'recoveredIdentityFields', 'offset', 'queueMs', 'bytes', 'totalBytes', 'entries', 'turns', 'turnCount', 'sourceBytes', 'projectedChars', 'oversizedTurns', 'hostAliases', 'sourceKind'] as const) {
       const value = event[key];
       if (value !== undefined) clean[key] = typeof value === 'string' ? value.slice(0, 128) : value;
     }

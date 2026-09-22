@@ -55,6 +55,33 @@ describe('ClaudeTranscriptDiagnosticLog', () => {
     expect(content).not.toContain(pageKey);
   });
 
+  it('persists re-key and refusal diagnostics through the serialization whitelist', async () => {
+    // The mapper hands these events over with previousPageKeyHash/rangeStart/
+    // rangeEnd; the serialization key whitelist must carry them to disk or
+    // they are silently dropped (matrix #7 visibility).
+    const log = new ClaudeTranscriptDiagnosticLog(vault);
+    log.record({
+      phase: 'page_rekeyed',
+      pageKeyHash: log.hashId('w:S2:0:5'),
+      previousPageKeyHash: log.hashId('w:S1:0:5'),
+      turns: 5,
+    });
+    log.record({
+      phase: 'page_rematerialize_refused',
+      pageKeyHash: log.hashId('w:S1:0:5'),
+      reason: 'range_mismatch',
+      rangeStart: 0,
+      rangeEnd: 5,
+      turnCount: 3,
+    });
+    const content = await readFile(join(vault, '.claudian/diagnostics/transcript-tail.current.jsonl'), 'utf8');
+    expect(content).toContain('"phase":"page_rekeyed"');
+    expect(content).toContain('"previousPageKeyHash":');
+    expect(content).toContain('"phase":"page_rematerialize_refused"');
+    expect(content).toContain('"rangeStart":0');
+    expect(content).toContain('"rangeEnd":5');
+  });
+
   it('keeps each serialized event within one kilobyte', async () => {
     const log = new ClaudeTranscriptDiagnosticLog(vault);
     log.record({ phase: 'callback_error', errorName: 'X'.repeat(10_000) });

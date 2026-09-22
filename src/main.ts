@@ -74,6 +74,22 @@ export function mapHistoryDiagnosticEvent(
       return { phase: event.kind, outcome: event.outcome, reason: event.reason, trigger: event.trigger, elapsedMs: event.elapsedMs };
     case 'memory_only_rematerialize':
       return { phase: event.kind, pageKeyHash: hashId(event.pageKey) };
+    case 'page_rekeyed':
+      return {
+        phase: event.kind,
+        pageKeyHash: hashId(event.pageKey),
+        previousPageKeyHash: hashId(event.previousPageKey),
+        turns: event.turns,
+      };
+    case 'page_rematerialize_refused':
+      return {
+        phase: event.kind,
+        pageKeyHash: hashId(event.pageKey),
+        reason: event.reason,
+        rangeStart: event.rangeStart,
+        rangeEnd: event.rangeEnd,
+        turnCount: event.actualRangeEnd - event.actualRangeStart,
+      };
     case 'dom_overcommit':
       return { phase: event.kind, pageKeyHash: hashId(event.pageKey), turns: event.turns };
     default: {

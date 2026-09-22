@@ -1072,6 +1072,32 @@ describe('ConversationController', () => {
       expect(result?.messages[0]).toMatchObject({ content: 'full detail body', projectionLevel: 'detail' });
     });
 
+    it('refuses a mismatched page key with a refusal diagnostic naming both ranges', async () => {
+      const events: HistoryDiagnosticEvent[] = [];
+      setHistoryDiagnosticsSink(event => events.push(event));
+      try {
+        const lease = makeLease(10);
+        deps.state.currentConversationId = 'conv';
+        deps.state.historyLease = lease;
+        // Planner shrink: the returned window {0,3} does not cover the
+        // requested {0,5} — the guard must refuse and leave a trace.
+        lease.loadWindow.mockResolvedValue({ messages: [{ id: 'm', role: 'user', content: 'x', timestamp: 1 }], range: { start: 0, end: 3 }, sourceBytes: 1, projectedChars: 1, oversizedTurnCount: 0, pageKey: 'w:S2:0:3', hasMoreBefore: false, hasMoreAfter: true });
+        const result = await controller.rematerializeHistoryPage({ pageKey: 'w:S1:0:5', range: { start: 0, end: 5 }, uiState: new Map() });
+        expect(result).toBeNull();
+        expect(lease.loadMessageDetail).not.toHaveBeenCalled();
+        expect(events).toContainEqual(expect.objectContaining({
+          kind: 'page_rematerialize_refused',
+          reason: 'range_mismatch',
+          rangeStart: 0,
+          rangeEnd: 5,
+          actualRangeStart: 0,
+          actualRangeEnd: 3,
+        }));
+      } finally {
+        setHistoryDiagnosticsSink(null);
+      }
+    });
+
     it('refuses rematerialization of a memory-only page with a diagnostic, never reading the stale index (F1)', async () => {
       const events: HistoryDiagnosticEvent[] = [];
       setHistoryDiagnosticsSink(event => events.push(event));
