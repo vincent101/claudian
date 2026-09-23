@@ -261,11 +261,10 @@ export class HistorySearchController {
     // 'fresh' and no stale hint. The join only waits: the initiator (the
     // idle branch below or refreshSnapshotAndRerun) owns the state writes and
     // the UI, and a failed refresh keeps the old snapshot searchable, so the
-    // rejection is swallowed here. If the join lands while the state is still
-    // 'idle' (a stream-completion refresh racing the debounced first query),
-    // the idle branch may acquire again — refreshSnapshotOnce dedupes while
-    // in flight; after a settle it rebuilds once more, wasted work but
-    // correct.
+    // rejection is swallowed here. Reaction order guarantees the initiator's
+    // await registers before any joiner's, so it resumes first and writes the
+    // state ('fresh'/'stale', or nothing once the panel closed — the joiner's
+    // own guards return then) — a joiner never sees 'idle' after the join.
     if (this.refreshInFlight) {
       try {
         await this.refreshInFlight;
