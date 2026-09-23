@@ -251,6 +251,30 @@ export class HistorySearchController {
   private async runSearch(generation: number, preserveCurrent = false): Promise<void> {
     const conversationId = this.deps.getConversationId(); const query = this.input?.value.trim() ?? ''; this.clearHighlights();
     if (!conversationId || !query) { this.results = []; this.selectedIndex = -1; this.renderStatus(); return; }
+    // A query racing an in-flight refresh must not read the pre-exchange
+    // lease: searchHistory resolves against the conversation's lease at call
+    // time, so an un-joined follow-up query — a second debounced keystroke
+    // during the idle rebind, or any keystroke during a stream-completion
+    // refresh, which never enters 'refreshing' — searches the stale snapshot
+    // while the refresh's own re-run dies on the keystroke's generation bump.
+    // Stale results would then strand on screen with the state ending
+    // 'fresh' and no stale hint. The join only waits: the initiator (the
+    // idle branch below or refreshSnapshotAndRerun) owns the state writes and
+    // the UI, and a failed refresh keeps the old snapshot searchable, so the
+    // rejection is swallowed here. If the join lands while the state is still
+    // 'idle' (a stream-completion refresh racing the debounced first query),
+    // the idle branch may acquire again — refreshSnapshotOnce dedupes while
+    // in flight; after a settle it rebuilds once more, wasted work but
+    // correct.
+    if (this.refreshInFlight) {
+      try {
+        await this.refreshInFlight;
+      } catch {
+        // The initiator records the outcome; this query proceeds on the old
+        // snapshot.
+      }
+      if (generation !== this.generation || !this.panel) return;
+    }
     // Rebind once per open before the first real query: the tab's fixed
     // snapshot predates the panel and may miss turns that finished while the
     // panel was closed. A failed refresh keeps the old snapshot searchable

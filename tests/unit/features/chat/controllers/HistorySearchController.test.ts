@@ -625,6 +625,132 @@ describe('HistorySearchController', () => {
         expect(searchHistory).toHaveBeenCalledTimes(1);
         expect(staleEl()).toBeNull();
       });
+
+      describe('query joins an in-flight refresh', () => {
+        beforeEach(() => {
+          locate.mockImplementation(async searchResult => {
+            const element = messages.querySelector<HTMLElement>(`[data-message-id="${searchResult.projectionKey}"]`);
+            // jsdom does not implement scrollIntoView; production only needs it to exist.
+            if (element) element.scrollIntoView = () => {};
+            return element;
+          });
+        });
+
+        // clearHighlights leaves split adjacent text nodes behind (an unmark
+        // is a replaceWith(text), never a node merge), so a message marked,
+        // unmarked, and marked again can carry a match split across two
+        // <mark> elements. Counting marks exactly is therefore brittle;
+        // assert which messages carry marks instead.
+        const markedMessageIds = (): string[] => Array.from(messages.querySelectorAll<HTMLElement>('[data-message-id]'))
+          .filter(element => element.querySelector('mark') !== null)
+          .map(element => element.dataset.messageId ?? '');
+
+        it('holds a follow-up query until the first-query rebind finishes instead of reading the pre-exchange lease', async () => {
+          mountMessage('m1', 'reviewer one');
+          mountMessage('m2', 'reviewer two');
+          mountMessage('m3', 'reviewer three');
+          let snapshotSwapped = false;
+          let releaseRefresh!: () => void;
+          refreshSnapshot.mockImplementationOnce(() => new Promise<{ status: 'rebuilt' }>(resolve => {
+            releaseRefresh = () => { snapshotSwapped = true; resolve({ status: 'rebuilt' }); };
+          }));
+          searchHistory.mockImplementation(async () => (
+            snapshotSwapped ? [result('m1'), result('m2'), result('m3')] : [result('m1')]
+          ));
+          const instance = makeController();
+          instance.open();
+          const input = root.querySelector('input') as HTMLInputElement;
+
+          input.value = 'revi';
+          input.dispatchEvent(new Event('input'));
+          await jest.advanceTimersByTimeAsync(300);
+          // The user keeps typing while the rebind acquire is still in flight.
+          input.value = 'reviewer';
+          input.dispatchEvent(new Event('input'));
+          await jest.advanceTimersByTimeAsync(300);
+
+          // The follow-up query must wait for the exchange: searching now
+          // reads the pre-open lease, and the rebind's own re-run dies on
+          // this keystroke's generation bump — stale results would strand
+          // on screen with the state ending 'fresh' and no stale hint.
+          expect(searchHistory).not.toHaveBeenCalled();
+
+          releaseRefresh();
+          await settle();
+
+          // The surviving query ran once, after the exchange, on the new
+          // snapshot: all three messages carry marks.
+          expect(searchHistory).toHaveBeenCalledTimes(1);
+          expect(searchHistory).toHaveBeenCalledWith('conversation', 'reviewer', expect.any(Function));
+          expect(markedMessageIds()).toEqual(['m1', 'm2', 'm3']);
+        });
+
+        it('holds a mid-acquire query during a stream-completion refresh that never enters the refreshing state', async () => {
+          mountMessage('m1', 'reviewers one');
+          mountMessage('m2', 'reviewers two');
+          mountMessage('m3', 'reviewers three');
+          const instance = makeController();
+          instance.open();
+          await typeQuery(instance, 'reviewer');
+          expect(searchHistory).toHaveBeenCalledTimes(1);
+
+          let snapshotSwapped = false;
+          let releaseRefresh!: () => void;
+          refreshSnapshot.mockImplementationOnce(() => new Promise<{ status: 'rebuilt' }>(resolve => {
+            releaseRefresh = () => { snapshotSwapped = true; resolve({ status: 'rebuilt' }); };
+          }));
+          searchHistory.mockImplementation(async () => (
+            snapshotSwapped ? [result('m1'), result('m2'), result('m3')] : [result('m1')]
+          ));
+          // A stream lands: the acquire runs while the state stays 'fresh'.
+          instance.onStreamComplete();
+          const input = root.querySelector('input') as HTMLInputElement;
+          input.value = 'reviewers';
+          input.dispatchEvent(new Event('input'));
+          await jest.advanceTimersByTimeAsync(300);
+
+          // Without the join this query reads the pre-exchange lease and the
+          // refresh's re-run dies on the keystroke's generation bump.
+          expect(searchHistory).toHaveBeenCalledTimes(1);
+
+          releaseRefresh();
+          await settle();
+
+          expect(searchHistory).toHaveBeenCalledTimes(2);
+          expect(searchHistory).toHaveBeenLastCalledWith('conversation', 'reviewers', expect.any(Function));
+          expect(markedMessageIds()).toEqual(['m1', 'm2', 'm3']);
+        });
+
+        it('keeps searching the old snapshot when the joined refresh rejects, with the stale hint instead of an error', async () => {
+          mountMessage('m1', 'reviewers one');
+          mountMessage('m2', 'reviewers two');
+          const instance = makeController();
+          instance.open();
+          await typeQuery(instance, 'reviewer');
+          expect(searchHistory).toHaveBeenCalledTimes(1);
+
+          let rejectRefresh!: (error: Error) => void;
+          refreshSnapshot.mockImplementationOnce(() => new Promise((_resolve, reject) => { rejectRefresh = reject; }));
+          instance.onStreamComplete();
+          const input = root.querySelector('input') as HTMLInputElement;
+          input.value = 'reviewers';
+          input.dispatchEvent(new Event('input'));
+          await jest.advanceTimersByTimeAsync(300);
+
+          // The query joined the failing acquire instead of racing past it.
+          expect(searchHistory).toHaveBeenCalledTimes(1);
+
+          rejectRefresh(new Error('index build failed'));
+          await settle();
+
+          // The join swallowed the rejection: the query still ran on the old
+          // snapshot and the initiator surfaced the stale hint, not an error.
+          expect(searchHistory).toHaveBeenCalledTimes(2);
+          expect(searchHistory).toHaveBeenLastCalledWith('conversation', 'reviewers', expect.any(Function));
+          expect(staleEl()).not.toBeNull();
+          expect(root.querySelector('.claudian-history-search-error')).toBeNull();
+        });
+      });
     });
   });
 });
