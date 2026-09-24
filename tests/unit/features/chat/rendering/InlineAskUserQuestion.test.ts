@@ -556,6 +556,41 @@ describe('InlineAskUserQuestion', () => {
     });
   });
 
+  describe('resolveExternal (relay channel B, first-settled race)', () => {
+    it('resolves with the external answers, one-shot', () => {
+      const input = makeInput([{ question: 'Pick', options: ['A', 'B'] }]);
+      const { resolve, widget } = renderWidget(input);
+
+      widget.resolveExternal({ Pick: 'B' });
+      widget.resolveExternal({ Pick: 'A' });
+
+      expect(resolve).toHaveBeenCalledTimes(1);
+      expect(resolve).toHaveBeenCalledWith({ Pick: 'B' });
+    });
+
+    it('resolves null (deny) when externally cancelled', () => {
+      const input = makeInput([{ question: 'Pick', options: ['A'] }]);
+      const { resolve, widget } = renderWidget(input);
+
+      widget.resolveExternal(null);
+
+      expect(resolve).toHaveBeenCalledWith(null);
+    });
+
+    it('a late resolveExternal after a desktop answer is a silent no-op', () => {
+      const input = makeInput([{ question: 'Pick', options: ['A'] }]);
+      const { container, resolve, widget } = renderWidget(input);
+
+      const root = findRoot(container);
+      fireKeyDown(root, 'Escape');
+      expect(resolve).toHaveBeenCalledTimes(1);
+
+      widget.resolveExternal({ Pick: 'B' });
+      expect(resolve).toHaveBeenCalledTimes(1);
+      expect(resolve).toHaveBeenCalledWith(null);
+    });
+  });
+
   describe('keyboard navigation', () => {
     it('Escape resolves null', () => {
       const input = makeInput([{ question: 'Q', options: ['A', 'B'] }]);

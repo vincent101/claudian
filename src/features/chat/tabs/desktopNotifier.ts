@@ -9,21 +9,24 @@ export type BackgroundTabNotification = {
   /** 1-based tab position as shown in the tab bar. */
   tabIndex: number;
   tabTitle: string;
+  /** Optional detail line (ask summary + relay nonce) for ask-pending notifications. */
+  detail?: string;
 };
 
 const NOTIFICATION_TITLE = 'Claudian';
 
 /**
- * Notifies the desktop OS that a background tab crossed a state edge
- * (needs response / finished streaming). Permission and settings gating lives
- * here so TabManager stays free of notification policy; failures are silent
- * because notifications must never break the chat state flow.
+ * Notifies the desktop OS that a tab crossed a state edge (needs response /
+ * finished streaming). Permission and settings gating lives here so
+ * TabManager stays free of notification policy; failures are silent because
+ * notifications must never break the chat state flow.
  */
 export function notifyBackgroundTabStateChange({
   plugin,
   kind,
   tabIndex,
   tabTitle,
+  detail,
 }: BackgroundTabNotification): void {
   // Undefined means "default on" so pre-existing settings files keep notifying.
   if (plugin.settings.desktopNotifications === false) {
@@ -34,12 +37,14 @@ export function notifyBackgroundTabStateChange({
     return;
   }
 
-  const body = t(
-    kind === 'needsAttention'
-      ? 'chat.notifications.needsAttention'
-      : 'chat.notifications.streamComplete',
-    { index: tabIndex, title: tabTitle },
-  );
+  const body = detail !== undefined
+    ? t('chat.notifications.needsAttentionDetail', { index: tabIndex, title: tabTitle, detail })
+    : t(
+      kind === 'needsAttention'
+        ? 'chat.notifications.needsAttention'
+        : 'chat.notifications.streamComplete',
+      { index: tabIndex, title: tabTitle },
+    );
 
   try {
     new Notification(NOTIFICATION_TITLE, { body, silent: true });

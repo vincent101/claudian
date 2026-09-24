@@ -35,6 +35,7 @@ import {
 import type { ChatViewPlacement, EnvironmentScope } from './core/types/settings';
 import { ClaudianView } from './features/chat/ClaudianView';
 import { type HistoryDiagnosticEvent, setHistoryDiagnosticsSink } from './features/chat/history/HistoryDiagnostics';
+import { cleanupAskRelayFiles } from './features/chat/services/AskRelayService';
 import { ConversationOpenRegistry } from './features/chat/tabs/ConversationOpenRegistry';
 import { type InlineEditContext, InlineEditModal } from './features/inline-edit/ui/InlineEditModal';
 import { ClaudianSettingTab } from './features/settings/ClaudianSettings';
@@ -118,6 +119,10 @@ export default class ClaudianPlugin extends Plugin {
       setHistoryDiagnosticsSink(event => {
         renderDiagnostics.record(mapHistoryDiagnosticEvent(event, id => renderDiagnostics.hashId(id)));
       });
+      // Startup orphan sweep: plugin start can never inherit a live pending
+      // ask (the SDK connection dropped with the previous process aborted any
+      // turn), so every ask-relay file from a previous run is stale.
+      cleanupAskRelayFiles(vaultPath);
     }
 
     this.registerView(

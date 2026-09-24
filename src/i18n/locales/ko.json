@@ -75,6 +75,7 @@
     },
     "notifications": {
       "needsAttention": "Tab {index} \"{title}\" needs your response",
+      "needsAttentionDetail": "Tab {index} \"{title}\" is asking: {detail}",
       "streamComplete": "Tab {index} \"{title}\" finished. Ready for review."
     },
     "ask": {

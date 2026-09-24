@@ -52,6 +52,7 @@ export type TranslationKey =
 
   // Chat - Desktop notifications
   | 'chat.notifications.needsAttention'
+  | 'chat.notifications.needsAttentionDetail'
   | 'chat.notifications.streamComplete'
 
   // Chat - Cancel settle-down

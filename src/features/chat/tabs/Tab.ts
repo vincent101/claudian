@@ -41,6 +41,7 @@ import { MessageRenderer } from '../rendering/MessageRenderer';
 import { ProjectionWriteCoordinator } from '../rendering/ProjectionWriteCoordinator';
 import { cleanupThinkingBlock } from '../rendering/ThinkingBlockRenderer';
 import { findRewindContext } from '../rewind';
+import { type AskRelayPendingInfo,AskRelayService } from '../services/AskRelayService';
 import { BangBashService } from '../services/BangBashService';
 import { SubagentManager } from '../services/SubagentManager';
 import { ChatState } from '../state/ChatState';
@@ -119,6 +120,7 @@ export interface TabCreateOptions {
   onTitleChanged?: (title: string) => void;
   onAttentionChanged?: (needsAttention: boolean) => void;
   onConversationIdChanged?: (conversationId: string | null) => void;
+  onAskAttentionTimeout?: (pending: AskRelayPendingInfo) => void;
 }
 
 export { getTabProviderId } from './providerResolution';
@@ -364,6 +366,7 @@ export function createTab(options: TabCreateOptions): TabData {
     onTurnCompleted,
     onAttentionChanged,
     onConversationIdChanged,
+    onAskAttentionTimeout,
   } = options;
 
   const id = tabId ?? generateTabId();
@@ -452,6 +455,7 @@ export function createTab(options: TabCreateOptions): TabData {
     renderer: null,
     lastNotifiedCompletedTurnId: null,
     onTurnCompleted,
+    onAskAttentionTimeout,
   };
 
   return tab;
@@ -1231,6 +1235,20 @@ export function initializeTabControllers(
 
   const { dom, state, services, ui } = tab;
 
+  // Channel B for user-turn asks: file-protocol relay under the vault's
+  // .claudian/ask-relay/ so a phone (dxchannel + ask_relay.py) can answer a
+  // pending ask while the desktop card stays live. Null vault path (non-
+  // filesystem adapter) simply leaves the relay disarmed.
+  services.askRelay = new AskRelayService({
+    getVaultPath: () => getVaultPath(plugin.app),
+    generateId: generateMessageId,
+    // Channel-level void diagnostic: the per-arm hook (InputController) has
+    // already cancelled the attention notification; this logs the void.
+    onInvalidated: () => {
+      console.warn('[Claudian] ask relay channel voided after repeated nonce failures');
+    },
+  });
+
   // Create renderer
   tab.renderer = new MessageRenderer(
     plugin,
@@ -1527,6 +1545,8 @@ export function initializeTabControllers(
     getSubagentManager: () => services.subagentManager,
     getTabProviderId: () => getTabProviderId(tab, plugin),
     onTurnCompleted: event => tab.onTurnCompleted?.(event),
+    getAskRelay: () => tab.services.askRelay ?? null,
+    onAskAttentionTimeout: pending => tab.onAskAttentionTimeout?.(pending),
     ensureServiceInitialized: async () => {
       if (tab.serviceInitialized && tab.lifecycleState === 'bound_active') {
         return true;

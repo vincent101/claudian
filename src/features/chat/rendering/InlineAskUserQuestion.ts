@@ -1,4 +1,5 @@
 import type { AskUserQuestionItem, AskUserQuestionOption } from '../../../core/types/tools';
+import { normalizeAskQuestions } from './askQuestions';
 
 const HINTS_TEXT = 'Enter to select \u00B7 Tab/Arrow keys to navigate \u00B7 Esc to cancel';
 const HINTS_TEXT_IMMEDIATE = 'Enter to select \u00B7 Arrow keys to navigate \u00B7 Esc to cancel';
@@ -72,7 +73,7 @@ export class InlineAskUserQuestion {
       this.rootEl.appendChild(this.config.headerEl);
     }
 
-    this.questions = this.parseQuestions();
+    this.questions = normalizeAskQuestions(this.input);
 
     if (this.questions.length === 0) {
       this.handleResolve(null);
@@ -114,69 +115,14 @@ export class InlineAskUserQuestion {
     this.handleResolve(null);
   }
 
-  private parseQuestions(): AskUserQuestionItem[] {
-    const raw = this.input.questions;
-    if (!Array.isArray(raw)) return [];
-
-    return raw
-      .filter(
-        (q): q is {
-          question: string;
-          header?: string;
-          options?: unknown[] | null;
-          multiSelect?: boolean;
-          isOther?: boolean;
-          isSecret?: boolean;
-          id?: string;
-        } =>
-          typeof q === 'object' &&
-          q !== null &&
-          typeof q.question === 'string' &&
-          ((Array.isArray(q.options) && q.options.length > 0) || q.isOther === true),
-      )
-      .map((q, idx) => ({
-        question: q.question,
-        id: typeof (q as Record<string, unknown>).id === 'string' ? (q as Record<string, unknown>).id as string : undefined,
-        header: typeof q.header === 'string' ? q.header.slice(0, 12) : `Q${idx + 1}`,
-        options: this.deduplicateOptions((q.options ?? []).map((o) => this.coerceOption(o))),
-        multiSelect: q.multiSelect === true,
-        isOther: q.isOther === true,
-        isSecret: q.isSecret === true,
-      }));
-  }
-
-  private coerceOption(opt: unknown): AskUserQuestionOption {
-    if (typeof opt === 'object' && opt !== null) {
-      const obj = opt as Record<string, unknown>;
-      const label = this.extractLabel(obj);
-      const description = typeof obj.description === 'string' ? obj.description : '';
-      const value = this.extractValue(obj, label);
-      return { label, description, ...(value !== label ? { value } : {}) };
-    }
-    return { label: typeof opt === 'string' ? opt : String(opt), description: '' };
-  }
-
-  private deduplicateOptions(options: AskUserQuestionOption[]): AskUserQuestionOption[] {
-    const seen = new Set<string>();
-    return options.filter((o) => {
-      if (seen.has(o.label)) return false;
-      seen.add(o.label);
-      return true;
-    });
-  }
-
-  private extractLabel(obj: Record<string, unknown>): string {
-    if (typeof obj.label === 'string') return obj.label;
-    if (typeof obj.value === 'string') return obj.value;
-    if (typeof obj.text === 'string') return obj.text;
-    if (typeof obj.name === 'string') return obj.name;
-    return String(obj);
-  }
-
-  private extractValue(obj: Record<string, unknown>, fallback: string): string {
-    if (typeof obj.value === 'string') return obj.value;
-    if (typeof obj.id === 'string') return obj.id;
-    return fallback;
+  /**
+   * External resolve path (ask-relay channel B). Same resolved guard as the
+   * UI interactions, so whichever channel settles first wins and the late
+   * one is a silent no-op — the same first-settled race as
+   * raceAutoTurnAskTimeout.
+   */
+  resolveExternal(result: Record<string, string | string[]> | null): void {
+    this.handleResolve(result);
   }
 
   private renderTabBar(): void {

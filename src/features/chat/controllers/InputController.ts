@@ -39,6 +39,7 @@ import type { MessageRenderer } from '../rendering/MessageRenderer';
 import type { ProjectionWriteLease } from '../rendering/ProjectionWriteCoordinator';
 import { setToolIcon, updateToolCallResult } from '../rendering/ToolCallRenderer';
 import { finalizeWriteEditBlock } from '../rendering/WriteEditRenderer';
+import type { AskRelayPendingInfo, AskRelayService } from '../services/AskRelayService';
 import type { SubagentManager } from '../services/SubagentManager';
 import type { ChatState } from '../state/ChatState';
 import type { QueuedMessage } from '../state/types';
@@ -64,6 +65,11 @@ const APPROVAL_OPTION_MAP: Record<string, ApprovalDecision> = {
 /** Plan A bound for auto-turn asks: 5 minutes for the attention notification
  * to reach the user before falling back to the deny+interrupt protection. */
 const AUTO_TURN_ASK_TIMEOUT_MS = 5 * 60 * 1000;
+
+/** User-turn ask attention window: past this the ask relay pending info goes
+ * out as a desktop notification (summary + nonce) — the user has likely left
+ * the desk and the phone is the reachable channel. */
+const USER_ASK_ATTENTION_TIMEOUT_MS = 60 * 1000;
 
 const DEFAULT_APPROVAL_DECISION_OPTIONS: ApprovalDecisionOption[] =
   Object.entries(APPROVAL_OPTION_MAP).map(([label, decision]) => ({
@@ -121,6 +127,16 @@ export interface InputControllerDeps {
    * settled. Notification policy reads this, never the UI busy state.
    */
   onTurnCompleted?: (event: CompletedTurnEvent) => void;
+  /**
+   * Ask relay service (channel B for AskUserQuestion). Absent in legacy
+   * tests → user-turn asks keep the pure desktop card path.
+   */
+  getAskRelay?: () => AskRelayService | null;
+  /**
+   * A user-turn ask armed the relay and stayed unanswered for the attention
+   * window — fire the ask-pending desktop notification (summary + nonce).
+   */
+  onAskAttentionTimeout?: (pending: AskRelayPendingInfo) => void;
   /** Returns true if ready. */
   ensureServiceInitialized?: () => Promise<boolean>;
   openConversation?: (conversationId: string) => Promise<void>;
@@ -1665,10 +1681,84 @@ export class InputController {
     // window, with a visible notice. The lease is exclusive, so its kind
     // still attributes the ask reliably; user turns keep the unbounded path.
     if (this.getTurnCoordinator()?.getActiveTurn()?.kind !== 'auto') {
+      this.armAskRelay(askPromise, input);
       return askPromise;
     }
 
     return this.raceAutoTurnAskTimeout(askPromise, parentEl);
+  }
+
+  /**
+   * Channel B for user-turn asks (fe case: user leaves the desk, the card
+   * waits forever and CLI-queued messages never dequeue). Arms the relay
+   * file protocol next to the desktop card — first answer wins via the
+   * InlineAskUserQuestion resolved guard. Replies never travel through the
+   * message queue: while the ask is pending, queue messages are not consumed
+   * as answers (2026-09-23 fe transcript).
+   *
+   * Fail-safe end to end: the relay is a bypass channel, so any failure while
+   * arming (read-only vault, full disk, broken deps) degrades to "no relay
+   * this turn" — it must never propagate into handleAskUserQuestion where the
+   * catch-all would deny+interrupt and kill the user's turn.
+   */
+  private armAskRelay(
+    askPromise: Promise<Record<string, string | string[]> | null>,
+    input: Record<string, unknown>,
+  ): void {
+    try {
+      const relay = this.deps.getAskRelay?.() ?? null;
+      const sessionId = this.getAgentService()?.getSessionId() ?? null;
+      if (!relay || !sessionId) return;
+
+      const conversationId = this.deps.state.currentConversationId;
+      const conversation = conversationId
+        ? this.deps.plugin.getConversationSync(conversationId)
+        : null;
+
+      // Same one-shot race shape as raceAutoTurnAskTimeout: any settle (answer,
+      // ESC, abort, dismiss) or relay invalidation (5 nonce failures) clears
+      // the timer; the timer against an already-settled ask is a no-op.
+      let settled = false;
+      let timer: ReturnType<typeof setTimeout> | null = null;
+      const cancelNotification = () => {
+        settled = true;
+        if (timer) clearTimeout(timer);
+      };
+
+      const pending = relay.armFor(
+        {
+          turnKind: 'user',
+          sessionId,
+          sessionName: conversation?.title ?? '',
+          input,
+        },
+        (answers) => {
+          // dispose first, synchronously: the askPromise settle → dispose path
+          // runs on a microtask, and a same-tick poll tick must not race it.
+          relay.dispose();
+          this.pendingAskInline?.resolveExternal(answers);
+        },
+        // Relay channel voided by nonce failures: the nonce in the pending
+        // info is dead — a notification carrying it would mislead the user.
+        cancelNotification,
+      );
+      if (!pending) return;
+
+      timer = setTimeout(() => {
+        if (!settled) {
+          this.deps.onAskAttentionTimeout?.(pending);
+        }
+      }, USER_ASK_ATTENTION_TIMEOUT_MS);
+      const settle = () => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer!);
+        relay.dispose();
+      };
+      askPromise.then(settle, settle);
+    } catch (error) {
+      console.warn('[Claudian] ask relay arm failed; continuing without relay', error);
+    }
   }
 
   /**

@@ -16,6 +16,7 @@ import type { TurnCoordinator } from '../controllers/TurnCoordinator';
 import type { HistoryWindowRenderer } from '../rendering/HistoryWindowRenderer';
 import type { MessageRenderer } from '../rendering/MessageRenderer';
 import type { ProjectionWriteCoordinator } from '../rendering/ProjectionWriteCoordinator';
+import type { AskRelayPendingInfo, AskRelayService } from '../services/AskRelayService';
 import type { SubagentManager } from '../services/SubagentManager';
 import type { ChatState } from '../state/ChatState';
 import type { BangBashModeManager } from '../ui/BangBashModeManager';
@@ -173,6 +174,8 @@ export interface TabServices {
   subagentManager: SubagentManager;
   instructionRefineService: InstructionRefineService | null;
   titleGenerationService: TitleGenerationService | null;
+  /** Ask relay (channel B for AskUserQuestion); created with the tab controllers. */
+  askRelay?: AskRelayService | null;
 }
 
 /**
@@ -300,6 +303,12 @@ export interface TabData {
 
   /** Successful-turn-completion callback wired into the turn controllers. */
   onTurnCompleted?: (event: CompletedTurnEvent) => void;
+
+  /**
+   * A user-turn ask armed the relay and stayed unanswered past the attention
+   * window — fires the ask-pending desktop notification (summary + nonce).
+   */
+  onAskAttentionTimeout?: (pending: AskRelayPendingInfo) => void;
 }
 
 export type TabProviderContext = Pick<TabData, 'conversationId' | 'service' | 'providerId' | 'lifecycleState' | 'draftModel'>;

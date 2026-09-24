@@ -75,6 +75,7 @@
     },
     "notifications": {
       "needsAttention": "Tab {index}「{title}」需要你回应",
+      "needsAttentionDetail": "Tab {index}「{title}」提问等待中：{detail}",
       "streamComplete": "Tab {index}「{title}」已完成，待检查"
     },
     "ask": {

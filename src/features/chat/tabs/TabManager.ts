@@ -14,6 +14,7 @@ import { t } from '../../../i18n/i18n';
 import type ClaudianPlugin from '../../../main';
 import { chooseForkTarget } from '../../../shared/modals/ForkTargetModal';
 import { getVaultPath } from '../../../utils/path';
+import type { AskRelayPendingInfo } from '../services/AskRelayService';
 import { type ConversationOpenClaim, ConversationOpenRegistry } from './ConversationOpenRegistry';
 import { type DesktopNotificationKind,notifyBackgroundTabStateChange } from './desktopNotifier';
 import { getTabProviderId } from './providerResolution';
@@ -132,6 +133,28 @@ export class TabManager implements TabManagerInterface {
     });
   }
 
+  /**
+   * Ask-pending detail notification: a user-turn ask armed the relay and
+   * stayed unanswered past the attention window. Unlike
+   * notifyBackgroundTabStateChange edges this fires for the active tab too —
+   * the user has likely left the desk and the notification body (summary +
+   * relay nonce) is the phone channel's entry point.
+   */
+  private notifyAskPending(tab: TabData, pending: AskRelayPendingInfo): void {
+    const tabIndex = Array.from(this.tabs.keys()).indexOf(tab.id) + 1;
+    if (tabIndex === 0) {
+      return;
+    }
+
+    notifyBackgroundTabStateChange({
+      plugin: this.plugin,
+      kind: 'needsAttention',
+      tabIndex,
+      tabTitle: getTabTitle(tab, this.plugin),
+      detail: `${pending.summary} · nonce ${pending.nonce}`,
+    });
+  }
+
   constructor(
     plugin: ClaudianPlugin,
     containerEl: HTMLElement,
@@ -237,6 +260,9 @@ export class TabManager implements TabManagerInterface {
           this.notifyBackgroundTab(tab, 'needsAttention');
         }
         this.callbacks.onTabAttentionChanged?.(tab.id, needsAttention);
+      },
+      onAskAttentionTimeout: (pending) => {
+        this.notifyAskPending(tab, pending);
       },
       onConversationIdChanged: (conversationId) => {
         // Sync tab.conversationId when conversation is lazily created

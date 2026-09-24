@@ -1,10 +1,14 @@
 import { createMockEl } from '@test/helpers/mockElement';
+import * as fs from 'fs';
 import { Notice } from 'obsidian';
+import * as os from 'os';
+import * as path from 'path';
 
 import type { ToolCallInfo } from '@/core/types';
 import { InputController, type InputControllerDeps } from '@/features/chat/controllers/InputController';
 import { TurnCoordinator } from '@/features/chat/controllers/TurnCoordinator';
 import { ProjectionWriteCoordinator as ProjectionWriteCoordinatorForTest } from '@/features/chat/rendering/ProjectionWriteCoordinator';
+import { AskRelayService } from '@/features/chat/services/AskRelayService';
 import { ChatState } from '@/features/chat/state/ChatState';
 import { t } from '@/i18n/i18n';
 import { encodeClaudeTurn } from '@/providers/claude/prompt/ClaudeTurnEncoder';
@@ -1742,6 +1746,262 @@ describe('InputController - Message Queue', () => {
         jest.advanceTimersByTime(5 * 60 * 1000);
         expect(jest.getTimerCount()).toBe(0);
         expect(await isSettled(askPromise)).toBe(false);
+
+        askController.dismissPendingApproval();
+        await expect(askPromise).resolves.toBeNull();
+      } finally {
+        jest.useRealTimers();
+      }
+    });
+  });
+
+  describe('Ask relay (channel B, user turns only)', () => {
+    let relayDir: string;
+
+    function relayAskInput(): Record<string, unknown> {
+      return {
+        questions: [{
+          question: 'Proceed?',
+          options: [{ label: 'Yes', value: 'yes' }, { label: 'No', value: 'no' }],
+          isOther: false,
+          isSecret: false,
+        }],
+      };
+    }
+
+    beforeEach(() => {
+      relayDir = fs.mkdtempSync(path.join(os.tmpdir(), 'input-relay-'));
+    });
+
+    afterEach(() => {
+      fs.rmSync(relayDir, { recursive: true, force: true });
+    });
+
+    /** User-turn-wired controller with a live AskRelayService on a tmp vault. */
+    function createRelayWiredDeps(opts: { sessionId?: string | null } = {}) {
+      const askDeps = createMockDeps();
+      const parentEl = createMockEl();
+      const containerEl = createMockEl();
+      (containerEl as any).parentElement = parentEl;
+      askDeps.getInputContainerEl = () => containerEl as any;
+      const turnCoordinator = new TurnCoordinator({
+        state: askDeps.state,
+        getConversationId: () => askDeps.state.currentConversationId,
+        processQueuedMessage: () => {},
+      });
+      askDeps.getTurnCoordinator = () => turnCoordinator;
+      expect(turnCoordinator.beginUserTurn('user-1', 5)).toBe(true);
+      (askDeps.mockAgentService.getSessionId as jest.Mock).mockReturnValue(
+        opts.sessionId === undefined ? 'sess-bbbbbbbb-2222' : opts.sessionId,
+      );
+
+      const relay = new AskRelayService({
+        getVaultPath: () => relayDir,
+        generateId: () => 'ask-relay-1',
+      });
+      const armed: Array<Record<string, string | string[]>> = [];
+      askDeps.getAskRelay = () => relay;
+      const attentionTimeout = jest.fn();
+      askDeps.onAskAttentionTimeout = attentionTimeout;
+
+      const askController = new InputController(askDeps);
+      return { askDeps, askController, relay, armed, attentionTimeout };
+    }
+
+    function relayAskFile(): string {
+      return path.join(relayDir, '.claudian', 'ask-relay', 'sess-bbb.ask.json');
+    }
+
+    function relayReplyFile(): string {
+      return path.join(relayDir, '.claudian', 'ask-relay', 'ask-relay-1.reply.json');
+    }
+
+    it('arms the relay for a user-turn ask and fires the attention notification after 60s', async () => {
+      jest.useFakeTimers();
+      try {
+        const { askController, attentionTimeout } = createRelayWiredDeps();
+
+        const askPromise = askController.handleAskUserQuestion(relayAskInput());
+
+        // ask.json written next to the still-mounted desktop card.
+        const askFile = JSON.parse(fs.readFileSync(relayAskFile(), 'utf-8'));
+        expect(askFile.askId).toBe('ask-relay-1');
+        expect(askFile.turnKind).toBe('user');
+        expect(askFile.questions[0].options).toEqual([
+          { label: 'Yes', description: '' },
+          { label: 'No', description: '' },
+        ]);
+
+        jest.advanceTimersByTime(60 * 1000 - 1);
+        expect(attentionTimeout).not.toHaveBeenCalled();
+        jest.advanceTimersByTime(1);
+        expect(attentionTimeout).toHaveBeenCalledTimes(1);
+        expect(attentionTimeout.mock.calls[0][0].nonce).toMatch(/^\d{6}$/);
+
+        askController.dismissPendingApproval();
+        await expect(askPromise).resolves.toBeNull();
+      } finally {
+        jest.useRealTimers();
+      }
+    });
+
+    it('a phone reply resolves the ask through the allow path (answers, not deny)', async () => {
+      jest.useFakeTimers();
+      try {
+        const { askController, attentionTimeout } = createRelayWiredDeps();
+        const askPromise = askController.handleAskUserQuestion(relayAskInput());
+
+        // Grab the nonce from the ask relay pending info via the armed file's
+        // sibling — the nonce only lives in the notification payload, which
+        // the attention timeout carries.
+        jest.advanceTimersByTime(60 * 1000);
+        const pending = attentionTimeout.mock.calls[0][0] as { askId: string; nonce: string };
+
+        fs.writeFileSync(relayReplyFile(), JSON.stringify({
+          askId: pending.askId,
+          sessionId: 'sess-bbbbbbbb-2222',
+          nonce: pending.nonce,
+          answers: [{ q: 0, picks: [1] }],
+          via: 'phone-dxchannel',
+        }));
+        jest.advanceTimersByTime(2000);
+
+        // answers flow to the SDK allow path (ClaudeApprovalHandler
+        // updatedInput answers), not the deny+interrupt null path.
+        await expect(askPromise).resolves.toEqual({ 'Proceed?': 'yes' });
+        // Settled: files cleaned, no late attention notification.
+        expect(fs.existsSync(relayAskFile())).toBe(false);
+        jest.advanceTimersByTime(10 * 60 * 1000);
+        expect(attentionTimeout).toHaveBeenCalledTimes(1);
+        expect(jest.getTimerCount()).toBe(0);
+      } finally {
+        jest.useRealTimers();
+      }
+    });
+
+    it('desktop answers first: relay settles, late reply is inert', async () => {
+      jest.useFakeTimers();
+      try {
+        const { askController, attentionTimeout } = createRelayWiredDeps();
+        const askPromise = askController.handleAskUserQuestion(relayAskInput());
+        const inline = (askController as any).pendingAskInline;
+
+        // Desktop click: option row → submit row.
+        inline.rootEl.querySelector('.claudian-ask-item').click();
+        inline.rootEl.querySelector('.claudian-ask-item').click();
+        await expect(askPromise).resolves.toEqual({ 'Proceed?': 'yes' });
+
+        // Late phone reply lands after the settle — nothing left to read it.
+        jest.advanceTimersByTime(60 * 1000);
+        const pending = attentionTimeout.mock.calls[0]?.[0] as { askId: string; nonce: string } | undefined;
+        expect(pending).toBeUndefined(); // answered before the window lapsed
+
+        expect(fs.existsSync(relayAskFile())).toBe(false);
+        expect(jest.getTimerCount()).toBe(0);
+      } finally {
+        jest.useRealTimers();
+      }
+    });
+
+    it('an auto turn never arms the relay (plan A path untouched)', async () => {
+      jest.useFakeTimers();
+      try {
+        const askDeps = createMockDeps();
+        const parentEl = createMockEl();
+        const containerEl = createMockEl();
+        (containerEl as any).parentElement = parentEl;
+        askDeps.getInputContainerEl = () => containerEl as any;
+        const turnCoordinator = new TurnCoordinator({
+          state: askDeps.state,
+          getConversationId: () => askDeps.state.currentConversationId,
+          processQueuedMessage: () => {},
+        });
+        askDeps.getTurnCoordinator = () => turnCoordinator;
+        expect(turnCoordinator.beginAutoTurn('auto-1', 2)).toBe(true);
+        (askDeps.mockAgentService.getSessionId as jest.Mock).mockReturnValue('sess-bbbbbbbb-2222');
+        const relay = new AskRelayService({ getVaultPath: () => relayDir, generateId: () => 'ask-relay-1' });
+        askDeps.getAskRelay = () => relay;
+        const askController = new InputController(askDeps);
+
+        const askPromise = askController.handleAskUserQuestion(relayAskInput());
+
+        expect(fs.existsSync(relayAskFile())).toBe(false);
+        expect(relay.isArmed()).toBe(false);
+
+        askController.dismissPendingApproval();
+        await expect(askPromise).resolves.toBeNull();
+      } finally {
+        jest.useRealTimers();
+      }
+    });
+
+    it('no session id → no relay, the card path is unchanged', async () => {
+      const { askController } = createRelayWiredDeps({ sessionId: null });
+
+      const askPromise = askController.handleAskUserQuestion(relayAskInput());
+
+      expect(fs.existsSync(relayAskFile())).toBe(false);
+
+      askController.dismissPendingApproval();
+      await expect(askPromise).resolves.toBeNull();
+    });
+
+    it('relay write failure degrades to no relay — ask flow unaffected (fail-safe)', async () => {
+      jest.useFakeTimers();
+      try {
+        // Vault "root" occupied by a regular file: every relay write fails.
+        const blockedPath = path.join(relayDir, 'not-a-dir');
+        fs.writeFileSync(blockedPath, 'occupied');
+        const { askDeps } = (() => {
+          const wired = createRelayWiredDeps();
+          const brokenRelay = new AskRelayService({
+            getVaultPath: () => blockedPath,
+            generateId: () => 'ask-relay-1',
+          });
+          wired.askDeps.getAskRelay = () => brokenRelay;
+          return wired;
+        })();
+
+        const askController = new InputController(askDeps);
+
+        // No exception escaping handleAskUserQuestion (a throw here would hit
+        // the ClaudeApprovalHandler catch-all → deny+interrupt → dead turn).
+        const askPromise = askController.handleAskUserQuestion(relayAskInput());
+        expect((askController as any).pendingAskInline).not.toBeNull();
+
+        askController.dismissPendingApproval();
+        await expect(askPromise).resolves.toBeNull();
+      } finally {
+        jest.useRealTimers();
+      }
+    });
+
+    it('relay voided by nonce failures cancels the attention notification', async () => {
+      jest.useFakeTimers();
+      try {
+        const { askController, attentionTimeout } = createRelayWiredDeps();
+        const askPromise = askController.handleAskUserQuestion(relayAskInput());
+
+        // Void the channel with 5 bad-nonce replies well inside the window.
+        // ('000000' can never collide: nonces are generated in [100000, 1000000).)
+        for (let i = 0; i < 5; i++) {
+          fs.writeFileSync(relayReplyFile(), JSON.stringify({
+            askId: 'ask-relay-1',
+            sessionId: 'sess-bbbbbbbb-2222',
+            nonce: '000000',
+            answers: [{ q: 0, picks: [1] }],
+          }));
+          jest.advanceTimersByTime(2000);
+        }
+
+        // Channel voided: ask file removed; the ask itself still waits on the
+        // desktop card (voiding the relay never ends the turn).
+        expect(fs.existsSync(relayAskFile())).toBe(false);
+        expect(await Promise.race([askPromise.then(() => true), Promise.resolve(false)])).toBe(false);
+
+        // Past the full 60s window: no notification carrying the dead nonce.
+        jest.advanceTimersByTime(60 * 1000);
+        expect(attentionTimeout).not.toHaveBeenCalled();
 
         askController.dismissPendingApproval();
         await expect(askPromise).resolves.toBeNull();
