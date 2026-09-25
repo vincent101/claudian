@@ -4,6 +4,10 @@ const baseConfig = {
   testEnvironment: 'node',
   transform: {
     '^.+\\.tsx?$': ['ts-jest', { tsconfig: 'tsconfig.jest.json' }],
+    // Real-SDK end-to-end tests (CLI-death settlement) load sdk.mjs through an
+    // absolute path, which bypasses moduleNameMapper but not this transform
+    // pipeline; ts-jest alone cannot compile ESM .mjs sources.
+    '^.+\\.mjs$': ['<rootDir>/jest.mjs-transform.cjs', {}],
   },
   roots: ['<rootDir>/src', '<rootDir>/tests'],
   moduleFileExtensions: ['ts', 'tsx', 'js', 'jsx', 'json', 'node'],
