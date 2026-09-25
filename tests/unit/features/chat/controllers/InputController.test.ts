@@ -913,6 +913,59 @@ describe('InputController - Message Queue', () => {
 
       expect((deps as any).mockAgentService.cancel).not.toHaveBeenCalled();
     });
+
+    it('force-settles the feature lease when a Stop-hook deadlock keeps isStreaming after cancel (2026-09-25)', () => {
+      jest.useFakeTimers();
+      try {
+        const coordinator = new TurnCoordinator({
+          state: deps.state,
+          getConversationId: () => deps.state.currentConversationId,
+          processQueuedMessage: () => controller.processQueuedMessage(),
+        });
+        (deps as any).getTurnCoordinator = () => coordinator;
+        deps.state.isStreaming = true;
+        expect(coordinator.beginUserTurn('user-1', deps.state.streamGeneration)).toBe(true);
+
+        controller.cancelStreaming();
+
+        // The interrupt is ignored by the CLI (Stop-hook blocked) — 5s later
+        // isStreaming is still up and the cancel flag still armed.
+        jest.advanceTimersByTime(5 * 1000);
+        expect(deps.state.isStreaming).toBe(false);
+        // The settled record survives so a genuine late release still pumps
+        // the queue exactly once.
+        expect(coordinator.release('user-1')).toBeUndefined();
+        expect(deps.state.isStreaming).toBe(false);
+      } finally {
+        jest.useRealTimers();
+      }
+    });
+
+    it('does not force-settle when the normal cancel path cleared streaming first', () => {
+      jest.useFakeTimers();
+      try {
+        const coordinator = new TurnCoordinator({
+          state: deps.state,
+          getConversationId: () => deps.state.currentConversationId,
+          processQueuedMessage: () => controller.processQueuedMessage(),
+        });
+        (deps as any).getTurnCoordinator = () => coordinator;
+        deps.state.isStreaming = true;
+        expect(coordinator.beginUserTurn('user-2', deps.state.streamGeneration)).toBe(true);
+
+        controller.cancelStreaming();
+        // Normal cancel settlement (generator finally) clears the flag and
+        // the lease before the watchdog fires.
+        coordinator.finish('user-2');
+        deps.state.isStreaming = false;
+
+        jest.advanceTimersByTime(5 * 1000);
+        // No new settle, no exception — pure no-op.
+        expect(deps.state.isStreaming).toBe(false);
+      } finally {
+        jest.useRealTimers();
+      }
+    });
   });
 
   describe('Sending messages', () => {

@@ -153,6 +153,29 @@ export class TurnCoordinator {
   }
 
   /**
+   * Stop-hook deadlock backstop (2026-09-25): the CLI blocks on a Stop hook
+   * and the SDK ignores interrupt() in that state, so the turn's result (and
+   * with it the runtime-side release callback) never arrives. finish() the
+   * active lease anyway so isStreaming drops and the queued input can flow;
+   * the settled record stays so a genuine late release from the same turn
+   * still pumps the queue exactly once. Idempotent: a turn that settled
+   * through the normal path is a no-op here.
+   *
+   * Unlike finish(), a USER turn also drops isStreaming here: the generator's
+   * finally — the normal owner of that flag on user turns — is exactly the
+   * thing the deadlock wedged (its chunk promise never resolves).
+   */
+  forceSettleForDeadCancel(): boolean {
+    if (!this.active) return false;
+    const turn = this.active;
+    const settled = this.finish(turn.turnId);
+    if (settled && turn.kind === 'user' && this.deps.state.isStreaming) {
+      this.deps.state.isStreaming = false;
+    }
+    return settled;
+  }
+
+  /**
    * Runtime-side compensation (unregistered dequeue): the runtime no longer
    * knows this turn, so its feature lease can never be released through the
    * normal generator finally. Clear only this turn's lease — the settled

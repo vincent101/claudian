@@ -65,6 +65,10 @@ const APPROVAL_OPTION_MAP: Record<string, ApprovalDecision> = {
 /** Plan A bound for auto-turn asks: 5 minutes for the attention notification
  * to reach the user before falling back to the deny+interrupt protection. */
 const AUTO_TURN_ASK_TIMEOUT_MS = 5 * 60 * 1000;
+// Stop-hook deadlock backstop window: interrupt() is ignored while the CLI
+// blocks on a Stop hook, so give the normal cancel path this long to settle
+// before force-settling the feature lease (see armCancelWatchdog).
+const CANCEL_WATCHDOG_MS = 5 * 1000;
 
 /** User-turn ask attention window: past this the ask relay pending info goes
  * out as a desktop notification (summary + nonce) — the user has likely left
@@ -1450,6 +1454,31 @@ export class InputController {
     this.restorePendingMessagesToInput();
     this.getAgentService()?.cancel();
     streamController.hideThinkingIndicator();
+    this.armCancelWatchdog();
+  }
+
+  /**
+   * Stop-hook deadlock backstop (2026-09-25 ailoan case): the SDK ignores
+   * interrupt() while the CLI blocks on a Stop hook (same control-channel
+   * family as the canUseTool note in 2.5.1 F3), so the user turn's result
+   * never arrives, the for-await consumer stays parked on its chunk promise
+   * and isStreaming never clears — ESC appears dead and every later input
+   * queues behind a lease that will never release. After CANCEL_WATCHDOG_MS
+   * still streaming with the cancel flag intact, settle the feature side
+   * ourselves: finish the turn lease (drops isStreaming, pumps the queue)
+   * and abandon the observer's active turn so the projection closes.
+   * The runtime turn itself stays settled-by-cancel; a late result finds
+   * nothing to settle on and is dropped lease-less.
+   */
+  private armCancelWatchdog(): void {
+    const { state } = this.deps;
+    const generation = state.streamGeneration;
+    setTimeout(() => {
+      if (!state.isStreaming || !state.cancelRequested) return;
+      if (state.streamGeneration !== generation) return; // a newer turn owns the flag
+      const coordinator = this.getTurnCoordinator();
+      coordinator?.forceSettleForDeadCancel();
+    }, CANCEL_WATCHDOG_MS);
   }
 
   private syncScrollToBottomAfterRenderUpdates(): void {
