@@ -1118,12 +1118,54 @@ export class ConversationController {
       });
       this.updateWelcomeVisibility();
       this.renderHistoryPager();
+      // The F1 rebuild routes through renderStoredPage, which (unlike the
+      // legacy renderMessages path) never scrolls: messagesEl.empty() clamps
+      // scrollTop to 0 while only the welcome remains and nothing restores
+      // it afterwards — the view parks at the very top. Anchor the view on
+      // the rewound message: it is the semantic focus of the rewind (the
+      // input box is pre-filled with its content).
+      this.revealMessageInViewport(userMessageId);
     } else {
       const welcomeEl = renderer.renderMessages(state.messages, () => this.getGreeting());
       this.deps.setWelcomeEl(welcomeEl);
       this.updateWelcomeVisibility();
     }
+    // Legacy (non-windowed) path: renderMessages renders bottom-up from
+    // scratch and its non-prepend branch scrolls to bottom — which lands on
+    // the rewound message anyway (it is the last message now). No extra call.
+    await this.finishRewind(result, prevAssistantUuid);
+  }
 
+  /**
+   * Scrolls the rewound user message into view after the F1 synthetic-page
+   * rebuild. Deferred to the next frame so the freshly mounted page layout
+   * settles first; page-level async content (markdown, tool calls) grows the
+   * message height afterwards, but 'nearest' keeps the anchor approximate
+   * without fighting the growth.
+   */
+  private revealMessageInViewport(messageId: string): void {
+    const messagesEl = this.deps.getMessagesEl();
+    const renderer = this.deps.renderer;
+    const reveal = () => {
+      // A conversation switch between the rewind and this frame rebuilds the
+      // DOM under a different lease — scrolling then would relocate the new
+      // view; the gone anchor query naturally no-ops except for the fallback,
+      // which the switch-away conversation's messagesEl also guards.
+      if (!messagesEl.isConnected) return;
+      const target = renderer.findMessageElement(messageId);
+      if (target) {
+        target.scrollIntoView({ block: 'nearest' });
+      } else {
+        // Anchor gone (race with a switch): bottom of the rebuilt view is
+        // still better than parked at the welcome header.
+        messagesEl.scrollTop = messagesEl.scrollHeight;
+      }
+    };
+    if (typeof requestAnimationFrame === 'function') requestAnimationFrame(reveal);
+    else setTimeout(reveal, 0);
+  }
+
+  private async finishRewind(result: { filesChanged?: string[] }, prevAssistantUuid: string): Promise<void> {
     const filesChanged = result.filesChanged?.length ?? 0;
     let saveError: string | null = null;
     try {

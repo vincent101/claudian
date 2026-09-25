@@ -4285,6 +4285,49 @@ describe('ConversationController - Rewind', () => {
       expect(deps.renderer.renderHistoryPager).toHaveBeenCalledWith(true, false, null, expect.any(Function));
     });
 
+    it('reveals the rewound message after the synthetic-page rebuild (view parks at top otherwise)', async () => {
+      makeWindowedDeps();
+      // messagesEl.empty() clamps scrollTop to 0 while only the welcome
+      // remains; renderStoredPage never scrolls, so without an explicit
+      // reveal the view stays at the very top after a windowed rewind.
+      const rafCallbacks: FrameRequestCallback[] = [];
+      (globalThis as any).requestAnimationFrame = (cb: FrameRequestCallback) => { rafCallbacks.push(cb); return rafCallbacks.length; };
+      (deps.getMessagesEl() as any).isConnected = true;
+      const scrollIntoView = jest.fn();
+      const anchorEl = { scrollIntoView, isConnected: true } as unknown as HTMLElement;
+      (deps.renderer.findMessageElement as jest.Mock).mockReturnValue(anchorEl);
+
+      try {
+        await controller.rewind('m2');
+        // Rewind waits one frame so the freshly mounted page layout settles.
+        expect(rafCallbacks.length).toBeGreaterThan(0);
+        rafCallbacks.forEach(cb => cb(0));
+        expect(deps.renderer.findMessageElement).toHaveBeenCalledWith('m2');
+        expect(scrollIntoView).toHaveBeenCalledWith({ block: 'nearest' });
+      } finally {
+        delete (globalThis as any).requestAnimationFrame;
+        delete (deps.getMessagesEl() as any).isConnected;
+      }
+    });
+
+    it('falls back to scrolling to the rebuilt view bottom when the rewound message anchor is gone', async () => {
+      makeWindowedDeps();
+      const rafCallbacks: FrameRequestCallback[] = [];
+      (globalThis as any).requestAnimationFrame = (cb: FrameRequestCallback) => { rafCallbacks.push(cb); return rafCallbacks.length; };
+      (deps.renderer.findMessageElement as jest.Mock).mockReturnValue(null);
+      (deps.getMessagesEl() as any).isConnected = true;
+      (deps.getMessagesEl() as any).scrollHeight = 4242;
+
+      try {
+        await controller.rewind('m2');
+        rafCallbacks.forEach(cb => cb(0));
+        expect((deps.getMessagesEl() as any).scrollTop).toBe(4242);
+      } finally {
+        delete (globalThis as any).requestAnimationFrame;
+        delete (deps.getMessagesEl() as any).isConnected;
+      }
+    });
+
     it('keeps the load-older anchor at the surviving window start instead of the stale snapshot total', async () => {
       const { lease } = makeWindowedDeps();
       lease.loadWindow.mockResolvedValue({
