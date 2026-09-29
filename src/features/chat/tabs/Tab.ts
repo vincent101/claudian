@@ -1862,8 +1862,12 @@ export async function destroyTab(tab: TabData): Promise<void> {
   cleanupThinkingBlock(tab.state.currentThinkingState);
   tab.state.currentThinkingState = null;
 
-  // Dismiss pending inline prompts before DOM teardown
+  // Dismiss pending inline prompts before DOM teardown. The ask relay's poll
+  // timer also dies here: the askPromise settle path disposes it only on a
+  // microtask, and a tab torn down while a relay ask is armed must not leave
+  // a bare setInterval running past the view (unload hang, jest force-exit).
   tab.controllers.inputController?.dismissPendingApproval();
+  tab.services.askRelay?.dispose();
 
   tab.controllers.inputController?.destroyResumeDropdown();
   tab.ui.fileContextManager?.destroy();

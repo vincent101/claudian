@@ -381,7 +381,7 @@ describe('AskRelayService', () => {
 
       expect(answers).toHaveLength(0);
       // Addressing mismatch is not a nonce failure: the ask stays armed.
-      expect(fs.existsSync(path.join(relayDir(dir), 'sess-aaa.ask.json'))).toBe(true);
+      expect(fs.readdirSync(relayDir(dir)).filter((f) => f.endsWith('.ask.json'))).toHaveLength(1);
     });
 
     it('drops corrupted replies without counting nonce failures', () => {
@@ -538,7 +538,7 @@ describe('AskRelayService', () => {
   describe('cleanupAskRelayFiles (startup orphan sweep)', () => {
     it('removes stale ask and reply files from a previous run', () => {
       fs.mkdirSync(relayDir(dir), { recursive: true });
-      fs.writeFileSync(path.join(relayDir(dir), 'abcd1234.ask.json'), '{}');
+      fs.writeFileSync(path.join(relayDir(dir), 'abcd1234-ask-1.ask.json'), '{}');
       fs.writeFileSync(path.join(relayDir(dir), 'ask-1.reply.json'), '{}');
       fs.writeFileSync(path.join(relayDir(dir), 'unrelated.txt'), 'keep');
 
@@ -547,8 +547,44 @@ describe('AskRelayService', () => {
       expect(fs.readdirSync(relayDir(dir))).toEqual(['unrelated.txt']);
     });
 
+    it('removes stranded phone-side reply staging files (.reply-*.tmp from mkstemp)', () => {
+      fs.mkdirSync(relayDir(dir), { recursive: true });
+      // ask_relay.py stages replies via mkstemp(prefix='.reply-', suffix='.tmp');
+      // a crash between staging and rename strands them — the sweep is the
+      // only thing that ever matches the name.
+      fs.writeFileSync(path.join(relayDir(dir), '.reply-ab12cd.tmp'), '{}');
+      fs.writeFileSync(path.join(relayDir(dir), '.reply-ff.tmp'), '{}');
+      fs.writeFileSync(path.join(relayDir(dir), 'not-a-reply-tmp.txt'), 'keep');
+
+      cleanupAskRelayFiles(dir);
+
+      expect(fs.readdirSync(relayDir(dir))).toEqual(['not-a-reply-tmp.txt']);
+    });
+
     it('is a no-op for a missing directory', () => {
       expect(() => cleanupAskRelayFiles(path.join(dir, 'nope'))).not.toThrow();
+    });
+  });
+
+  describe('ask file naming (hygiene batch 2026-09-29)', () => {
+    it('suffixes the unique askId past the sid8 prefix so same-prefix sessions never overwrite', () => {
+      // Two tabs, two service instances (per-tab exclusivity), distinct
+      // askIds as production generateId guarantees. Before the suffix, two
+      // sessions sharing the sid8 prefix wrote the same file name and the
+      // second arm silently destroyed the first tab's pending ask.
+      const mk = (id: string) => new AskRelayService({ getVaultPath: () => dir, generateId: () => id });
+      const first = arm(mk('ask-alpha'), [], { sessionId: 'sess-aaaaaaaa-1111' });
+      const second = arm(mk('ask-beta'), [], { sessionId: 'sess-aaaaaaaa-9999' });
+
+      const askFiles = fs.readdirSync(relayDir(dir)).filter((f) => f.endsWith('.ask.json'));
+      expect(askFiles).toHaveLength(2);
+      expect(askFiles).toContain(`sess-aaa-${first.askId}.ask.json`);
+      expect(askFiles).toContain(`sess-aaa-${second.askId}.ask.json`);
+      // Both contents survive (no overwrite).
+      const bodies = askFiles.map((f) => JSON.parse(fs.readFileSync(path.join(relayDir(dir), f), 'utf-8')));
+      expect(new Set(bodies.map((b) => b.sessionId))).toEqual(
+        new Set(['sess-aaaaaaaa-1111', 'sess-aaaaaaaa-9999']),
+      );
     });
   });
 });

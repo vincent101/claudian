@@ -1862,7 +1862,9 @@ describe('InputController - Message Queue', () => {
     }
 
     function relayAskFile(): string {
-      return path.join(relayDir, '.claudian', 'ask-relay', 'sess-bbb.ask.json');
+      // ask.json name is `<sid8>-<askId>.ask.json` (hygiene batch: the askId
+      // suffix keeps same-prefix sessions from overwriting each other).
+      return path.join(relayDir, '.claudian', 'ask-relay', 'sess-bbb-ask-relay-1.ask.json');
     }
 
     function relayReplyFile(): string {

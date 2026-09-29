@@ -104,7 +104,10 @@ export class AskRelayService {
       questions: toRelayQuestions(questions),
     };
 
-    const askFilePath = path.join(dir, `${params.sessionId.slice(0, 8)}.ask.json`);
+    // File name carries the unique askId past the sid8 prefix: two sessions
+    // sharing the first 8 chars of their UUIDs would otherwise overwrite each
+    // other's pending ask (tab exclusivity makes it rare, not impossible).
+    const askFilePath = path.join(dir, `${params.sessionId.slice(0, 8)}-${askId}.ask.json`);
     // Fail-safe: the relay is a bypass channel — a write failure (read-only
     // vault, full disk) must degrade to "no relay this turn", never propagate
     // into handleAskUserQuestion where the catch-all would deny+interrupt
@@ -288,8 +291,15 @@ export function cleanupAskRelayFiles(vaultPath: string): void {
   // listing is a no-op, not a crash.
   if (!Array.isArray(entries)) return;
   for (const entry of entries) {
-    if (typeof entry === 'string'
-      && (entry.endsWith('.ask.json') || entry.endsWith('.reply.json') || entry.endsWith('.ask.json.tmp'))) {
+    if (typeof entry !== 'string') continue;
+    if (entry.endsWith('.ask.json') || entry.endsWith('.reply.json') || entry.endsWith('.ask.json.tmp')) {
+      removeFileSync(path.join(dir, entry));
+      continue;
+    }
+    // Half-written phone-side replies: ask_relay.py stages them via
+    // mkstemp('.reply-*.tmp') and a crash between staging and rename strands
+    // them here forever (nothing else ever matches the name).
+    if (entry.startsWith('.reply-') && entry.endsWith('.tmp')) {
       removeFileSync(path.join(dir, entry));
     }
   }
