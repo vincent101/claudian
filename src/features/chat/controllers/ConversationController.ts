@@ -110,6 +110,17 @@ type HistoryRenderOptions = {
 };
 
 export class ConversationController {
+  /**
+   * Cap on the search-refresh exchange's FIFO wait for the stored grant —
+   * never on the granted task body. The critical section itself is <ms
+   * (lease pointer swap + two releases + one diagnostic write) and the index
+   * build runs outside the grant, so the entire budget is pure queue time;
+   * the measured pathology is a Stop-hook-stretched live turn holding the
+   * grant for 33 minutes. Aborting costs nothing durable (the old snapshot
+   * keeps serving; Retry / onStreamComplete / reopening re-trigger) while a
+   * 60s wait already sits at the edge of "索引中" user patience.
+   */
+  private static readonly REFRESH_EXCHANGE_GRANT_TIMEOUT_MS = 60_000;
   private deps: ConversationControllerDeps;
   private callbacks: ConversationCallbacks;
   private projectionCache = new Map<string, HTMLElement>();
@@ -407,6 +418,7 @@ export class ConversationController {
    */
   private async runStoredTransaction<T>(
     task: (isStale: () => boolean) => Promise<T>,
+    options?: { timeoutMs?: number },
   ): Promise<T | null> {
     const conversationId = this.deps.state.currentConversationId;
     const isStale = (): boolean => this.deps.state.currentConversationId !== conversationId;
@@ -414,7 +426,7 @@ export class ConversationController {
     if (!coordinator) {
       return task(isStale);
     }
-    return coordinator.runStored(isStale, () => task(isStale));
+    return coordinator.runStored(isStale, () => task(isStale), options);
   }
 
   /**
@@ -681,32 +693,43 @@ export class ConversationController {
     // either case `next` was never mounted, so it ends its reference and no
     // lease is resurrected onto the tab. Swap before releasing previous so
     // no window load ever observes a mounted-but-released lease.
-    const exchange = await this.runStoredTransaction<HistorySearchSnapshotRefreshResult>(async () => {
-      if (state.currentConversationId !== conversationId || state.historyLease !== previous) {
-        next.release();
-        return this.reportRefreshNotApplicable('stale', startedAt, trigger);
-      }
-      state.historyLease = next;
-      previous.release();
-      // The lease reports what actually happened; without a service-provided
-      // outcome the honest report is rebuilt (a fresh acquire did run).
-      const outcome = next.acquireOutcome === 'cache_hit' ? 'cache_hit' : 'rebuilt';
-      recordHistoryDiagnosticEvent({ kind: 'search_snapshot_refresh', outcome, trigger, elapsedMs: performance.now() - startedAt });
-      return outcome === 'cache_hit' ? { status: 'cache_hit' } : { status: 'rebuilt' };
-    });
-    // A cancelled transaction (the conversation switched while the exchange
-    // queued behind a live turn or stored work, or the coordinator was
-    // disposed) never ran the swap: `next` was never mounted, so it ends
-    // its reference here. That is staleness, not a failure.
+    const exchange = await this.runStoredTransaction<HistorySearchSnapshotRefreshResult>(
+      async () => {
+        if (state.currentConversationId !== conversationId || state.historyLease !== previous) {
+          next.release();
+          return this.reportRefreshNotApplicable('stale', startedAt, trigger);
+        }
+        state.historyLease = next;
+        previous.release();
+        // The lease reports what actually happened; without a service-provided
+        // outcome the honest report is rebuilt (a fresh acquire did run).
+        const outcome = next.acquireOutcome === 'cache_hit' ? 'cache_hit' : 'rebuilt';
+        recordHistoryDiagnosticEvent({ kind: 'search_snapshot_refresh', outcome, trigger, elapsedMs: performance.now() - startedAt });
+        return outcome === 'cache_hit' ? { status: 'cache_hit' } : { status: 'rebuilt' };
+      },
+      { timeoutMs: ConversationController.REFRESH_EXCHANGE_GRANT_TIMEOUT_MS },
+    );
+    // A null transaction (the conversation switched while the exchange
+    // queued behind a live turn or stored work, the coordinator was
+    // disposed, or the grant wait timed out) never ran the swap: `next` was
+    // never mounted, so it ends its reference here.
     if (!exchange) {
       next.release();
-      return this.reportRefreshNotApplicable('stale', startedAt, trigger);
+      // runStored's null cannot distinguish timeout / cancelled / disposed,
+      // so re-check the same staleness the task body would have checked: a
+      // real conversation switch (or a same-conversation lease swap) keeps
+      // the honest 'stale' report — 'stale' means conversation-switch
+      // mismatch and must not absorb the timeout; only a non-stale null is
+      // a grant_timeout (coordinator dispose at teardown lands here too:
+      // diagnostic-label difference only, no behavioral consequence).
+      const stale = state.currentConversationId !== conversationId || state.historyLease !== previous;
+      return this.reportRefreshNotApplicable(stale ? 'stale' : 'grant_timeout', startedAt, trigger);
     }
     return exchange;
   }
 
   private reportRefreshNotApplicable(
-    reason: 'no_conversation' | 'no_lease' | 'provider_without_index' | 'stale',
+    reason: 'no_conversation' | 'no_lease' | 'provider_without_index' | 'stale' | 'grant_timeout',
     startedAt: number,
     trigger: 'search' | 'rewind' | 'fork',
   ): HistorySearchSnapshotRefreshResult {

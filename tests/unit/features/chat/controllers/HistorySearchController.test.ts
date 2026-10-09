@@ -575,6 +575,40 @@ describe('HistorySearchController', () => {
         expect(searchHistory).toHaveBeenCalledTimes(1);
       });
 
+      it('marks the open stale with a Retry affordance when the idle rebind hits grant_timeout', async () => {
+        mountMessage('m1', 'needle one');
+        searchHistory.mockResolvedValue([result('m1')]);
+        refreshSnapshot.mockResolvedValue({ status: 'not_applicable', reason: 'grant_timeout' });
+        const instance = makeController();
+        instance.open();
+        await typeQuery(instance, 'needle');
+
+        // The exchange timed out behind a stuck live holder: the open ends
+        // stale (hint + Retry) while the old snapshot still answers the query.
+        expect(searchHistory).toHaveBeenCalledTimes(1);
+        expect(staleEl()?.textContent).toBeTruthy();
+        expect(retryEl()).not.toBeNull();
+      });
+
+      it('marks the open stale when a stream-completion refresh hits grant_timeout', async () => {
+        mountMessage('m1', 'needle one');
+        searchHistory.mockResolvedValue([result('m1')]);
+        refreshSnapshot.mockResolvedValue({ status: 'rebuilt' });
+        const instance = makeController();
+        instance.open();
+        await typeQuery(instance, 'needle');
+        expect(staleEl()).toBeNull();
+
+        refreshSnapshot.mockResolvedValue({ status: 'not_applicable', reason: 'grant_timeout' });
+        instance.onStreamComplete();
+        await settle();
+
+        expect(staleEl()).not.toBeNull();
+        expect(retryEl()).not.toBeNull();
+        // Results from the old snapshot stay visible and searchable.
+        expect(searchHistory).toHaveBeenCalledTimes(2);
+      });
+
       it('re-arms the per-open auto refresh after close and reopen', async () => {
         refreshSnapshot.mockRejectedValue(new Error('index build failed'));
         const instance = makeController();

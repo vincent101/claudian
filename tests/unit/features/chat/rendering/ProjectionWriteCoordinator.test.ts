@@ -178,6 +178,99 @@ describe('ProjectionWriteCoordinator', () => {
     second!.release();
   });
 
+  describe('runStored wait timeout (exits the wait, never the queue order)', () => {
+    afterEach(() => { jest.useRealTimers(); });
+
+    it('resolves null when the FIFO wait times out, and the timed-out slot is skipped at grant without reordering successors', async () => {
+      jest.useFakeTimers();
+      const coordinator = new ProjectionWriteCoordinator();
+      const live = await coordinator.acquireLive();
+      let timedOutRuns = 0;
+      let successorRuns = 0;
+
+      const timedOut = coordinator.runStored(() => false, async () => {
+        timedOutRuns += 1;
+      }, { timeoutMs: 5_000 });
+      const successor = coordinator.runStored(() => false, async () => {
+        successorRuns += 1;
+      });
+
+      await jest.advanceTimersByTimeAsync(5_000);
+      // The caller is unblocked immediately even though the holder never
+      // released: pump cannot run while the live lease is held.
+      await expect(timedOut).resolves.toBeNull();
+      expect(timedOutRuns).toBe(0);
+
+      // The timed-out entry keeps its queue slot and is skipped at grant
+      // time; the successor runs after it in the original FIFO order.
+      live!.release();
+      await successor;
+      expect(successorRuns).toBe(1);
+      expect(timedOutRuns).toBe(0);
+    });
+
+    it('runs the task to completion when the grant lands before the timer', async () => {
+      jest.useFakeTimers();
+      const coordinator = new ProjectionWriteCoordinator();
+      const live = await coordinator.acquireLive();
+      let ran = false;
+
+      const stored = coordinator.runStored(() => false, async () => {
+        ran = true;
+        await Promise.resolve();
+        return 'done';
+      }, { timeoutMs: 60_000 });
+      live!.release();
+
+      // The timeout only covers the wait: a granted task body is never
+      // interrupted, and the settled promise is not overwritten late.
+      await expect(stored).resolves.toBe('done');
+      expect(ran).toBe(true);
+      await jest.advanceTimersByTimeAsync(60_000);
+      await expect(stored).resolves.toBe('done');
+    });
+
+    it('resolves null when queue-time cancellation and the wait timeout coexist', async () => {
+      jest.useFakeTimers();
+      const coordinator = new ProjectionWriteCoordinator();
+      const live = await coordinator.acquireLive();
+      let cancelled = false;
+
+      const stored = coordinator.runStored(() => cancelled, async () => {
+        throw new Error('cancelled task must not run');
+      }, { timeoutMs: 5_000 });
+
+      cancelled = true;
+      await jest.advanceTimersByTimeAsync(5_000);
+      await expect(stored).resolves.toBeNull();
+
+      // A cancelled slot must still not block successors once released.
+      const later = coordinator.runStored(() => false, async () => 'later');
+      live!.release();
+      await expect(later).resolves.toBe('later');
+    });
+
+    it('clears the wait timer when dispose settles a pending timed waiter', async () => {
+      jest.useFakeTimers();
+      const clearSpy = jest.spyOn(globalThis, 'clearTimeout');
+      const coordinator = new ProjectionWriteCoordinator();
+      const live = await coordinator.acquireLive();
+
+      const stored = coordinator.runStored(() => false, async () => {
+        throw new Error('disposed task must not run');
+      }, { timeoutMs: 60_000 });
+
+      coordinator.dispose();
+      await expect(stored).resolves.toBeNull();
+      expect(clearSpy).toHaveBeenCalled();
+      // No timer survives dispose: advancing past the timeout stays inert.
+      await jest.advanceTimersByTimeAsync(60_000);
+
+      clearSpy.mockRestore();
+      live!.release();
+    });
+  });
+
   it('reports hasLiveTurn only while a live turn holds or waits for the lease', async () => {
     const coordinator = new ProjectionWriteCoordinator();
     expect(coordinator.hasLiveTurn()).toBe(false);

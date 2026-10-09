@@ -859,6 +859,84 @@ describe('ConversationController', () => {
       expect(deps.state.historyLease).toBe(previous);
     });
 
+    it('times the exchange wait out behind a stuck live holder and reports grant_timeout', async () => {
+      jest.useFakeTimers();
+      const events: HistoryDiagnosticEvent[] = [];
+      setHistoryDiagnosticsSink(event => events.push(event));
+      try {
+        const coordinator = new ProjectionWriteCoordinator();
+        deps.getProjectionCoordinator = () => coordinator;
+        deps.state.currentConversationId = 'large';
+        const conversation = { id: 'large', providerId: 'claude', title: 'Large', messages: [], sessionId: 'session', createdAt: 1, updatedAt: 1 } as any;
+        (deps.plugin.getConversationSync as jest.Mock).mockReturnValue(conversation);
+        const previous = makeLease(100);
+        deps.state.historyLease = previous as any;
+        const next = makeLease(100);
+        const service = { acquireHistoryIndex: jest.fn().mockReturnValue(next) };
+        deps.getHistoryIndexCapableService = () => service as any;
+
+        const live = await coordinator.acquireLive();
+        const refreshing = controller.refreshHistorySearchSnapshot();
+        // The build resolves off-grant (P1); only the exchange queues behind
+        // the live turn, which never releases (Stop-hook-stretched turn).
+        await Promise.resolve();
+        await Promise.resolve();
+
+        // One millisecond short of the 60s grant-wait cap the refresh is
+        // still waiting; the cap itself is part of the contract.
+        await jest.advanceTimersByTimeAsync(59_999);
+        expect(deps.state.historyLease).toBe(previous);
+        await jest.advanceTimersByTimeAsync(1);
+
+        await expect(refreshing).resolves.toEqual({ status: 'not_applicable', reason: 'grant_timeout' });
+        // The never-mounted next lease ends its reference; the mounted
+        // previous lease keeps serving reads on the old snapshot.
+        expect(next.release).toHaveBeenCalledTimes(1);
+        expect(previous.release).not.toHaveBeenCalled();
+        expect(deps.state.historyLease).toBe(previous);
+        const refreshEvents = events.filter((event): event is Extract<HistoryDiagnosticEvent, { kind: 'search_snapshot_refresh' }> => event.kind === 'search_snapshot_refresh');
+        expect(refreshEvents[refreshEvents.length - 1]).toMatchObject({ outcome: 'not_applicable', reason: 'grant_timeout', trigger: 'search' });
+        live!.release();
+      } finally {
+        setHistoryDiagnosticsSink(null);
+        jest.useRealTimers();
+      }
+    });
+
+    it('keeps reporting stale, not grant_timeout, when the conversation switched before the wait timed out', async () => {
+      jest.useFakeTimers();
+      try {
+        const coordinator = new ProjectionWriteCoordinator();
+        deps.getProjectionCoordinator = () => coordinator;
+        deps.state.currentConversationId = 'large';
+        const conversation = { id: 'large', providerId: 'claude', title: 'Large', messages: [], sessionId: 'session', createdAt: 1, updatedAt: 1 } as any;
+        (deps.plugin.getConversationSync as jest.Mock).mockReturnValue(conversation);
+        const previous = makeLease(100);
+        deps.state.historyLease = previous as any;
+        const next = makeLease(100);
+        const service = { acquireHistoryIndex: jest.fn().mockReturnValue(next) };
+        deps.getHistoryIndexCapableService = () => service as any;
+
+        const live = await coordinator.acquireLive();
+        const refreshing = controller.refreshHistorySearchSnapshot();
+        await Promise.resolve();
+        await Promise.resolve();
+
+        // The conversation switched while the exchange waits: a runStored
+        // null has three sources (timeout / cancelled / dispose) and the
+        // caller must re-check staleness before blaming the timeout.
+        deps.state.currentConversationId = 'switched';
+        await jest.advanceTimersByTimeAsync(60_000);
+
+        await expect(refreshing).resolves.toEqual({ status: 'not_applicable', reason: 'stale' });
+        expect(next.release).toHaveBeenCalledTimes(1);
+        expect(previous.release).not.toHaveBeenCalled();
+        live!.release();
+      } finally {
+        jest.useRealTimers();
+      }
+    });
+
     // ============================================
     // Projection write lease (coord protocol P3)
     // ============================================

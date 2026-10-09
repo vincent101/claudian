@@ -81,7 +81,7 @@ export function enumerateVisibleMatches(root: HTMLElement, query: string): Visib
 export type HistorySearchSnapshotRefreshResult =
   | { status: 'rebuilt' }
   | { status: 'cache_hit' }
-  | { status: 'not_applicable'; reason: 'no_conversation' | 'no_lease' | 'provider_without_index' | 'stale' };
+  | { status: 'not_applicable'; reason: 'no_conversation' | 'no_lease' | 'provider_without_index' | 'stale' | 'grant_timeout' };
 
 interface HistorySearchControllerDeps {
   rootEl: HTMLElement;
@@ -205,11 +205,22 @@ export class HistorySearchController {
   }
 
   /**
+   * A grant_timeout exchange timed out behind a stuck live holder: the open
+   * must surface as stale (hint + Retry) so the user knows the snapshot
+   * lags, while the old snapshot keeps answering queries. Every other
+   * not_applicable reason (lease-less providers etc.) stays a normal
+   * capability branch.
+   */
+  private isGrantTimeout(refreshed: HistorySearchSnapshotRefreshResult | void): boolean {
+    return refreshed?.status === 'not_applicable' && refreshed.reason === 'grant_timeout';
+  }
+
+  /**
    * Explicit refresh (stream completion or the Retry affordance). Unlike the
    * per-open auto refresh this runs regardless of the current state — new
-   * content just landed or the user asked for it — and only a successful
-   * rebind re-runs the active query; a failure marks the open stale while
-   * the old snapshot results stay visible.
+   * content just landed or the user asked for it — and only a non-failing
+   * rebind re-runs the active query (a grant timeout still re-runs it on the
+   * old snapshot so results stay visible); a failure marks the open stale.
    */
   private refreshSnapshotAndRerun(): void {
     if (!this.panel) return;
@@ -222,8 +233,11 @@ export class HistorySearchController {
     const generation = ++this.generation;
     void (async () => {
       try {
-        await this.refreshSnapshotOnce();
-        if (this.panel === openPanel) this.snapshotState = 'fresh';
+        const refreshed = await this.refreshSnapshotOnce();
+        if (this.panel === openPanel) {
+          this.snapshotState = this.isGrantTimeout(refreshed) ? 'stale' : 'fresh';
+          if (this.snapshotState === 'stale') this.renderStatus();
+        }
       } catch {
         if (this.panel === openPanel) {
           this.snapshotState = 'stale';
@@ -276,8 +290,9 @@ export class HistorySearchController {
     }
     // Rebind once per open before the first real query: the tab's fixed
     // snapshot predates the panel and may miss turns that finished while the
-    // panel was closed. A failed refresh keeps the old snapshot searchable
-    // and marks this open stale (only Retry or a reopen rebinds); later
+    // panel was closed. A failed or grant-timed-out refresh keeps the old
+    // snapshot searchable and marks this open stale (only Retry or a reopen
+    // rebinds — a stale open never re-arms on later keystrokes); later
     // keystrokes reuse the bound snapshot so typing never rebuilds per key.
     // State writes are guarded by the panel identity, not generation: a
     // refresh settling after this open closed must not write the state
@@ -286,8 +301,10 @@ export class HistorySearchController {
       const openPanel = this.panel;
       this.snapshotState = 'refreshing';
       try {
-        await this.refreshSnapshotOnce();
-        if (this.panel === openPanel) this.snapshotState = 'fresh';
+        const refreshed = await this.refreshSnapshotOnce();
+        if (this.panel === openPanel) {
+          this.snapshotState = this.isGrantTimeout(refreshed) ? 'stale' : 'fresh';
+        }
       } catch {
         if (this.panel === openPanel) this.snapshotState = 'stale';
       }

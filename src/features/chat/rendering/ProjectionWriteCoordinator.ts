@@ -31,6 +31,18 @@ interface QueueEntry {
   cancel: () => void;
 }
 
+export interface RunStoredOptions {
+  /**
+   * Cap on the FIFO wait only (enqueue → grant). A granted task body is
+   * never interrupted: the timeout resolves the caller's wait with null
+   * while the queue slot stays put — pump skips it at grant time through
+   * the existing cancellation check, so successors never overtake a
+   * still-running predecessor. Exiting the wait is not preempting the
+   * queue: the timed-out waiter neither releases nor steals any lease.
+   */
+  timeoutMs?: number;
+}
+
 export class ProjectionWriteCoordinator {
   private queue: QueueEntry[] = [];
   private active = false;
@@ -50,12 +62,17 @@ export class ProjectionWriteCoordinator {
 
   /**
    * Runs one stored projection transaction (clear-rebuild / prepend framing).
-   * The task is skipped — resolves null — when the wait is cancelled or the
-   * coordinator is disposed; a cancelled waiter still waits out its FIFO turn
-   * so successors never overtake a still-running predecessor.
+   * The task is skipped — resolves null — when the wait is cancelled, the
+   * coordinator is disposed, or (with `options.timeoutMs`) the FIFO wait
+   * itself times out; a cancelled or timed-out waiter still waits out its
+   * FIFO turn so successors never overtake a still-running predecessor.
    */
-  async runStored<T>(isCancelled: () => boolean, task: () => Promise<T>): Promise<T | null> {
-    const lease = await this.acquire(false, isCancelled);
+  async runStored<T>(
+    isCancelled: () => boolean,
+    task: () => Promise<T>,
+    options?: RunStoredOptions,
+  ): Promise<T | null> {
+    const lease = await this.acquire(false, isCancelled, options?.timeoutMs);
     if (!lease) return null;
     try {
       return await task();
@@ -110,19 +127,49 @@ export class ProjectionWriteCoordinator {
     this.drainCancelled();
   }
 
-  private acquire(isLive: boolean, isCancelled?: () => boolean): Promise<ProjectionWriteLease | null> {
+  private acquire(isLive: boolean, isCancelled?: () => boolean, timeoutMs?: number): Promise<ProjectionWriteLease | null> {
     return new Promise(resolve => {
       if (this.disposed || isCancelled?.()) {
         resolve(null);
         return;
       }
+      // Single-threaded settled-flag race: the grant path (start) and the
+      // timer callback can never interleave, and resolve is idempotent —
+      // whichever fires first wins, the other becomes a no-op.
+      let timedOut = false;
+      let timer: ReturnType<typeof setTimeout> | null = null;
+      const clearTimer = (): void => {
+        if (timer !== null) {
+          clearTimeout(timer);
+          timer = null;
+        }
+      };
       this.queue.push({
-        isCancelled: isCancelled ?? (() => false),
+        isCancelled: timeoutMs === undefined
+          ? (isCancelled ?? (() => false))
+          : () => (isCancelled?.() ?? false) || timedOut,
         isLive,
-        start: granted => resolve(granted),
-        cancel: () => resolve(null),
+        start: granted => {
+          clearTimer();
+          resolve(granted);
+        },
+        cancel: () => {
+          clearTimer();
+          resolve(null);
+        },
       });
       if (isLive) this.queuedLiveCount += 1;
+      if (timeoutMs !== undefined) {
+        timer = setTimeout(() => {
+          timer = null;
+          timedOut = true;
+          // Resolve immediately to unblock the caller: pump will not run
+          // before the current holder releases, so the latch alone would
+          // leave the caller waiting exactly as long as the pathological
+          // holder it is escaping. The queue slot stays for grant-time skip.
+          resolve(null);
+        }, timeoutMs);
+      }
       this.pump();
     });
   }
