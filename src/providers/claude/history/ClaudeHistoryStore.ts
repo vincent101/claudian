@@ -1,4 +1,8 @@
 import { isSubagentToolName } from '../../../core/tools/toolNames';
+import {
+  clampToolResultForProjection,
+  setClampedToolCallResult,
+} from '../../../core/tools/toolResultProjection';
 import type { ChatMessage, SubagentInfo, ToolCallInfo } from '../../../core/types';
 import { buildAsyncSubagentInfo } from './sdkAsyncSubagent';
 import { filterActiveBranch } from './sdkBranchFilter';
@@ -181,7 +185,34 @@ export async function materializeSDKMessages(
   // by timestamp would reorder history whenever a transcript row carries an
   // anomalous timestamp, so the materialized order is final here.
 
+  clampMaterializedToolResults(chatMessages);
+
   return chatMessages;
+}
+
+/**
+ * Source clamp (render-pipeline sub-item 3, write point 3): bounds every tool
+ * result this materialization outputs — detail pages and window pages share
+ * this path. Runs after answer/diff hydration so extractResolvedAnswers* and
+ * extractDiffData parse the full text first; user message content is never
+ * touched (rewind/fork exact-content resolution). Nested subagent toolCalls
+ * are already clamped at the sidecar source (sdkSubagentSidecar).
+ */
+function clampMaterializedToolResults(messages: ChatMessage[]): void {
+  for (const msg of messages) {
+    if (msg.role !== 'assistant' || !msg.toolCalls) continue;
+    for (const toolCall of msg.toolCalls) {
+      if (typeof toolCall.result === 'string') {
+        setClampedToolCallResult(toolCall, toolCall.result);
+      }
+      if (toolCall.subagent && typeof toolCall.subagent.result === 'string') {
+        // buildAsyncSubagentInfo write-back channel: toolCall.result and
+        // subagent.result share the value; clamp each from its current full
+        // string so the marker and count stay exact.
+        toolCall.subagent.result = clampToolResultForProjection(toolCall.subagent.result).text;
+      }
+    }
+  }
 }
 
 export async function loadSDKSessionMessages(

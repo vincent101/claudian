@@ -1288,6 +1288,19 @@ export function initializeTabControllers(
     () => autoResizeTextarea(dom.inputEl)
   );
 
+  // Render-pipeline sub-item 3: dynamic gate for tool-result projection
+  // clamping, shared by StreamController and SubagentManager. Evaluated per
+  // write so a provider switch can never leave a stale decision behind
+  // (Codex/OpenCode persist full messages — clamping there would lose data).
+  // Same adaptation criterion as getHistoryIndexCapableService below:
+  // index-capable providers (Claude) only.
+  const isProjectionClampEnabled = (): boolean => {
+    const service = tab.service;
+    if (!service) return false;
+    return typeof ProviderRegistry.getConversationHistoryService(service.providerId)
+      .acquireHistoryIndex === 'function';
+  };
+
   tab.controllers.streamController = new StreamController({
     plugin,
     state,
@@ -1298,6 +1311,7 @@ export function initializeTabControllers(
     updateQueueIndicator: () => tab.controllers.inputController?.updateQueueIndicator(),
     getAgentService: () => tab.service,
     onStreamComplete: () => tab.controllers.historySearchController?.onStreamComplete(),
+    isClampEnabled: isProjectionClampEnabled,
   });
 
   // Wire subagent callback now that StreamController exists
@@ -1326,6 +1340,7 @@ export function initializeTabControllers(
       }
     }
   );
+  services.subagentManager.setProjectionClampEnabled?.(isProjectionClampEnabled);
 
   tab.controllers.conversationController = new ConversationController(
     {

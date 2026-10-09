@@ -4,6 +4,7 @@ import { mkdtempSync, rmSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 
+import { TOOL_RESULT_PROJECTION_CHARS } from '@/core/tools/toolResultProjection';
 import type { SubagentInfo, ToolCallInfo } from '@/core/types';
 import { SubagentManager } from '@/features/chat/services/SubagentManager';
 import { createStopSubagentHook } from '@/providers/claude/hooks/SubagentHooks';
@@ -2211,5 +2212,136 @@ Only this is the final result.
       expect(manager.getByTaskId('async-1')).toBeUndefined();
       const { markAsyncSubagentOrphaned } = jest.requireMock('@/features/chat/rendering/SubagentRenderer');
       expect(markAsyncSubagentOrphaned).toHaveBeenCalled();
+    });
+  });
+
+  // ============================================
+  // extractAgentResult projection clamp (render-pipeline sub-item 3, write point 7)
+  // ============================================
+
+  describe('extractAgentResult projection clamp', () => {
+    function setupRunningOutput(manager: SubagentManager, agentId = 'agent-clamp'): void {
+      const parentEl = createMockEl();
+      manager.handleTaskToolUse('task-clamp', { description: 'BG', run_in_background: true }, parentEl);
+      manager.handleTaskToolResult('task-clamp', JSON.stringify({ agent_id: agentId }));
+      manager.handleAgentOutputToolUse({
+        id: 'output-clamp', name: 'AgentOutput',
+        input: { task_id: agentId }, status: 'running', isExpanded: false,
+      });
+    }
+
+    it('clamps oversized agent results at the single exit while parsing sees the full input', () => {
+      const { manager, updates } = createManager();
+      manager.setProjectionClampEnabled(() => true);
+      setupRunningOutput(manager);
+
+      // JSON payload whose inner result alone exceeds the budget: clamping
+      // before JSON.parse would break the parse and return the raw clamped
+      // JSON — asserting the extracted inner string proves parse-first.
+      const inner = 'R'.repeat(TOOL_RESULT_PROJECTION_CHARS + 3456);
+      manager.handleAgentOutputToolResult('output-clamp', JSON.stringify({ result: inner }), false);
+
+      const final = updates[updates.length - 1];
+      expect(final.result).toBeDefined();
+      expect(final.result!.startsWith('R'.repeat(64))).toBe(true);
+      expect(final.result!.startsWith('{')).toBe(false);
+      expect(final.result!.length).toBeLessThanOrEqual(TOOL_RESULT_PROJECTION_CHARS + 64);
+      expect(final.result!.endsWith('字符]')).toBe(true);
+    });
+
+    it('keeps full results when no clamp gate is injected (Codex zero-change guard)', () => {
+      const { manager, updates } = createManager();
+      setupRunningOutput(manager);
+
+      const inner = 'R'.repeat(TOOL_RESULT_PROJECTION_CHARS + 3456);
+      manager.handleAgentOutputToolResult('output-clamp', JSON.stringify({ result: inner }), false);
+
+      const final = updates[updates.length - 1];
+      expect(final.result).toBe(inner);
+    });
+
+    it('clamps the sync finalize path through the same exit', () => {
+      const { manager } = createManager();
+      manager.setProjectionClampEnabled(() => true);
+      // No parent element → domain-only terminal transition sets record.result.
+      manager.handleTaskToolUse('task-sync', { description: 'Sync', run_in_background: false }, null);
+
+      const big = 'S'.repeat(TOOL_RESULT_PROJECTION_CHARS + 999);
+      const info = manager.finalizeSyncSubagent('task-sync', big, false);
+
+      expect(info).not.toBeNull();
+      expect(info!.result!.length).toBeLessThanOrEqual(TOOL_RESULT_PROJECTION_CHARS + 64);
+      expect(info!.result!.startsWith('S'.repeat(64))).toBe(true);
+      expect(info!.result!.endsWith('字符]')).toBe(true);
+    });
+
+    it('leaves sub-threshold results unchanged under the gate', () => {
+      const { manager, updates } = createManager();
+      manager.setProjectionClampEnabled(() => true);
+      setupRunningOutput(manager);
+
+      manager.handleAgentOutputToolResult('output-clamp', JSON.stringify({ result: 'small outcome' }), false);
+
+      const final = updates[updates.length - 1];
+      expect(final.result).toBe('small outcome');
+    });
+  });
+
+  // ============================================
+  // Notification settle clamp (review fix 中1: residual channel)
+  // ============================================
+
+  describe('notification settle clamp (review fix 中1)', () => {
+    function launchActive(manager: SubagentManager, agentId = 'agent-ntf'): void {
+      const parentEl = createMockEl();
+      manager.handleTaskToolUse('task-ntf', { description: 'BG', run_in_background: true }, parentEl);
+      manager.handleTaskToolResult('task-ntf', JSON.stringify({ agent_id: agentId }));
+    }
+
+    const hugeNotification = 'N'.repeat(TOOL_RESULT_PROJECTION_CHARS + 11_000);
+
+    it('clamps a giant notification result under the gate with exact metadata', () => {
+      const { manager, updates } = createManager();
+      manager.setProjectionClampEnabled(() => true);
+      launchActive(manager);
+
+      manager.handleTaskNotification('agent-ntf', 'completed', hugeNotification);
+
+      const final = updates[updates.length - 1];
+      expect(final.status).toBe('completed');
+      expect(final.result!.length).toBeLessThanOrEqual(TOOL_RESULT_PROJECTION_CHARS + 64);
+      expect(final.result!.startsWith('N'.repeat(64))).toBe(true);
+      expect(final.resultTruncated).toEqual({
+        originalChars: TOOL_RESULT_PROJECTION_CHARS + 11_000,
+      });
+    });
+
+    it('keeps the notification result full when no gate is injected (Codex zero-change guard)', () => {
+      const { manager, updates } = createManager();
+      launchActive(manager);
+
+      manager.handleTaskNotification('agent-ntf', 'completed', hugeNotification);
+
+      const final = updates[updates.length - 1];
+      expect(final.result).toBe(hugeNotification);
+      expect(final.resultTruncated).toBeUndefined();
+    });
+
+    it('early-terminal promotion settles through the same clamped write', () => {
+      const { manager, updates } = createManager();
+      manager.setProjectionClampEnabled(() => true);
+      // Notification arrives before promotion → remembered, settled at
+      // handleTaskToolResult time through the same settleActiveSubagent write.
+      const parentEl = createMockEl();
+      manager.handleTaskToolUse('task-early', { description: 'BG', run_in_background: true }, parentEl);
+      manager.handleTaskNotification('agent-early', 'failed', hugeNotification);
+      manager.handleTaskToolResult('task-early', JSON.stringify({ agent_id: 'agent-early' }));
+
+      const final = updates[updates.length - 1];
+      expect(final.status).toBe('error');
+      expect(final.result!.length).toBeLessThanOrEqual(TOOL_RESULT_PROJECTION_CHARS + 64);
+      expect(final.resultTruncated).toEqual({
+        originalChars: TOOL_RESULT_PROJECTION_CHARS + 11_000,
+      });
     });
   });

@@ -1,15 +1,19 @@
 import '@/providers';
 
 import { createMockEl } from '@test/helpers/mockElement';
+import { mkdirSync, rmSync, writeFileSync } from 'fs';
 
 import { ProviderSettingsCoordinator } from '@/core/providers/ProviderSettingsCoordinator';
 import {
   TOOL_AGENT_OUTPUT,
+  TOOL_ASK_USER_QUESTION,
   TOOL_SPAWN_AGENT,
   TOOL_TASK,
   TOOL_TODO_WRITE,
   TOOL_WAIT_AGENT,
+  TOOL_WRITE,
 } from '@/core/tools/toolNames';
+import { clampToolResultForProjection,TOOL_RESULT_PROJECTION_CHARS } from '@/core/tools/toolResultProjection';
 import type { ChatMessage } from '@/core/types';
 import {
   createTurnProjectionContext,
@@ -19,6 +23,11 @@ import {
 } from '@/features/chat/controllers/StreamController';
 import { SubagentManager } from '@/features/chat/services/SubagentManager';
 import { ChatState } from '@/features/chat/state/ChatState';
+import { encodeVaultPathForSDK } from '@/providers/claude/history/sdkSessionPaths';
+import {
+  loadSubagentFinalResult,
+  loadSubagentToolCalls,
+} from '@/providers/claude/history/sdkSubagentSidecar';
 import { DEFAULT_CODEX_PRIMARY_MODEL } from '@/providers/codex/types/models';
 
 jest.mock('@/core/tools/todo', () => ({
@@ -29,6 +38,17 @@ jest.mock('@/core/tools/toolInput', () => ({
   extractResolvedAnswers: jest.fn().mockReturnValue(undefined),
   extractResolvedAnswersFromResultText: jest.fn().mockReturnValue(undefined),
 }));
+
+// Subagent sidecar root redirects into a temp directory so the live-hydration
+// clamp tests can exercise the real sidecar source clamp end to end.
+jest.mock('@/providers/claude/history/sdkSessionPaths', () => {
+  const actual = jest.requireActual('@/providers/claude/history/sdkSessionPaths');
+  return {
+    ...actual,
+    getSDKProjectsPath: () =>
+      `${process.env.TMPDIR ?? '/tmp'}/claudian-sc-clamp-${process.pid}`,
+  };
+});
 
 jest.mock('@/features/chat/rendering/SubagentRenderer', () => ({
   createSubagentBlock: jest.fn().mockReturnValue({
@@ -65,6 +85,7 @@ jest.mock('@/features/chat/rendering/WriteEditRenderer', () => ({
 
 jest.mock('@/utils/path', () => ({
   getVaultPath: jest.fn().mockReturnValue('/test/vault'),
+  normalizePathForVault: (rawPath: string) => rawPath,
 }));
 
 function createMockDeps(): StreamControllerDeps {
@@ -3259,5 +3280,530 @@ describe('StreamController - projection mount validation', () => {
     // Detached finalize: block lands from the context buffer, no DOM wait.
     expect(msg.contentBlocks).toContainEqual({ type: 'text', content: 'before eviction' });
     expect(context.textBuffer).toBe('');
+  });
+});
+
+// ============================================
+// Tool result projection clamping (render-pipeline de-stress sub-item 3)
+// ============================================
+
+describe('StreamController - tool result projection clamp', () => {
+  const bigResult = 'x'.repeat(TOOL_RESULT_PROJECTION_CHARS + 5_000);
+  const anotherBigResult = 'y'.repeat(TOOL_RESULT_PROJECTION_CHARS + 7_000);
+
+  const sidecarFixtureRoot = `${process.env.TMPDIR ?? '/tmp'}/claudian-sc-clamp-${process.pid}`;
+
+  beforeAll(() => {
+    const sidecarDir = `${sidecarFixtureRoot}/${encodeVaultPathForSDK('/test/vault')}/session-1/subagents`;
+    rmSync(sidecarFixtureRoot, { recursive: true, force: true });
+    mkdirSync(sidecarDir, { recursive: true });
+    // Sidecar file name is `agent-${agentId}.jsonl` — the runtime agent id is
+    // 'agent-live', so the fixture file doubles the prefix.
+    writeFileSync(
+      `${sidecarDir}/agent-agent-live.jsonl`,
+      [
+        JSON.stringify({
+          type: 'assistant',
+          message: {
+            role: 'assistant',
+            content: [
+              { type: 'tool_use', id: 'toolu_live', name: 'Read', input: { file_path: '/x.md' } },
+            ],
+          },
+        }),
+        JSON.stringify({
+          type: 'user',
+          message: {
+            role: 'user',
+            content: [
+              {
+                type: 'tool_result',
+                tool_use_id: 'toolu_live',
+                content: 'L'.repeat(TOOL_RESULT_PROJECTION_CHARS + 6_000),
+                is_error: false,
+              },
+            ],
+          },
+        }),
+        JSON.stringify({
+          type: 'assistant',
+          message: {
+            role: 'assistant',
+            content: [
+              { type: 'text', text: 'F'.repeat(TOOL_RESULT_PROJECTION_CHARS + 4_000) },
+            ],
+          },
+        }),
+      ].join('\n') + '\n',
+    );
+  });
+
+  afterAll(() => {
+    rmSync(sidecarFixtureRoot, { recursive: true, force: true });
+  });
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    jest.useFakeTimers();
+    deps = createMockDeps();
+    controller = new StreamController(deps);
+    deps.state.currentContentEl = createMockEl();
+  });
+
+  afterEach(() => {
+    deps.state.resetStreamingState();
+    jest.useRealTimers();
+  });
+
+  describe('handleToolResult (write point 4)', () => {
+    it('clamps oversized results with exact metadata when the gate is on', async () => {
+      deps.isClampEnabled = () => true;
+      const msg = createTestMessage();
+      msg.toolCalls = [
+        { id: 'tool-1', name: 'Read', input: {}, status: 'running', isExpanded: false } as any,
+      ];
+
+      await controller.handleStreamChunk(
+        { type: 'tool_result', id: 'tool-1', content: bigResult },
+        ctx(msg)
+      );
+
+      const toolCall = msg.toolCalls![0];
+      expect(toolCall.result!.length).toBeLessThanOrEqual(TOOL_RESULT_PROJECTION_CHARS + 64);
+      expect(toolCall.result!.startsWith('x'.repeat(64))).toBe(true);
+      expect(toolCall.resultTruncated).toEqual({
+        originalChars: TOOL_RESULT_PROJECTION_CHARS + 5_000,
+      });
+    });
+
+    it('exempts AskUserQuestion results from clamping', async () => {
+      deps.isClampEnabled = () => true;
+      const msg = createTestMessage();
+      msg.toolCalls = [
+        { id: 'ask-1', name: TOOL_ASK_USER_QUESTION, input: {}, status: 'running', isExpanded: false } as any,
+      ];
+
+      await controller.handleStreamChunk(
+        { type: 'tool_result', id: 'ask-1', content: bigResult },
+        ctx(msg)
+      );
+
+      expect(msg.toolCalls![0].result).toBe(bigResult);
+      expect(msg.toolCalls![0].resultTruncated).toBeUndefined();
+    });
+
+    it('extracts diffData from the raw toolUseResult before clamping the result', async () => {
+      deps.isClampEnabled = () => true;
+      const msg = createTestMessage();
+      msg.toolCalls = [
+        { id: 'write-1', name: TOOL_WRITE, input: { file_path: '/vault/a.md' }, status: 'running', isExpanded: false } as any,
+      ];
+      deps.state.writeEditStates.set('write-1', {} as any);
+
+      await controller.handleStreamChunk(
+        {
+          type: 'tool_result',
+          id: 'write-1',
+          content: bigResult,
+          toolUseResult: {
+            type: 'text',
+            filePath: '/vault/a.md',
+            structuredPatch: [
+              { oldStart: 1, newStart: 1, lines: ['-old', '+new', ' ctx'] },
+            ],
+          } as any,
+        },
+        ctx(msg)
+      );
+
+      const toolCall = msg.toolCalls![0];
+      expect(toolCall.diffData).toBeDefined();
+      expect(toolCall.diffData!.diffLines).toHaveLength(3);
+      expect(toolCall.result!.length).toBeLessThanOrEqual(TOOL_RESULT_PROJECTION_CHARS + 64);
+      expect(toolCall.resultTruncated).toEqual({
+        originalChars: TOOL_RESULT_PROJECTION_CHARS + 5_000,
+      });
+    });
+  });
+
+  describe('handleToolOutput progressive append (write point 5)', () => {
+    it('stops at the threshold, drops further appends, and flags metadata once', async () => {
+      deps.isClampEnabled = () => true;
+      const msg = createTestMessage();
+      msg.toolCalls = [
+        { id: 'bash-1', name: 'Bash', input: {}, status: 'running', isExpanded: false } as any,
+      ];
+
+      await controller.handleStreamChunk(
+        { type: 'tool_output', id: 'bash-1', content: 'a'.repeat(200_000) },
+        ctx(msg)
+      );
+      await controller.handleStreamChunk(
+        { type: 'tool_output', id: 'bash-1', content: 'b'.repeat(100_000) },
+        ctx(msg)
+      );
+
+      const toolCall = msg.toolCalls![0];
+      expect(toolCall.result!.length).toBe(TOOL_RESULT_PROJECTION_CHARS);
+      expect(toolCall.result!.startsWith('a'.repeat(200_000))).toBe(true);
+      expect(toolCall.resultTruncated).toEqual({ originalChars: 300_000 });
+
+      // Third append is dropped entirely; metadata is only set once.
+      await controller.handleStreamChunk(
+        { type: 'tool_output', id: 'bash-1', content: 'c'.repeat(50_000) },
+        ctx(msg)
+      );
+      expect(toolCall.result!.length).toBe(TOOL_RESULT_PROJECTION_CHARS);
+      expect(toolCall.result!.endsWith('b'.repeat(10))).toBe(true);
+      expect(toolCall.resultTruncated).toEqual({ originalChars: 300_000 });
+    });
+
+    it('appends unbounded when no gate is injected (Codex zero-change guard)', async () => {
+      const msg = createTestMessage();
+      msg.toolCalls = [
+        { id: 'bash-1', name: 'Bash', input: {}, status: 'running', isExpanded: false } as any,
+      ];
+
+      await controller.handleStreamChunk(
+        { type: 'tool_output', id: 'bash-1', content: 'a'.repeat(200_000) },
+        ctx(msg)
+      );
+      await controller.handleStreamChunk(
+        { type: 'tool_output', id: 'bash-1', content: 'b'.repeat(100_000) },
+        ctx(msg)
+      );
+
+      expect(msg.toolCalls![0].result!.length).toBe(300_000);
+      expect(msg.toolCalls![0].resultTruncated).toBeUndefined();
+    });
+  });
+
+  describe('dynamic capability gate (capability routing)', () => {
+    it('re-evaluates per write: a provider switch to a non-clamping service stops clamping', async () => {
+      let gateOn = true;
+      deps.isClampEnabled = () => gateOn;
+      const msg = createTestMessage();
+      msg.toolCalls = [
+        { id: 'tool-1', name: 'Read', input: {}, status: 'running', isExpanded: false } as any,
+        { id: 'tool-2', name: 'Read', input: {}, status: 'running', isExpanded: false } as any,
+      ];
+
+      await controller.handleStreamChunk(
+        { type: 'tool_result', id: 'tool-1', content: bigResult },
+        ctx(msg)
+      );
+      expect(msg.toolCalls![0].result!.length).toBeLessThanOrEqual(TOOL_RESULT_PROJECTION_CHARS + 64);
+
+      // Provider switch: the gate callback now observes a non-index-capable
+      // service and flips to false — later writes must stay untouched.
+      gateOn = false;
+      await controller.handleStreamChunk(
+        { type: 'tool_result', id: 'tool-2', content: anotherBigResult },
+        ctx(msg)
+      );
+      expect(msg.toolCalls![1].result).toBe(anotherBigResult);
+      expect(msg.toolCalls![1].resultTruncated).toBeUndefined();
+    });
+  });
+
+  describe('subagent channels (write point 6)', () => {
+    it('clamps nested subagent tool results from subagent_tool_result chunks', async () => {
+      deps.isClampEnabled = () => true;
+      const msg = createTestMessage();
+      const nested: any = {
+        id: 'nested-1', name: 'Read', input: {}, status: 'running', isExpanded: false,
+      };
+      (deps.subagentManager.getSyncSubagent as jest.Mock).mockReturnValue({
+        id: 'task-1', description: 'Sync', toolCalls: [nested],
+      });
+
+      await controller.handleStreamChunk(
+        { type: 'subagent_tool_result', id: 'nested-1', subagentId: 'task-1', content: bigResult },
+        ctx(msg)
+      );
+
+      expect(nested.result!.length).toBeLessThanOrEqual(TOOL_RESULT_PROJECTION_CHARS + 64);
+      expect(nested.resultTruncated).toEqual({
+        originalChars: TOOL_RESULT_PROJECTION_CHARS + 5_000,
+      });
+    });
+
+    it('clamps the sync-finalize fallback result when the manager has no record', async () => {
+      deps.isClampEnabled = () => true;
+      const msg = createTestMessage();
+      (deps.subagentManager.getSyncSubagent as jest.Mock).mockReturnValue({ id: 'task-1' });
+      (deps.subagentManager.finalizeSyncSubagent as jest.Mock).mockReturnValue(null);
+
+      await controller.handleStreamChunk(
+        { type: 'tool_result', id: 'task-1', content: bigResult },
+        ctx(msg)
+      );
+
+      const taskToolCall = msg.toolCalls!.find(tc => tc.id === 'task-1')!;
+      expect(taskToolCall).toBeDefined();
+      expect(taskToolCall.result!.length).toBeLessThanOrEqual(TOOL_RESULT_PROJECTION_CHARS + 64);
+      expect(taskToolCall.resultTruncated).toEqual({
+        originalChars: TOOL_RESULT_PROJECTION_CHARS + 5_000,
+      });
+    });
+  });
+
+  describe('async settle via applySubagentToTaskToolCall (write point 8, clamped sources)', () => {
+    function setupRealManager(clamp: () => boolean = () => true) {
+      const stateChanges: any[] = [];
+      const manager = new SubagentManager((subagent) => {
+        stateChanges.push(subagent);
+        controller.onAsyncSubagentStateChange(subagent);
+      });
+      manager.setProjectionClampEnabled(clamp);
+      deps.subagentManager = manager as any;
+      return { manager, stateChanges };
+    }
+
+    it('async settle of a huge TaskOutput clamps both taskToolCall.result and subagent.result without rewriting the shared object', async () => {
+      const msg = createTestMessage();
+      msg.toolCalls = [{
+        id: 'task-apl', name: TOOL_TASK, input: {}, status: 'running', isExpanded: false,
+      }];
+      deps.state.messages = [msg];
+      deps.state.currentContentEl = createMockEl();
+      const { manager } = setupRealManager();
+      manager.handleTaskToolUse('task-apl', { description: 'Bg', prompt: 'work', run_in_background: true }, null);
+      manager.handleTaskToolResult('task-apl', JSON.stringify({ agent_id: 'agent-apl' }));
+      manager.handleAgentOutputToolUse({
+        id: 'out-apl', name: TOOL_AGENT_OUTPUT, input: { task_id: 'agent-apl' },
+        status: 'running', isExpanded: false,
+      });
+
+      const inner = 't'.repeat(TOOL_RESULT_PROJECTION_CHARS + 8_000);
+      await controller.handleStreamChunk(
+        { type: 'tool_result', id: 'out-apl', content: JSON.stringify({ result: inner }) },
+        ctx(msg)
+      );
+
+      const taskToolCall = msg.toolCalls![0];
+      expect(taskToolCall.result).toBeDefined();
+      expect(taskToolCall.result!.length).toBeLessThanOrEqual(TOOL_RESULT_PROJECTION_CHARS + 64);
+      expect(taskToolCall.result!.startsWith('t'.repeat(64))).toBe(true);
+      expect(taskToolCall.subagent).toBeDefined();
+      expect(taskToolCall.subagent!.result).toBe(taskToolCall.result);
+
+      // Repeated state changes re-apply the same clamped string — the shared
+      // record is not rewritten or double-clamped (single marker).
+      controller.onAsyncSubagentStateChange(taskToolCall.subagent!);
+      expect(taskToolCall.result!.endsWith('字符]')).toBe(true);
+      expect(taskToolCall.result!.split('已截断').length - 1).toBe(1);
+      expect(msg.toolCalls!.filter(tc => tc.id === 'task-apl')).toHaveLength(1);
+    });
+  });
+
+  describe('live hydration consumes source-clamped sidecar data (source clamps, live consumers)', () => {
+    // Real timers: the sidecar reads real files, whose promises settle on the
+    // event loop rather than the microtask queue.
+    beforeEach(() => {
+      jest.useRealTimers();
+    });
+
+    /**
+     * Deterministic wait (review fix 中2): polls the condition instead of a
+     * fixed sleep so real-fs latency under load cannot drift the assertions.
+     */
+    async function pollUntil(check: () => boolean, timeoutMs = 2_000): Promise<void> {
+      const deadline = Date.now() + timeoutMs;
+      while (!check()) {
+        if (Date.now() >= deadline) {
+          throw new Error(`pollUntil: condition not met within ${timeoutMs}ms`);
+        }
+        await new Promise(resolve => setTimeout(resolve, 10));
+      }
+    }
+
+    it('mergeSubagentToolCallsById and the final result assignment receive clamped values', async () => {
+      const runtime = deps.getAgentService!() as any;
+      runtime.loadSubagentToolCalls.mockImplementation((agentId: string) =>
+        loadSubagentToolCalls('/test/vault', 'session-1', agentId));
+      runtime.loadSubagentFinalResult.mockImplementation((agentId: string) =>
+        loadSubagentFinalResult('/test/vault', 'session-1', agentId));
+
+      const msg = createTestMessage();
+      msg.toolCalls = [{
+        id: 'task-live', name: TOOL_TASK, input: {}, status: 'running', isExpanded: false,
+      }];
+      deps.state.messages = [msg];
+      const manager = new SubagentManager((subagent) => {
+        controller.onAsyncSubagentStateChange(subagent);
+      });
+      deps.subagentManager = manager as any;
+      manager.handleTaskToolUse('task-live', { description: 'Bg', prompt: 'work', run_in_background: true }, null);
+      manager.handleTaskToolResult('task-live', JSON.stringify({ agent_id: 'agent-live' }));
+
+      controller.handleAsyncSubagentNotification('agent-live', 'completed', 'done');
+      await pollUntil(() => {
+        const record = msg.toolCalls![0].subagent;
+        return !!record && record.toolCalls.length === 1 && !!record.result;
+      });
+      for (let i = 0; i < 8; i++) {
+        await Promise.resolve();
+      }
+
+      const record = msg.toolCalls![0].subagent!;
+      expect(record.toolCalls).toHaveLength(1);
+      expect(record.toolCalls[0].result!.length).toBeLessThanOrEqual(TOOL_RESULT_PROJECTION_CHARS + 64);
+      expect(record.toolCalls[0].resultTruncated).toEqual({
+        originalChars: TOOL_RESULT_PROJECTION_CHARS + 6_000,
+      });
+      // Final result channel also lands clamped from the source, with the
+      // marker metadata recovered on the hydration overwrite (review fix 低3).
+      expect(record.result!.length).toBeLessThanOrEqual(TOOL_RESULT_PROJECTION_CHARS + 64);
+      expect(record.result!.startsWith('F'.repeat(64))).toBe(true);
+      expect(record.resultTruncated).toEqual({
+        originalChars: TOOL_RESULT_PROJECTION_CHARS + 4_000,
+      });
+
+      // Deterministic chain conclusion (review fix 中2): the running-phase
+      // poll chain's terminal tick re-reads the sidecar (2nd read) and stops
+      // on finalResultHydrated — wait for that read, then flush continuations.
+      await pollUntil(
+        () => (runtime.loadSubagentToolCalls as jest.Mock).mock.calls.length >= 2
+      );
+      for (let i = 0; i < 8; i++) {
+        await Promise.resolve();
+      }
+      // Failsafe for slow machines: any still-pending chain tick must stop
+      // immediately instead of retrying against the fixture afterAll removes.
+      record.asyncStatus = 'orphaned';
+    });
+  });
+
+  // ============================================
+  // Review fixes 中1/低3: notification settle clamp + hydrate metadata
+  // ============================================
+
+  describe('notification settle clamp and hydrate metadata (review fixes 中1/低3)', () => {
+    function setupRealManager(clamp: () => boolean = () => true) {
+      const manager = new SubagentManager((subagent) => {
+        controller.onAsyncSubagentStateChange(subagent);
+      });
+      manager.setProjectionClampEnabled(clamp);
+      deps.subagentManager = manager as any;
+      return { manager };
+    }
+
+    function seedLiveTask(msg: ChatMessage, manager: SubagentManager, agentId: string): void {
+      msg.toolCalls = [{
+        id: 'task-ntf', name: TOOL_TASK, input: {}, status: 'running', isExpanded: false,
+      }];
+      deps.state.messages = [msg];
+      manager.handleTaskToolUse('task-ntf', { description: 'Bg', prompt: 'work', run_in_background: true }, null);
+      manager.handleTaskToolResult('task-ntf', JSON.stringify({ agent_id: agentId }));
+    }
+
+    async function flushAsync(): Promise<void> {
+      for (let i = 0; i < 8; i++) {
+        await Promise.resolve();
+      }
+    }
+
+    it('a giant notification result stays clamped in ChatMessage when hydration never succeeds (attempt-cap residual channel)', async () => {
+      const runtime = deps.getAgentService!() as any;
+      runtime.loadSubagentToolCalls.mockResolvedValue([]);
+      runtime.loadSubagentFinalResult.mockResolvedValue(null);
+
+      const msg = createTestMessage();
+      const { manager } = setupRealManager();
+      seedLiveTask(msg, manager, 'agent-ntf');
+
+      const huge = 'N'.repeat(TOOL_RESULT_PROJECTION_CHARS + 9_000);
+      controller.handleAsyncSubagentNotification('agent-ntf', 'completed', huge);
+      await flushAsync();
+
+      const taskToolCall = msg.toolCalls![0];
+      expect(taskToolCall.result!.length).toBeLessThanOrEqual(TOOL_RESULT_PROJECTION_CHARS + 64);
+      expect(taskToolCall.result!.startsWith('N'.repeat(64))).toBe(true);
+      expect(taskToolCall.resultTruncated).toEqual({
+        originalChars: TOOL_RESULT_PROJECTION_CHARS + 9_000,
+      });
+      expect(taskToolCall.subagent!.result).toBe(taskToolCall.result);
+      expect(taskToolCall.subagent!.resultTruncated).toEqual({
+        originalChars: TOOL_RESULT_PROJECTION_CHARS + 9_000,
+      });
+    });
+
+    it('keeps the notification result full when the gate evaluates false (Codex zero-change guard)', async () => {
+      const runtime = deps.getAgentService!() as any;
+      runtime.loadSubagentToolCalls.mockResolvedValue([]);
+      runtime.loadSubagentFinalResult.mockResolvedValue(null);
+
+      const msg = createTestMessage();
+      const { manager } = setupRealManager(() => false);
+      seedLiveTask(msg, manager, 'agent-off');
+
+      const huge = 'N'.repeat(TOOL_RESULT_PROJECTION_CHARS + 9_000);
+      controller.handleAsyncSubagentNotification('agent-off', 'completed', huge);
+      await flushAsync();
+
+      const taskToolCall = msg.toolCalls![0];
+      expect(taskToolCall.result).toBe(huge);
+      expect(taskToolCall.resultTruncated).toBeUndefined();
+      expect(taskToolCall.subagent!.resultTruncated).toBeUndefined();
+    });
+
+    it('hydration overwrite of the clamped final result lands resultTruncated metadata (review fix 低3)', async () => {
+      const runtime = deps.getAgentService!() as any;
+      runtime.loadSubagentToolCalls.mockResolvedValue([]);
+      const hugeFinal = 'H'.repeat(TOOL_RESULT_PROJECTION_CHARS + 6_600);
+      const clampedFinal = clampToolResultForProjection(hugeFinal).text;
+      runtime.loadSubagentFinalResult.mockResolvedValue(clampedFinal);
+
+      const msg = createTestMessage();
+      const { manager } = setupRealManager();
+      seedLiveTask(msg, manager, 'agent-low3');
+
+      controller.handleAsyncSubagentNotification('agent-low3', 'completed', 'small settled text');
+      await flushAsync();
+
+      const taskToolCall = msg.toolCalls![0];
+      expect(taskToolCall.result).toBe(clampedFinal);
+      expect(taskToolCall.resultTruncated).toEqual({ originalChars: hugeFinal.length });
+      expect(taskToolCall.subagent!.resultTruncated).toEqual({ originalChars: hugeFinal.length });
+    });
+
+    it('merged nested tool results carry resultTruncated metadata on refresh', async () => {
+      const runtime = deps.getAgentService!() as any;
+      const nestedOriginal = TOOL_RESULT_PROJECTION_CHARS + 2_000;
+      // Production shape: the sidecar source clamp delivers the clamped
+      // string plus its metadata; the merge only propagates both.
+      const clampedNested = clampToolResultForProjection('M'.repeat(nestedOriginal));
+      runtime.loadSubagentToolCalls
+        .mockResolvedValueOnce([
+          { id: 'nested-m', name: 'Read', input: {}, status: 'running', isExpanded: false },
+        ])
+        .mockResolvedValueOnce([
+          {
+            id: 'nested-m', name: 'Read', input: {}, status: 'completed', isExpanded: false,
+            result: clampedNested.text,
+            resultTruncated: { originalChars: clampedNested.originalChars },
+          },
+        ]);
+      runtime.loadSubagentFinalResult.mockResolvedValue(null);
+
+      const msg = createTestMessage();
+      const { manager } = setupRealManager();
+      seedLiveTask(msg, manager, 'agent-merge');
+
+      controller.handleAsyncSubagentNotification('agent-merge', 'completed', 'done');
+      await flushAsync();
+
+      // First read created the entry; the chain's terminal tick refreshes it
+      // with the clamped result — the by-id merge must carry the metadata.
+      jest.advanceTimersByTime(200);
+      await flushAsync();
+
+      const record = msg.toolCalls![0].subagent!;
+      expect(record.toolCalls).toHaveLength(1);
+      expect(record.toolCalls[0].status).toBe('completed');
+      expect(record.toolCalls[0].result!.length).toBeLessThanOrEqual(TOOL_RESULT_PROJECTION_CHARS + 64);
+      expect(record.toolCalls[0].resultTruncated).toEqual({ originalChars: nestedOriginal });
+    });
   });
 });

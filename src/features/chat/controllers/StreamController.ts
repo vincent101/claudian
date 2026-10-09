@@ -22,6 +22,11 @@ import {
   TOOL_WRITE,
 } from '../../../core/tools/toolNames';
 import { extractToolResultContent } from '../../../core/tools/toolResultContent';
+import {
+  parseClampMarkerOriginalChars,
+  setClampedToolCallResult,
+  TOOL_RESULT_PROJECTION_CHARS,
+} from '../../../core/tools/toolResultProjection';
 import type { ChatMessage, StreamChunk, SubagentInfo, ToolCallInfo } from '../../../core/types';
 import type { SDKToolUseResult } from '../../../core/types/diff';
 import type ClaudianPlugin from '../../../main';
@@ -73,6 +78,13 @@ export interface StreamControllerDeps {
   /** Get the agent service from the tab. */
   getAgentService?: () => ChatRuntime | null;
   onStreamComplete?: () => void;
+  /**
+   * Render-pipeline sub-item 3: dynamic gate for tool-result projection
+   * clamping. Evaluated per write so a provider switch can never leave a
+   * stale decision behind (Codex/OpenCode persist full messages — clamping
+   * there would lose data). Absent → never clamps.
+   */
+  isClampEnabled?: () => boolean;
 }
 
 /**
@@ -230,6 +242,29 @@ export class StreamController {
 
   private normalizeToolResultContent(content: unknown): string {
     return extractToolResultContent(content, { fallbackIndent: 2 });
+  }
+
+  private isProjectionClampEnabled(): boolean {
+    return this.deps.isClampEnabled?.() ?? false;
+  }
+
+  /**
+   * ChatMessage write points 4/6 (render-pipeline sub-item 3): bound the
+   * projected copy behind the dynamic capability gate. AskUserQuestion is
+   * exempt — its result feeds extractResolvedAnswersFromResultText and stays
+   * far below the budget. Values already clamped upstream (extractAgentResult
+   * exit / provider-owned source clamps) pass through unchanged — the helper
+   * is marker-aware idempotent.
+   */
+  private assignProjectedToolResult(toolCall: ToolCallInfo, text: string): void {
+    if (toolCall.name === TOOL_ASK_USER_QUESTION || !this.isProjectionClampEnabled()) {
+      toolCall.result = text;
+      // Metadata reflects the current assignment: an exact write supersedes
+      // any flag left by the progressive-append clamp.
+      delete toolCall.resultTruncated;
+      return;
+    }
+    setClampedToolCallResult(toolCall, text);
   }
 
   // ============================================
@@ -583,7 +618,19 @@ export class StreamController {
       return;
     }
 
-    existingToolCall.result = (existingToolCall.result ?? '') + chunk.content;
+    // Write point 5 (render-pipeline sub-item 3): once the projection budget
+    // is exhausted, the append is dropped and the truncation flag set once —
+    // the full output stays in the transcript; the settled tool_result later
+    // re-clamps with exact metadata at write point 4.
+    const combined = (existingToolCall.result ?? '') + chunk.content;
+    if (this.isProjectionClampEnabled() && combined.length > TOOL_RESULT_PROJECTION_CHARS) {
+      existingToolCall.result = combined.slice(0, TOOL_RESULT_PROJECTION_CHARS);
+      if (!existingToolCall.resultTruncated) {
+        existingToolCall.resultTruncated = { originalChars: combined.length };
+      }
+    } else {
+      existingToolCall.result = combined;
+    }
     this.scheduleToolOutputRender(chunk.id, existingToolCall);
     this.showThinkingIndicator();
   }
@@ -778,7 +825,10 @@ export class StreamController {
       } else {
         existingToolCall.status = 'completed';
       }
-      existingToolCall.result = normalizedContent;
+      // Write point 4 (render-pipeline sub-item 3). The parses below
+      // (resolvedAnswers, extractDiffData) read the full local
+      // normalizedContent / chunk.toolUseResult, so ordering holds.
+      this.assignProjectedToolResult(existingToolCall, normalizedContent);
 
       if (existingToolCall.name === TOOL_ASK_USER_QUESTION) {
         const answers =
@@ -1304,7 +1354,9 @@ export class StreamController {
           const normalizedContent = this.normalizeToolResultContent(chunk.content);
           const isBlocked = isBlockedToolResult(normalizedContent, chunk.isError);
           toolCall.status = isBlocked ? 'blocked' : (chunk.isError ? 'error' : 'completed');
-          toolCall.result = normalizedContent;
+          // Write point 6 (render-pipeline sub-item 3): nested subagent tool
+          // results entering the projection.
+          this.assignProjectedToolResult(toolCall, normalizedContent);
           subagentManager.updateSyncToolResult(parentToolUseId, chunk.id, toolCall);
         }
         break;
@@ -1330,10 +1382,13 @@ export class StreamController {
 
     const taskToolCall = this.ensureTaskToolCall(msg, chunk.id);
     taskToolCall.status = isError ? 'error' : 'completed';
-    taskToolCall.result = extractedResult;
+    // Write point 6 (render-pipeline sub-item 3): finalized.result is already
+    // clamped at the extractAgentResult exit; the fallback path clamps here.
+    // Marker-aware idempotency keeps already-clamped values byte-identical.
+    this.assignProjectedToolResult(taskToolCall, extractedResult);
     if (taskToolCall.subagent) {
       taskToolCall.subagent.status = isError ? 'error' : 'completed';
-      taskToolCall.subagent.result = extractedResult;
+      taskToolCall.subagent.result = taskToolCall.result;
     }
 
     if (finalized) {
@@ -1515,6 +1570,15 @@ export class StreamController {
         finalResultHydrated = true;
         if (recoveredFinalResult !== subagent.result) {
           subagent.result = recoveredFinalResult;
+          // Review fix 低3: the sidecar source clamp returns the marker text
+          // only; recover the original size from the marker so the metadata
+          // travels with the hydrated value into taskToolCall.
+          const markerChars = parseClampMarkerOriginalChars(recoveredFinalResult);
+          if (markerChars !== null) {
+            subagent.resultTruncated = { originalChars: markerChars };
+          } else {
+            delete subagent.resultTruncated;
+          }
           hasHydrated = true;
         }
       }
@@ -1579,6 +1643,13 @@ export class StreamController {
 
     if (typeof incoming.result === 'string' && incoming.result !== current.result) {
       current.result = incoming.result;
+      // Metadata travels with the value (sidecar source clamp carries
+      // resultTruncated) so a refreshed entry never loses its marker info.
+      if (incoming.resultTruncated) {
+        current.resultTruncated = incoming.resultTruncated;
+      } else {
+        delete current.resultTruncated;
+      }
       changed = true;
     }
 
@@ -1763,6 +1834,13 @@ export class StreamController {
     else taskToolCall.status = 'running';
     if (subagent.result !== undefined) {
       taskToolCall.result = subagent.result;
+      // Review fix 中1/低3: keep truncation metadata alongside the value so
+      // the phase-2 "view full text" affordance never misses this path.
+      if (subagent.resultTruncated) {
+        taskToolCall.resultTruncated = subagent.resultTruncated;
+      } else {
+        delete taskToolCall.resultTruncated;
+      }
     }
   }
 

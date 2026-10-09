@@ -2,6 +2,10 @@ import { existsSync } from 'fs';
 import * as fs from 'fs/promises';
 import * as path from 'path';
 
+import {
+  clampToolResultForProjection,
+  setClampedToolCallResult,
+} from '../../../core/tools/toolResultProjection';
 import type { ToolCallInfo } from '../../../core/types';
 import { extractFinalResultFromSubagentJsonl } from '../../../utils/subagentJsonl';
 import { extractToolResultContent } from '../sdk/toolResultContent';
@@ -144,15 +148,19 @@ function buildToolCallsFromSubagentEvents(events: SubagentToolEvent[]): ToolCall
     }
 
     if (!existing) {
+      const orphanToolCall: ToolCallInfo = {
+        id: event.toolUseId,
+        name: 'Unknown',
+        input: {},
+        status: event.isError ? 'error' : 'completed',
+        isExpanded: false,
+      };
+      // Source clamp (sub-item 3, write point 1): both consumers (live
+      // hydration merge + history materialization) share this single channel,
+      // so nested subagent tool results enter projections already clamped.
+      setClampedToolCallResult(orphanToolCall, event.content);
       toolsById.set(event.toolUseId, {
-        toolCall: {
-          id: event.toolUseId,
-          name: 'Unknown',
-          input: {},
-          status: event.isError ? 'error' : 'completed',
-          result: event.content,
-          isExpanded: false,
-        },
+        toolCall: orphanToolCall,
         hasToolUse: false,
         hasToolResult: true,
         timestamp: event.timestamp,
@@ -161,7 +169,7 @@ function buildToolCallsFromSubagentEvents(events: SubagentToolEvent[]): ToolCall
     }
 
     existing.toolCall.status = event.isError ? 'error' : 'completed';
-    existing.toolCall.result = event.content;
+    setClampedToolCallResult(existing.toolCall, event.content);
     existing.hasToolResult = true;
   }
 
@@ -254,7 +262,10 @@ export async function loadSubagentFinalResult(
     }
 
     const content = await fs.readFile(subagentFilePath, 'utf-8');
-    return extractFinalResultFromSubagentJsonl(content);
+    const finalResult = extractFinalResultFromSubagentJsonl(content);
+    // Source clamp (sub-item 3, write point 2): extract the final result from
+    // the full sidecar content first, then bound the projected copy.
+    return finalResult === null ? null : clampToolResultForProjection(finalResult).text;
   } catch {
     return null;
   }

@@ -35,6 +35,11 @@ export interface ToolCallInfo {
   input: Record<string, unknown>;
   status: 'running' | 'completed' | 'error' | 'blocked';
   result?: string;
+  /**
+   * Set when `result` was clamped for projection (sub-item 3): the full text
+   * stays in the transcript/history index; this records its original size.
+   */
+  resultTruncated?: { originalChars: number };
   isExpanded?: boolean;
   diffData?: ToolDiffData;
   resolvedAnswers?: AskUserAnswers;
@@ -70,6 +75,11 @@ export interface SubagentInfo {
   mode?: SubagentMode;
   isExpanded: boolean;
   result?: string;
+  /**
+   * Set when `result` was clamped for projection — mirrors ToolCallInfo's
+   * field so the metadata survives the subagent → taskToolCall copy.
+   */
+  resultTruncated?: { originalChars: number };
   status: 'running' | 'completed' | 'error';
   toolCalls: ToolCallInfo[];
   asyncStatus?: AsyncSubagentStatus;

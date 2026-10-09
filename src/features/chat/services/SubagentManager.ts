@@ -6,6 +6,7 @@ import { ProviderRegistry } from '../../../core/providers/ProviderRegistry';
 import type { ProviderTaskResultInterpreter } from '../../../core/providers/types';
 import { TOOL_TASK } from '../../../core/tools/toolNames';
 import { extractToolResultContent } from '../../../core/tools/toolResultContent';
+import { clampToolResultForProjection } from '../../../core/tools/toolResultProjection';
 import type {
   SubagentInfo,
   SubagentMode,
@@ -64,6 +65,13 @@ export class SubagentManager {
 
   private onStateChange: SubagentStateChangeCallback;
   private taskResultInterpreter: ProviderTaskResultInterpreter;
+  /**
+   * Render-pipeline sub-item 3 write point 7 gate: bounds agent results
+   * leaving extractAgentResult. Optional and evaluated per call so a provider
+   * switch can never leave a stale decision behind (Codex/OpenCode persist
+   * full messages — clamping there would lose data).
+   */
+  private projectionClampEnabled?: () => boolean;
 
   constructor(
     onStateChange: SubagentStateChangeCallback,
@@ -79,6 +87,10 @@ export class SubagentManager {
 
   public setTaskResultInterpreter(interpreter: ProviderTaskResultInterpreter): void {
     this.taskResultInterpreter = interpreter;
+  }
+
+  public setProjectionClampEnabled(enabled?: () => boolean): void {
+    this.projectionClampEnabled = enabled;
   }
 
   // ============================================
@@ -430,7 +442,16 @@ export class SubagentManager {
 
     subagent.asyncStatus = finalStatus;
     subagent.status = finalStatus;
-    subagent.result = trimmedResult || subagent.result || `Task ${status}`;
+    // Review fix 中1 (residual channel): notification results up to ~500K
+    // chars landed in ChatMessage unclamped when sidecar hydration never
+    // succeeds (read failure to the attempt cap). Pure string assignment —
+    // no shared-object identity concerns; one write covers both the
+    // StreamController entry and the Tab.ts notification-handler fallback.
+    // Behind the same projectionClampEnabled gate as extractAgentResult.
+    this.assignSettledSubagentResult(
+      subagent,
+      trimmedResult || subagent.result || `Task ${status}`
+    );
     subagent.completedAt = Date.now();
 
     if (subagent.outputToolId) {
@@ -441,6 +462,26 @@ export class SubagentManager {
 
     this.projectAsyncSubagentState(subagent);
     this.onStateChange(subagent);
+  }
+
+  /**
+   * Settled-result write with the projection clamp applied (review fix 中1).
+   * Marker-aware idempotency: a previously clamped subagent.result chosen as
+   * the fallback value passes through unchanged.
+   */
+  private assignSettledSubagentResult(subagent: SubagentInfo, text: string): void {
+    if (this.projectionClampEnabled?.()) {
+      const clamped = clampToolResultForProjection(text);
+      subagent.result = clamped.text;
+      if (clamped.truncated) {
+        subagent.resultTruncated = { originalChars: clamped.originalChars };
+      } else {
+        delete subagent.resultTruncated;
+      }
+      return;
+    }
+    subagent.result = text;
+    delete subagent.resultTruncated;
   }
 
   /**
@@ -1077,6 +1118,19 @@ export class SubagentManager {
   }
 
   private extractAgentResult(result: string, agentId: string, toolUseResult?: unknown): string {
+    // Render-pipeline sub-item 3 write point 7: the single exit both call
+    // sites (:311/:522) share for agent results entering ChatMessage
+    // projections. All parsing inside extractAgentResultContent ran on the
+    // full input; the gate bounds only the projected copy — the transcript
+    // keeps the full text.
+    const extracted = this.extractAgentResultContent(result, agentId, toolUseResult);
+    if (this.projectionClampEnabled?.()) {
+      return clampToolResultForProjection(extracted).text;
+    }
+    return extracted;
+  }
+
+  private extractAgentResultContent(result: string, agentId: string, toolUseResult?: unknown): string {
     const structuredResult = this.taskResultInterpreter.extractStructuredResult(toolUseResult);
     const normalizedStructuredResult = this.extractResultFromCandidateString(structuredResult);
     if (normalizedStructuredResult) {
