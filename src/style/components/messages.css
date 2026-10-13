@@ -160,7 +160,11 @@
 
 .claudian-search-match {
   padding: 0;
-  background: color-mix(in srgb, var(--text-highlight-bg) 55%, transparent);
+  /* 全量主题高亮色：55% color-mix 稀释在浅色主题下有效 alpha 仅 0.22
+     （白底合成 Δ(0,10,56)，肉眼不可见）——普通匹配隐形、只剩 is-current
+     的紫色 outline 可辨（2026-10-10 实测）。对齐 Obsidian 原生搜索：
+     普通匹配不做稀释，层次感由 is-current 的 outline 承担。 */
+  background: var(--text-highlight-bg);
   color: inherit;
 }
 
