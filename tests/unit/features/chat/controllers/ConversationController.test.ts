@@ -614,17 +614,18 @@ describe('ConversationController', () => {
       expect(previous.release).not.toHaveBeenCalled();
 
       // The build completes while another live turn streams: the exchange
-      // queues behind it (necessary serialization, not a build-length
-      // block) and swaps once the turn ends.
+      // no longer queues behind the live turn (B — the exchange writes no
+      // DOM the live page owns); it swaps the mounted lease in place while
+      // the turn keeps streaming.
       const liveTwo = await coordinator.acquireLive();
       resolveReady();
       await Promise.resolve();
       await Promise.resolve();
-      expect(deps.state.historyLease).toBe(previous);
+      expect(deps.state.historyLease).toBe(next);
+      expect(previous.release).toHaveBeenCalledTimes(1);
       liveTwo!.release();
       await refreshing;
       expect(deps.state.historyLease).toBe(next);
-      expect(previous.release).toHaveBeenCalledTimes(1);
     });
 
     it('starts the refresh build without waiting for an in-flight live turn (P1)', async () => {
@@ -655,13 +656,13 @@ describe('ConversationController', () => {
       resolveReady();
       await Promise.resolve();
       await Promise.resolve();
-      // The exchange defers to the still-streaming turn — the necessary
-      // serialization, not the old build-length block.
-      expect(deps.state.historyLease).toBe(previous);
-      live!.release();
-      await refreshing;
+      // B: the exchange runs in the live domain's blind spot — the swap
+      // lands while the turn still streams (previously it waited for the
+      // turn to end, which is exactly the 60s first-query stall B removes).
       expect(deps.state.historyLease).toBe(next);
       expect(previous.release).toHaveBeenCalledTimes(1);
+      live!.release();
+      await refreshing;
       expect(next.release).not.toHaveBeenCalled();
     });
 
@@ -825,7 +826,7 @@ describe('ConversationController', () => {
       expect(deps.state.historyLease).toBeNull();
     });
 
-    it('releases the unbuilt-for next lease when the conversation switches while the exchange waits behind a live turn (F5)', async () => {
+    it('releases the unbuilt-for next lease when the conversation switches while the exchange waits behind stored work (F5)', async () => {
       const coordinator = new ProjectionWriteCoordinator();
       deps.getProjectionCoordinator = () => coordinator;
       deps.state.currentConversationId = 'large';
@@ -837,18 +838,21 @@ describe('ConversationController', () => {
       const service = { acquireHistoryIndex: jest.fn().mockReturnValue(next) };
       deps.getHistoryIndexCapableService = () => service as any;
 
-      const live = await coordinator.acquireLive();
+      // The exchange no longer queues behind live turns (B), so the wait it
+      // can still be caught in is the S slot: held here by slow stored work.
+      let releaseStored!: () => void;
+      const gate = new Promise<void>(resolve => { releaseStored = resolve; });
+      const stored = coordinator.runStored(() => false, () => gate);
       const refreshing = controller.refreshHistorySearchSnapshot();
       await Promise.resolve();
       await Promise.resolve();
-      // P1: the build already started under the live turn (it takes no
-      // projection grant), so the switch below lands while only the
-      // exchange waits on the FIFO.
+      // P1: the build already started (it takes no projection grant), so the
+      // switch below lands while only the exchange waits on the FIFO.
       expect(service.acquireHistoryIndex).toHaveBeenCalledTimes(1);
 
-      // The conversation switched while the exchange waits for the live turn.
+      // The conversation switched while the exchange waits for the S slot.
       deps.state.currentConversationId = 'switched';
-      live!.release();
+      releaseStored();
 
       await expect(refreshing).resolves.toEqual({ status: 'not_applicable', reason: 'stale' });
       // The never-mounted next lease ends its reference exactly once; the
@@ -857,9 +861,10 @@ describe('ConversationController', () => {
       expect(next.release).toHaveBeenCalledTimes(1);
       expect(previous.release).not.toHaveBeenCalled();
       expect(deps.state.historyLease).toBe(previous);
+      await stored;
     });
 
-    it('times the exchange wait out behind a stuck live holder and reports grant_timeout', async () => {
+    it('times the exchange wait out behind a stuck stored holder and reports grant_timeout', async () => {
       jest.useFakeTimers();
       const events: HistoryDiagnosticEvent[] = [];
       setHistoryDiagnosticsSink(event => events.push(event));
@@ -875,10 +880,12 @@ describe('ConversationController', () => {
         const service = { acquireHistoryIndex: jest.fn().mockReturnValue(next) };
         deps.getHistoryIndexCapableService = () => service as any;
 
-        const live = await coordinator.acquireLive();
+        // B removed the live turn from the exchange's wait path, so the
+        // timeout's remaining job is the S slot held by stored work that
+        // never completes (rewind rebuild / large-page mount).
+        void coordinator.runStored(() => false, () => new Promise(() => {}));
         const refreshing = controller.refreshHistorySearchSnapshot();
-        // The build resolves off-grant (P1); only the exchange queues behind
-        // the live turn, which never releases (Stop-hook-stretched turn).
+        // The build resolves off-grant (P1); only the exchange queues.
         await Promise.resolve();
         await Promise.resolve();
 
@@ -896,7 +903,6 @@ describe('ConversationController', () => {
         expect(deps.state.historyLease).toBe(previous);
         const refreshEvents = events.filter((event): event is Extract<HistoryDiagnosticEvent, { kind: 'search_snapshot_refresh' }> => event.kind === 'search_snapshot_refresh');
         expect(refreshEvents[refreshEvents.length - 1]).toMatchObject({ outcome: 'not_applicable', reason: 'grant_timeout', trigger: 'search' });
-        live!.release();
       } finally {
         setHistoryDiagnosticsSink(null);
         jest.useRealTimers();
@@ -917,7 +923,7 @@ describe('ConversationController', () => {
         const service = { acquireHistoryIndex: jest.fn().mockReturnValue(next) };
         deps.getHistoryIndexCapableService = () => service as any;
 
-        const live = await coordinator.acquireLive();
+        void coordinator.runStored(() => false, () => new Promise(() => {}));
         const refreshing = controller.refreshHistorySearchSnapshot();
         await Promise.resolve();
         await Promise.resolve();
@@ -931,10 +937,170 @@ describe('ConversationController', () => {
         await expect(refreshing).resolves.toEqual({ status: 'not_applicable', reason: 'stale' });
         expect(next.release).toHaveBeenCalledTimes(1);
         expect(previous.release).not.toHaveBeenCalled();
+      } finally {
+        jest.useRealTimers();
+      }
+    });
+
+    // ============================================
+    // Search snapshot refresh: exchange/live domain split (B-精准版)
+    // ============================================
+
+    it('completes the exchange during a held live turn without ever touching the 60s budget', async () => {
+      jest.useFakeTimers();
+      try {
+        const coordinator = new ProjectionWriteCoordinator();
+        deps.getProjectionCoordinator = () => coordinator;
+        deps.state.currentConversationId = 'large';
+        const conversation = { id: 'large', providerId: 'claude', title: 'Large', messages: [], sessionId: 'session', createdAt: 1, updatedAt: 1 } as any;
+        (deps.plugin.getConversationSync as jest.Mock).mockReturnValue(conversation);
+        const previous = makeLease(100);
+        deps.state.historyLease = previous as any;
+        const next = makeLease(102);
+        const service = { acquireHistoryIndex: jest.fn().mockReturnValue(next) };
+        deps.getHistoryIndexCapableService = () => service as any;
+
+        const live = await coordinator.acquireLive();
+        const refreshing = controller.refreshHistorySearchSnapshot();
+        // Fake timers never advance: any grant wait would hang the refresh
+        // (the pre-B pathology behind a Stop-hook-stretched turn). Resolving
+        // at all proves the exchange never waited on the live domain.
+        await expect(refreshing).resolves.toEqual({ status: 'rebuilt' });
+        expect(deps.state.historyLease).toBe(next);
+        expect(previous.release).toHaveBeenCalledTimes(1);
+        expect(next.release).not.toHaveBeenCalled();
         live!.release();
       } finally {
         jest.useRealTimers();
       }
+    });
+
+    it('folds the live turns into loadedRanges on exchange so load-older anchors inside the old window (invariant g)', async () => {
+      const coordinator = new ProjectionWriteCoordinator();
+      deps.getProjectionCoordinator = () => coordinator;
+      deps.state.currentConversationId = 'large';
+      const conversation = { id: 'large', providerId: 'claude', title: 'Large', messages: [], sessionId: 'session', createdAt: 1, updatedAt: 1 } as any;
+      (deps.plugin.getConversationSync as jest.Mock).mockReturnValue(conversation);
+      const previous = makeLease(100);
+      deps.state.historyLease = previous as any;
+      deps.state.loadedRanges = [{ start: 90, end: 100 }];
+      deps.state.historyHasMore = true;
+      // The live tail (2 turns) sits in memory with local ids; the fresh
+      // snapshot counts it: N=100 → N+2.
+      deps.state.messages = [
+        { id: 'fs', role: 'user', content: 'first screen', timestamp: 1, displayOrder: [0, 95, 0] },
+        { id: 'live-user', role: 'user', content: 'live turn', timestamp: 2, displayOrder: [1, 100, 0] },
+        { id: 'live-assistant', role: 'assistant', content: 'live reply', timestamp: 3, displayOrder: [1, 101, 0] },
+      ] as any;
+      const next = makeLease(102);
+      next.loadWindow.mockResolvedValue({ messages: [{ id: 'older', role: 'user', content: 'older', timestamp: 0, displayOrder: [0, 85, 0] }], range: { start: 80, end: 90 }, snapshotOffset: 5, sourceBytes: 1, projectedChars: 1, oversizedTurnCount: 0, pageKey: 'w:80:90', hasMoreBefore: true, hasMoreAfter: false });
+      const service = { acquireHistoryIndex: jest.fn().mockReturnValue(next) };
+      deps.getHistoryIndexCapableService = () => service as any;
+
+      await controller.refreshHistorySearchSnapshot();
+      // The exchange folded [100, 102) in: the live tail counts as loaded.
+      expect(deps.state.loadedRanges).toEqual([{ start: 90, end: 102 }]);
+      expect(deps.state.historyHasMore).toBe(true);
+
+      await controller.loadOlderHistory();
+      // Pre-fix the anchor walked past the live tail to 102 and materialized
+      // [100, 102) — the transcript copies of turns already in memory.
+      expect(next.loadWindow).toHaveBeenCalledWith(expect.objectContaining({ anchorTurn: 90, direction: 'older', minTurn: 0 }));
+      expect(deps.state.messages.map(message => message.id)).toEqual(['older', 'fs', 'live-user', 'live-assistant']);
+    });
+
+    it('merges nothing when the refreshed total regressed or stayed flat (rewind refresh)', async () => {
+      deps.state.currentConversationId = 'large';
+      const conversation = { id: 'large', providerId: 'claude', title: 'Large', messages: [], sessionId: 'session', createdAt: 1, updatedAt: 1 } as any;
+      (deps.plugin.getConversationSync as jest.Mock).mockReturnValue(conversation);
+      const previous = makeLease(120);
+      deps.state.historyLease = previous as any;
+      deps.state.loadedRanges = [{ start: 90, end: 120 }];
+      deps.state.historyHasMore = true;
+      // A rewind truncated the transcript: the refreshed snapshot counts
+      // fewer turns than the mounted one.
+      const regressed = makeLease(110);
+      deps.getHistoryIndexCapableService = () => ({ acquireHistoryIndex: jest.fn().mockReturnValue(regressed) } as any);
+      await controller.refreshHistorySearchSnapshot();
+      expect(deps.state.loadedRanges).toEqual([{ start: 90, end: 120 }]);
+      expect(deps.state.historyHasMore).toBe(true);
+
+      // Equal totals merge nothing either: a zero interval is not a range.
+      const flat = makeLease(110);
+      deps.state.historyLease = regressed as any;
+      deps.getHistoryIndexCapableService = () => ({ acquireHistoryIndex: jest.fn().mockReturnValue(flat) } as any);
+      await controller.refreshHistorySearchSnapshot();
+      expect(deps.state.loadedRanges).toEqual([{ start: 90, end: 120 }]);
+      expect(deps.state.historyHasMore).toBe(true);
+    });
+
+    it('reports the second concurrent refresh as stale when the first exchange already swapped the lease', async () => {
+      deps.state.currentConversationId = 'large';
+      const conversation = { id: 'large', providerId: 'claude', title: 'Large', messages: [], sessionId: 'session', createdAt: 1, updatedAt: 1 } as any;
+      (deps.plugin.getConversationSync as jest.Mock).mockReturnValue(conversation);
+      const previous = makeLease(100);
+      deps.state.historyLease = previous as any;
+      const nextOne = makeLease(100);
+      const nextTwo = makeLease(100);
+      const service = { acquireHistoryIndex: jest.fn().mockReturnValueOnce(nextOne).mockReturnValueOnce(nextTwo) };
+      deps.getHistoryIndexCapableService = () => service as any;
+
+      const [first, second] = await Promise.all([
+        controller.refreshHistorySearchSnapshot(),
+        controller.refreshHistorySearchSnapshot(),
+      ]);
+
+      // Two exchanges serialize in the S slot; the second revalidates
+      // against a lease the first already swapped out → fail-safe 'stale'.
+      expect(first).toEqual({ status: 'rebuilt' });
+      expect(second).toEqual({ status: 'not_applicable', reason: 'stale' });
+      expect(deps.state.historyLease).toBe(nextOne);
+      expect(previous.release).toHaveBeenCalledTimes(1);
+      expect(nextTwo.release).toHaveBeenCalledTimes(1);
+      expect(nextOne.release).not.toHaveBeenCalled();
+    });
+
+    it('keeps the post-turn stored FIFO intact while the exchange lands mid-turn, and paging stays anchored (B integration)', async () => {
+      const coordinator = new ProjectionWriteCoordinator();
+      deps.getProjectionCoordinator = () => coordinator;
+      deps.state.currentConversationId = 'large';
+      const conversation = { id: 'large', providerId: 'claude', title: 'Large', messages: [], sessionId: 'session', createdAt: 1, updatedAt: 1 } as any;
+      (deps.plugin.getConversationSync as jest.Mock).mockReturnValue(conversation);
+      const previous = makeLease(100);
+      deps.state.historyLease = previous as any;
+      deps.state.loadedRanges = [{ start: 90, end: 100 }];
+      deps.state.historyHasMore = true;
+      deps.state.messages = [
+        { id: 'fs', role: 'user', content: 'first screen', timestamp: 1, displayOrder: [0, 95, 0] },
+        { id: 'live-user', role: 'user', content: 'live turn', timestamp: 2, displayOrder: [1, 100, 0] },
+      ] as any;
+      const next = makeLease(102);
+      next.loadWindow.mockResolvedValue({ messages: [{ id: 'older', role: 'user', content: 'older', timestamp: 0, displayOrder: [0, 85, 0] }], range: { start: 80, end: 90 }, snapshotOffset: 5, sourceBytes: 1, projectedChars: 1, oversizedTurnCount: 0, pageKey: 'w:80:90', hasMoreBefore: true, hasMoreAfter: false });
+      const service = { acquireHistoryIndex: jest.fn().mockReturnValue(next) };
+      deps.getHistoryIndexCapableService = () => service as any;
+
+      // onStreamComplete fires the refresh while the live lease is still held.
+      const live = await coordinator.acquireLive();
+      await expect(controller.refreshHistorySearchSnapshot()).resolves.toEqual({ status: 'rebuilt' });
+      expect(deps.state.loadedRanges).toEqual([{ start: 90, end: 102 }]);
+
+      // The turn's own stored follow-up (freeze/reproject) still queues
+      // behind the live domain and runs only after it releases — the
+      // exchange does not erode the P3 FIFO for default stored work.
+      const reprojectRuns: string[] = [];
+      const reproject = coordinator.runStored(() => false, async () => {
+        reprojectRuns.push('reproject');
+      });
+      await Promise.resolve();
+      await Promise.resolve();
+      expect(reprojectRuns).toEqual([]);
+      live!.release();
+      await reproject;
+      expect(reprojectRuns).toEqual(['reproject']);
+
+      await controller.loadOlderHistory();
+      expect(next.loadWindow).toHaveBeenCalledWith(expect.objectContaining({ anchorTurn: 90, minTurn: 0 }));
+      expect(deps.state.messages.map(message => message.id)).toEqual(['older', 'fs', 'live-user']);
     });
 
     // ============================================

@@ -271,6 +271,166 @@ describe('ProjectionWriteCoordinator', () => {
     });
   });
 
+  describe('bypassLive exchange domain (two-slot: stored S / live L)', () => {
+    it('grants a bypassLive exchange while a live turn holds the lease, without disturbing it', async () => {
+      const coordinator = new ProjectionWriteCoordinator();
+      const live = await coordinator.acquireLive();
+      const order: string[] = [];
+
+      const exchange = coordinator.runStored(() => false, async () => {
+        order.push('exchange');
+      }, { bypassLive: true });
+      await exchange;
+      expect(order).toEqual(['exchange']);
+
+      // The live turn was never preempted: default stored work still waits
+      // for the live domain exactly as before.
+      let defaultRuns = 0;
+      const stored = coordinator.runStored(() => false, async () => {
+        defaultRuns += 1;
+      });
+      await Promise.resolve();
+      await Promise.resolve();
+      expect(defaultRuns).toBe(0);
+
+      live!.release();
+      await stored;
+      expect(defaultRuns).toBe(1);
+    });
+
+    it('does not let an exchange overtake a default stored waiter queued ahead of it behind a live turn', async () => {
+      const coordinator = new ProjectionWriteCoordinator();
+      const live = await coordinator.acquireLive();
+      const order: string[] = [];
+
+      const defaultStored = coordinator.runStored(() => false, async () => {
+        order.push('default');
+      });
+      const exchange = coordinator.runStored(() => false, async () => {
+        order.push('exchange');
+      }, { bypassLive: true });
+
+      await Promise.resolve();
+      await Promise.resolve();
+      // The S domain stays strictly FIFO: the exchange does not skip the
+      // viable default waiter even though the S slot itself is free.
+      expect(order).toEqual([]);
+
+      live!.release();
+      await Promise.all([defaultStored, exchange]);
+      expect(order).toEqual(['default', 'exchange']);
+    });
+
+    it('degenerates to the single-slot behavior when no live turn is involved', async () => {
+      const coordinator = new ProjectionWriteCoordinator();
+      const order: string[] = [];
+
+      const first = coordinator.runStored(() => false, async () => {
+        order.push('first');
+      });
+      const exchange = coordinator.runStored(() => false, async () => {
+        order.push('exchange');
+      }, { bypassLive: true });
+      const second = coordinator.runStored(() => false, async () => {
+        order.push('second');
+      });
+
+      await Promise.all([first, exchange, second]);
+      // Without live turns the S slot is the old single active slot: the
+      // bypassLive marker changes nothing about grant order or exclusivity.
+      expect(order).toEqual(['first', 'exchange', 'second']);
+    });
+
+    it('holds default stored work behind an active exchange, and grants a live lease beside it (disjoint domains)', async () => {
+      const coordinator = new ProjectionWriteCoordinator();
+      let releaseExchange!: () => void;
+      const gate = new Promise<void>(resolve => { releaseExchange = resolve; });
+
+      const exchange = coordinator.runStored(() => false, () => gate, { bypassLive: true });
+      await Promise.resolve();
+
+      // The exchange holds only S: a live lease at the queue head acquires
+      // immediately in parallel — disjoint write domains, no mutual exclusion.
+      const live = await coordinator.acquireLive();
+
+      let defaultRuns = 0;
+      const stored = coordinator.runStored(() => false, async () => {
+        defaultRuns += 1;
+      });
+      await Promise.resolve();
+      await Promise.resolve();
+      // Queued behind BOTH holders: S (exchange) and L (live).
+      expect(defaultRuns).toBe(0);
+
+      releaseExchange();
+      await exchange;
+      await Promise.resolve();
+      await Promise.resolve();
+      // S is free again but L is still held: default stored keeps waiting.
+      expect(defaultRuns).toBe(0);
+
+      live!.release();
+      await stored;
+      expect(defaultRuns).toBe(1);
+    });
+
+    it('lets an exchange start past queued live waiters and dead (cancelled) stored slots, never past a viable default', async () => {
+      const coordinator = new ProjectionWriteCoordinator();
+      const live = await coordinator.acquireLive();
+      const order: string[] = [];
+
+      // Queued live waiter (blocked by the active live) plus a cancelled
+      // default stored slot ahead of the exchange: both are skippable — the
+      // live waiter by the domain split, the dead slot because successors
+      // already pass cancelled entries at grant time.
+      const queuedLive = coordinator.acquireLive();
+      const cancelled = coordinator.runStored(() => true, async () => {
+        throw new Error('cancelled task must not run');
+      });
+      const exchange = coordinator.runStored(() => false, async () => {
+        order.push('exchange');
+      }, { bypassLive: true });
+
+      await exchange;
+      expect(order).toEqual(['exchange']);
+
+      live!.release();
+      await expect(cancelled).resolves.toBeNull();
+      const secondLive = await queuedLive;
+      secondLive!.release();
+    });
+
+    it('clears both slots on dispose and settles queued waiters without leaking timers', async () => {
+      jest.useFakeTimers();
+      const clearSpy = jest.spyOn(globalThis, 'clearTimeout');
+      const coordinator = new ProjectionWriteCoordinator();
+
+      // Both domains are held simultaneously: live owns L, the exchange owns S.
+      const live = await coordinator.acquireLive();
+      const exchange = coordinator.runStored(() => false, () => new Promise(() => {}), { bypassLive: true });
+      await Promise.resolve();
+      const queued = coordinator.runStored(() => false, async () => {
+        throw new Error('disposed task must not run');
+      }, { timeoutMs: 60_000 });
+      const queuedLive = coordinator.acquireLive();
+
+      coordinator.dispose();
+      await expect(queued).resolves.toBeNull();
+      await expect(queuedLive).resolves.toBeNull();
+      expect(clearSpy).toHaveBeenCalled();
+      await jest.advanceTimersByTimeAsync(60_000);
+
+      await expect(coordinator.acquireLive()).resolves.toBeNull();
+      await expect(coordinator.runStored(() => false, async () => 'x')).resolves.toBeNull();
+      // Releasing the previously held leases after dispose stays a no-op.
+      live!.release();
+      void exchange;
+
+      clearSpy.mockRestore();
+      jest.useRealTimers();
+    });
+  });
+
   it('reports hasLiveTurn only while a live turn holds or waits for the lease', async () => {
     const coordinator = new ProjectionWriteCoordinator();
     expect(coordinator.hasLiveTurn()).toBe(false);

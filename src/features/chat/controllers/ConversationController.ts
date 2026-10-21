@@ -114,11 +114,13 @@ export class ConversationController {
    * Cap on the search-refresh exchange's FIFO wait for the stored grant —
    * never on the granted task body. The critical section itself is <ms
    * (lease pointer swap + two releases + one diagnostic write) and the index
-   * build runs outside the grant, so the entire budget is pure queue time;
-   * the measured pathology is a Stop-hook-stretched live turn holding the
-   * grant for 33 minutes. Aborting costs nothing durable (the old snapshot
-   * keeps serving; Retry / onStreamComplete / reopening re-trigger) while a
-   * 60s wait already sits at the edge of "索引中" user patience.
+   * build runs outside the grant, so the entire budget is pure queue time.
+   * The exchange no longer queues behind live turns (B: it rides the stored
+   * slot only), so this budget covers the S slot held by slow stored work —
+   * a rewind rebuild or a large-page mount. Aborting costs nothing durable
+   * (the old snapshot keeps serving; Retry / onStreamComplete / reopening
+   * re-trigger) while a 60s wait already sits at the edge of "索引中" user
+   * patience.
    */
   private static readonly REFRESH_EXCHANGE_GRANT_TIMEOUT_MS = 60_000;
   private deps: ConversationControllerDeps;
@@ -418,7 +420,7 @@ export class ConversationController {
    */
   private async runStoredTransaction<T>(
     task: (isStale: () => boolean) => Promise<T>,
-    options?: { timeoutMs?: number },
+    options?: { timeoutMs?: number; bypassLive?: boolean },
   ): Promise<T | null> {
     const conversationId = this.deps.state.currentConversationId;
     const isStale = (): boolean => this.deps.state.currentConversationId !== conversationId;
@@ -693,6 +695,15 @@ export class ConversationController {
     // either case `next` was never mounted, so it ends its reference and no
     // lease is resurrected onto the tab. Swap before releasing previous so
     // no window load ever observes a mounted-but-released lease.
+    //
+    // The exchange enters through bypassLive (B): it queues on the stored
+    // slot only, so a Stop-hook-stretched live turn no longer delays the
+    // swap — its writes (lease refs, paging bookkeeping) are disjoint from
+    // the live page, while the stored-domain serialization above is kept
+    // whole. STRUCTURAL CONTRACT: this task body must stay synchronous —
+    // no await. The exchange now runs inside the live domain's blind spot,
+    // and the switch-vs-exchange / finalize-vs-exchange total orders are
+    // only decidable because the section is atomic.
     const exchange = await this.runStoredTransaction<HistorySearchSnapshotRefreshResult>(
       async () => {
         if (state.currentConversationId !== conversationId || state.historyLease !== previous) {
@@ -701,13 +712,27 @@ export class ConversationController {
         }
         state.historyLease = next;
         previous.release();
+        // Anchor-chain repair (invariant g): live turns that landed between
+        // the two snapshots never enter loadedRanges through their own
+        // writers (first screen / paging / rewind / reset are the only
+        // ones), so fold [previous.totalTurns, next.totalTurns) in here —
+        // otherwise loadOlderWindow's newest-range probe misses, the anchor
+        // walks past the live tail, and the transcript copies of turns
+        // already in memory get materialized as duplicates. B made the
+        // exchange land mid-turn routinely, so this gap is now the common
+        // path, not a rare race. A regressed or flat total (rewind refresh)
+        // merges nothing: a negative or zero interval is never a range.
+        if (next.totalTurns > previous.totalTurns) {
+          state.loadedRanges = this.mergeRanges([...state.loadedRanges, { start: previous.totalTurns, end: next.totalTurns }]);
+          state.historyHasMore = !this.coversAll(state.loadedRanges, next.totalTurns);
+        }
         // The lease reports what actually happened; without a service-provided
         // outcome the honest report is rebuilt (a fresh acquire did run).
         const outcome = next.acquireOutcome === 'cache_hit' ? 'cache_hit' : 'rebuilt';
         recordHistoryDiagnosticEvent({ kind: 'search_snapshot_refresh', outcome, trigger, elapsedMs: performance.now() - startedAt });
         return outcome === 'cache_hit' ? { status: 'cache_hit' } : { status: 'rebuilt' };
       },
-      { timeoutMs: ConversationController.REFRESH_EXCHANGE_GRANT_TIMEOUT_MS },
+      { timeoutMs: ConversationController.REFRESH_EXCHANGE_GRANT_TIMEOUT_MS, bypassLive: true },
     );
     // A null transaction (the conversation switched while the exchange
     // queued behind a live turn or stored work, the coordinator was
