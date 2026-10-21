@@ -14,7 +14,11 @@ export const HISTORY_WINDOW_LIMITS = {
 } as const;
 
 export interface HistoryPageInput extends Pick<HistoryWindowPage, 'pageKey' | 'range' | 'messages'> {
-  projectedWeight: number;
+  /**
+   * Provider-supplied page weight. Omitted (live pages, rewind synthetic
+   * pages) → the page store computes it through its per-message cache.
+   */
+  projectedWeight?: number;
   /** Data-source semantics passed through to the page store (F1). */
   retention?: HistoryPageRetention;
 }
@@ -119,7 +123,6 @@ export class HistoryWindowRenderer {
       pageKey,
       range: { start: totalTurns, end: totalTurns },
       messages,
-      projectedWeight: this.estimateWeight(messages),
       pins: ['live'],
     });
     const wrapper = this.ensureWrapper(record);
@@ -134,11 +137,15 @@ export class HistoryWindowRenderer {
     if (!this.livePageKey) return;
     const record = this.options.pageStore.peek(this.livePageKey);
     if (record && messages) {
+      // Invalidate before the settle upsert: the live turn mutates its
+      // messages in place after begin (InputController rewrites the user
+      // message's persisted content mid-turn), so the frozen weight must be
+      // computed from the final content, not a stale cache entry.
+      this.options.pageStore.invalidateMessageWeights(messages);
       this.options.pageStore.upsertPage({
         pageKey: record.pageKey,
         range: record.range,
         messages,
-        projectedWeight: this.estimateWeight(messages),
       });
     }
     this.options.pageStore.unpin(this.livePageKey, 'live');
@@ -617,10 +624,6 @@ export class HistoryWindowRenderer {
       ) return;
       this.mount(current);
     });
-  }
-
-  private estimateWeight(messages: ChatMessage[]): number {
-    return messages.reduce((sum, message) => sum + JSON.stringify(message).length * 2, 0);
   }
 
   private scrollDirection(): StoredIntentDirection {

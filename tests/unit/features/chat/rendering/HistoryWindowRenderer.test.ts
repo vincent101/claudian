@@ -15,12 +15,11 @@ const messages = (count: number, prefix = 'm'): ChatMessage[] => Array.from({ le
   timestamp: index,
 }));
 
-function createHarness(totalTurns = 300, overrides: Record<string, unknown> = {}) {
+function createHarness(totalTurns = 300, overrides: Record<string, unknown> = {}, store = new HistoryPageStore()) {
   document.body.innerHTML = '<div id="viewport"><div id="messages"></div></div>';
   const viewport = document.querySelector('#viewport') as HTMLElement;
   const root = document.querySelector('#messages') as HTMLElement;
   Object.defineProperty(viewport, 'clientWidth', { configurable: true, value: 600 });
-  const store = new HistoryPageStore();
   const coordinator = new ProjectionWriteCoordinator();
   let conversationId = 'conversation';
   const renderer = new HistoryWindowRenderer({
@@ -654,6 +653,34 @@ describe('HistoryWindowRenderer', () => {
     expect(store.peek('live:1')?.pins.has('live')).toBe(true);
     renderer.freezeLivePage(messages(3, 'live'));
     expect(store.peek('live:1')?.pins.has('live')).toBe(false);
+  });
+
+  it('settles live page weights through the store: no weight input, and freeze recomputes in-place mutations', () => {
+    let calls = 0;
+    const store = new HistoryPageStore({
+      messageWeightFn: item => { calls += 1; return JSON.stringify(item).length * 2; },
+    });
+    const { renderer } = createHarness(300, {}, store);
+    const live = messages(2, 'live');
+    const formula = (items: ChatMessage[]): number =>
+      items.reduce((sum, item) => sum + JSON.stringify(item).length * 2, 0);
+
+    // beginLivePage no longer carries a weight input: the store computes
+    // each message exactly once, equal to the old inline formula.
+    renderer.beginLivePage('live:1', live, 300);
+    expect(calls).toBe(2);
+    expect(store.peek('live:1')?.projectedWeight).toBe(formula(live));
+
+    // The turn rewrote the message in place after begin (InputController
+    // replaces userMsg.content with the persisted projection): freeze
+    // invalidates the whole page first — the store cannot know which
+    // message mutated — so the settle recomputes every page message once
+    // from the final content. That single final pass is the contract; it
+    // never regresses to per-chunk full-array stringifies.
+    live[0] = { ...live[0], content: 'mutated '.repeat(50) };
+    renderer.freezeLivePage(live);
+    expect(calls).toBe(4);
+    expect(store.peek('live:1')?.projectedWeight).toBe(formula(live));
   });
 
   it('releases search pin after the located page leaves the viewport', async () => {

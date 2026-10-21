@@ -1151,11 +1151,13 @@ export class ConversationController {
         welcomeEl.createDiv({ cls: 'claudian-welcome-greeting', text: this.getGreeting() });
         this.deps.setWelcomeEl(welcomeEl);
         const pageStart = kept.length > 0 ? kept[0].start : (keepStart ?? lease.totalTurns);
+        // No projectedWeight: the page store computes the synthetic page's
+        // weight through its per-message cache — the same formula the old
+        // inline reduce used, now single-sourced in HistoryPageStore.
         windowRenderer.addPage({
           pageKey: `rewind:${pageStart}:${keepEnd}`,
           range: { start: pageStart, end: keepEnd },
           messages: state.messages,
-          projectedWeight: state.messages.reduce((sum, message) => sum + JSON.stringify(message).length * 2, 0),
           // The synthetic page IS the memory truth: the disk snapshot still
           // contains the discarded branches, so it is exempt from eviction
           // (explicit overcommit) and must never be rematerialized (F1).

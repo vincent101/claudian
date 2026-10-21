@@ -51,6 +51,12 @@ export interface HistoryPageStoreOptions {
   maxPages?: number;
   maxProjectedWeight?: number;
   onDiagnostic?: (event: HistoryPageStoreDiagnostic) => void;
+  /**
+   * Per-message projected weight (default: JSON.stringify(m).length * 2).
+   * Injectable so tests can count computations; production always uses the
+   * default, matching the historical inline formula byte for byte.
+   */
+  messageWeightFn?: (message: ChatMessage) => number;
 }
 
 type TicketState = {
@@ -65,21 +71,36 @@ export class HistoryPageStore {
   private readonly maxPages: number;
   private readonly maxProjectedWeight: number;
   private readonly onDiagnostic?: (event: HistoryPageStoreDiagnostic) => void;
+  private readonly messageWeightFn: (message: ChatMessage) => number;
+  /**
+   * Per-message weight cache keyed by object identity: any upsert cadence
+   * costs at most one computation per newly seen message, never a repeated
+   * full-array stringify. Weak so cloned/replaced messages GC naturally.
+   * Known fail-soft drift: writers that mutate an already frozen message in
+   * place after freeze (async subagent settle/hydration) have no invalidate
+   * hook, so their cached weight understates reality — projectedWeight is
+   * only an eviction/windowing heuristic, and the projection clamp bounds
+   * the drift's magnitude.
+   */
+  private readonly messageWeights = new WeakMap<ChatMessage, number>();
   private clock = 0;
 
   constructor(options: HistoryPageStoreOptions = {}) {
     this.maxPages = options.maxPages ?? 12;
     this.maxProjectedWeight = options.maxProjectedWeight ?? 32 * 1024 * 1024;
     this.onDiagnostic = options.onDiagnostic;
+    this.messageWeightFn = options.messageWeightFn ?? (message => JSON.stringify(message).length * 2);
   }
 
-  upsertPage(input: Pick<HistoryPageRecord, 'pageKey' | 'range' | 'messages' | 'projectedWeight'> & { retention?: HistoryPageRetention; pins?: Iterable<HistoryPagePin> }): HistoryPageRecord {
+  upsertPage(input: Pick<HistoryPageRecord, 'pageKey' | 'range' | 'messages'> & { projectedWeight?: number; retention?: HistoryPageRetention; pins?: Iterable<HistoryPagePin> }): HistoryPageRecord {
+    const projectedWeight = input.projectedWeight
+      ?? (input.messages ? this.computeWeight(input.messages) : 0);
     const existing = this.records.get(input.pageKey);
     if (existing) {
       existing.range = { ...input.range };
       existing.messages = input.messages;
       if (input.messages) existing.messageIds = new Set(input.messages.map(message => message.id));
-      existing.projectedWeight = input.projectedWeight;
+      existing.projectedWeight = projectedWeight;
       // Absent retention preserves the record's data-source semantics — a
       // memory-only page must never be silently downgraded to evictable.
       if (input.retention) existing.retention = input.retention;
@@ -90,6 +111,7 @@ export class HistoryPageStore {
     }
     const record: HistoryPageRecord = {
       ...input,
+      projectedWeight,
       retention: input.retention ?? 'reloadable',
       range: { ...input.range },
       measuredHeight: null,
@@ -108,6 +130,24 @@ export class HistoryPageStore {
     this.records.set(record.pageKey, record);
     this.enforceLimits();
     return record;
+  }
+
+  /** Drops the cached weights of the given messages so the next upsert recomputes them. */
+  invalidateMessageWeights(messages: ChatMessage[]): void {
+    for (const message of messages) this.messageWeights.delete(message);
+  }
+
+  private computeWeight(messages: ChatMessage[]): number {
+    let sum = 0;
+    for (const message of messages) {
+      let weight = this.messageWeights.get(message);
+      if (weight === undefined) {
+        weight = this.messageWeightFn(message);
+        this.messageWeights.set(message, weight);
+      }
+      sum += weight;
+    }
+    return sum;
   }
 
   get(pageKey: string): HistoryPageRecord | undefined {

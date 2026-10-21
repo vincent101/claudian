@@ -201,4 +201,79 @@ describe('HistoryPageStore', () => {
 
     expect(store.get('a')).toMatchObject({ measuredHeight: 100, heightQuality: 'measured', heightStale: true });
   });
+
+  describe('per-message weight computation (projectedWeight omitted at upsert)', () => {
+    const defaultWeight = (messages: ChatMessage[]): number =>
+      messages.reduce((sum, item) => sum + JSON.stringify(item).length * 2, 0);
+
+    it('computes the page weight with the default formula when the input omits projectedWeight', () => {
+      const store = new HistoryPageStore();
+      const messages = [message('a'), message('b')];
+      const record = store.upsertPage({ pageKey: 'a', range: { start: 0, end: 1 }, messages });
+      expect(record.projectedWeight).toBe(defaultWeight(messages));
+    });
+
+    it('reuses cached weights: a second upsert of the same message objects computes nothing', () => {
+      let calls = 0;
+      const store = new HistoryPageStore({
+        messageWeightFn: item => { calls += 1; return JSON.stringify(item).length * 2; },
+      });
+      const messages = [message('a'), message('b'), message('c')];
+      store.upsertPage({ pageKey: 'a', range: { start: 0, end: 1 }, messages });
+      expect(calls).toBe(3);
+
+      store.upsertPage({ pageKey: 'a', range: { start: 0, end: 2 }, messages });
+      store.upsertPage({ pageKey: 'b', range: { start: 0, end: 1 }, messages });
+      expect(calls).toBe(3);
+      expect(store.get('b')?.projectedWeight).toBe(defaultWeight(messages));
+    });
+
+    it('recomputes invalidated messages so in-place mutations settle at freeze', () => {
+      let calls = 0;
+      const store = new HistoryPageStore({
+        messageWeightFn: item => { calls += 1; return JSON.stringify(item).length * 2; },
+      });
+      const messages = [message('a')];
+      store.upsertPage({ pageKey: 'a', range: { start: 0, end: 1 }, messages });
+      expect(calls).toBe(1);
+
+      // The live turn rewrote the message in place after begin; freeze
+      // invalidates first, so the settled weight reflects the new content.
+      messages[0] = { ...messages[0], content: 'a'.repeat(200) };
+      store.invalidateMessageWeights(messages);
+      store.upsertPage({ pageKey: 'a', range: { start: 0, end: 1 }, messages });
+      expect(calls).toBe(2);
+      expect(store.get('a')?.projectedWeight).toBe(defaultWeight(messages));
+    });
+
+    it('degrades a whole-array replacement to exactly one computation per message', () => {
+      let calls = 0;
+      const store = new HistoryPageStore({
+        messageWeightFn: item => { calls += 1; return JSON.stringify(item).length * 2; },
+      });
+      const first = Array.from({ length: 5 }, (_, index) => message(`x${index}`));
+      store.upsertPage({ pageKey: 'a', range: { start: 0, end: 1 }, messages: first });
+      expect(calls).toBe(5);
+
+      // Fresh objects (paging remount / rewind rebuild): full miss, each
+      // message computed exactly once, then fully cached.
+      const second = Array.from({ length: 5 }, (_, index) => message(`y${index}`));
+      store.upsertPage({ pageKey: 'b', range: { start: 1, end: 2 }, messages: second });
+      expect(calls).toBe(10);
+      store.upsertPage({ pageKey: 'b', range: { start: 1, end: 3 }, messages: second });
+      expect(calls).toBe(10);
+    });
+
+    it('keeps an explicit projectedWeight authoritative and out of the cache path', () => {
+      let calls = 0;
+      const store = new HistoryPageStore({
+        messageWeightFn: item => { calls += 1; return JSON.stringify(item).length * 2; },
+      });
+      const record = store.upsertPage({
+        pageKey: 'a', range: { start: 0, end: 1 }, messages: [message('a')], projectedWeight: 40,
+      });
+      expect(record.projectedWeight).toBe(40);
+      expect(calls).toBe(0);
+    });
+  });
 });
