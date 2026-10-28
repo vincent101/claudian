@@ -152,6 +152,8 @@
       "copyTitle": "Copy session title",
       "copyTitleDone": "Session title copied",
       "copyTitleFailed": "Failed to copy title",
+      "renameTitle": "セッションタイトルを変更",
+      "renameTitleFailed": "セッション名の変更に失敗しました",
       "moveLeft": "左へ移動",
       "moveRight": "右へ移動",
       "close": "タブを閉じる",

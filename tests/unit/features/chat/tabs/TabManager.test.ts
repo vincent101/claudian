@@ -1341,6 +1341,35 @@ describe('TabManager - Tab Bar Data', () => {
       expect(items[0].conversationTitle).toBe('quant策略架构Agent');
     });
 
+    it('should expose the bound conversation id on tab bar items', async () => {
+      manager = createManager({
+        plugin: createMockPlugin({
+          getConversationSync: jest.fn().mockReturnValue({ id: 'conv-1', title: 'T' }),
+        }),
+        tabFactory: () => createMockTabData({
+          id: 'tab-1',
+          conversationId: 'conv-1',
+        }),
+      });
+
+      await manager.createTab();
+
+      expect(manager.getTabBarItems()[0].conversationId).toBe('conv-1');
+    });
+
+    it('should expose null conversation id for an unbound tab', async () => {
+      manager = createManager({
+        tabFactory: () => createMockTabData({
+          id: 'tab-1',
+          conversationId: null,
+        }),
+      });
+
+      await manager.createTab();
+
+      expect(manager.getTabBarItems()[0].conversationId).toBeNull();
+    });
+
     it('should expose null conversation title for an untitled conversation', async () => {
       manager = createManager({
         plugin: createMockPlugin({

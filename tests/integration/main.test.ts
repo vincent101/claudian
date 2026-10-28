@@ -807,6 +807,55 @@ describe('ClaudianPlugin', () => {
     });
   });
 
+  describe('renameConversationManually', () => {
+    it('renames first, then clears titleGenerationStatus with an explicit undefined key', async () => {
+      await plugin.onload();
+      const conv = await plugin.createConversation();
+
+      const order: string[] = [];
+      const renameSpy = jest.spyOn(plugin, 'renameConversation').mockImplementation(async () => {
+        order.push('rename');
+      });
+      const updateSpy = jest.spyOn(plugin, 'updateConversation').mockImplementation(async () => {
+        order.push('clear');
+      });
+
+      await plugin.renameConversationManually(conv.id, 'Hand title');
+
+      expect(order).toEqual(['rename', 'clear']);
+      expect(renameSpy).toHaveBeenCalledWith(conv.id, 'Hand title');
+      expect(updateSpy).toHaveBeenCalledTimes(1);
+      const [calledId, payload] = updateSpy.mock.calls[0];
+      expect(calledId).toBe(conv.id);
+      expect('titleGenerationStatus' in payload).toBe(true);
+      expect(payload.titleGenerationStatus).toBeUndefined();
+    });
+
+    it('persists the new title and drops a success status so AI regeneration cannot overwrite it', async () => {
+      await plugin.onload();
+      const conv = await plugin.createConversation();
+      await plugin.updateConversation(conv.id, { titleGenerationStatus: 'success' });
+
+      await plugin.renameConversationManually(conv.id, 'Hand title');
+
+      const updated = await plugin.getConversationById(conv.id);
+      expect(updated?.title).toBe('Hand title');
+      expect(updated?.titleGenerationStatus).toBeUndefined();
+    });
+
+    it('does not clear the status and rethrows when renameConversation rejects', async () => {
+      await plugin.onload();
+      const conv = await plugin.createConversation();
+
+      const failure = new Error('disk full');
+      jest.spyOn(plugin, 'renameConversation').mockRejectedValue(failure);
+      const updateSpy = jest.spyOn(plugin, 'updateConversation');
+
+      await expect(plugin.renameConversationManually(conv.id, 'Hand title')).rejects.toBe(failure);
+      expect(updateSpy).not.toHaveBeenCalled();
+    });
+  });
+
   describe('updateConversation', () => {
     it('should update conversation messages', async () => {
       await plugin.onload();

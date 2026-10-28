@@ -152,6 +152,8 @@
       "copyTitle": "Copy session title",
       "copyTitleDone": "Session title copied",
       "copyTitleFailed": "Failed to copy title",
+      "renameTitle": "Renomear título da sessão",
+      "renameTitleFailed": "Falha ao renomear a sessão",
       "moveLeft": "Move left",
       "moveRight": "Move right",
       "close": "Close",

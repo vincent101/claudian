@@ -6,8 +6,10 @@ import { ProviderRegistry } from '../../core/providers/ProviderRegistry';
 import { ProviderSettingsCoordinator } from '../../core/providers/ProviderSettingsCoordinator';
 import { DEFAULT_CHAT_PROVIDER_ID, type ProviderId } from '../../core/providers/types';
 import { VIEW_TYPE_CLAUDIAN } from '../../core/types';
+import { t } from '../../i18n/i18n';
 import type ClaudianPlugin from '../../main';
 import { createProviderIconSvg } from '../../shared/icons';
+import { InputModal } from '../../shared/modals/InputModal';
 import type { HistoryConversationOpenState } from './controllers/ConversationController';
 import {
   closeHistorySearchForTab,
@@ -282,6 +284,7 @@ export class ClaudianView extends ItemView {
       onTabClose: (tabId) => this.handleTabClose(tabId),
       onNewTab: () => this.createNewTab(),
       onTabReorder: (tabId, targetIndex) => this.handleTabReorder(tabId, targetIndex),
+      onTabRename: (tabId) => this.handleTabRename(tabId),
     });
     fragment.appendChild(this.tabBarContainerEl);
 
@@ -405,6 +408,27 @@ export class ClaudianView extends ItemView {
    */
   private handleTabReorder(tabId: TabId, targetIndex: number): void {
     this.tabManager?.moveTab(tabId, targetIndex);
+  }
+
+  private handleTabRename(tabId: TabId): void {
+    const conversationId = this.tabManager?.getTab(tabId)?.conversationId;
+    if (!conversationId) return;
+
+    const currentTitle = this.plugin.getConversationSync(conversationId)?.title;
+    new InputModal(this.app, {
+      value: currentTitle ?? '',
+      onSubmit: async (raw) => {
+        const title = raw.trim();
+        if (!title || title === currentTitle) return;
+        try {
+          await this.plugin.renameConversationManually(conversationId, title);
+          this.updateTabBar();
+          this.updateHistoryDropdown();
+        } catch {
+          new Notice(t('chat.tabs.renameTitleFailed'));
+        }
+      },
+    }).open();
   }
 
   async createNewTab(): Promise<void> {

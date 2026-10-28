@@ -152,6 +152,8 @@
       "copyTitle": "Copy session title",
       "copyTitleDone": "Session title copied",
       "copyTitleFailed": "Failed to copy title",
+      "renameTitle": "Изменить название сессии",
+      "renameTitleFailed": "Не удалось переименовать сессию",
       "moveLeft": "Move left",
       "moveRight": "Move right",
       "close": "Close",

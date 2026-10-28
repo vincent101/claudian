@@ -20,6 +20,9 @@ export interface TabBarCallbacks {
    * source tab is removed first; the owner translates it into a moveTab call.
    */
   onTabReorder: (sourceTabId: TabId, targetIndex: number) => void;
+
+  /** Called when "rename session title" is chosen from a tab's context menu. */
+  onTabRename: (tabId: TabId) => void;
 }
 
 /**
@@ -231,6 +234,15 @@ export class TabBar {
           } catch {
             new Notice(t('chat.tabs.copyTitleFailed'));
           }
+        });
+    });
+    menu.addItem((menuItem) => {
+      menuItem
+        .setTitle(t('chat.tabs.renameTitle'))
+        .setIcon('pencil')
+        .setDisabled(!item.conversationId)
+        .onClick(() => {
+          this.callbacks.onTabRename(item.id);
         });
     });
     menu.addSeparator();

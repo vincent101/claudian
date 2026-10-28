@@ -69,6 +69,7 @@ function createMockDeps(overrides: Partial<ConversationControllerDeps> = {}): Co
       findEmptyConversation: jest.fn().mockResolvedValue(null),
       updateConversation: jest.fn().mockResolvedValue(undefined),
       renameConversation: jest.fn().mockResolvedValue(undefined),
+      renameConversationManually: jest.fn().mockResolvedValue(undefined),
       deleteConversation: jest.fn().mockResolvedValue(undefined),
       agentService: {
         getSessionId: jest.fn().mockResolvedValue(null),
@@ -2886,6 +2887,93 @@ describe('ConversationController', () => {
       } finally {
         global.document = origDocument;
       }
+    });
+
+    describe('inline rename commit (finishRename)', () => {
+      /** Opens the inline rename input and returns its captured blur/keydown handlers. */
+      function openRenameInput(initialTitle: string) {
+        (deps.plugin.getConversationList as jest.Mock).mockReturnValue([
+          { id: 'conv-1', title: initialTitle, createdAt: 1000, lastResponseAt: 1000 },
+        ]);
+        controller.updateHistoryDropdown();
+
+        const item = dropdown.children[1].children[0];
+        const rBtn = item.querySelector('.claudian-history-item-actions')!.children[0];
+        const clickHandlers = rBtn._eventListeners?.get('click');
+
+        const listeners = new Map<string, (...args: any[]) => any>();
+        const input: any = {
+          type: '',
+          className: '',
+          value: '',
+          focus: jest.fn(),
+          select: jest.fn(),
+          blur: jest.fn(),
+          addEventListener: (event: string, handler: (...args: any[]) => any) => {
+            listeners.set(event, handler);
+          },
+        };
+        const titleEl = item.querySelector('.claudian-history-item-title');
+        (titleEl as any).replaceWith = jest.fn();
+
+        const origDocument = global.document;
+        global.document = { createElement: jest.fn().mockReturnValue(input) } as any;
+        try {
+          clickHandlers![0]({ stopPropagation: jest.fn() });
+        } finally {
+          global.document = origDocument;
+        }
+
+        return { input, listeners };
+      }
+
+      beforeEach(() => {
+        mockNotice.mockClear();
+      });
+
+      it('commits the trimmed title through renameConversationManually, then refreshes the dropdown', async () => {
+        const { input, listeners } = openRenameInput('Old title');
+        const refreshSpy = jest.spyOn(controller, 'updateHistoryDropdown');
+        input.value = '  New title  ';
+
+        await listeners.get('blur')!();
+
+        expect(deps.plugin.renameConversationManually).toHaveBeenCalledTimes(1);
+        expect(deps.plugin.renameConversationManually).toHaveBeenCalledWith('conv-1', 'New title');
+        expect(refreshSpy).toHaveBeenCalledTimes(1);
+        expect(mockNotice).not.toHaveBeenCalled();
+      });
+
+      it('falls back to the current title when the input is blank', async () => {
+        const { input, listeners } = openRenameInput('Old title');
+        input.value = '   ';
+
+        await listeners.get('blur')!();
+
+        expect(deps.plugin.renameConversationManually).toHaveBeenCalledWith('conv-1', 'Old title');
+      });
+
+      it('shows the failure notice and skips the dropdown refresh when the manual rename rejects', async () => {
+        const { input, listeners } = openRenameInput('Old title');
+        const refreshSpy = jest.spyOn(controller, 'updateHistoryDropdown');
+        (deps.plugin.renameConversationManually as jest.Mock).mockRejectedValue(new Error('disk full'));
+        input.value = 'New title';
+
+        await listeners.get('blur')!();
+
+        expect(mockNotice).toHaveBeenCalledWith('Failed to rename conversation');
+        expect(refreshSpy).not.toHaveBeenCalled();
+      });
+
+      it('does not call the two-step primitives directly (semantics live in the plugin method)', async () => {
+        const { input, listeners } = openRenameInput('Old title');
+        input.value = 'New title';
+
+        await listeners.get('blur')!();
+
+        expect(deps.plugin.renameConversation).not.toHaveBeenCalled();
+        expect(deps.plugin.updateConversation).not.toHaveBeenCalled();
+      });
     });
 
     it('should delete conversation and reload active when deleting current conversation', async () => {

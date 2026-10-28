@@ -12,6 +12,7 @@ function createMockCallbacks(): TabBarCallbacks {
     onTabClose: jest.fn(),
     onNewTab: jest.fn(),
     onTabReorder: jest.fn(),
+    onTabRename: jest.fn(),
   };
 }
 
@@ -28,6 +29,7 @@ function createTabBarItem(overrides: Partial<TabBarItem> = {}): TabBarItem {
     needsReview: false,
     canClose: true,
     conversationTitle: null,
+    conversationId: null,
     ...overrides,
   };
 }
@@ -436,6 +438,7 @@ describe('TabBar', () => {
       expect(menu.addSeparator).toHaveBeenCalled();
       expect(menu.items.map((item: any) => item.title)).toEqual([
         t('chat.tabs.copyTitle'),
+        t('chat.tabs.renameTitle'),
         t('chat.tabs.moveLeft'),
         t('chat.tabs.moveRight'),
         t('chat.tabs.close'),
@@ -456,14 +459,14 @@ describe('TabBar', () => {
       const menu = (Menu as any).instances.at(-1);
 
       // Middle tab moves left → insertion index 0 in remove-then-insert space.
-      menu.items[1].clickHandler?.();
+      menu.items[2].clickHandler?.();
       expect(callbacks.onTabReorder).toHaveBeenCalledWith('t2', 0);
 
       // Middle tab moves right → insertion index 2.
-      menu.items[2].clickHandler?.();
+      menu.items[3].clickHandler?.();
       expect(callbacks.onTabReorder).toHaveBeenCalledWith('t2', 2);
 
-      menu.items[3].clickHandler?.();
+      menu.items[4].clickHandler?.();
       expect(callbacks.onTabClose).toHaveBeenCalledWith('t2');
     });
 
@@ -479,14 +482,14 @@ describe('TabBar', () => {
 
       containerEl._children[0].dispatchEvent('contextmenu', { preventDefault: jest.fn() });
       let menu = (Menu as any).instances.at(-1);
-      expect(menu.items[1].disabled).toBe(true);
-      expect(menu.items[2].disabled).toBe(false);
+      expect(menu.items[2].disabled).toBe(true);
       expect(menu.items[3].disabled).toBe(false);
+      expect(menu.items[4].disabled).toBe(false);
 
       containerEl._children[2].dispatchEvent('contextmenu', { preventDefault: jest.fn() });
       menu = (Menu as any).instances.at(-1);
-      expect(menu.items[1].disabled).toBe(false);
-      expect(menu.items[2].disabled).toBe(true);
+      expect(menu.items[2].disabled).toBe(false);
+      expect(menu.items[3].disabled).toBe(true);
     });
 
     it('does not open a menu when the tab cannot close (single streaming tab)', () => {
@@ -497,6 +500,52 @@ describe('TabBar', () => {
       tabBar.update([createTabBarItem({ id: 'uncloseable-tab', canClose: false })]);
 
       expect(containerEl._children[0]._eventListeners.has('contextmenu')).toBe(false);
+    });
+
+    describe('rename title item', () => {
+      it('places the rename item right after copy title with a pencil icon', () => {
+        const containerEl = createMockEl();
+        const callbacks = createMockCallbacks();
+        const tabBar = new TabBar(containerEl, callbacks);
+        tabBar.update([createTabBarItem({ id: 't1', conversationId: 'conv-1', conversationTitle: 'Old' })]);
+
+        containerEl._children[0].dispatchEvent('contextmenu', { preventDefault: jest.fn() });
+        const menu = (Menu as any).instances.at(-1);
+
+        expect(menu.items[0].title).toBe(t('chat.tabs.copyTitle'));
+        expect(menu.items[1].title).toBe(t('chat.tabs.renameTitle'));
+        expect(menu.items[1].icon).toBe('pencil');
+        expect(menu.items[1].disabled).toBe(false);
+      });
+
+      it('disables the rename item when the tab is not bound to a conversation', () => {
+        const containerEl = createMockEl();
+        const callbacks = createMockCallbacks();
+        const tabBar = new TabBar(containerEl, callbacks);
+        tabBar.update([createTabBarItem({ id: 't1', conversationId: null, conversationTitle: null })]);
+
+        containerEl._children[0].dispatchEvent('contextmenu', { preventDefault: jest.fn() });
+        const menu = (Menu as any).instances.at(-1);
+
+        expect(menu.items[1].disabled).toBe(true);
+      });
+
+      it('reports the clicked tab id through onTabRename', () => {
+        const containerEl = createMockEl();
+        const callbacks = createMockCallbacks();
+        const tabBar = new TabBar(containerEl, callbacks);
+        tabBar.update([
+          createTabBarItem({ id: 't1', index: 1, conversationId: 'conv-1', conversationTitle: 'A' }),
+          createTabBarItem({ id: 't2', index: 2, conversationId: 'conv-2', conversationTitle: 'B' }),
+        ]);
+
+        containerEl._children[1].dispatchEvent('contextmenu', { preventDefault: jest.fn() });
+        const menu = (Menu as any).instances.at(-1);
+        menu.items[1].clickHandler?.();
+
+        expect(callbacks.onTabRename).toHaveBeenCalledTimes(1);
+        expect(callbacks.onTabRename).toHaveBeenCalledWith('t2');
+      });
     });
 
     describe('copy title item', () => {

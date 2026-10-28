@@ -152,6 +152,8 @@
       "copyTitle": "Copy session title",
       "copyTitleDone": "Session title copied",
       "copyTitleFailed": "Failed to copy title",
+      "renameTitle": "세션 제목 변경",
+      "renameTitleFailed": "세션 이름 변경에 실패했습니다",
       "moveLeft": "왼쪽으로 이동",
       "moveRight": "오른쪽으로 이동",
       "close": "탭 닫기",

@@ -152,6 +152,8 @@
       "copyTitle": "复制会话标题",
       "copyTitleDone": "已复制会话标题",
       "copyTitleFailed": "复制标题失败",
+      "renameTitle": "更改会话标题",
+      "renameTitleFailed": "重命名会话失败",
       "moveLeft": "向左移动",
       "moveRight": "向右移动",
       "close": "关闭标签页",

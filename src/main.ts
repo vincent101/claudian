@@ -742,6 +742,20 @@ export default class ClaudianPlugin extends Plugin {
     );
   }
 
+  /**
+   * Manual (user-initiated) rename: rename, then clear titleGenerationStatus.
+   * The clear must follow the rename — periodic AI title regeneration only
+   * fires when the status is 'success'/'failed', so leaving it set lets the
+   * next regeneration cycle overwrite the hand-edited title. Both entry
+   * points (history dropdown, tab context menu) share this method; the
+   * automatic title path keeps calling renameConversation directly and
+   * preserves its status.
+   */
+  async renameConversationManually(id: string, title: string): Promise<void> {
+    await this.renameConversation(id, title);
+    await this.updateConversation(id, { titleGenerationStatus: undefined });
+  }
+
   async updateConversation(id: string, updates: Partial<Conversation>): Promise<void> {
     const conversation = this.conversations.find(c => c.id === id);
     if (!conversation) return;

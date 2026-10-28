@@ -1785,8 +1785,7 @@ export class ConversationController {
     const finishRename = async () => {
       try {
         const newTitle = input.value.trim() || currentTitle;
-        await this.deps.plugin.renameConversation(convId, newTitle);
-        await this.deps.plugin.updateConversation(convId, { titleGenerationStatus: undefined });
+        await this.deps.plugin.renameConversationManually(convId, newTitle);
         this.updateHistoryDropdown();
       } catch {
         new Notice('Failed to rename conversation');

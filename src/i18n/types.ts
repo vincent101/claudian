@@ -119,6 +119,8 @@ export type TranslationKey =
   | 'chat.tabs.copyTitle'
   | 'chat.tabs.copyTitleDone'
   | 'chat.tabs.copyTitleFailed'
+  | 'chat.tabs.renameTitle'
+  | 'chat.tabs.renameTitleFailed'
   | 'chat.tabs.moveLeft'
   | 'chat.tabs.moveRight'
   | 'chat.tabs.close'

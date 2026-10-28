@@ -386,4 +386,6 @@ export interface TabBarItem {
   canClose: boolean;
   /** Conversation title for clipboard copy; null when untitled or unbound. */
   conversationTitle: string | null;
+  /** Bound conversation id for rename; null for a new tab without a conversation. */
+  conversationId: string | null;
 }

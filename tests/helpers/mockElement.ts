@@ -156,6 +156,7 @@ export function createMockEl(tag = 'div'): any {
     },
     scrollIntoView() {},
     focus() {},
+    select() {},
     blur() {},
 
     setAttribute(name: string, value: string) { attributes.set(name, value); },
