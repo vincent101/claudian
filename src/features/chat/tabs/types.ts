@@ -384,4 +384,6 @@ export interface TabBarItem {
   /** Background tab finished streaming and awaits user review. */
   needsReview: boolean;
   canClose: boolean;
+  /** Conversation title for clipboard copy; null when untitled or unbound. */
+  conversationTitle: string | null;
 }

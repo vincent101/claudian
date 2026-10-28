@@ -1319,6 +1319,63 @@ describe('TabManager - Tab Bar Data', () => {
 
       expect(items[0].providerId).toBe('codex');
     });
+
+    it('should expose the bound conversation title on tab bar items', async () => {
+      manager = createManager({
+        plugin: createMockPlugin({
+          getConversationSync: jest.fn().mockReturnValue({
+            id: 'conv-1',
+            title: 'quant策略架构Agent',
+          }),
+        }),
+        tabFactory: () => createMockTabData({
+          id: 'tab-1',
+          conversationId: 'conv-1',
+        }),
+      });
+
+      await manager.createTab();
+
+      const items = manager.getTabBarItems();
+
+      expect(items[0].conversationTitle).toBe('quant策略架构Agent');
+    });
+
+    it('should expose null conversation title for an untitled conversation', async () => {
+      manager = createManager({
+        plugin: createMockPlugin({
+          getConversationSync: jest.fn().mockReturnValue({ id: 'conv-1', title: null }),
+        }),
+        tabFactory: () => createMockTabData({
+          id: 'tab-1',
+          conversationId: 'conv-1',
+        }),
+      });
+
+      await manager.createTab();
+
+      const items = manager.getTabBarItems();
+
+      expect(items[0].conversationTitle).toBeNull();
+    });
+
+    it('should expose null conversation title for an unbound tab without a lookup', async () => {
+      const plugin = createMockPlugin();
+      manager = createManager({
+        plugin,
+        tabFactory: () => createMockTabData({
+          id: 'tab-1',
+          conversationId: null,
+        }),
+      });
+
+      await manager.createTab();
+
+      const items = manager.getTabBarItems();
+
+      expect(items[0].conversationTitle).toBeNull();
+      expect(plugin.getConversationSync).not.toHaveBeenCalled();
+    });
   });
 });
 

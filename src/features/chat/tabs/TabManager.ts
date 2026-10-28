@@ -673,10 +673,14 @@ export class TabManager implements TabManagerInterface {
     let index = 1;
 
     for (const tab of this.tabs.values()) {
+      const conversation = tab.conversationId
+        ? this.plugin.getConversationSync(tab.conversationId)
+        : null;
       items.push({
         id: tab.id,
         index: index++,
         title: getTabTitle(tab, this.plugin),
+        conversationTitle: conversation?.title ?? null,
         providerId: getTabProviderId(tab, this.plugin),
         isActive: tab.id === this.activeTabId,
         isStreaming: tab.state.isStreaming,

@@ -149,6 +149,9 @@
       "compactBoundary": "대화가 압축되었습니다"
     },
     "tabs": {
+      "copyTitle": "Copy session title",
+      "copyTitleDone": "Session title copied",
+      "copyTitleFailed": "Failed to copy title",
       "moveLeft": "왼쪽으로 이동",
       "moveRight": "오른쪽으로 이동",
       "close": "탭 닫기",

@@ -1,4 +1,4 @@
-import { Menu } from 'obsidian';
+import { Menu, Notice } from 'obsidian';
 
 import { t } from '../../../i18n/i18n';
 import type { TabBarItem, TabId } from './types';
@@ -217,6 +217,23 @@ export class TabBar {
     const index = ids.indexOf(item.id);
 
     const menu = new Menu();
+    menu.addItem((menuItem) => {
+      menuItem
+        .setTitle(t('chat.tabs.copyTitle'))
+        .setIcon('copy')
+        .setDisabled(!item.conversationTitle)
+        .onClick(async () => {
+          const title = item.conversationTitle;
+          if (!title) return;
+          try {
+            await navigator.clipboard.writeText(title);
+            new Notice(t('chat.tabs.copyTitleDone'));
+          } catch {
+            new Notice(t('chat.tabs.copyTitleFailed'));
+          }
+        });
+    });
+    menu.addSeparator();
     menu.addItem((menuItem) => {
       menuItem
         .setTitle(t('chat.tabs.moveLeft'))

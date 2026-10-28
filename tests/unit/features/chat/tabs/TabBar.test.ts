@@ -1,5 +1,5 @@
 import { createMockEl } from '@test/helpers/mockElement';
-import { Menu } from 'obsidian';
+import { Menu, Notice } from 'obsidian';
 
 import { TabBar, type TabBarCallbacks } from '@/features/chat/tabs/TabBar';
 import type { TabBarItem } from '@/features/chat/tabs/types';
@@ -27,6 +27,7 @@ function createTabBarItem(overrides: Partial<TabBarItem> = {}): TabBarItem {
     needsAttention: false,
     needsReview: false,
     canClose: true,
+    conversationTitle: null,
     ...overrides,
   };
 }
@@ -432,7 +433,9 @@ describe('TabBar', () => {
       const menu = (Menu as any).instances.at(-1);
       expect(menu).toBeDefined();
       expect(menu.showAtMouseEvent).toHaveBeenCalledWith(mockEvent);
+      expect(menu.addSeparator).toHaveBeenCalled();
       expect(menu.items.map((item: any) => item.title)).toEqual([
+        t('chat.tabs.copyTitle'),
         t('chat.tabs.moveLeft'),
         t('chat.tabs.moveRight'),
         t('chat.tabs.close'),
@@ -453,14 +456,14 @@ describe('TabBar', () => {
       const menu = (Menu as any).instances.at(-1);
 
       // Middle tab moves left → insertion index 0 in remove-then-insert space.
-      menu.items[0].clickHandler?.();
+      menu.items[1].clickHandler?.();
       expect(callbacks.onTabReorder).toHaveBeenCalledWith('t2', 0);
 
       // Middle tab moves right → insertion index 2.
-      menu.items[1].clickHandler?.();
+      menu.items[2].clickHandler?.();
       expect(callbacks.onTabReorder).toHaveBeenCalledWith('t2', 2);
 
-      menu.items[2].clickHandler?.();
+      menu.items[3].clickHandler?.();
       expect(callbacks.onTabClose).toHaveBeenCalledWith('t2');
     });
 
@@ -476,14 +479,14 @@ describe('TabBar', () => {
 
       containerEl._children[0].dispatchEvent('contextmenu', { preventDefault: jest.fn() });
       let menu = (Menu as any).instances.at(-1);
-      expect(menu.items[0].disabled).toBe(true);
-      expect(menu.items[1].disabled).toBe(false);
+      expect(menu.items[1].disabled).toBe(true);
       expect(menu.items[2].disabled).toBe(false);
+      expect(menu.items[3].disabled).toBe(false);
 
       containerEl._children[2].dispatchEvent('contextmenu', { preventDefault: jest.fn() });
       menu = (Menu as any).instances.at(-1);
-      expect(menu.items[0].disabled).toBe(false);
-      expect(menu.items[1].disabled).toBe(true);
+      expect(menu.items[1].disabled).toBe(false);
+      expect(menu.items[2].disabled).toBe(true);
     });
 
     it('does not open a menu when the tab cannot close (single streaming tab)', () => {
@@ -494,6 +497,74 @@ describe('TabBar', () => {
       tabBar.update([createTabBarItem({ id: 'uncloseable-tab', canClose: false })]);
 
       expect(containerEl._children[0]._eventListeners.has('contextmenu')).toBe(false);
+    });
+
+    describe('copy title item', () => {
+      function stubClipboard(writeText: jest.Mock) {
+        Object.defineProperty(globalThis, 'navigator', {
+          value: { clipboard: { writeText } },
+          writable: true,
+          configurable: true,
+        });
+      }
+
+      it('copies the conversation title and shows a success notice', async () => {
+        const containerEl = createMockEl();
+        const callbacks = createMockCallbacks();
+        const tabBar = new TabBar(containerEl, callbacks);
+        tabBar.update([createTabBarItem({ id: 't1', conversationTitle: 'quant策略架构Agent' })]);
+        const writeText = jest.fn().mockResolvedValue(undefined);
+        stubClipboard(writeText);
+        (Notice as jest.Mock).mockClear();
+
+        containerEl._children[0].dispatchEvent('contextmenu', { preventDefault: jest.fn() });
+        const menu = (Menu as any).instances.at(-1);
+
+        expect(menu.items[0].title).toBe(t('chat.tabs.copyTitle'));
+        expect(menu.items[0].icon).toBe('copy');
+        expect(menu.items[0].disabled).toBe(false);
+
+        await menu.items[0].clickHandler?.();
+
+        expect(writeText).toHaveBeenCalledWith('quant策略架构Agent');
+        expect(Notice).toHaveBeenCalledWith(t('chat.tabs.copyTitleDone'));
+      });
+
+      it('disables the copy item when the tab has no conversation title', () => {
+        const containerEl = createMockEl();
+        const callbacks = createMockCallbacks();
+        const tabBar = new TabBar(containerEl, callbacks);
+        tabBar.update([createTabBarItem({ id: 't1', conversationTitle: null })]);
+        const writeText = jest.fn().mockResolvedValue(undefined);
+        stubClipboard(writeText);
+        (Notice as jest.Mock).mockClear();
+
+        containerEl._children[0].dispatchEvent('contextmenu', { preventDefault: jest.fn() });
+        const menu = (Menu as any).instances.at(-1);
+
+        expect(menu.items[0].disabled).toBe(true);
+
+        menu.items[0].clickHandler?.();
+
+        expect(writeText).not.toHaveBeenCalled();
+        expect(Notice).not.toHaveBeenCalled();
+      });
+
+      it('shows a failure notice when the clipboard write rejects', async () => {
+        const containerEl = createMockEl();
+        const callbacks = createMockCallbacks();
+        const tabBar = new TabBar(containerEl, callbacks);
+        tabBar.update([createTabBarItem({ id: 't1', conversationTitle: 'My Conversation' })]);
+        stubClipboard(jest.fn().mockRejectedValue(new Error('no focus')));
+        (Notice as jest.Mock).mockClear();
+
+        containerEl._children[0].dispatchEvent('contextmenu', { preventDefault: jest.fn() });
+        const menu = (Menu as any).instances.at(-1);
+
+        await menu.items[0].clickHandler?.();
+
+        expect(Notice).toHaveBeenCalledWith(t('chat.tabs.copyTitleFailed'));
+      });
     });
   });
 

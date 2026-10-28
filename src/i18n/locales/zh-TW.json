@@ -149,6 +149,9 @@
       "compactBoundary": "對話已壓縮"
     },
     "tabs": {
+      "copyTitle": "複製會話標題",
+      "copyTitleDone": "已複製會話標題",
+      "copyTitleFailed": "複製標題失敗",
       "moveLeft": "向左移動",
       "moveRight": "向右移動",
       "close": "關閉分頁",

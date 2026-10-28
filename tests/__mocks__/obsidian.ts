@@ -204,6 +204,7 @@ export class Menu {
 
   items: MockMenuItem[] = [];
   showAtMouseEvent = jest.fn();
+  addSeparator = jest.fn();
 
   constructor() {
     Menu.instances.push(this);

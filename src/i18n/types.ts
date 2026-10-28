@@ -116,6 +116,9 @@ export type TranslationKey =
   | 'chat.message.compactBoundary'
 
   // Chat - Tab bar
+  | 'chat.tabs.copyTitle'
+  | 'chat.tabs.copyTitleDone'
+  | 'chat.tabs.copyTitleFailed'
   | 'chat.tabs.moveLeft'
   | 'chat.tabs.moveRight'
   | 'chat.tabs.close'
