@@ -1681,7 +1681,7 @@ export function wireTabInputEvents(tab: TabData, plugin: ClaudianPlugin): void {
 
     if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
       e.preventDefault();
-      void controllers.inputController?.sendMessage();
+      void controllers.inputController?.sendMessage({ userInitiated: true });
     }
   };
   dom.inputEl.addEventListener('keydown', keydownHandler);

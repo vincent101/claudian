@@ -367,6 +367,10 @@ describe('InputController - Message Queue', () => {
         await Promise.resolve();
 
         expect(sendSpy).toHaveBeenCalledWith(expect.objectContaining({ editorContextOverride: null }));
+        // Queue drain is programmatic: never flags the send as user-initiated
+        // (stale ask-timeout markers must survive it).
+        const drainArg = sendSpy.mock.calls[0][0] ?? {};
+        expect(drainArg.userInitiated).toBeUndefined();
         sendSpy.mockRestore();
       } finally {
         jest.useRealTimers();
@@ -1705,6 +1709,42 @@ describe('InputController - Message Queue', () => {
         jest.advanceTimersByTime(10 * 60 * 1000);
         expect(parentEl.querySelector('.claudian-ask-timeout-notice')).toBeNull();
         expect(jest.getTimerCount()).toBe(0);
+      } finally {
+        jest.useRealTimers();
+      }
+    });
+
+    it('plan A: the next real user message clears a lingering timeout notice', async () => {
+      jest.useFakeTimers();
+      try {
+        const { askDeps, askController, parentEl } = createTurnWiredDeps('auto');
+
+        // Window lapses → notice is rendered into the input area's parent.
+        const askPromise = askController.handleAskUserQuestion(askInput());
+        jest.advanceTimersByTime(5 * 60 * 1000 + 1);
+        await expect(askPromise).resolves.toBeNull();
+        expect(parentEl.querySelector('.claudian-ask-timeout-notice')).not.toBeNull();
+
+        // Programmatic sends (queue drain shape: context overrides, no
+        // userInitiated) keep the marker — the user may not have seen it yet.
+        // isStreaming routes both sends into the early queue branch (past the
+        // clear gate, before the send pipeline), keeping the test deterministic.
+        const askDepsInputEl = (askController as any).deps.getInputEl();
+        askDepsInputEl.value = 'queued';
+        askDeps.state.isStreaming = true;
+        await askController.sendMessage({ editorContextOverride: null });
+        expect(parentEl.querySelector('.claudian-ask-timeout-notice')).not.toBeNull();
+
+        // The user's own send (Enter key → userInitiated: true) removes it.
+        // The queued drain above cleared the input field — refill it.
+        askDepsInputEl.value = 'my next message';
+        await askController.sendMessage({ userInitiated: true });
+        expect(parentEl.querySelector('.claudian-ask-timeout-notice')).toBeNull();
+        askDeps.state.isStreaming = false;
+        askDepsInputEl.value = '';
+
+        // Idempotent: a second call against an already-cleared input area.
+        expect(() => (askController as any).clearAskTimeoutNotices()).not.toThrow();
       } finally {
         jest.useRealTimers();
       }

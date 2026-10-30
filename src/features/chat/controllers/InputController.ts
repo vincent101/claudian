@@ -239,6 +239,10 @@ export class InputController {
     browserContextOverride?: BrowserSelectionContext | null;
     canvasContextOverride?: CanvasSelectionContext | null;
     content?: string;
+    /** True only for the user's own send (Enter key). Programmatic sends —
+     *  queue drain, deferred auto-send, plan continuation — leave stale
+     *  ask-timeout markers in place; the user may not have seen them yet. */
+    userInitiated?: boolean;
   }): Promise<void> {
     const {
       plugin,
@@ -274,6 +278,10 @@ export class InputController {
       await this.executeBuiltInCommand(builtInCmd.command, builtInCmd.args);
       return;
     }
+
+    // The auto-turn timeout notice is a marker for one lapsed ask; only the
+    // user's own next message supersedes it (see userInitiated).
+    if (options?.userInitiated) this.clearAskTimeoutNotices();
 
     // If agent is working, queue the message instead of dropping it.
     // The feature turn lease (S2) covers both user turns and SDK-initiated
@@ -1907,6 +1915,19 @@ export class InputController {
         reject(err);
       }
     });
+  }
+
+  /**
+   * Remove stale auto-turn ask timeout notices ("后台轮提问超时未响应") from
+   * the input area. Called on the next real user message — the marker documents
+   * one lapsed ask and is superseded once the user acts again. Scoped to the
+   * live input container only: notices rendered into detached containers (e.g.
+   * after a tab switch) are garbage-collected with their DOM subtree.
+   */
+  private clearAskTimeoutNotices(): void {
+    const inputContainerEl = this.deps.getInputContainerEl();
+    const scopeEl = inputContainerEl?.parentElement;
+    scopeEl?.querySelectorAll('.claudian-ask-timeout-notice')?.forEach((el) => el.remove());
   }
 
   dismissPendingApprovalPrompt(): void {

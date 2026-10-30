@@ -2237,7 +2237,7 @@ describe('Tab - Event Handler Behavior', () => {
       fireKeydown(event);
 
       expect(event.preventDefault).toHaveBeenCalled();
-      expect(mockInputController.sendMessage).toHaveBeenCalled();
+      expect(mockInputController.sendMessage).toHaveBeenCalledWith({ userInitiated: true });
     });
 
     it('should not send message on Shift+Enter (newline)', () => {

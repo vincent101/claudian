@@ -61,6 +61,7 @@ export function createMockEl(tag = 'div'): any {
     children,
     style,
     dataset,
+    parentElement: null as MockElement | null,
     scrollTop: 0,
     scrollHeight: 0,
     innerHTML: '',
@@ -112,6 +113,7 @@ export function createMockEl(tag = 'div'): any {
       const child = createMockEl('div');
       if (opts?.cls) child.addClass(opts.cls);
       if (opts?.text) child.textContent = opts.text;
+      child.parentElement = element;
       children.push(child);
       return child;
     },
@@ -144,7 +146,15 @@ export function createMockEl(tag = 'div'): any {
       }
     },
     get firstChild() { return children[0] || null; },
-    remove() {},
+    // DOM detach: drop self from the parent's children so querySelector(All)
+    // no longer finds the element — tests assert removal through observation,
+    // not through inspecting this spy.
+    remove() {
+      const parent = element.parentElement;
+      if (!parent) return;
+      const idx = (parent as any).children?.indexOf(element);
+      if (idx !== undefined && idx !== -1) (parent as any).children.splice(idx, 1);
+    },
     empty() {
       children.length = 0;
       element.innerHTML = '';
