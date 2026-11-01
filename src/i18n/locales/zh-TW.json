@@ -82,7 +82,8 @@
       "autoTurnTimeout": "後台輪提問逾時未回應，已自動拒絕"
     },
     "cancel": {
-      "toolInterrupted": "已中斷"
+      "toolInterrupted": "已中斷",
+      "interruptUnacknowledged": "CLI 未回應取消。若介面長時間未恢復，請重新載入會話。"
     },
     "history": {
       "loading": "正在載入對話…",

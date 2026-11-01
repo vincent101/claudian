@@ -24,6 +24,13 @@ export interface ClaudeTranscriptObserverCallbacks {
   released: (turnId: string) => void;
   cancelled: (event: AutoTurnCancelledEvent) => void;
   projectEmbeddedExternal: (event: AutoTurnStartedEvent) => Promise<void>;
+  /**
+   * P0-1 result-late watchdog terminal signal: the transcript showed the
+   * HOST user turn's terminal state (end_turn + stop-hook evidence) at this
+   * tick. Called with the live hostUserTurnId; the runtime stamps the tick
+   * time onto the turn.
+   */
+  onHostTurnTerminalObserved: (turnId: string) => void;
 }
 
 /**
@@ -52,6 +59,11 @@ export class ClaudeTranscriptTurnObserver {
   private hostUserTurnId: string | null = null;
   private readonly hostUserTranscriptIds = new Set<string>();
   private lastHostUserOffset: number | null = null;
+  /** The live host turn's own user row has been observed on the transcript.
+   * Terminal facts may only be attributed to a turn whose row is already on
+   * disk — the previous turn's trailing rows can still flush after the
+   * hostUserTurnId already switched to the freshly dispatched turn. */
+  private hostUserRowObserved = false;
   /** 2.5.1 残余 a: host user turn was cancelled — CLI interrupt already
    * killed the pipeline, so turns promoting after the cancel can never see
    * their result line and must be settled deterministically. */
@@ -104,6 +116,7 @@ export class ClaudeTranscriptTurnObserver {
     this.hostUserTurnId = null;
     this.hostUserTranscriptIds.clear();
     this.lastHostUserOffset = null;
+    this.hostUserRowObserved = false;
     this.mapper.reset(this.generation);
   }
 
@@ -116,6 +129,13 @@ export class ClaudeTranscriptTurnObserver {
     // A new host user turn is live CLI work: a previous cancel no longer
     // constrains turns that promote behind it.
     this.hostCancelled = false;
+    // Reviewer #1 cross-turn residue: this turn switch is the authoritative
+    // reset point for host terminal attribution. Any unconfirmed candidate
+    // belongs to the previous turn (queue release required its settlement),
+    // and this turn's terminal rows can only land after its own user row —
+    // which has not been observed yet.
+    this.mapper.clearHostTerminalCandidate();
+    this.hostUserRowObserved = false;
   }
 
   async completeUserTurnProjection(turnId: string): Promise<void> {
@@ -169,6 +189,7 @@ export class ClaudeTranscriptTurnObserver {
         lineOffset,
       });
       this.reportObservedStarts(facts);
+      this.reportHostTerminal(facts);
       for (const event of adaptTranscriptFacts(facts, { hostUserTurnActive: this.hostUserTurnId !== null })) {
         this.diagnostics?.record({ phase: 'map', generation, turnIdHash: this.diagnostics.hashId(event.event.turnId) });
         this.enqueue(event);
@@ -190,6 +211,7 @@ export class ClaudeTranscriptTurnObserver {
       const message = JSON.parse(line) as { type?: string; uuid?: string };
       if (message.type !== 'user' || !message.uuid || !this.hostUserTranscriptIds.delete(message.uuid)) return;
       this.lastHostUserOffset = lineOffset;
+      this.hostUserRowObserved = true;
     } catch {
       // Malformed transcript rows cannot establish causal ownership.
     }
@@ -210,6 +232,38 @@ export class ClaudeTranscriptTurnObserver {
           ...(fact.lineOffset !== undefined ? { lineOffset: fact.lineOffset } : {}),
           ...(fact.source ? { sourceKind: fact.source.kind } : {}),
         });
+      } catch {
+        // The bypass must never disturb the consume chain.
+      }
+    }
+  }
+
+  /**
+   * P0-1 read-only bypass: host-terminal facts notify the runtime with the
+   * live hostUserTurnId so the result-late watchdog can arm. Replay facts
+   * stay out (recovery scans past turns, never the live host wait). Isolated
+   * like the reconciliation bypass — never disturbs the consume chain.
+   *
+   * Attribution guards (reviewer #1): the fact only belongs to the live
+   * hostUserTurnId when that turn's own user row is already observed AND the
+   * terminal row lies past it in the transcript. The previous turn's
+   * end_turn/stop_hook_summary can still flush after the hostUserTurnId has
+   * already switched (release → queue pump dispatches the next message within
+   * milliseconds); those rows precede the new user row and must never stamp
+   * the new turn's transcriptTerminalSeenAt.
+   */
+  private reportHostTerminal(facts: ReturnType<ClaudeTranscriptTurnMapper['mapLine']>): void {
+    for (const fact of facts) {
+      if (fact.type !== 'observed_host_terminal' || fact.replay) continue;
+      const hostTurnId = this.hostUserTurnId;
+      if (!hostTurnId || !this.hostUserRowObserved) continue;
+      // Offset attribution when both anchors are known (live rows). A
+      // recovery-claimed row (mid-turn observer restart) has no live offset:
+      // every row the live reader can still deliver sits past the replayed
+      // boundary, so the observed flag alone attributes correctly there.
+      if (fact.lineOffset !== undefined && this.lastHostUserOffset !== null && fact.lineOffset <= this.lastHostUserOffset) continue;
+      try {
+        this.callbacks.onHostTurnTerminalObserved(hostTurnId);
       } catch {
         // The bypass must never disturb the consume chain.
       }
@@ -356,6 +410,7 @@ export class ClaudeTranscriptTurnObserver {
     if (this.quietTimer) clearTimeout(this.quietTimer);
     this.quietTimer = null;
     const facts = this.mapper.settleTerminalCandidate();
+    this.reportHostTerminal(facts);
     for (const event of adaptTranscriptFacts(facts, { hostUserTurnActive: this.hostUserTurnId !== null })) this.enqueue(event);
     await this.promote();
     await this.drainActive();

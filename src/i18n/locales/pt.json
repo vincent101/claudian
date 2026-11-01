@@ -82,7 +82,8 @@
       "autoTurnTimeout": "A pergunta do turno em segundo plano não recebeu resposta em 5 minutos — recusada automaticamente."
     },
     "cancel": {
-      "toolInterrupted": "Interrompido"
+      "toolInterrupted": "Interrompido",
+      "interruptUnacknowledged": "A CLI não respondeu ao cancelamento. Se a interface demorar muito a recuperar, recarregue a conversa."
     },
     "history": {
       "loading": "Loading conversation…",

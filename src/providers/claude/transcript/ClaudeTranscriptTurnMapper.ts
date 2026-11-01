@@ -66,6 +66,18 @@ export type TranscriptTurnFact =
       nextGeneration: number;
       lineOffset?: number;
       replay: boolean;
+    }
+  | {
+      /**
+       * Terminal evidence for the HOST user turn (P0-1 result-late watchdog).
+       * Host rows never open a mapper turn, so the fact carries no identity:
+       * the observer attaches the live hostUserTurnId when notifying the
+       * runtime. Evidence = end_turn candidate confirmed by stop_hook_summary
+       * (or quiet-settled when no Stop hook writes a summary row).
+       */
+      type: 'observed_host_terminal';
+      lineOffset?: number;
+      replay: boolean;
     };
 
 export interface TranscriptMapContext {
@@ -133,12 +145,37 @@ interface ActiveTurn {
 
 export class ClaudeTranscriptTurnMapper {
   private active: ActiveTurn | null = null;
+  /** end_turn seen for the host user turn, awaiting stop_hook_summary (or quiet settle). */
+  private hostTerminalCandidate = false;
+  /** Offset of the row that armed the host candidate: the fact inherits it so
+   * the observer can attribute the terminal to the turn owning that row. */
+  private hostTerminalCandidateOffset?: number;
+  /**
+   * An embedded external turn (hostUserTurnActive + showUser start diverted
+   * into the embedded queue) owns transcript emission until its own
+   * end_turn/summary: those terminal rows belong to it, never to the host.
+   */
+  private embeddedExternalEmission = false;
 
   constructor(private generation = 0) {}
 
   reset(generation = this.generation + 1): void {
     this.generation = generation;
     this.active = null;
+    this.hostTerminalCandidate = false;
+    this.hostTerminalCandidateOffset = undefined;
+    this.embeddedExternalEmission = false;
+  }
+
+  /**
+   * A new host user turn is live: any unconfirmed host candidate belongs to
+   * the turn that just ended (queue release requires its settlement), so it
+   * must never arm the next turn's result-late watchdog (reviewer #1: the
+   * previous turn's stop_hook_summary can be flushed by the next dispatch).
+   */
+  clearHostTerminalCandidate(): void {
+    this.hostTerminalCandidate = false;
+    this.hostTerminalCandidateOffset = undefined;
   }
 
   mapLine(line: string, replay = false, context: TranscriptMapContext = { hostUserTurnActive: false }): TranscriptTurnFact[] {
@@ -167,6 +204,7 @@ export class ClaudeTranscriptTurnMapper {
         replay,
       });
       if (context.hostUserTurnActive && start.showUser) {
+        this.embeddedExternalEmission = true;
         return facts;
       }
       this.active = {
@@ -184,6 +222,12 @@ export class ClaudeTranscriptTurnMapper {
     if (isQueryableHostUserRow(message)) {
       // Host rows never open an observer turn (the host runtime owns their
       // lifecycle); the fact exists so reconciliation can match the UUID.
+      // A newer host row also retires any pending terminal candidate: its
+      // end_turn belonged to the previous turn, which must already have
+      // settled for this row to dispatch (queue release requires settle).
+      this.hostTerminalCandidate = false;
+      this.hostTerminalCandidateOffset = undefined;
+      this.embeddedExternalEmission = false;
       facts.push({
         type: 'observed_start',
         identity: { canonicalTurnId: message.uuid, transcriptUserId: message.uuid, generation: this.generation },
@@ -192,6 +236,8 @@ export class ClaudeTranscriptTurnMapper {
         replay,
       });
     }
+
+    this.trackHostTerminalEvidence(message, replay, facts, context);
 
     const active = this.active;
     if (!active) return facts;
@@ -243,7 +289,17 @@ export class ClaudeTranscriptTurnMapper {
   }
 
   settleTerminalCandidate(replay = false): TranscriptTurnFact[] {
-    return this.active?.terminalCandidate ? this.finishActive(replay, 'end_turn_quiet') : [];
+    const facts: TranscriptTurnFact[] = this.active?.terminalCandidate ? this.finishActive(replay, 'end_turn_quiet') : [];
+    if (this.hostTerminalCandidate) {
+      // Quiet settle without a stop_hook_summary row (no Stop hooks
+      // configured): end_turn plus transcript silence settles the host too.
+      // The fact carries the arming end_turn's offset so the observer can
+      // still attribute it when the host turn has since been replaced.
+      this.hostTerminalCandidate = false;
+      facts.push({ type: 'observed_host_terminal', lineOffset: this.hostTerminalCandidateOffset, replay });
+      this.hostTerminalCandidateOffset = undefined;
+    }
+    return facts;
   }
 
   hasOpenTurn(): boolean {
@@ -251,7 +307,48 @@ export class ClaudeTranscriptTurnMapper {
   }
 
   hasTerminalCandidate(): boolean {
-    return this.active?.terminalCandidate === true;
+    return this.active?.terminalCandidate === true || this.hostTerminalCandidate;
+  }
+
+  /**
+   * P0-1 terminal evidence for the host user turn. While no external turn is
+   * open, the rows between the host user row and the turn's end belong to the
+   * host turn: end_turn arms the candidate, stop_hook_summary confirms it
+   * (the CLI only writes that row after the hook round-trip completed — the
+   * 2026-10-31 case's terminal pair), and a Stop-hook block feedback row
+   * retracts it (the turn continues).
+   */
+  private trackHostTerminalEvidence(
+    message: SDKNativeMessage,
+    replay: boolean,
+    facts: TranscriptTurnFact[],
+    context: TranscriptMapContext,
+  ): void {
+    if (!context.hostUserTurnActive || this.active !== null) return;
+    const endTurn = message.type === 'assistant' && message.message?.stop_reason === 'end_turn';
+    const stopHookSummary = message.type === 'system' && message.subtype === 'stop_hook_summary';
+    if (this.embeddedExternalEmission) {
+      // Rows between an embedded external start and its terminal belong to
+      // that turn: its end_turn/summary only return emission ownership to
+      // the host, they never arm the host candidate.
+      if (endTurn || stopHookSummary) this.embeddedExternalEmission = false;
+      return;
+    }
+    if (isStopHookBlockFeedback(message)) {
+      this.hostTerminalCandidate = false;
+      this.hostTerminalCandidateOffset = undefined;
+      return;
+    }
+    if (endTurn) {
+      this.hostTerminalCandidate = true;
+      this.hostTerminalCandidateOffset = context.lineOffset;
+      return;
+    }
+    if (stopHookSummary && this.hostTerminalCandidate) {
+      this.hostTerminalCandidate = false;
+      facts.push({ type: 'observed_host_terminal', lineOffset: context.lineOffset, replay });
+      this.hostTerminalCandidateOffset = undefined;
+    }
   }
 
   private closeBeforeNextUser(replay: boolean): TranscriptTurnFact[] {

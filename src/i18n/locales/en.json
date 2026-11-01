@@ -82,7 +82,8 @@
       "autoTurnTimeout": "Background turn asked a question but got no response within 5 minutes — automatically declined."
     },
     "cancel": {
-      "toolInterrupted": "Interrupted"
+      "toolInterrupted": "Interrupted",
+      "interruptUnacknowledged": "Claude did not respond to the cancellation. If the interface stays unresponsive for a long time, reload the conversation."
     },
     "history": {
       "loading": "Loading conversation…",

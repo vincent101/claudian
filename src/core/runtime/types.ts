@@ -160,7 +160,10 @@ export interface AutoTurnChunkEvent {
 
 export interface AutoTurnDiagnosticEvent {
   phase: 'tick_start' | 'tick_end' | 'map' | 'lease_begin' | 'lease_finish' | 'lease_release'
-    | 'render_start' | 'render_end' | 'save_start' | 'save_end' | 'save_timeout' | 'callback_error';
+    | 'render_start' | 'render_end' | 'save_start' | 'save_end' | 'save_timeout' | 'callback_error'
+    // P0 cancellation trace (2026-11-01): feature-layer cancel snapshot and
+    // the dead-cancel force settle outcome.
+    | 'cancel_request' | 'force_settle';
   turnId?: string;
   generation?: number;
   leaseKind?: 'user' | 'auto';
@@ -168,6 +171,12 @@ export interface AutoTurnDiagnosticEvent {
   batchLines?: number;
   elapsedMs?: number;
   errorName?: string;
+  /** cancel_request: queued message slots held at cancel time. */
+  queueLength?: number;
+  /** cancel_request: streaming flag state at cancel time. */
+  isStreaming?: boolean;
+  /** Free-form short context (force_settle outcome). */
+  detail?: string;
 }
 
 export interface AutoTurnFinishedEvent {

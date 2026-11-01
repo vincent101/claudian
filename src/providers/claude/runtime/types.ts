@@ -143,6 +143,22 @@ export interface RuntimeTurn {
    * settling on it would end this turn prematurely (2.3.2 fix ①).
    */
   notificationResultPending: boolean;
+  /**
+   * P0-1 result-late watchdog: observer tick time at which the transcript
+   * first showed this turn's terminal state (end_turn + stop-hook
+   * evidence). Null until then — a long turn without terminal evidence must
+   * never arm the watchdog (T4 red line).
+   */
+  transcriptTerminalSeenAt: number | null;
+  /** P0-1 diagnostics: wall time of the last chunk delivered to this turn. */
+  lastChunkAt: number | null;
+  /**
+   * P0-3 interrupt acknowledgement: wall time of the last SDK message routed
+   * to this turn's lease (chunk, result — including a trailing result the
+   * cancelled-phase gate drops). Any change after the interrupt proves the
+   * CLI responded, even while the feature projection is still closing.
+   */
+  lastRoutedMessageAt: number | null;
   /** Recovery generation carried by the exact dispatch awaiting confirmation. */
   recoveryGeneration?: number;
 }
@@ -172,6 +188,9 @@ export function createRuntimeTurn(options: RuntimeTurnOptions): RuntimeTurn {
     waiters: new Set(),
     mergedInto: null,
     notificationResultPending: false,
+    transcriptTerminalSeenAt: null,
+    lastChunkAt: null,
+    lastRoutedMessageAt: null,
   };
 }
 

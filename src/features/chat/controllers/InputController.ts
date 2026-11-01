@@ -1455,6 +1455,15 @@ export class InputController {
     const { state, streamController } = this.deps;
     if (!state.isStreaming) return;
     state.cancelRequested = true;
+    // P0-2: the cancel entry snapshot (active turn, queue depth, streaming
+    // state) is the post-mortem baseline for every later settle event.
+    this.getAgentService()?.recordAutoTurnDiagnostic?.({
+      phase: 'cancel_request',
+      turnId: this.getTurnCoordinator()?.getActiveTurn()?.turnId,
+      generation: state.streamGeneration,
+      queueLength: (state.queuedMessage ? 1 : 0) + (this.pendingSteerMessage ? 1 : 0),
+      isStreaming: state.isStreaming,
+    });
     // Settle any pending render flush now (fix 3): the generator's finalize
     // must not hang on a render promise for a turn the user just cancelled.
     streamController.invalidateRenderFlush?.();
@@ -1485,7 +1494,16 @@ export class InputController {
       if (!state.isStreaming || !state.cancelRequested) return;
       if (state.streamGeneration !== generation) return; // a newer turn owns the flag
       const coordinator = this.getTurnCoordinator();
-      coordinator?.forceSettleForDeadCancel();
+      const activeTurnId = coordinator?.getActiveTurn()?.turnId;
+      const settled = coordinator?.forceSettleForDeadCancel() ?? false;
+      // P0-2: whether the dead-cancel backstop actually settled a lease.
+      this.getAgentService()?.recordAutoTurnDiagnostic?.({
+        phase: 'force_settle',
+        turnId: activeTurnId,
+        generation,
+        leaseKind: 'user',
+        detail: settled ? 'settled' : 'noop',
+      });
     }, CANCEL_WATCHDOG_MS);
   }
 

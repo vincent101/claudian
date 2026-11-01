@@ -92,6 +92,11 @@ export function adaptTranscriptFacts(
         });
         continue;
       }
+      case 'observed_host_terminal': {
+        // Host-terminal facts carry no legacy event shape: the observer
+        // routes them straight to the runtime callback (P0-1 watchdog).
+        continue;
+      }
     }
   }
   return events;

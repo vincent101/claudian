@@ -82,7 +82,8 @@
       "autoTurnTimeout": "Вопрос фонового хода не получил ответа за 5 минут — автоматически отклонён."
     },
     "cancel": {
-      "toolInterrupted": "Прервано"
+      "toolInterrupted": "Прервано",
+      "interruptUnacknowledged": "CLI не ответила на отмену. Если интерфейс долго не восстанавливается, перезагрузите диалог."
     },
     "history": {
       "loading": "Loading conversation…",

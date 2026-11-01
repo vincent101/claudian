@@ -57,6 +57,7 @@ export type TranslationKey =
 
   // Chat - Cancel settle-down
   | 'chat.cancel.toolInterrupted'
+  | 'chat.cancel.interruptUnacknowledged'
 
   // Chat - Auto-turn ask timeout fallback (plan A)
   | 'chat.ask.autoTurnTimeout'

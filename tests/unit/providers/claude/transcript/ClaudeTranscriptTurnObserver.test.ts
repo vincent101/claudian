@@ -52,6 +52,7 @@ describe('ClaudeTranscriptTurnObserver', () => {
       released: jest.fn(turnId => { order.push(`release:${turnId}`); }),
       cancelled: jest.fn(),
       projectEmbeddedExternal: jest.fn(async event => { order.push(`embedded:${event.turnId}`); }),
+      onHostTurnTerminalObserved: jest.fn(turnId => { order.push(`host-terminal:${turnId}`); }),
     };
     const observer = new ClaudeTranscriptTurnObserver(callbacks, canAcquire);
     return { observer, callbacks, order };
@@ -344,6 +345,7 @@ describe('ClaudeTranscriptTurnObserver', () => {
       released: jest.fn((turnId: string) => { order.push(`release:${turnId}`); }),
       cancelled: jest.fn(),
       projectEmbeddedExternal: jest.fn(async () => {}),
+      onHostTurnTerminalObserved: jest.fn(),
     };
     const observer = new ClaudeTranscriptTurnObserver(callbacks, () => true);
     try {
@@ -657,6 +659,261 @@ describe('ClaudeTranscriptTurnObserver', () => {
       observer.stop();
     }
   });
+
+  describe('host user turn terminal notification (P0-1 result-late watchdog)', () => {
+    function hostUserRow(uuid: string): string {
+      return JSON.stringify({ type: 'user', uuid, isSidechain: false, message: { role: 'user', content: 'hello' } });
+    }
+
+    function hostEndTurn(): string {
+      return JSON.stringify({ type: 'assistant', uuid: 'host-a1', message: { id: 'host-m1', role: 'assistant', content: [{ type: 'text', text: 'done' }], stop_reason: 'end_turn' } });
+    }
+
+    function stopHookSummary(): string {
+      return JSON.stringify({ type: 'system', subtype: 'stop_hook_summary' });
+    }
+
+    function hostTerminalLines(): string[] {
+      return [hostEndTurn(), stopHookSummary()];
+    }
+
+    it('notifies the runtime with the live hostUserTurnId at tick time', async () => {
+      await writeFile(file, '');
+      const { observer, callbacks } = setup();
+      await observer.start(file);
+      observer.registerHostUserTranscriptId('host-watch-row');
+      observer.beginUserTurnProjection('host-watch');
+      const generation = (observer as any).generation;
+
+      await (observer as any).consumeBatch(
+        { lines: [hostUserRow('host-watch-row'), ...hostTerminalLines()], lineOffsets: [0, 100, 200], reset: false },
+        generation,
+      );
+
+      expect(callbacks.onHostTurnTerminalObserved).toHaveBeenCalledTimes(1);
+      expect(callbacks.onHostTurnTerminalObserved).toHaveBeenCalledWith('host-watch');
+      observer.stop();
+    });
+
+    it('does not notify after the host turn projection completed (hostUserTurnId cleared)', async () => {
+      await writeFile(file, '');
+      const { observer, callbacks } = setup();
+      await observer.start(file);
+      observer.registerHostUserTranscriptId('host-done-row');
+      observer.beginUserTurnProjection('host-done');
+      await observer.completeUserTurnProjection('host-done');
+      const generation = (observer as any).generation;
+
+      await (observer as any).consumeBatch(
+        { lines: [hostUserRow('host-done-row'), ...hostTerminalLines()], lineOffsets: [0, 100, 200], reset: false },
+        generation,
+      );
+
+      expect(callbacks.onHostTurnTerminalObserved).not.toHaveBeenCalled();
+      observer.stop();
+    });
+
+    it('does not notify for stop-hook block continuations until the turn really ends', async () => {
+      await writeFile(file, '');
+      const { observer, callbacks } = setup();
+      await observer.start(file);
+      observer.registerHostUserTranscriptId('host-block-row');
+      observer.beginUserTurnProjection('host-block');
+      const generation = (observer as any).generation;
+
+      const blocked = [
+        hostUserRow('host-block-row'),
+        JSON.stringify({ type: 'assistant', uuid: 'host-b1', message: { id: 'host-bm1', role: 'assistant', content: [{ type: 'text', text: 'first' }], stop_reason: 'end_turn' } }),
+        JSON.stringify({ type: 'user', isMeta: true, userType: 'external', message: { role: 'user', content: 'Stop hook feedback: Background subagent still running' } }),
+        JSON.stringify({ type: 'system', subtype: 'stop_hook_summary' }),
+      ];
+      await (observer as any).consumeBatch({ lines: blocked, lineOffsets: [0, 100, 200, 300], reset: false }, generation);
+      expect(callbacks.onHostTurnTerminalObserved).not.toHaveBeenCalled();
+
+      await (observer as any).consumeBatch({ lines: hostTerminalLines(), lineOffsets: [400, 500], reset: false }, generation);
+      expect(callbacks.onHostTurnTerminalObserved).toHaveBeenCalledTimes(1);
+      expect(callbacks.onHostTurnTerminalObserved).toHaveBeenCalledWith('host-block');
+      observer.stop();
+    });
+
+    it('quiet-settles a host terminal candidate that never saw stop_hook_summary', async () => {
+      await writeFile(file, '');
+      const { observer, callbacks } = setup();
+      await observer.start(file);
+      observer.registerHostUserTranscriptId('host-quiet-row');
+      observer.beginUserTurnProjection('host-quiet');
+      const generation = (observer as any).generation;
+
+      await (observer as any).consumeBatch(
+        { lines: [hostUserRow('host-quiet-row'), hostEndTurn()], lineOffsets: [0, 100], reset: false },
+        generation,
+      );
+      expect(callbacks.onHostTurnTerminalObserved).not.toHaveBeenCalled();
+      expect((observer as any).quietTimer).not.toBeNull();
+
+      await (observer as any).settleQuietCandidate(generation);
+      expect(callbacks.onHostTurnTerminalObserved).toHaveBeenCalledTimes(1);
+      expect(callbacks.onHostTurnTerminalObserved).toHaveBeenCalledWith('host-quiet');
+      observer.stop();
+    });
+
+    it('recovery replay of past terminal rows never notifies the host callback', async () => {
+      // beginUserTurnProjection happens before the observer start in this
+      // shape (host turn live while recovery scans prior transcript rows);
+      // replay facts must stay out of the live host notification channel.
+      await writeFile(file, `${hostTerminalLines().join('\n')}\n`);
+      const { observer, callbacks } = setup();
+      observer.beginUserTurnProjection('host-replay');
+      await observer.start(file);
+
+      expect(callbacks.onHostTurnTerminalObserved).not.toHaveBeenCalled();
+      observer.stop();
+    });
+
+    it('isolates a throwing host callback from the consume chain', async () => {
+      await writeFile(file, '');
+      const order: string[] = [];
+      const observer = new ClaudeTranscriptTurnObserver({
+        started: () => true,
+        chunk: async () => {},
+        finished: async () => {},
+        released: () => {},
+        cancelled: () => {},
+        projectEmbeddedExternal: async () => {},
+        onHostTurnTerminalObserved: () => { order.push('throw'); throw new Error('host callback failure'); },
+      }, () => true);
+      await observer.start(file);
+      observer.registerHostUserTranscriptId('host-throw-row');
+      observer.beginUserTurnProjection('host-throw');
+      const generation = (observer as any).generation;
+
+      await expect((observer as any).consumeBatch(
+        { lines: [hostUserRow('host-throw-row'), ...hostTerminalLines()], lineOffsets: [0, 100, 200], reset: false },
+        generation,
+      )).resolves.toBeUndefined();
+      expect(order).toEqual(['throw']);
+      observer.stop();
+    });
+
+    describe('cross-turn residue attribution (reviewer #1: terminal rows flushing after the hostUserTurnId switched)', () => {
+      it('the previous turn\'s stop_hook_summary never stamps the freshly dispatched turn', async () => {
+        await writeFile(file, '');
+        const { observer, callbacks } = setup();
+        await observer.start(file);
+        observer.registerHostUserTranscriptId('n1-row');
+        observer.registerHostUserTranscriptId('n2-row');
+        observer.beginUserTurnProjection('turn-n1');
+        const generation = (observer as any).generation;
+
+        // Turn n1: its user row lands, its end_turn lands — then the result
+        // settles, the queue pumps and the next dispatch switches the
+        // hostUserTurnId before the stop_hook_summary row is consumed.
+        await (observer as any).consumeBatch(
+          { lines: [hostUserRow('n1-row'), hostEndTurn()], lineOffsets: [0, 100], reset: false },
+          generation,
+        );
+        expect(callbacks.onHostTurnTerminalObserved).not.toHaveBeenCalled();
+
+        observer.beginUserTurnProjection('turn-n2');
+
+        // The residue flushes in the same batch as the new turn's user row:
+        // physically [stop_hook_summary n1][user row n2].
+        await (observer as any).consumeBatch(
+          { lines: [stopHookSummary(), hostUserRow('n2-row')], lineOffsets: [200, 300], reset: false },
+          generation,
+        );
+        expect(callbacks.onHostTurnTerminalObserved).not.toHaveBeenCalled();
+
+        // The new turn's own terminal still notifies normally.
+        await (observer as any).consumeBatch({ lines: hostTerminalLines(), lineOffsets: [400, 500], reset: false }, generation);
+        expect(callbacks.onHostTurnTerminalObserved).toHaveBeenCalledTimes(1);
+        expect(callbacks.onHostTurnTerminalObserved).toHaveBeenCalledWith('turn-n2');
+        observer.stop();
+      });
+
+      it('a whole stale batch ([end_turn n1][stop_hook_summary n1][user row n2]) after the switch stamps nothing', async () => {
+        await writeFile(file, '');
+        const { observer, callbacks } = setup();
+        await observer.start(file);
+        observer.registerHostUserTranscriptId('stale-n1-row');
+        observer.registerHostUserTranscriptId('stale-n2-row');
+        observer.beginUserTurnProjection('turn-stale-n1');
+        const generation = (observer as any).generation;
+
+        await (observer as any).consumeBatch({ lines: [hostUserRow('stale-n1-row')], lineOffsets: [0], reset: false }, generation);
+        observer.beginUserTurnProjection('turn-stale-n2');
+
+        await (observer as any).consumeBatch(
+          { lines: [hostEndTurn(), stopHookSummary(), hostUserRow('stale-n2-row')], lineOffsets: [100, 200, 300], reset: false },
+          generation,
+        );
+        expect(callbacks.onHostTurnTerminalObserved).not.toHaveBeenCalled();
+        observer.stop();
+      });
+
+      it('a quiet-settled residue re-armed after the switch never notifies (row not yet observed)', async () => {
+        await writeFile(file, '');
+        const { observer, callbacks } = setup();
+        await observer.start(file);
+        observer.registerHostUserTranscriptId('quiet-n1-row');
+        observer.registerHostUserTranscriptId('quiet-n2-row');
+        observer.beginUserTurnProjection('turn-quiet-n1');
+        const generation = (observer as any).generation;
+
+        await (observer as any).consumeBatch({ lines: [hostUserRow('quiet-n1-row')], lineOffsets: [0], reset: false }, generation);
+        observer.beginUserTurnProjection('turn-quiet-n2');
+        // The stale end_turn is consumed AFTER the switch (tail lag), re-arming
+        // a candidate; the new turn's user row has not landed yet.
+        await (observer as any).consumeBatch({ lines: [hostEndTurn()], lineOffsets: [100], reset: false }, generation);
+        expect((observer as any).quietTimer).not.toBeNull();
+
+        await (observer as any).settleQuietCandidate(generation);
+        expect(callbacks.onHostTurnTerminalObserved).not.toHaveBeenCalled();
+        observer.stop();
+      });
+
+      it('the offset guard is the second line of defense for terminal facts preceding the live row', async () => {
+        await writeFile(file, '');
+        const { observer, callbacks } = setup();
+        await observer.start(file);
+        observer.registerHostUserTranscriptId('guard-n2-row');
+        observer.beginUserTurnProjection('turn-guard');
+        const generation = (observer as any).generation;
+
+        // Mechanism-level shape (offsets deliberately non-monotonic): the
+        // live turn's row is observed first, then a terminal row that
+        // physically precedes it produces a fact — the offset guard must
+        // drop it even though the row anchor is satisfied.
+        await (observer as any).consumeBatch({ lines: [hostUserRow('guard-n2-row')], lineOffsets: [300], reset: false }, generation);
+        await (observer as any).consumeBatch({ lines: [hostEndTurn()], lineOffsets: [100], reset: false }, generation);
+        await (observer as any).consumeBatch({ lines: [stopHookSummary()], lineOffsets: [200], reset: false }, generation);
+
+        expect(callbacks.onHostTurnTerminalObserved).not.toHaveBeenCalled();
+        observer.stop();
+      });
+
+      it('beginUserTurnProjection retires an unconfirmed candidate outright', async () => {
+        await writeFile(file, '');
+        const { observer, callbacks } = setup();
+        await observer.start(file);
+        observer.registerHostUserTranscriptId('retire-n1-row');
+        observer.registerHostUserTranscriptId('retire-n2-row');
+        observer.beginUserTurnProjection('turn-retire-n1');
+        const generation = (observer as any).generation;
+
+        await (observer as any).consumeBatch(
+          { lines: [hostUserRow('retire-n1-row'), hostEndTurn()], lineOffsets: [0, 100], reset: false },
+          generation,
+        );
+        observer.beginUserTurnProjection('turn-retire-n2');
+
+        // Quiet settle finds no candidate: the switch retired it.
+        await (observer as any).settleQuietCandidate(generation);
+        expect(callbacks.onHostTurnTerminalObserved).not.toHaveBeenCalled();
+        observer.stop();
+      });
+    });
+  });
 });
 
 describe('ClaudeTranscriptTurnObserver — reconciliation bypass (batch 1)', () => {
@@ -682,6 +939,7 @@ describe('ClaudeTranscriptTurnObserver — reconciliation bypass (batch 1)', () 
       released: jest.fn(turnId => { order.push(`release:${turnId}`); }),
       cancelled: jest.fn(),
       projectEmbeddedExternal: jest.fn(async event => { order.push(`embedded:${event.turnId}`); }),
+      onHostTurnTerminalObserved: jest.fn(turnId => { order.push(`host-terminal:${turnId}`); }),
     };
     const observedStarts: Array<{ canonicalTurnId: string; lineOffset?: number; sourceKind?: string }> = [];
     const reconciliation = {
@@ -718,6 +976,7 @@ describe('ClaudeTranscriptTurnObserver — reconciliation bypass (batch 1)', () 
       released: jest.fn(),
       cancelled: jest.fn(),
       projectEmbeddedExternal: jest.fn(async () => {}),
+      onHostTurnTerminalObserved: jest.fn(),
     };
     const reconciliation = {
       recordObservedStart: jest.fn(() => { throw new Error('sink failure'); }),
@@ -745,6 +1004,7 @@ describe('ClaudeTranscriptTurnObserver — reconciliation bypass (batch 1)', () 
       released: turnId => { plainOrder.push(`release:${turnId}`); },
       cancelled: () => {},
       projectEmbeddedExternal: async () => {},
+      onHostTurnTerminalObserved: () => {},
     }, () => true);
 
     await withSink.observer.start(file);
@@ -758,4 +1018,5 @@ describe('ClaudeTranscriptTurnObserver — reconciliation bypass (batch 1)', () 
     withSink.observer.stop();
     plainObserver.stop();
   });
+
 });

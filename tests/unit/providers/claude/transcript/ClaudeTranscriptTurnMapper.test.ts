@@ -366,4 +366,132 @@ describe('ClaudeTranscriptTurnMapper', () => {
       expect(adaptTranscriptFacts(externalFacts, { hostUserTurnActive: true })[0]?.type).toBe('embedded');
     });
   });
+
+  describe('host user turn terminal evidence (P0-1 result-late watchdog)', () => {
+    const hostContext: TranscriptMapContext = { hostUserTurnActive: true };
+
+    function hostUserRow(): SDKNativeMessage {
+      return { type: 'user', uuid: 'host-uuid-1', isSidechain: false, message: { role: 'user', content: 'hello' } };
+    }
+
+    function hostEndTurn(): SDKNativeMessage {
+      return { type: 'assistant', uuid: 'host-a1', isSidechain: false, message: { id: 'host-m1', role: 'assistant', content: [{ type: 'text', text: 'done' }], stop_reason: 'end_turn' } };
+    }
+
+    function stopHookSummary(): SDKNativeMessage {
+      return { type: 'system', subtype: 'stop_hook_summary', isSidechain: false };
+    }
+
+    function stopHookFeedback(): SDKNativeMessage {
+      return { type: 'user', isMeta: true, userType: 'external', isSidechain: false, message: { role: 'user', content: 'Stop hook feedback: Background subagent still running' } };
+    }
+
+    it('emits observed_host_terminal when end_turn is confirmed by stop_hook_summary', () => {
+      const mapper = new ClaudeTranscriptTurnMapper();
+      mapper.map(hostUserRow(), false, hostContext);
+      const candidateFacts = mapper.map(hostEndTurn(), false, hostContext);
+      expect(candidateFacts.some(fact => fact.type === 'observed_host_terminal')).toBe(false);
+      expect(mapper.hasTerminalCandidate()).toBe(true);
+
+      const terminalFacts = mapper.map(stopHookSummary(), false, hostContext);
+      expect(terminalFacts).toContainEqual(expect.objectContaining({ type: 'observed_host_terminal', replay: false }));
+      expect(mapper.hasTerminalCandidate()).toBe(false);
+    });
+
+    it('retracts the candidate on stop-hook block feedback, so a later summary emits nothing', () => {
+      const mapper = new ClaudeTranscriptTurnMapper();
+      mapper.map(hostUserRow(), false, hostContext);
+      mapper.map(hostEndTurn(), false, hostContext);
+      mapper.map(stopHookFeedback(), false, hostContext);
+      expect(mapper.hasTerminalCandidate()).toBe(false);
+
+      const facts = mapper.map(stopHookSummary(), false, hostContext);
+      expect(facts.some(fact => fact.type === 'observed_host_terminal')).toBe(false);
+    });
+
+    it('quiet-settles a pending host candidate without stop_hook_summary (no Stop hooks configured)', () => {
+      const mapper = new ClaudeTranscriptTurnMapper();
+      mapper.map(hostUserRow(), false, hostContext);
+      mapper.map(hostEndTurn(), false, hostContext);
+      expect(mapper.hasTerminalCandidate()).toBe(true);
+
+      const facts = mapper.settleTerminalCandidate();
+      expect(facts).toContainEqual(expect.objectContaining({ type: 'observed_host_terminal', replay: false }));
+      expect(mapper.hasTerminalCandidate()).toBe(false);
+    });
+
+    it('clears the candidate when a newer host user row starts the next turn', () => {
+      const mapper = new ClaudeTranscriptTurnMapper();
+      mapper.map(hostUserRow(), false, hostContext);
+      mapper.map(hostEndTurn(), false, hostContext);
+      const nextTurnFacts = mapper.map({ ...hostUserRow(), uuid: 'host-uuid-2' }, false, hostContext);
+      expect(nextTurnFacts.some(fact => fact.type === 'observed_host_terminal')).toBe(false);
+      expect(mapper.hasTerminalCandidate()).toBe(false);
+    });
+
+    it('emits no host terminal fact without an active host user turn', () => {
+      const mapper = new ClaudeTranscriptTurnMapper();
+      mapper.map(hostUserRow(), false, { hostUserTurnActive: false });
+      mapper.map(hostEndTurn(), false, { hostUserTurnActive: false });
+      const facts = mapper.map(stopHookSummary(), false, { hostUserTurnActive: false });
+      expect(facts.some(fact => fact.type === 'observed_host_terminal')).toBe(false);
+      expect(mapper.hasTerminalCandidate()).toBe(false);
+    });
+
+    it('never claims host terminal evidence for an open external turn rows', () => {
+      const mapper = new ClaudeTranscriptTurnMapper();
+      // Task-notification starts keep showUser:false, so they open a mapper
+      // turn even while a host user turn is active.
+      mapper.map({ type: 'user', uuid: 'notif-1', isSidechain: false, origin: { kind: 'task-notification' }, message: { role: 'user', content: 'task done' } }, false, hostContext);
+      mapper.map(hostEndTurn(), false, hostContext);
+      const facts = mapper.settleTerminalCandidate();
+      expect(facts.some(fact => fact.type === 'observed_terminal')).toBe(true);
+      expect(facts.some(fact => fact.type === 'observed_host_terminal')).toBe(false);
+    });
+
+    it('never claims an embedded external turn terminal as host evidence', () => {
+      const mapper = new ClaudeTranscriptTurnMapper();
+      mapper.map(hostUserRow(), false, hostContext);
+      // Embedded peer turn (showUser start diverted while the host is active).
+      mapper.map({ ...peer, uuid: 'peer-embedded' }, false, hostContext);
+      mapper.map(hostEndTurn(), false, hostContext);
+      const embeddedSummary = mapper.map(stopHookSummary(), false, hostContext);
+      expect(embeddedSummary.some(fact => fact.type === 'observed_host_terminal')).toBe(false);
+      expect(mapper.hasTerminalCandidate()).toBe(false);
+
+      // Emission is back with the host: its own terminal still fires.
+      const hostFacts = [...mapper.map(hostEndTurn(), false, hostContext), ...mapper.map(stopHookSummary(), false, hostContext)];
+      expect(hostFacts).toContainEqual(expect.objectContaining({ type: 'observed_host_terminal', replay: false }));
+    });
+
+    it('the legacy adapter drops observed_host_terminal facts without events', () => {
+      const facts: TranscriptTurnFact[] = [{ type: 'observed_host_terminal', replay: false }];
+      expect(adaptTranscriptFacts(facts, { hostUserTurnActive: true })).toEqual([]);
+    });
+
+    it('clearHostTerminalCandidate retires an unconfirmed candidate so a later summary stays silent (reviewer #1)', () => {
+      const mapper = new ClaudeTranscriptTurnMapper();
+      mapper.map(hostUserRow(), false, hostContext);
+      mapper.map(hostEndTurn(), false, hostContext);
+      expect(mapper.hasTerminalCandidate()).toBe(true);
+
+      // The host turn switch (fresh dispatch) retires the residue.
+      mapper.clearHostTerminalCandidate();
+      expect(mapper.hasTerminalCandidate()).toBe(false);
+
+      const summaryFacts = mapper.map(stopHookSummary(), false, hostContext);
+      const quietFacts = mapper.settleTerminalCandidate();
+      expect(summaryFacts.some(fact => fact.type === 'observed_host_terminal')).toBe(false);
+      expect(quietFacts.some(fact => fact.type === 'observed_host_terminal')).toBe(false);
+    });
+
+    it('quiet-settled host terminal facts carry the arming end_turn offset', () => {
+      const mapper = new ClaudeTranscriptTurnMapper();
+      mapper.map(hostUserRow(), false, { ...hostContext, lineOffset: 0 });
+      mapper.map(hostEndTurn(), false, { ...hostContext, lineOffset: 120 });
+
+      const facts = mapper.settleTerminalCandidate();
+      expect(facts).toContainEqual(expect.objectContaining({ type: 'observed_host_terminal', lineOffset: 120, replay: false }));
+    });
+  });
 });

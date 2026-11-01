@@ -82,7 +82,8 @@
       "autoTurnTimeout": "백그라운드 턴 질문이 5분 내에 응답되지 않아 자동으로 거부되었습니다"
     },
     "cancel": {
-      "toolInterrupted": "중단됨"
+      "toolInterrupted": "중단됨",
+      "interruptUnacknowledged": "CLI가 취소에 응답하지 않았습니다. 화면이 오랫동안 복구되지 않으면 대화를 다시 로드하세요."
     },
     "history": {
       "loading": "Loading conversation…",

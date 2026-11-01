@@ -82,7 +82,8 @@
       "autoTurnTimeout": "バックグラウンドターンの質問に5分以内の応答がなかったため、自動的に拒否しました"
     },
     "cancel": {
-      "toolInterrupted": "中断されました"
+      "toolInterrupted": "中断されました",
+      "interruptUnacknowledged": "CLI がキャンセルに応答しませんでした。画面が長時間復旧しない場合は、会話を再読み込みしてください。"
     },
     "history": {
       "loading": "Loading conversation…",

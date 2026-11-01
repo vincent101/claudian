@@ -62,6 +62,7 @@ import type {
   ToolCallInfo,
 } from '../../../core/types';
 import type { ClaudianSettings, PermissionMode } from '../../../core/types/settings';
+import { t } from '../../../i18n/i18n';
 import type ClaudianPlugin from '../../../main';
 import { stripCurrentNoteContext } from '../../../utils/context';
 import { getEnhancedPath, getMissingNodeError, parseEnvironmentVariables } from '../../../utils/env';
@@ -88,7 +89,7 @@ import { getClaudeProviderSettings } from '../settings';
 import {
   transformSDKMessage,
 } from '../stream/transformClaudeMessage';
-import { ClaudeTranscriptDiagnosticLog } from '../transcript/ClaudeTranscriptDiagnosticLog';
+import { ClaudeTranscriptDiagnosticLog, type TranscriptDiagnosticEvent } from '../transcript/ClaudeTranscriptDiagnosticLog';
 import { ClaudeTranscriptTurnObserver } from '../transcript/ClaudeTranscriptTurnObserver';
 import { getContextWindowSize } from '../types/models';
 import { type ClaudeProviderState, getClaudeState } from '../types/providerState';
@@ -135,6 +136,25 @@ export interface ClaudeRuntimeServices {
 }
 
 type QueryOptions = ChatRuntimeQueryOptions;
+
+/**
+ * P0-1 result-late watchdog (2026-10-31 5m18s stall): the CLI can stop
+ * yielding the SDK result after the transcript already recorded end_turn +
+ * Stop-hook completion. Terminal-evidence threshold before the watchdog may
+ * act, plus the post-interrupt grace window for a belated result.
+ */
+const RESULT_WATCHDOG_MS = 120_000;
+const RESULT_WATCHDOG_GRACE_MS = 15_000;
+/** P0-3: escalate an interrupt the CLI never acknowledged. */
+const INTERRUPT_ACK_WATCHDOG_MS = 5_000;
+
+/** Chunk-wait state of the queryViaPersistent generator loop. */
+interface ChunkWaitState {
+  chunks: StreamChunk[];
+  resolveChunk: ((chunk: StreamChunk | null) => void) | null;
+  done: boolean;
+  error: Error | null;
+}
 
 function isChatMessageArray(value: unknown): value is ChatMessage[] {
   return Array.isArray(value) && value.length > 0 &&
@@ -617,7 +637,10 @@ export class ClaudianService implements ChatRuntime {
   /**
    * Closes the persistent query and cleans up resources.
    */
-  closePersistentQuery(_reason?: string, options?: ClosePersistentQueryOptions): void {
+  closePersistentQuery(reason?: string, options?: ClosePersistentQueryOptions): void {
+    // P0-2: the close reason is the U3 discriminator (reload vs stdin error
+    // vs session reset) — it was already plumbed but never recorded.
+    this.recordTranscriptDiagnostic({ phase: 'query_close', detail: reason });
     this.abortUserTurnCompletionBarriers();
     if (!this.persistentQuery) {
       return;
@@ -832,6 +855,10 @@ export class ClaudianService implements ChatRuntime {
         for await (const message of this.persistentQuery) {
           if (this.shuttingDown) break;
 
+          // P0-2 runPhase bypass (read-only): the SDK session-state channel
+          // tells whether the CLI agent loop is running/idle — the U1
+          // discriminator for the stall family. Must never affect routing.
+          this.noteSessionStateChange(message);
           await this.routeMessage(message);
         }
       } catch (error) {
@@ -981,6 +1008,10 @@ export class ClaudianService implements ChatRuntime {
       if (isLeaselessSessionControlMessage(message)) this.applyLeaselessSystemMessage(message);
       return;
     }
+    // P0-3 evidence: any message routed to this turn's lease proves CLI
+    // activity on the turn — recorded before the cancelled-phase gate so a
+    // trailing result being dropped still counts as an interrupt response.
+    turn.lastRoutedMessageAt = Date.now();
     if (turn.phase === 'cancelled' && isTurnCompleteMessage(message)) return;
     const activeTurn = turn;
 
@@ -1133,6 +1164,7 @@ export class ClaudianService implements ChatRuntime {
    */
   private async deliverChunkToTurn(turn: RuntimeTurn, chunk: StreamChunk): Promise<void> {
     turn.receivedChunk = true;
+    turn.lastChunkAt = Date.now();
     if (turn.waiters.size > 0) {
       for (const handler of turn.waiters) {
         handler.onChunk(chunk);
@@ -1197,6 +1229,10 @@ export class ClaudianService implements ChatRuntime {
    * the released signal that lets the UI queue proceed.
    */
   private async settleTurnAtResult(turn: RuntimeTurn): Promise<void> {
+    // P0-2: settle_result marks the result-arrival settlement path — the
+    // hardest signal to separate from cancel/force settlement in the case
+    // post-mortem (the CLI never reached this line during the 5m18s stall).
+    this.recordTranscriptDiagnostic({ phase: 'settle_result', turnId: turn.id, generation: turn.generation, leaseKind: turn.kind });
     this.noteTurnIdentitySettled(turn.id);
     // Defensive only: terminal cleanup cannot prove attribution when the
     // notification result itself never arrives; the dual-track state machine
@@ -2128,14 +2164,14 @@ export class ClaudianService implements ChatRuntime {
         wasSent: true,
       });
 
-      // Yield chunks as they arrive
+      // Yield chunks as they arrive. The bare promise is raced with the
+      // result-late watchdog: without it a CLI that never yields the result
+      // parks this generator (and the lease) indefinitely (P0-1).
       while (!state.done) {
         if (state.chunks.length > 0) {
           yield state.chunks.shift()!;
         } else {
-          const chunk = await new Promise<StreamChunk | null>((resolve) => {
-            state.resolveChunk = resolve;
-          });
+          const chunk = await this.awaitChunkWithResultWatchdog(turn, state);
           if (chunk) {
             yield chunk;
           }
@@ -2167,6 +2203,84 @@ export class ClaudianService implements ChatRuntime {
       this.currentAllowedTools = null;
       this.finishTurnFromGenerator(turn, handler);
     }
+  }
+
+  /**
+   * P0-1 result-late watchdog: the chunk wait races a re-arming timer. The
+   * timer resolves nothing by itself — every wake re-checks the guards, so
+   * chunk arrival, turn settlement and generation replacement all clear it
+   * through the settle path (clearTimeout on resolve; identity check on
+   * stale ticks). No timer survives a resolved wait.
+   */
+  private awaitChunkWithResultWatchdog(turn: RuntimeTurn, state: ChunkWaitState): Promise<StreamChunk | null> {
+    return new Promise<StreamChunk | null>(resolve => {
+      let timer: ReturnType<typeof setTimeout> | null = null;
+      const settle = (value: StreamChunk | null): void => {
+        if (timer !== null) {
+          clearTimeout(timer);
+          timer = null;
+        }
+        resolve(value);
+      };
+      const arm = (delayMs: number = RESULT_WATCHDOG_MS): void => {
+        timer = setTimeout(() => {
+          void this.onResultWatchdogTick(turn, state, settle, arm);
+        }, delayMs);
+      };
+      state.resolveChunk = settle;
+      arm();
+    });
+  }
+
+  private async onResultWatchdogTick(
+    turn: RuntimeTurn,
+    state: ChunkWaitState,
+    settle: (chunk: StreamChunk | null) => void,
+    arm: (delayMs?: number) => void,
+  ): Promise<void> {
+    // State guard (v2): a resolved or superseded wait must never act.
+    if (state.resolveChunk !== settle || state.done) return;
+    // The turn left the registry (settled/cancelled elsewhere): stop ticking.
+    if (this.runtimeTurns.get(turn.id) !== turn) return;
+    const terminalSeenAt = turn.transcriptTerminalSeenAt;
+    if (terminalSeenAt === null) {
+      // T4 red line: no transcript terminal evidence — a legitimately long
+      // turn (blocking Agent/TaskOutput) keeps waiting.
+      arm();
+      return;
+    }
+    const now = Date.now();
+    if (now - terminalSeenAt < RESULT_WATCHDOG_MS) {
+      // Terminal was stamped mid-wait: re-arm for the REMAINING window
+      // (reviewer #2) instead of a full period, so a stamp 60s into the wait
+      // fires at stamp+120s (180s total), never at 240s.
+      arm(RESULT_WATCHDOG_MS - (now - terminalSeenAt));
+      return;
+    }
+    this.recordTranscriptDiagnostic({
+      phase: 'settle_watchdog_fire',
+      turnId: turn.id,
+      generation: turn.generation,
+      leaseKind: turn.kind,
+      terminalSeenAgeMs: now - terminalSeenAt,
+      ...(turn.lastChunkAt !== null ? { lastChunkAgeMs: now - turn.lastChunkAt } : {}),
+    });
+    // One interrupt so the CLI gets a chance to flush its belated result.
+    if (this.persistentQuery && !this.shuttingDown) {
+      this.recordTranscriptDiagnostic({ phase: 'interrupt_sent', turnId: turn.id, generation: turn.generation, detail: 'result_watchdog' });
+      void this.persistentQuery.interrupt().catch(() => {
+        // Silence abort/interrupt errors
+      });
+    }
+    await new Promise<void>(resolve => {
+      setTimeout(resolve, RESULT_WATCHDOG_GRACE_MS);
+    });
+    // Grace over and the wait is still parked on this turn: force-settle so
+    // the lease releases and the queue pumps (a result arriving later is
+    // dropped lease-less by routeMessage).
+    if (state.resolveChunk !== settle || state.done) return;
+    if (this.runtimeTurns.get(turn.id) !== turn) return;
+    this.cancelTurn(turn.id, 'result_watchdog');
   }
 
   /**
@@ -2410,6 +2524,10 @@ export class ClaudianService implements ChatRuntime {
 
   cancel() {
     this.approvalDismisser?.();
+    this.recordTranscriptDiagnostic({
+      phase: 'runtime_cancel',
+      turnId: this.messageChannel?.getActiveTurnId() ?? undefined,
+    });
 
     if (this.abortController) {
       this.abortController.abort();
@@ -2427,9 +2545,11 @@ export class ClaudianService implements ChatRuntime {
 
     // Interrupt persistent query (Phase 1.9)
     if (this.persistentQuery && !this.shuttingDown) {
+      this.recordTranscriptDiagnostic({ phase: 'interrupt_sent', turnId: activeTurnId ?? undefined, detail: 'user_cancel' });
       void this.persistentQuery.interrupt().catch(() => {
         // Silence abort/interrupt errors
       });
+      this.armInterruptAcknowledgementWatchdog(activeTurnId);
     }
 
     // 2.5.1 F3: transcript-observed auto turns have no runtime-side lease, so
@@ -2591,6 +2711,7 @@ export class ClaudianService implements ChatRuntime {
         released: turnId => this._onAutoTurnReleased?.(turnId),
         cancelled: event => this._onAutoTurnCancelled?.(event),
         projectEmbeddedExternal: event => this._onEmbeddedExternal?.(event) ?? Promise.resolve(),
+        onHostTurnTerminalObserved: turnId => this.noteTranscriptTerminalSeen(turnId),
       }, () => true, this.transcriptDiagnosticLog, {
         // Observe-mode bypass: verdicts are recorded as diagnostics only.
         recordObservedStart: fact => this.turnReconciliation.recordObservedStart(fact),
@@ -2742,6 +2863,67 @@ export class ClaudianService implements ChatRuntime {
       ...event,
       ...(event.turnId ? { turnIdHash: this.transcriptDiagnosticLog.hashId(event.turnId) } : {}),
     });
+  }
+
+  /** Runtime-side settlement diagnostics: hashes the turn id when a log exists. */
+  private recordTranscriptDiagnostic(event: TranscriptDiagnosticEvent & { turnId?: string }): void {
+    const log = this.transcriptDiagnosticLog;
+    if (!log) return;
+    const { turnId, ...rest } = event;
+    log.record(turnId !== undefined ? { ...rest, turnIdHash: log.hashId(turnId) } : rest);
+  }
+
+  /**
+   * P0-1: stamp the observer tick time at which the transcript first showed
+   * the host turn's terminal state. First-seen wins: later ticks (quiet
+   * settle, trailing rows) must not extend the threshold.
+   */
+  private noteTranscriptTerminalSeen(turnId: string): void {
+    const turn = this.runtimeTurns.get(turnId);
+    if (!turn || turn.phase === 'settled' || turn.phase === 'cancelled') return;
+    if (turn.transcriptTerminalSeenAt === null) {
+      turn.transcriptTerminalSeenAt = Date.now();
+    }
+  }
+
+  /**
+   * P0-2 runPhase bypass: SDK session_state_changed carries the CLI agent
+   * loop phase ('idle' fires after held-back results flush and the
+   * background-agent gate exits). Read-only, never throws into routing.
+   */
+  private noteSessionStateChange(message: SDKMessage): void {
+    if (message.type !== 'system' || message.subtype !== 'session_state_changed') return;
+    const state = (message as { state?: string }).state ?? 'unknown';
+    this.recordTranscriptDiagnostic({ phase: 'run_phase', detail: state });
+  }
+
+  /**
+   * P0-3 interrupt acknowledgement: escalate only when the CLI produced NO
+   * response evidence since the interrupt — no message routed to the turn's
+   * lease (chunk, trailing result, even one the cancelled gate drops) and no
+   * settlement completing. A turn still registered behind the projection
+   * barrier is NOT evidence of a dead cancel (reviewer #3): the feature
+   * close-out (completeUserTurnProjection) can legitimately outlast the
+   * window while the CLI already responded. Complements the feature-side
+   * forceSettleForDeadCancel watchdog, which only drops flags.
+   */
+  private armInterruptAcknowledgementWatchdog(turnId: string | null): void {
+    if (!turnId) return;
+    // Snapshot taken after cancelTurn ran (its own phase mutation is local,
+    // never CLI evidence): only post-interrupt changes count as a response.
+    const turn = this.runtimeTurns.get(turnId);
+    const routedEvidenceAt = turn?.lastRoutedMessageAt ?? null;
+    setTimeout(() => {
+      const current = this.runtimeTurns.get(turnId);
+      if (!current || current.phase === 'settled') return;
+      if (this.shuttingDown || !this.persistentQuery) return;
+      if (current.lastRoutedMessageAt !== routedEvidenceAt) return;
+      this.recordTranscriptDiagnostic({ phase: 'interrupt_sent', turnId, detail: 'interrupt_unacknowledged' });
+      void this.persistentQuery.interrupt().catch(() => {
+        // Silence abort/interrupt errors
+      });
+      new Notice(t('chat.cancel.interruptUnacknowledged'));
+    }, INTERRUPT_ACK_WATCHDOG_MS);
   }
 
   /** Turn-lease hotfix fix 6: notify the feature layer on an unregistered dequeue. */

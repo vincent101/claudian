@@ -82,7 +82,8 @@
       "autoTurnTimeout": "Frage des Hintergrund-Turns wurde innerhalb von 5 Minuten nicht beantwortet — automatisch abgelehnt."
     },
     "cancel": {
-      "toolInterrupted": "Abgebrochen"
+      "toolInterrupted": "Abgebrochen",
+      "interruptUnacknowledged": "Die CLI hat auf den Abbruch nicht reagiert. Falls die Oberfläche lange nicht reagiert, laden Sie die Konversation neu."
     },
     "history": {
       "loading": "Loading conversation…",

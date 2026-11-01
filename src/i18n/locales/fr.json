@@ -82,7 +82,8 @@
       "autoTurnTimeout": "La question du tour en arrière-plan n'a reçu aucune réponse sous 5 minutes — refusée automatiquement."
     },
     "cancel": {
-      "toolInterrupted": "Interrompu"
+      "toolInterrupted": "Interrompu",
+      "interruptUnacknowledged": "L'interface CLI n'a pas répondu à l'annulation. Si l'interface reste inactive longtemps, rechargez la conversation."
     },
     "history": {
       "loading": "Loading conversation…",
