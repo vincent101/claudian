@@ -220,6 +220,27 @@ function needsClaudeModelPresetMigration(stored: Record<string, unknown>): boole
     || 'enableOpus1M' in claudeConfig;
 }
 
+/**
+ * Codex counterpart of the Claude preset migration trigger: the stored Codex
+ * config predates modelPresets (or still carries the retired customModels
+ * field), so the migrated preset list produced during load must be written
+ * back in the new format.
+ */
+function needsCodexModelPresetMigration(stored: Record<string, unknown>): boolean {
+  const providerConfigs = stored.providerConfigs;
+  if (!providerConfigs || typeof providerConfigs !== 'object' || Array.isArray(providerConfigs)) {
+    return false;
+  }
+
+  const codexConfig = (providerConfigs as Record<string, unknown>).codex;
+  if (!codexConfig || typeof codexConfig !== 'object' || Array.isArray(codexConfig)) {
+    return false;
+  }
+
+  return !Array.isArray((codexConfig as Record<string, unknown>).modelPresets)
+    || 'customModels' in codexConfig;
+}
+
 function mergeLegacyClaudeHiddenCommands(
   hiddenProviderCommands: HiddenProviderCommands,
   legacyHiddenSlashCommands: unknown,
@@ -301,6 +322,7 @@ export class ClaudianSettingsStorage {
       || (
       hasLegacyTopLevelProviderFields(stored)
       || needsClaudeModelPresetMigration(stored)
+      || needsCodexModelPresetMigration(stored)
       || 'show1MModel' in stored
       || 'slashCommands' in stored
       || 'hiddenSlashCommands' in stored
