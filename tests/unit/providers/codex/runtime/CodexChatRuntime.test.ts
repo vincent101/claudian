@@ -545,7 +545,7 @@ describe('CodexChatRuntime', () => {
         model: CODEX_SPARK_MODEL,
         providerConfigs: {
           codex: {
-            customModels: CODEX_SPARK_MODEL,
+            modelPresets: [{ label: 'Spark', model: CODEX_SPARK_MODEL }],
             reasoningSummary: 'detailed',
           },
         },

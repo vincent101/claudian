@@ -13,10 +13,13 @@ jest.mock('@/core/providers/ProviderSettingsCoordinator', () => ({
   ProviderSettingsCoordinator: {
     reconcileTitleGenerationModelSelection: jest.fn((settings: Record<string, unknown>) => {
       const titleGenerationModel = settings.titleGenerationModel;
-      const customModels = (
-        settings.providerConfigs as { codex?: { customModels?: string } } | undefined
-      )?.codex?.customModels ?? '';
-      if (titleGenerationModel === 'my-custom-model' && customModels !== 'my-custom-model') {
+      const codexPresets = (
+        settings.providerConfigs as { codex?: { modelPresets?: Array<{ model: string }> } } | undefined
+      )?.codex?.modelPresets ?? [];
+      if (
+        titleGenerationModel === 'my-custom-model'
+        && !codexPresets.some(preset => preset.model === 'my-custom-model')
+      ) {
         settings.titleGenerationModel = '';
         return true;
       }
@@ -33,6 +36,7 @@ jest.mock('obsidian', () => {
     public textAreaComponents: MockTextAreaComponent[] = [];
     public dropdownComponents: MockDropdownComponent[] = [];
     public toggleComponents: MockToggleComponent[] = [];
+    public infoEl = createMockElement();
     public settingEl = { style: {} };
 
     constructor(_container: unknown) {
@@ -155,6 +159,7 @@ const createdSettings: Array<{
   textAreaComponents: MockTextAreaComponent[];
   dropdownComponents: MockDropdownComponent[];
   toggleComponents: MockToggleComponent[];
+  infoEl: PresetMockElement;
 }> = [];
 
 interface MockInputEl {
@@ -277,6 +282,115 @@ function createContainer(): any {
   };
 }
 
+interface PresetListenerMap {
+  [event: string]: Array<(event?: unknown) => void>;
+}
+
+interface PresetMockElement {
+  cls: string;
+  value: string;
+  text: string;
+  style: Record<string, string>;
+  children: PresetMockElement[];
+  parent: PresetMockElement | null;
+  _listeners: PresetListenerMap;
+  appendChild: (child: PresetMockElement) => PresetMockElement;
+  removeChild: (child: PresetMockElement) => PresetMockElement;
+  addEventListener: (event: string, handler: (event?: unknown) => void) => void;
+  createDiv: (options: { cls: string }) => PresetMockElement;
+  createEl: (tag: string, options: Record<string, unknown>) => PresetMockElement;
+  setText: (text: string) => void;
+  trigger: (event: string, payload?: unknown) => void;
+}
+
+/** DOM-shaped mock for the preset editor rendered into Setting.infoEl. */
+function createMockElement(cls = ''): PresetMockElement {
+  const element: PresetMockElement = {
+    cls,
+    value: '',
+    text: '',
+    style: {},
+    children: [],
+    parent: null,
+    _listeners: {},
+    appendChild(child: PresetMockElement) {
+      if (child.parent && child.parent !== element) {
+        const index = child.parent.children.indexOf(child);
+        if (index >= 0) child.parent.children.splice(index, 1);
+      }
+      child.parent = element;
+      const existing = element.children.indexOf(child);
+      if (existing >= 0) element.children.splice(existing, 1);
+      element.children.push(child);
+      return element;
+    },
+    removeChild(child: PresetMockElement) {
+      const index = element.children.indexOf(child);
+      if (index >= 0) element.children.splice(index, 1);
+      child.parent = null;
+      return element;
+    },
+    addEventListener(event: string, handler: (event?: unknown) => void) {
+      element._listeners[event] = element._listeners[event] ?? [];
+      element._listeners[event].push(handler);
+    },
+    createDiv(options: { cls: string }) {
+      const child = createMockElement(options.cls);
+      element.appendChild(child);
+      return child;
+    },
+    createEl(tag: string, options: Record<string, unknown>) {
+      const child = createMockElement(String(options.cls ?? ''));
+      child.value = typeof options.value === 'string' ? options.value : '';
+      child.text = typeof options.text === 'string' ? options.text : '';
+      element.appendChild(child);
+      return child;
+    },
+    setText(text: string) {
+      element.text = text;
+    },
+    trigger(event: string, payload?: unknown) {
+      for (const handler of element._listeners[event] ?? []) {
+        handler(payload);
+      }
+    },
+  };
+  return element;
+}
+
+function flushAsync(): Promise<void> {
+  return new Promise<void>((resolve) => setImmediate(resolve));
+}
+
+function presetEditorInfo(_plugin: any): PresetMockElement {
+  const setting = createdSettings.find(candidate => candidate.name === 'settings.codex.modelPresets.name');
+  if (!setting) {
+    throw new Error('preset editor setting not found');
+  }
+  return setting.infoEl;
+}
+
+function presetRows(infoEl: PresetMockElement): PresetMockElement[] {
+  const list = infoEl.children.find(child => child.cls === 'claudian-model-preset-list');
+  return (list?.children ?? []).filter(child => child.cls === 'claudian-model-preset-row');
+}
+
+function rowInput(row: PresetMockElement, cls: string): PresetMockElement {
+  const input = row.children.find(child => child.cls === cls);
+  if (!input) {
+    throw new Error(`preset row input not found: ${cls}`);
+  }
+  return input;
+}
+
+function rowButton(row: PresetMockElement, cls: string): PresetMockElement {
+  const button = row.children.find(child => child.cls === cls);
+  if (!button) {
+    throw new Error(`preset row button not found: ${cls}`);
+  }
+  return button;
+}
+
 function createPlugin(overrides: Record<string, unknown> = {}): any {
   return {
     settings: {
@@ -287,7 +401,11 @@ function createPlugin(overrides: Record<string, unknown> = {}): any {
         codex: {
           ...DEFAULT_CODEX_PROVIDER_SETTINGS,
           enabled: true,
-          customModels: 'my-custom-model',
+          modelPresets: [
+            { label: 'GPT-5.4 Mini', model: 'gpt-5.4-mini' },
+            { label: 'GPT-5.5', model: 'gpt-5.5' },
+            { label: 'My Custom', model: 'my-custom-model' },
+          ],
         },
       },
       ...overrides,
@@ -453,37 +571,59 @@ describe('CodexSettingsTab', () => {
     expect(mockBroadcastToAllTabs).toHaveBeenCalledTimes(0);
   });
 
-  it('does not switch the active model while the custom models textarea is mid-edit', async () => {
+  it('renders the preset editor in place of the retired custom models textarea', () => {
+    Object.defineProperty(process, 'platform', { value: 'darwin' });
+    const plugin = createPlugin();
+
+    codexSettingsTabRenderer.render(createContainer(), createContext(plugin));
+
+    expect(findSetting('settings.codex.modelPresets.name')).toBeDefined();
+    expect(findOptionalSetting('settings.codex.customModels.name')).toBeUndefined();
+    expect(presetRows(presetEditorInfo(plugin))).toHaveLength(3);
+  });
+
+  it('does not commit the preset list while a row is mid-edit', async () => {
     Object.defineProperty(process, 'platform', { value: 'darwin' });
     const plugin = createPlugin();
     const context = createContext(plugin);
 
     codexSettingsTabRenderer.render(createContainer(), context);
 
-    const customModelsSetting = findSetting('settings.codex.customModels.name');
-    const customModelsTextArea = customModelsSetting.textAreaComponents[0];
+    const customRow = presetRows(presetEditorInfo(plugin))[2];
+    rowInput(customRow, 'claudian-model-preset-model').value = 'different-custom-model';
 
-    await customModelsTextArea.onChangeCallback?.('different-custom-model');
-
-    expect(plugin.settings.providerConfigs.codex.customModels).toBe('my-custom-model');
+    expect(plugin.settings.providerConfigs.codex.modelPresets.map((p: { model: string }) => p.model))
+      .toEqual(['gpt-5.4-mini', 'gpt-5.5', 'my-custom-model']);
     expect(plugin.settings.model).toBe('my-custom-model');
     expect(mockSaveSettings).not.toHaveBeenCalled();
     expect(context.refreshModelSelectors).not.toHaveBeenCalled();
   });
 
-  it('shows current Codex custom model examples in the custom models textarea', () => {
+  it('renames the active, title, and saved codex models along with the preset', async () => {
     Object.defineProperty(process, 'platform', { value: 'darwin' });
-    const plugin = createPlugin();
+    const plugin = createPlugin({
+      titleGenerationModel: 'my-custom-model',
+      savedProviderModel: { claude: 'haiku', codex: 'my-custom-model' },
+    });
+    const context = createContext(plugin);
 
-    codexSettingsTabRenderer.render(createContainer(), createContext(plugin));
+    codexSettingsTabRenderer.render(createContainer(), context);
 
-    const customModelsSetting = findSetting('settings.codex.customModels.name');
-    expect(customModelsSetting.textAreaComponents[0].placeholder).toBe(
-      'gpt-5.4\ngpt-5.3-codex-spark',
-    );
+    const customRow = presetRows(presetEditorInfo(plugin))[2];
+    const modelInput = rowInput(customRow, 'claudian-model-preset-model');
+    modelInput.value = 'renamed-model';
+    modelInput.trigger('blur');
+    await flushAsync();
+
+    expect(plugin.settings.providerConfigs.codex.modelPresets.map((p: { model: string }) => p.model))
+      .toEqual(['gpt-5.4-mini', 'gpt-5.5', 'renamed-model']);
+    expect(plugin.settings.model).toBe('renamed-model');
+    expect(plugin.settings.titleGenerationModel).toBe('renamed-model');
+    expect(plugin.settings.savedProviderModel).toEqual({ claude: 'haiku', codex: 'renamed-model' });
+    expect(mockSaveSettings).toHaveBeenCalledTimes(1);
   });
 
-  it('reconciles removed custom models on blur and clears stale title model selections', async () => {
+  it('falls the removed active model back to the first preset and clears stale title models', async () => {
     Object.defineProperty(process, 'platform', { value: 'darwin' });
     const plugin = createPlugin({
       titleGenerationModel: 'my-custom-model',
@@ -492,20 +632,19 @@ describe('CodexSettingsTab', () => {
 
     codexSettingsTabRenderer.render(createContainer(), context);
 
-    const customModelsSetting = findSetting('settings.codex.customModels.name');
-    const customModelsTextArea = customModelsSetting.textAreaComponents[0];
+    const customRow = presetRows(presetEditorInfo(plugin))[2];
+    rowButton(customRow, 'claudian-model-preset-remove').trigger('click');
+    await flushAsync();
 
-    await customModelsTextArea.onChangeCallback?.('different-custom-model');
-    await customModelsTextArea.trigger('blur');
-
-    expect(plugin.settings.providerConfigs.codex.customModels).toBe('different-custom-model');
+    expect(plugin.settings.providerConfigs.codex.modelPresets.map((p: { model: string }) => p.model))
+      .toEqual(['gpt-5.4-mini', 'gpt-5.5']);
     expect(plugin.settings.model).toBe('gpt-5.4-mini');
     expect(plugin.settings.titleGenerationModel).toBe('');
     expect(mockSaveSettings).toHaveBeenCalledTimes(1);
     expect(context.refreshModelSelectors).toHaveBeenCalledTimes(1);
   });
 
-  it('reconciles an inactive Codex saved model when a removed custom model was selected', async () => {
+  it('reconciles an inactive Codex saved model when its preset row is removed', async () => {
     Object.defineProperty(process, 'platform', { value: 'darwin' });
     const plugin = createPlugin({
       settingsProvider: 'claude',
@@ -519,17 +658,59 @@ describe('CodexSettingsTab', () => {
 
     codexSettingsTabRenderer.render(createContainer(), context);
 
-    const customModelsSetting = findSetting('settings.codex.customModels.name');
-    const customModelsTextArea = customModelsSetting.textAreaComponents[0];
-
-    await customModelsTextArea.onChangeCallback?.('different-custom-model');
-    await customModelsTextArea.trigger('blur');
+    const customRow = presetRows(presetEditorInfo(plugin))[2];
+    rowButton(customRow, 'claudian-model-preset-remove').trigger('click');
+    await flushAsync();
 
     expect(plugin.settings.model).toBe('haiku');
     expect(plugin.settings.savedProviderModel).toEqual({
       claude: 'haiku',
       codex: 'gpt-5.4-mini',
     });
+    expect(mockSaveSettings).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps at least one preset row', async () => {
+    Object.defineProperty(process, 'platform', { value: 'darwin' });
+    const plugin = createPlugin({
+      providerConfigs: {
+        codex: {
+          ...DEFAULT_CODEX_PROVIDER_SETTINGS,
+          enabled: true,
+          modelPresets: [{ label: 'Only', model: 'only-model' }],
+        },
+      },
+    });
+    const context = createContext(plugin);
+
+    codexSettingsTabRenderer.render(createContainer(), context);
+
+    const infoEl = presetEditorInfo(plugin);
+    expect(presetRows(infoEl)).toHaveLength(1);
+    rowButton(presetRows(infoEl)[0], 'claudian-model-preset-remove').trigger('click');
+    await flushAsync();
+
+    expect(presetRows(presetEditorInfo(plugin))).toHaveLength(1);
+    expect(mockSaveSettings).not.toHaveBeenCalled();
+  });
+
+  it('restores the two factory presets from the reset button', async () => {
+    Object.defineProperty(process, 'platform', { value: 'darwin' });
+    const plugin = createPlugin();
+    const context = createContext(plugin);
+
+    codexSettingsTabRenderer.render(createContainer(), context);
+
+    const reset = presetEditorInfo(plugin).children
+      .flatMap(child => child.children)
+      .find(child => child.cls === 'claudian-model-preset-reset');
+    reset?.trigger('click');
+    await flushAsync();
+
+    expect(plugin.settings.providerConfigs.codex.modelPresets).toEqual([
+      { label: 'GPT-5.4 Mini', model: 'gpt-5.4-mini' },
+      { label: 'GPT-5.5', model: 'gpt-5.5' },
+    ]);
     expect(mockSaveSettings).toHaveBeenCalledTimes(1);
   });
 });

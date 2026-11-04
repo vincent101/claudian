@@ -2,11 +2,14 @@ import { getRuntimeEnvironmentVariables } from '../../core/providers/providerEnv
 import type { ProviderUIOption } from '../../core/providers/types';
 import { getCodexProviderSettings } from './settings';
 import {
-  DEFAULT_CODEX_MODEL_SET,
   DEFAULT_CODEX_MODELS,
   DEFAULT_CODEX_PRIMARY_MODEL,
   formatCodexModelLabel,
 } from './types/models';
+
+const BUILT_IN_CODEX_MODEL_DESCRIPTIONS = new Map(
+  DEFAULT_CODEX_MODELS.map(model => [model.value, model.description]),
+);
 
 function createCustomCodexModelOption(modelId: string, description: string): ProviderUIOption {
   return {
@@ -21,46 +24,32 @@ function getConfiguredEnvModel(settings: Record<string, unknown>): string | null
   return modelId ? modelId : null;
 }
 
-export function getConfiguredEnvCustomModel(settings: Record<string, unknown>): string | null {
+/**
+ * Env additions stay compatible with the presets, never a replacement — but
+ * OPENAI_MODEL joins the list only when the presets do not already cover it:
+ * resolve locks onto the env value regardless, so the dropdown must be able to
+ * point at it even when the matching factory preset was deleted.
+ */
+export function getConfiguredEnvCustomModel(
+  settings: Record<string, unknown>,
+  presetModels: ReadonlySet<string>,
+): string | null {
   const modelId = getConfiguredEnvModel(settings);
-  return modelId && !DEFAULT_CODEX_MODEL_SET.has(modelId) ? modelId : null;
-}
-
-export function parseConfiguredCustomModelIds(value: string): string[] {
-  const modelIds: string[] = [];
-  const seen = new Set<string>();
-
-  for (const line of value.split(/\r?\n/)) {
-    const modelId = line.trim();
-    if (!modelId || seen.has(modelId)) {
-      continue;
-    }
-
-    seen.add(modelId);
-    modelIds.push(modelId);
-  }
-
-  return modelIds;
+  return modelId && !presetModels.has(modelId) ? modelId : null;
 }
 
 export function getCodexModelOptions(settings: Record<string, unknown>): ProviderUIOption[] {
-  const models = [...DEFAULT_CODEX_MODELS];
-  const seenValues = new Set(models.map(model => model.value));
-
-  const envModel = getConfiguredEnvCustomModel(settings);
-  if (envModel) {
-    seenValues.add(envModel);
-    models.unshift(createCustomCodexModelOption(envModel, 'Custom (env)'));
-  }
-
   const codexSettings = getCodexProviderSettings(settings);
-  for (const modelId of parseConfiguredCustomModelIds(codexSettings.customModels)) {
-    if (seenValues.has(modelId)) {
-      continue;
-    }
+  const models: ProviderUIOption[] = codexSettings.modelPresets.map(preset => ({
+    value: preset.model,
+    label: preset.label,
+    description: BUILT_IN_CODEX_MODEL_DESCRIPTIONS.get(preset.model) ?? 'Custom model',
+  }));
 
-    seenValues.add(modelId);
-    models.push(createCustomCodexModelOption(modelId, 'Custom model'));
+  const presetModels = new Set(models.map(model => model.value));
+  const envModel = getConfiguredEnvCustomModel(settings, presetModels);
+  if (envModel) {
+    models.unshift(createCustomCodexModelOption(envModel, 'Custom (env)'));
   }
 
   return models;

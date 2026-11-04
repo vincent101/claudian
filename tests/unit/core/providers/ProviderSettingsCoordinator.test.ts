@@ -149,7 +149,7 @@ describe('ProviderSettingsCoordinator', () => {
         providerConfigs: {
           codex: {
             enabled: true,
-            customModels: 'my-custom-model',
+            modelPresets: [{ label: 'My Custom', model: 'my-custom-model' }],
           },
         },
       };

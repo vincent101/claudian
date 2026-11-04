@@ -10,7 +10,11 @@ export function getBuiltInProviderDefaultConfigs(): ProviderConfigMap {
       // Shallow spread would share the frozen preset array across consumers.
       modelPresets: DEFAULT_CLAUDE_PROVIDER_SETTINGS.modelPresets.map(preset => ({ ...preset })),
     },
-    codex: { ...DEFAULT_CODEX_PROVIDER_SETTINGS },
+    codex: {
+      ...DEFAULT_CODEX_PROVIDER_SETTINGS,
+      // Shallow spread would share the frozen preset array across consumers.
+      modelPresets: DEFAULT_CODEX_PROVIDER_SETTINGS.modelPresets.map(preset => ({ ...preset })),
+    },
     opencode: { ...DEFAULT_OPENCODE_PROVIDER_SETTINGS },
   };
 }

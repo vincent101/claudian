@@ -1,5 +1,6 @@
 import { recalculateUsageForModel } from '@/features/chat/utils/usageInfo';
 import { setLocale } from '@/i18n/i18n';
+import { resolveCodexModelSelection } from '@/providers/codex/modelOptions';
 import { CODEX_SPARK_MODEL, DEFAULT_CODEX_PRIMARY_MODEL } from '@/providers/codex/types/models';
 import { codexChatUIConfig } from '@/providers/codex/ui/CodexChatUIConfig';
 
@@ -64,10 +65,12 @@ describe('CodexChatUIConfig', () => {
         },
       });
 
+      // The env model is covered by the migrated presets, so it keeps its
+      // preset position instead of being prepended.
       expect(options.map(option => option.value)).toEqual([
-        'my-custom-model',
         'gpt-5.4-mini',
         DEFAULT_CODEX_PRIMARY_MODEL,
+        'my-custom-model',
         'second-custom-model',
       ]);
     });
@@ -77,6 +80,130 @@ describe('CodexChatUIConfig', () => {
         environmentVariables: `OPENAI_MODEL=${DEFAULT_CODEX_PRIMARY_MODEL}`,
       });
       expect(options.length).toBe(2);
+    });
+
+    it('maps stored presets directly, keeping their labels', () => {
+      const options = codexChatUIConfig.getModelOptions({
+        providerConfigs: {
+          codex: {
+            modelPresets: [
+              { label: 'Fast custom', model: 'gpt-5.6-preview' },
+              { label: 'Opus', model: 'claude-opus' },
+            ],
+          },
+        },
+      });
+
+      expect(options).toEqual([
+        { value: 'gpt-5.6-preview', label: 'Fast custom', description: 'Custom model' },
+        { value: 'claude-opus', label: 'Opus', description: 'Custom model' },
+      ]);
+    });
+
+    it('shows only the user rows when both factory presets are deleted', () => {
+      const options = codexChatUIConfig.getModelOptions({
+        providerConfigs: {
+          codex: {
+            modelPresets: [
+              { label: 'claude-opus', model: 'claude-opus' },
+              { label: 'claude-sonnet', model: 'claude-sonnet' },
+            ],
+          },
+        },
+      });
+
+      expect(options.map(option => option.value)).toEqual(['claude-opus', 'claude-sonnet']);
+    });
+
+    it('uses the built-in description for factory model presets', () => {
+      const options = codexChatUIConfig.getModelOptions({
+        providerConfigs: {
+          codex: {
+            modelPresets: [
+              { label: 'GPT-5.4 Mini', model: 'gpt-5.4-mini' },
+              { label: 'GPT-5.5', model: 'gpt-5.5' },
+            ],
+          },
+        },
+      });
+
+      expect(options.map(option => option.description)).toEqual(['Fast', 'Latest']);
+    });
+
+    it('adds a Custom (env) option when OPENAI_MODEL names a deleted factory preset', () => {
+      const options = codexChatUIConfig.getModelOptions({
+        environmentVariables: `OPENAI_MODEL=${DEFAULT_CODEX_PRIMARY_MODEL}`,
+        providerConfigs: {
+          codex: {
+            modelPresets: [{ label: 'Mini', model: 'gpt-5.4-mini' }],
+          },
+        },
+      });
+
+      // resolve locks onto the env value even though its preset was deleted,
+      // so the dropdown must still be able to point at it.
+      expect(options.map(option => option.value)).toEqual([
+        DEFAULT_CODEX_PRIMARY_MODEL,
+        'gpt-5.4-mini',
+      ]);
+      expect(options[0].description).toBe('Custom (env)');
+    });
+  });
+
+  describe('resolveCodexModelSelection', () => {
+    it('locks onto OPENAI_MODEL whenever it is set', () => {
+      const settings = {
+        environmentVariables: 'OPENAI_MODEL=env-model',
+        providerConfigs: {
+          codex: {
+            modelPresets: [{ label: 'Preset', model: 'preset-model' }],
+          },
+        },
+      };
+
+      expect(resolveCodexModelSelection(settings, 'preset-model')).toBe('env-model');
+    });
+
+    it('keeps the current model while it stays in the options', () => {
+      const settings = {
+        providerConfigs: {
+          codex: {
+            modelPresets: [
+              { label: 'A', model: 'a-model' },
+              { label: 'B', model: 'b-model' },
+            ],
+          },
+        },
+      };
+
+      expect(resolveCodexModelSelection(settings, 'b-model')).toBe('b-model');
+    });
+
+    it('falls back to the first preset when the current model is removed', () => {
+      const settings = {
+        providerConfigs: {
+          codex: {
+            modelPresets: [
+              { label: 'A', model: 'a-model' },
+              { label: 'B', model: 'b-model' },
+            ],
+          },
+        },
+      };
+
+      expect(resolveCodexModelSelection(settings, 'removed-model')).toBe('a-model');
+    });
+
+    it('seeds the factory presets when the stored list is empty', () => {
+      const settings = {
+        providerConfigs: {
+          codex: {
+            modelPresets: [],
+          },
+        },
+      };
+
+      expect(resolveCodexModelSelection(settings, 'removed-model')).toBe('gpt-5.4-mini');
     });
   });
 

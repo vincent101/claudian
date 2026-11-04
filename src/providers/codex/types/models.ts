@@ -1,3 +1,4 @@
+import type { ModelPreset } from '../../../core/providers/modelPresets';
 import type { ProviderUIOption } from '../../../core/providers/types';
 
 export type CodexModel = string;
@@ -44,3 +45,13 @@ export const DEFAULT_CODEX_MODELS: ProviderUIOption[] = [
 ];
 
 export const DEFAULT_CODEX_MODEL_SET = new Set(DEFAULT_CODEX_MODELS.map(model => model.value));
+
+/**
+ * Factory preset seed derived from DEFAULT_CODEX_MODELS: presets are editable
+ * and deletable, so this only feeds first-launch defaults, the legacy custom
+ * model migration, and the editor reset button — never a hardcoded picker
+ * entry.
+ */
+export const DEFAULT_CODEX_MODEL_PRESETS: readonly ModelPreset[] = Object.freeze(
+  DEFAULT_CODEX_MODELS.map(option => ({ label: option.label, model: option.value })),
+);

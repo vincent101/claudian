@@ -3,7 +3,7 @@ import {
   DEFAULT_CLAUDE_MODEL_PRESETS,
   getClaudeProviderSettings,
 } from '@/providers/claude/settings';
-import { ModelPresetSettings } from '@/providers/claude/ui/ModelPresetSettings';
+import { claudeModelPresetBinding, ModelPresetSettings } from '@/providers/claude/ui/ModelPresetSettings';
 
 jest.mock('@/i18n/i18n', () => ({
   t: (key: string) => key,
@@ -127,6 +127,7 @@ function createHarness(initialSettings: Record<string, unknown> = {}): Harness {
     getSettings: () => settingsBag,
     saveSettings,
     refreshModelSelectors,
+    binding: claudeModelPresetBinding,
     onModelOptionsChanged,
   });
 

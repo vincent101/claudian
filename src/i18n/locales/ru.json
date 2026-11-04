@@ -500,9 +500,13 @@
         "detailed": "Detailed",
         "off": "Off"
       },
-      "customModels": {
-        "name": "Custom models",
-        "desc": "Append additional Codex model IDs to the picker, one per line. OPENAI_MODEL still takes precedence when set."
+      "modelPresets": {
+        "name": "Пресеты моделей",
+        "desc": "Определяет модели, отображаемые в селекторе моделей Codex. Идентификатор модели отправляется в Codex как есть; окно контекста необязательно и переопределяет значение по умолчанию 200000.",
+        "labelPlaceholder": "Название",
+        "modelPlaceholder": "Идентификатор модели (напр. gpt-5.5)",
+        "windowPlaceholder": "Окно контекста (по умолчанию 200000)",
+        "reset": "Восстановить значения по умолчанию"
       },
       "reasoningSummary": {
         "name": "Reasoning summary",

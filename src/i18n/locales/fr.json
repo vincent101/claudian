@@ -500,9 +500,13 @@
         "detailed": "Detailed",
         "off": "Off"
       },
-      "customModels": {
-        "name": "Custom models",
-        "desc": "Append additional Codex model IDs to the picker, one per line. OPENAI_MODEL still takes precedence when set."
+      "modelPresets": {
+        "name": "Préréglages de modèles",
+        "desc": "Définit les modèles affichés dans le sélecteur de modèles Codex. L'identifiant du modèle est envoyé tel quel à Codex ; la fenêtre de contexte est facultative et remplace la valeur par défaut de 200000.",
+        "labelPlaceholder": "Libellé",
+        "modelPlaceholder": "ID du modèle (ex. gpt-5.5)",
+        "windowPlaceholder": "Fenêtre de contexte (par défaut 200000)",
+        "reset": "Restaurer les valeurs par défaut"
       },
       "reasoningSummary": {
         "name": "Reasoning summary",

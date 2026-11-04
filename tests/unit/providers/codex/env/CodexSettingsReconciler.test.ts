@@ -47,7 +47,11 @@ describe('codexSettingsReconciler', () => {
       model: 'my-custom-model',
       providerConfigs: {
         codex: {
-          customModels: 'my-custom-model',
+          modelPresets: [
+            { label: 'GPT-5.4 Mini', model: 'gpt-5.4-mini' },
+            { label: 'GPT-5.5', model: 'gpt-5.5' },
+            { label: 'My Custom', model: 'my-custom-model' },
+          ],
           environmentVariables: 'OPENAI_BASE_URL=https://api.example.com/v1',
           environmentHash: '',
         },
@@ -71,7 +75,10 @@ describe('codexSettingsReconciler', () => {
       model: 'my-custom-model',
       providerConfigs: {
         codex: {
-          customModels: '',
+          modelPresets: [
+            { label: 'GPT-5.4 Mini', model: 'gpt-5.4-mini' },
+            { label: 'GPT-5.5', model: 'gpt-5.5' },
+          ],
           environmentVariables: 'OPENAI_BASE_URL=https://api.example.com/v1',
           environmentHash: '',
         },

@@ -1,13 +1,27 @@
+import {
+  importLegacyContextLimits,
+  type ModelPreset,
+  normalizeModelPresets,
+  parseLegacyCustomModelIds,
+  projectModelPresetsToContextLimits,
+} from '../../core/providers/modelPresets';
 import { getProviderConfig, setProviderConfig } from '../../core/providers/providerConfig';
 import { getProviderEnvironmentVariables } from '../../core/providers/providerEnvironment';
 import type { HostnameCliPaths } from '../../core/types/settings';
 import { getHostnameKey } from '../../utils/env';
-import { CODEX_SPARK_MODEL } from './types/models';
+import {
+  CODEX_SPARK_MODEL,
+  DEFAULT_CODEX_MODEL_PRESETS,
+  formatCodexModelLabel,
+} from './types/models';
 
 export type CodexSafeMode = 'workspace-write' | 'read-only';
 export type CodexReasoningSummary = 'auto' | 'concise' | 'detailed' | 'none';
 export type CodexInstallationMethod = 'native-windows' | 'wsl';
 export type HostnameInstallationMethods = Record<string, CodexInstallationMethod>;
+
+/** Editable model tier for the Codex selector (shared preset shape). */
+export type CodexModelPreset = ModelPreset;
 
 function normalizeCodexInstallationMethod(value: unknown): CodexInstallationMethod {
   return value === 'wsl' ? 'wsl' : 'native-windows';
@@ -22,7 +36,7 @@ export interface CodexProviderSettings {
   safeMode: CodexSafeMode;
   cliPath: string;
   cliPathsByHost: HostnameCliPaths;
-  customModels: string;
+  modelPresets: CodexModelPreset[];
   reasoningSummary: CodexReasoningSummary;
   environmentVariables: string;
   environmentHash: string;
@@ -37,7 +51,7 @@ export const DEFAULT_CODEX_PROVIDER_SETTINGS: Readonly<CodexProviderSettings> = 
   safeMode: 'workspace-write',
   cliPath: '',
   cliPathsByHost: {},
-  customModels: '',
+  modelPresets: DEFAULT_CODEX_MODEL_PRESETS.map(preset => ({ ...preset })),
   reasoningSummary: 'detailed',
   environmentVariables: '',
   environmentHash: '',
@@ -99,6 +113,30 @@ function normalizeInstallationMethodsByHost(value: unknown): HostnameInstallatio
   return result;
 }
 
+/**
+ * One-shot migration from the retired custom-model textarea into the preset
+ * list. Deterministic and idempotent: it only runs when the stored config has
+ * no usable modelPresets, and the output never depends on how often it is
+ * invoked. Legacy labels reuse the picker's display formatting, so the
+ * migrated list is visually identical to the pre-migration selector.
+ */
+export function migrateCodexModelPresets(
+  config: Record<string, unknown>,
+  settings: Record<string, unknown>,
+): CodexModelPreset[] {
+  const presets: CodexModelPreset[] = DEFAULT_CODEX_MODEL_PRESETS.map(preset => ({ ...preset }));
+
+  for (const modelId of parseLegacyCustomModelIds(config.customModels)) {
+    if (presets.some(preset => preset.model === modelId)) {
+      continue;
+    }
+    presets.push({ label: formatCodexModelLabel(modelId), model: modelId });
+  }
+
+  importLegacyContextLimits(presets, settings.customContextLimits);
+  return presets;
+}
+
 export function getCodexProviderSettings(
   settings: Record<string, unknown>,
 ): CodexProviderSettings {
@@ -110,6 +148,8 @@ export function getCodexProviderSettings(
   const hasHostScopedWslDistroOverrides = Object.keys(wslDistroOverridesByHost).length > 0;
   const legacyInstallationMethod = normalizeCodexInstallationMethod(config.installationMethod);
   const legacyWslDistroOverride = normalizeOptionalString(config.wslDistroOverride);
+  const modelPresets = normalizeModelPresets(config.modelPresets)
+    ?? migrateCodexModelPresets(config, settings);
 
   return {
     enabled: (config.enabled as boolean | undefined)
@@ -122,8 +162,7 @@ export function getCodexProviderSettings(
       ?? (settings.codexCliPath as string | undefined)
       ?? DEFAULT_CODEX_PROVIDER_SETTINGS.cliPath,
     cliPathsByHost: normalizeHostnameCliPaths(config.cliPathsByHost ?? settings.codexCliPathsByHost),
-    customModels: (config.customModels as string | undefined)
-      ?? DEFAULT_CODEX_PROVIDER_SETTINGS.customModels,
+    modelPresets,
     reasoningSummary: (config.reasoningSummary as CodexReasoningSummary | undefined)
       ?? (settings.codexReasoningSummary as CodexReasoningSummary | undefined)
       ?? DEFAULT_CODEX_PROVIDER_SETTINGS.reasoningSummary,
@@ -206,12 +245,18 @@ export function updateCodexProviderSettings(
     safeMode: next.safeMode,
     cliPath: next.cliPath,
     cliPathsByHost: next.cliPathsByHost,
-    customModels: next.customModels,
+    modelPresets: next.modelPresets,
     reasoningSummary: next.reasoningSummary,
     environmentVariables: next.environmentVariables,
     environmentHash: next.environmentHash,
     installationMethodsByHost,
     wslDistroOverridesByHost,
   });
+  if ('modelPresets' in updates) {
+    settings.customContextLimits = projectModelPresetsToContextLimits(
+      settings.customContextLimits,
+      next.modelPresets,
+    );
+  }
   return next;
 }

@@ -1,19 +1,70 @@
 import * as fs from 'fs';
 import { Setting } from 'obsidian';
 
+import type { ModelPresetEditorBinding } from '../../../core/providers/modelPresets';
 import { ProviderSettingsCoordinator } from '../../../core/providers/ProviderSettingsCoordinator';
 import type { ProviderSettingsTabRenderer } from '../../../core/providers/types';
 import { renderEnvironmentSettingsSection } from '../../../features/settings/ui/EnvironmentSettingsSection';
 import { t } from '../../../i18n/i18n';
+import { ModelPresetSettings } from '../../../shared/ModelPresetSettings';
 import { getHostnameKey } from '../../../utils/env';
 import { expandHomePath } from '../../../utils/path';
 import { getCodexWorkspaceServices } from '../app/CodexWorkspaceServices';
-import { parseConfiguredCustomModelIds, resolveCodexModelSelection } from '../modelOptions';
+import { resolveCodexModelSelection } from '../modelOptions';
 import { isWindowsStyleCliReference } from '../runtime/CodexBinaryLocator';
 import { getCodexProviderSettings, updateCodexProviderSettings } from '../settings';
-import { DEFAULT_CODEX_PRIMARY_MODEL } from '../types/models';
+import { DEFAULT_CODEX_MODEL_PRESETS, DEFAULT_CODEX_PRIMARY_MODEL } from '../types/models';
 import { CodexSkillSettings } from './CodexSkillSettings';
 import { CodexSubagentSettings } from './CodexSubagentSettings';
+
+/** Codex adapter for the shared preset editor (see claudeModelPresetBinding). */
+const codexModelPresetBinding: ModelPresetEditorBinding = {
+  i18nPrefix: 'settings.codex.modelPresets',
+
+  getPresets(settings) {
+    return getCodexProviderSettings(settings).modelPresets;
+  },
+
+  commitPresets(settings, presets) {
+    updateCodexProviderSettings(settings, { modelPresets: presets });
+  },
+
+  resetPresets() {
+    return DEFAULT_CODEX_MODEL_PRESETS.map(preset => ({ ...preset }));
+  },
+
+  applyRenames(settings, renames) {
+    if (settings.settingsProvider === 'codex') {
+      const currentModel = typeof settings.model === 'string' ? settings.model : '';
+      if (currentModel && renames.has(currentModel)) {
+        settings.model = renames.get(currentModel) as string;
+      }
+    }
+
+    const titleModel = typeof settings.titleGenerationModel === 'string'
+      ? settings.titleGenerationModel
+      : '';
+    if (titleModel && renames.has(titleModel)) {
+      settings.titleGenerationModel = renames.get(titleModel) as string;
+    }
+
+    const savedProviderModel = (
+      settings.savedProviderModel
+      && typeof settings.savedProviderModel === 'object'
+    )
+      ? settings.savedProviderModel as Record<string, unknown>
+      : {};
+    const currentSavedModel = typeof savedProviderModel.codex === 'string'
+      ? savedProviderModel.codex
+      : '';
+    if (currentSavedModel && renames.has(currentSavedModel)) {
+      settings.savedProviderModel = {
+        ...savedProviderModel,
+        codex: renames.get(currentSavedModel) as string,
+      };
+    }
+  },
+};
 
 export const codexSettingsTabRenderer: ProviderSettingsTabRenderer = {
   render(container, context) {
@@ -37,6 +88,39 @@ export const codexSettingsTabRenderer: ProviderSettingsTabRenderer = {
       }
 
       settingsBag.model = nextModel;
+    };
+
+    // Re-resolves the saved Codex model of an inactive provider so a preset
+    // deletion cannot leave a stale selection behind (resolve keeps a still
+    // offered model unchanged, so this only fires on real removals).
+    const reconcileInactiveCodexProjection = (): boolean => {
+      if (settingsBag.settingsProvider === 'codex') {
+        return false;
+      }
+
+      const savedProviderModel = (
+        settingsBag.savedProviderModel
+        && typeof settingsBag.savedProviderModel === 'object'
+      )
+        ? settingsBag.savedProviderModel as Record<string, unknown>
+        : {};
+      const currentSavedModel = typeof savedProviderModel.codex === 'string'
+        ? savedProviderModel.codex
+        : '';
+      if (!currentSavedModel) {
+        return false;
+      }
+
+      const nextSavedModel = resolveCodexModelSelection(settingsBag, currentSavedModel);
+      if (!nextSavedModel || nextSavedModel === currentSavedModel) {
+        return false;
+      }
+
+      settingsBag.savedProviderModel = {
+        ...savedProviderModel,
+        codex: nextSavedModel,
+      };
+      return true;
     };
 
     // --- Setup ---
@@ -263,95 +347,21 @@ export const codexSettingsTabRenderer: ProviderSettingsTabRenderer = {
       { value: 'none', label: t('settings.codex.summary.off') },
     ];
 
-    new Setting(container)
-      .setName(t('settings.codex.customModels.name'))
-      .setDesc(t('settings.codex.customModels.desc'))
-      .addTextArea((text) => {
-        let pendingCustomModels = codexSettings.customModels;
-        let savedCustomModels = codexSettings.customModels;
+    const presetsSetting = new Setting(container)
+      .setName(t('settings.codex.modelPresets.name'))
+      .setDesc(t('settings.codex.modelPresets.desc'));
 
-        const reconcileInactiveCodexProjection = (
-          previousCustomModels: string,
-        ): boolean => {
-          if (settingsBag.settingsProvider === 'codex') {
-            return false;
-          }
-
-          const savedProviderModel = (
-            settingsBag.savedProviderModel
-            && typeof settingsBag.savedProviderModel === 'object'
-          )
-            ? settingsBag.savedProviderModel as Record<string, unknown>
-            : {};
-          const currentSavedModel = typeof savedProviderModel.codex === 'string'
-            ? savedProviderModel.codex
-            : '';
-          if (!currentSavedModel) {
-            return false;
-          }
-
-          const previousCustomModelIds = new Set(parseConfiguredCustomModelIds(previousCustomModels));
-          if (!previousCustomModelIds.has(currentSavedModel)) {
-            return false;
-          }
-
-          const nextSavedModel = resolveCodexModelSelection(settingsBag, currentSavedModel);
-          if (!nextSavedModel || nextSavedModel === currentSavedModel) {
-            return false;
-          }
-
-          settingsBag.savedProviderModel = {
-            ...savedProviderModel,
-            codex: nextSavedModel,
-          };
-          return true;
-        };
-
-        const commitCustomModels = async (): Promise<void> => {
-          const previousCustomModels = savedCustomModels;
-          const previousModel = typeof settingsBag.model === 'string' ? settingsBag.model : '';
-          const previousTitleModel = typeof settingsBag.titleGenerationModel === 'string'
-            ? settingsBag.titleGenerationModel
-            : '';
-
-          if (pendingCustomModels !== savedCustomModels) {
-            updateCodexProviderSettings(settingsBag, { customModels: pendingCustomModels });
-            savedCustomModels = pendingCustomModels;
-          }
-
-          reconcileActiveCodexModelSelection();
-          const didReconcileInactiveProjection = reconcileInactiveCodexProjection(previousCustomModels);
-          const didReconcileTitleModel = ProviderSettingsCoordinator
-            .reconcileTitleGenerationModelSelection(settingsBag);
-          const nextModel = typeof settingsBag.model === 'string' ? settingsBag.model : '';
-          const nextTitleModel = typeof settingsBag.titleGenerationModel === 'string'
-            ? settingsBag.titleGenerationModel
-            : '';
-          const didModelSelectionChange = previousModel !== nextModel;
-          const didCustomModelsChange = previousCustomModels !== savedCustomModels;
-
-          if (!didCustomModelsChange && !didModelSelectionChange && !didReconcileInactiveProjection
-            && !didReconcileTitleModel
-            && previousTitleModel === nextTitleModel) {
-            return;
-          }
-
-          await context.plugin.saveSettings();
-          context.refreshModelSelectors();
-        };
-
-        text
-          .setPlaceholder('gpt-5.4\ngpt-5.3-codex-spark')
-          .setValue(codexSettings.customModels)
-          .onChange((value) => {
-            pendingCustomModels = value;
-          });
-        text.inputEl.rows = 4;
-        text.inputEl.cols = 40;
-        text.inputEl.addEventListener('blur', () => {
-          void commitCustomModels();
-        });
-      });
+    new ModelPresetSettings(presetsSetting.infoEl, {
+      getSettings: () => settingsBag,
+      saveSettings: () => context.plugin.saveSettings(),
+      refreshModelSelectors: () => context.refreshModelSelectors(),
+      binding: codexModelPresetBinding,
+      onModelOptionsChanged: () => {
+        reconcileActiveCodexModelSelection();
+        reconcileInactiveCodexProjection();
+        ProviderSettingsCoordinator.reconcileTitleGenerationModelSelection(settingsBag);
+      },
+    });
 
     new Setting(container)
       .setName(t('settings.codex.reasoningSummary.name'))

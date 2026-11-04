@@ -3,6 +3,7 @@ import {
   DEFAULT_CODEX_PROVIDER_SETTINGS,
   getCodexProviderSettings,
   getEffectiveCodexReasoningSummary,
+  migrateCodexModelPresets,
   updateCodexProviderSettings,
 } from '@/providers/codex/settings';
 import { CODEX_SPARK_MODEL } from '@/providers/codex/types/models';
@@ -21,7 +22,10 @@ describe('codex settings', () => {
   it('defaults installationMethod to native-windows and leaves wslDistroOverride empty', () => {
     const settings = getCodexProviderSettings({});
 
-    expect(settings.customModels).toBe('');
+    expect(settings.modelPresets).toEqual([
+      { label: 'GPT-5.4 Mini', model: 'gpt-5.4-mini' },
+      { label: 'GPT-5.5', model: 'gpt-5.5' },
+    ]);
     expect(settings.installationMethod).toBe('native-windows');
     expect(settings.wslDistroOverride).toBe('');
     expect(settings.installationMethod).toBe(DEFAULT_CODEX_PROVIDER_SETTINGS.installationMethod);
@@ -142,4 +146,122 @@ describe('codex settings', () => {
 
     expect(getCodexProviderSettings(settingsBag).reasoningSummary).toBe('none');
   });
+
+  describe('codex model presets', () => {
+    it('migrates the legacy customModels textarea into presets without loss', () => {
+      const settings = getCodexProviderSettings({
+        providerConfigs: {
+          codex: {
+            customModels: 'claude-opus\nclaude-sonnet\nclaude-haiku',
+          },
+        },
+      });
+
+      expect(settings.modelPresets).toEqual([
+        { label: 'GPT-5.4 Mini', model: 'gpt-5.4-mini' },
+        { label: 'GPT-5.5', model: 'gpt-5.5' },
+        { label: 'claude-opus', model: 'claude-opus' },
+        { label: 'claude-sonnet', model: 'claude-sonnet' },
+        { label: 'claude-haiku', model: 'claude-haiku' },
+      ]);
+    });
+
+    it('migrateCodexModelPresets is idempotent and dedupes legacy lines', () => {
+      const config = { customModels: 'gpt-5.5\n  \nclaude-opus\nclaude-opus\n' };
+      const first = migrateCodexModelPresets(config, {});
+      const second = migrateCodexModelPresets(config, {});
+
+      expect(first).toEqual([
+        { label: 'GPT-5.4 Mini', model: 'gpt-5.4-mini' },
+        { label: 'GPT-5.5', model: 'gpt-5.5' },
+        { label: 'claude-opus', model: 'claude-opus' },
+      ]);
+      expect(second).toEqual(first);
+    });
+
+    it('imports legacy customContextLimits into the migrated presets', () => {
+      const settings = getCodexProviderSettings({
+        customContextLimits: { 'claude-opus': 1_000_000 },
+        providerConfigs: {
+          codex: { customModels: 'claude-opus' },
+        },
+      });
+
+      expect(settings.modelPresets.find(p => p.model === 'claude-opus')?.contextWindow)
+        .toBe(1_000_000);
+    });
+
+    it('normalizes stored presets: drops invalid rows, dedupes, falls back to migration', () => {
+      const settings = getCodexProviderSettings({
+        providerConfigs: {
+          codex: {
+            modelPresets: [
+              { label: 'Kept', model: 'kept-model' },
+              { label: '', model: 'no-label' },
+              { label: 'Dup', model: 'kept-model' },
+              'garbage',
+            ],
+          },
+        },
+      });
+
+      expect(settings.modelPresets).toEqual([{ label: 'Kept', model: 'kept-model' }]);
+
+      // All rows invalid -> no usable presets -> migration seeds the factory two.
+      expect(getCodexProviderSettings({
+        providerConfigs: {
+          codex: { modelPresets: [{ label: '', model: '' }] },
+        },
+      }).modelPresets).toEqual([
+        { label: 'GPT-5.4 Mini', model: 'gpt-5.4-mini' },
+        { label: 'GPT-5.5', model: 'gpt-5.5' },
+      ]);
+    });
+
+    it('updateCodexProviderSettings drops customModels and projects preset windows', () => {
+      const settingsBag: Record<string, unknown> = {
+        customContextLimits: { 'old-model': 128_000 },
+        providerConfigs: {
+          codex: { customModels: 'old-model' },
+        },
+      };
+
+      const next = updateCodexProviderSettings(settingsBag, {
+        modelPresets: [
+          { label: 'Opus', model: 'claude-opus', contextWindow: 1_000_000 },
+          { label: 'Mini', model: 'gpt-5.4-mini' },
+        ],
+      });
+
+      expect(next.modelPresets).toHaveLength(2);
+      const codexConfig = (settingsBag.providerConfigs as Record<string, Record<string, unknown>>).codex;
+      expect(codexConfig).not.toHaveProperty('customModels');
+      expect(codexConfig.modelPresets).toHaveLength(2);
+      expect(codexConfig.modelPresets).toEqual([
+        { label: 'Opus', model: 'claude-opus', contextWindow: 1_000_000 },
+        { label: 'Mini', model: 'gpt-5.4-mini' },
+      ]);
+      // Foreign keys stay untouched; preset windows project into the shared map.
+      expect(settingsBag.customContextLimits).toEqual({
+        'old-model': 128_000,
+        'claude-opus': 1_000_000,
+      });
+    });
+
+    it('removes the context limit entry when a preset loses its window', () => {
+      const settingsBag: Record<string, unknown> = {
+        customContextLimits: { 'claude-opus': 1_000_000 },
+        providerConfigs: {
+          codex: { modelPresets: [{ label: 'Opus', model: 'claude-opus', contextWindow: 1_000_000 }] },
+        },
+      };
+
+      updateCodexProviderSettings(settingsBag, {
+        modelPresets: [{ label: 'Opus', model: 'claude-opus' }],
+      });
+
+      expect(settingsBag.customContextLimits).toEqual({});
+    });
+  });
 });
+

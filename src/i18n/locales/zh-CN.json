@@ -500,9 +500,13 @@
         "detailed": "详细",
         "off": "关闭"
       },
-      "customModels": {
-        "name": "自定义模型",
-        "desc": "向选择器添加其他 Codex 模型 ID，每行一个。设置 OPENAI_MODEL 后仍以其为准。"
+      "modelPresets": {
+        "name": "模型档位",
+        "desc": "定义 Codex 模型选择器中显示的档位。模型 ID 原样发送给 Codex；上下文窗口可选，填写后覆盖默认值 200000。",
+        "labelPlaceholder": "名称",
+        "modelPlaceholder": "模型 ID（如 gpt-5.5）",
+        "windowPlaceholder": "上下文窗口（默认 200000）",
+        "reset": "恢复默认"
       },
       "reasoningSummary": {
         "name": "推理摘要",

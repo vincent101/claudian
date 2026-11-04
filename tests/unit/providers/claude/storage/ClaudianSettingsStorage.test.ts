@@ -413,6 +413,60 @@ describe('ClaudianSettingsStorage', () => {
       });
     });
 
+    describe('Codex model preset migration', () => {
+      it('migrates legacy customModels to modelPresets and drops the old field on write-back', async () => {
+        mockAdapter.exists.mockResolvedValue(true);
+        mockAdapter.read.mockResolvedValue(JSON.stringify({
+          providerConfigs: {
+            codex: {
+              customModels: 'claude-opus\nclaude-sonnet\nclaude-haiku',
+            },
+          },
+        }));
+
+        const result = await storage.load();
+        const writtenContent = JSON.parse(mockAdapter.write.mock.calls[0][1]);
+        const codexConfig = writtenContent.providerConfigs.codex;
+
+        expect(getCodexProviderSettings(result).modelPresets.map(p => p.model)).toEqual([
+          'gpt-5.4-mini', 'gpt-5.5', 'claude-opus', 'claude-sonnet', 'claude-haiku',
+        ]);
+        expect(getCodexProviderSettings(result).modelPresets.map(p => p.label)).toEqual([
+          'GPT-5.4 Mini', 'GPT-5.5', 'claude-opus', 'claude-sonnet', 'claude-haiku',
+        ]);
+        expect(codexConfig.modelPresets).toHaveLength(5);
+        expect(codexConfig).not.toHaveProperty('customModels');
+      });
+
+      it('seeds the two factory presets on first launch', async () => {
+        mockAdapter.exists.mockResolvedValue(false);
+
+        const result = await storage.load();
+
+        expect(getCodexProviderSettings(result as unknown as Record<string, unknown>).modelPresets)
+          .toEqual([
+            { label: 'GPT-5.4 Mini', model: 'gpt-5.4-mini' },
+            { label: 'GPT-5.5', model: 'gpt-5.5' },
+          ]);
+        expect(mockAdapter.write).not.toHaveBeenCalled();
+      });
+
+      it('does not rewrite the file again once codex presets are stored', async () => {
+        mockAdapter.exists.mockResolvedValue(true);
+        mockAdapter.read.mockResolvedValue(JSON.stringify({
+          providerConfigs: {
+            codex: {
+              modelPresets: [{ label: 'Only', model: 'only-model' }],
+            },
+          },
+        }));
+
+        await storage.load();
+
+        expect(mockAdapter.write).not.toHaveBeenCalled();
+      });
+    });
+
     it('should throw on read error', async () => {
       mockAdapter.exists.mockResolvedValue(true);
       mockAdapter.read.mockRejectedValue(new Error('Read failed'));
