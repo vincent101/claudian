@@ -18,7 +18,7 @@ import {
 } from '../settings';
 import { AgentSettings } from './AgentSettings';
 import { claudeChatUIConfig } from './ClaudeChatUIConfig';
-import { ModelPresetSettings } from './ModelPresetSettings';
+import { claudeModelPresetBinding, ModelPresetSettings } from './ModelPresetSettings';
 import { PluginSettingsManager } from './PluginSettingsManager';
 import { SlashCommandSettings } from './SlashCommandSettings';
 
@@ -190,6 +190,7 @@ export const claudeSettingsTabRenderer: ProviderSettingsTabRenderer = {
       getSettings: () => settingsBag,
       saveSettings: () => context.plugin.saveSettings(),
       refreshModelSelectors: () => context.refreshModelSelectors(),
+      binding: claudeModelPresetBinding,
       onModelOptionsChanged: () => {
         reconcileActiveClaudeModelSelection();
         ProviderSettingsCoordinator.reconcileTitleGenerationModelSelection(settingsBag);
