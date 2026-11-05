@@ -123,6 +123,7 @@ let mockRewindFilesImpl: ((userMessageId: string, options?: { dryRun?: boolean }
 let lastResponse: (AsyncGenerator<any> & {
   interrupt: jest.Mock;
   stopTask: jest.Mock;
+  close: jest.Mock;
   setModel: jest.Mock;
   setMaxThinkingTokens: jest.Mock;
   setPermissionMode: jest.Mock;
@@ -294,23 +295,32 @@ export function query({ prompt, options }: { prompt: any; options: Options }): A
   lastOptions = options;
   queryCallCount++;
 
+  // Post-close trailing messages: results that were already in the CLI pipe
+  // when the transport closed (real shape: buffered stdout drains after the
+  // channel ends). Tests push these to simulate old-scope late arrivals.
+  const lateMessages: any[] = [];
+
   const generator = async function* () {
     if (isAsyncIterable(prompt)) {
       for await (const _ of prompt) {
         void _; // Consume async iterable input
         const messages = getMessagesForPrompt();
         yield* emitMessages(messages, options);
+        for (const late of lateMessages.splice(0)) yield late;
       }
+      for (const late of lateMessages.splice(0)) yield late;
       return;
     }
 
     const messages = getMessagesForPrompt();
     yield* emitMessages(messages, options);
+    for (const late of lateMessages.splice(0)) yield late;
   };
 
   const gen = generator() as AsyncGenerator<any> & {
     interrupt: jest.Mock;
     stopTask: jest.Mock;
+    close: jest.Mock;
     setModel: jest.Mock;
     setMaxThinkingTokens: jest.Mock;
     setPermissionMode: jest.Mock;
@@ -321,6 +331,10 @@ export function query({ prompt, options }: { prompt: any; options: Options }): A
   };
   gen.interrupt = jest.fn().mockResolvedValue(undefined);
   gen.stopTask = jest.fn().mockResolvedValue(undefined);
+  gen.close = jest.fn().mockImplementation(() => {});
+  (gen as { pushLateMessage?: (message: any) => void }).pushLateMessage = (message: any) => {
+    lateMessages.push(message);
+  };
   // Dynamic update methods for persistent queries
   gen.setModel = jest.fn().mockResolvedValue(undefined);
   gen.setMaxThinkingTokens = jest.fn().mockResolvedValue(undefined);

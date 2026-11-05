@@ -159,6 +159,27 @@ interface ChunkWaitState {
   error: Error | null;
 }
 
+/**
+ * Query boundary (2026-11-05 fix 2): one scope per persistent query
+ * incarnation. Every consumer/routing/handoff side effect must verify it
+ * still acts on the CURRENT, un-retired scope — a result arriving through an
+ * old consumer must never settle a turn leased by a newer query, and an old
+ * consumer's error/teardown must never act on the new query.
+ */
+interface QueryScope {
+  readonly epoch: number;
+  readonly query: Query;
+  readonly channel: MessageChannel;
+  readonly abortController: AbortController;
+  /** Retired scopes reject routing and block new dispatches (watchdog rebuild). */
+  retired: boolean;
+  /** Prevents a second consumer loop on the same scope. */
+  consumerStarted: boolean;
+  /** Resolved by the spawn exit notification once this scope's CLI truly exited. */
+  exitWaiters: Array<(code: number | null) => void>;
+  exitNotified: boolean;
+}
+
 function isChatMessageArray(value: unknown): value is ChatMessage[] {
   return Array.isArray(value) && value.length > 0 &&
     !!value[0] && typeof value[0] === 'object' && 'role' in value[0] && 'content' in value[0];
@@ -281,6 +302,9 @@ export class ClaudianService implements ChatRuntime {
   private historyRecoverySource: (() => FullHistoryIterable) | null = null;
   private transcriptDiagnosticLog: ClaudeTranscriptDiagnosticLog | null = null;
   private transcriptCliVersion: string | undefined;
+  /** Query boundary isolation (2.4): the live persistent-query scope, null when retired/absent. */
+  private currentQueryScope: QueryScope | null = null;
+  private queryEpochCounter = 0;
   /**
    * Turn-identity reconciliation (batch 1, observe mode): read-only bypass
    * recording host/observer facts and rate diagnostics. Never consulted by
@@ -615,6 +639,53 @@ export class ClaudianService implements ChatRuntime {
     this.notifyReadyStateChange();
   }
 
+  /**
+   * Query boundary: materializes the scope for the query currently sitting in
+   * the slot fields. Idempotent — the lazy attach also serves the test seams
+   * that install persistentQuery/messageChannel directly, so every consumer
+   * started after those installs is scope-guarded without test changes.
+   */
+  private ensureQueryScope(): QueryScope | null {
+    const query = this.persistentQuery;
+    const channel = this.messageChannel;
+    if (!query || !channel) return null;
+    if (this.currentQueryScope?.query === query) return this.currentQueryScope;
+    const scope: QueryScope = {
+      epoch: ++this.queryEpochCounter,
+      query,
+      channel,
+      abortController: this.queryAbortController ?? new AbortController(),
+      retired: false,
+      consumerStarted: false,
+      exitWaiters: [],
+      exitNotified: false,
+    };
+    this.currentQueryScope = scope;
+    this.queryAbortController = scope.abortController;
+    return scope;
+  }
+
+  /** The scope still owning the runtime slot, or null once retired/replaced. */
+  private liveQueryScope(): QueryScope | null {
+    const scope = this.currentQueryScope;
+    if (!scope || scope.retired) return null;
+    return scope;
+  }
+
+  private isCurrentQueryScope(scope: QueryScope | null | undefined): boolean {
+    if (!scope) return false;
+    return this.currentQueryScope === scope && !scope.retired;
+  }
+
+  /** Spawn exit notification (query-scope-bound): confirms the CLI truly exited. */
+  notifyQueryProcessExit(scopeEpoch: number): void {
+    const scope = this.currentQueryScope;
+    if (!scope || scope.epoch !== scopeEpoch) return;
+    scope.exitNotified = true;
+    const waiters = scope.exitWaiters.splice(0);
+    for (const resolve of waiters) resolve(null);
+  }
+
   private attachPersistentQueryStdinErrorHandler(query: Query): void {
     const stdin = (query as { transport?: { processStdin?: NodeJS.WritableStream } }).transport?.processStdin;
     if (!stdin || typeof stdin.on !== 'function' || typeof stdin.once !== 'function') {
@@ -623,6 +694,11 @@ export class ClaudianService implements ChatRuntime {
 
     const handler = (error: NodeJS.ErrnoException) => {
       if (this.shuttingDown || this.isPipeError(error)) {
+        return;
+      }
+      // Query boundary: an old query's stdin must never close the scope that
+      // replaced it — identity check, not slot liveness (2026-11-05 fix 2).
+      if (this.currentQueryScope && this.currentQueryScope.query !== query) {
         return;
       }
       this.closePersistentQuery('stdin error');
@@ -648,6 +724,7 @@ export class ClaudianService implements ChatRuntime {
     // vs session reset) — it was already plumbed but never recorded.
     this.recordTranscriptDiagnostic({ phase: 'query_close', detail: reason });
     this.abortUserTurnCompletionBarriers();
+    const scope = this.currentQueryScope;
     if (!this.persistentQuery) {
       return;
     }
@@ -656,14 +733,24 @@ export class ClaudianService implements ChatRuntime {
 
     this.shuttingDown = true;
 
+    // Retire the scope FIRST (2.4): from here the old consumer rejects
+    // routing and its teardown can never act on a replacement scope.
+    if (scope) {
+      scope.retired = true;
+    }
+
     // Close the message channel (ends the async iterable). close() reports
     // every turn that still held lease/queue state so the runtime can settle it.
     const channelTurnIds = this.messageChannel?.close() ?? [];
 
-    // Interrupt the query
-    void this.persistentQuery.interrupt().catch(() => {
-      // Silence abort/interrupt errors during shutdown
-    });
+    // Official Query.close(): terminates the CLI subprocess and cleans up
+    // pending requests/MCP transports. interrupt()+abort() alone cannot
+    // guarantee the process is gone (2026-11-05 fix 2); close() replaces it.
+    try {
+      this.persistentQuery.close();
+    } catch {
+      // Already-closed/failed transports are fine: abort below is the backup.
+    }
 
     // Abort as backup
     this.queryAbortController?.abort();
@@ -704,6 +791,7 @@ export class ClaudianService implements ChatRuntime {
     this.persistentQuery = null;
     this.messageChannel = null;
     this.queryAbortController = null;
+    this.currentQueryScope = null;
     this.responseConsumerRunning = false;
     this.responseConsumerPromise = null;
     this.currentConfig = null;
@@ -842,36 +930,44 @@ export class ClaudianService implements ChatRuntime {
   }
 
   /**
-   * Starts the background consumer loop that routes chunks to handlers.
+   * Starts the background consumer loop that routes chunks to handlers. The
+   * loop captures the query SCOPE, not the mutable slot fields: once a scope
+   * is retired or replaced, the loop stops routing, its error handler stops
+   * restarting anything, and its teardown never touches the new scope.
    */
   private startResponseConsumer(): void {
-    if (this.responseConsumerRunning) {
+    const scope = this.ensureQueryScope();
+    if (!scope) {
       return;
     }
-
+    if (scope.consumerStarted) {
+      return;
+    }
+    scope.consumerStarted = true;
     this.responseConsumerRunning = true;
 
-    // Track which query this consumer is for, to detect if we were replaced
-    const queryForThisConsumer = this.persistentQuery;
-
     this.responseConsumerPromise = (async () => {
-      if (!this.persistentQuery) return;
-
       try {
-        for await (const message of this.persistentQuery) {
-          if (this.shuttingDown) break;
+        for await (const message of scope.query) {
+          if (this.shuttingDown || scope.retired || this.currentQueryScope !== scope) break;
 
           // P0-2 runPhase bypass (read-only): the SDK session-state channel
           // tells whether the CLI agent loop is running/idle — the U1
           // discriminator for the stall family. Must never affect routing.
           this.noteSessionStateChange(message);
-          await this.routeMessage(message);
+          await this.routeMessage(message, scope);
+          // Post-await re-check (2.4): routing may have awaited chunk delivery
+          // while the scope was retired/replaced; further messages must not route.
+          if (scope.retired || this.currentQueryScope !== scope) break;
         }
       } catch (error) {
-        // Skip error handling if this consumer was replaced by a new one.
-        // This prevents race conditions where the OLD consumer's error handler
-        // interferes with the NEW handler after a restart (e.g., from applyDynamicUpdates).
-        if (this.persistentQuery !== queryForThisConsumer && this.persistentQuery !== null) {
+        // Skip error handling if this consumer's scope was replaced or retired,
+        // or the slot query was swapped out from under it (test seam / manual
+        // installs). This prevents race conditions where the OLD consumer's
+        // error handler interferes with the NEW handler after a restart (e.g.,
+        // from applyDynamicUpdates), and keeps a retired scope's teardown from
+        // restarting crash recovery.
+        if (!this.isCurrentQueryScope(scope) || this.persistentQuery !== scope.query) {
           return;
         }
 
@@ -885,12 +981,19 @@ export class ClaudianService implements ChatRuntime {
             this.crashRecoveryAttempted = true;
             try {
               await this.ensureReady({ force: true, preserveHandlers: true });
+              // Scope may have been replaced by the restart itself.
+              if (!this.isCurrentQueryScope(scope)) {
+                return;
+              }
               if (!this.messageChannel) {
                 throw new Error('Persistent query restart did not create message channel', {
                   cause: error,
                 });
               }
               await this.applyDynamicUpdates(this.lastSentQueryOptions ?? undefined, { preserveHandlers: true });
+              if (!this.isCurrentQueryScope(scope)) {
+                return;
+              }
               // Replay on the same turnId so the preserved handler/turn stay
               // bound to one lease across the restart.
               const replayTurnId = this.lastSentTurnId;
@@ -910,13 +1013,15 @@ export class ClaudianService implements ChatRuntime {
               if (isSessionExpiredError(restartError)) {
                 this.sessionManager.invalidateSession();
               }
-              handler.onError(errorInstance);
+              if (this.isCurrentQueryScope(scope) && handler) {
+                handler.onError(errorInstance);
+              }
               return;
             }
           }
 
           // Notify active handler of error
-          if (handler) {
+          if (handler && this.isCurrentQueryScope(scope)) {
             handler.onError(errorInstance);
           }
 
@@ -939,7 +1044,7 @@ export class ClaudianService implements ChatRuntime {
         // Only clear the flag if this consumer wasn't replaced by a new one (e.g., after restart)
         // If ensureReady() restarted, it starts a new consumer which sets the flag true,
         // so we shouldn't clear it here.
-        if (this.persistentQuery === queryForThisConsumer || this.persistentQuery === null) {
+        if (this.currentQueryScope === scope || this.currentQueryScope === null) {
           this.responseConsumerRunning = false;
         }
       }
@@ -982,9 +1087,21 @@ export class ClaudianService implements ChatRuntime {
    * 6. Chunks go to the owning turn's waiters; a turn without waiters buffers
    *    chunks and flushes through the auto-turn callback adapter on result.
    */
-  private async routeMessage(message: SDKMessage): Promise<void> {
+  private async routeMessage(message: SDKMessage, scope: QueryScope | null = this.currentQueryScope): Promise<void> {
     // Note: Session expiration errors are handled in catch blocks (queryViaSDK, handleAbort)
     // The SDK throws errors as exceptions, not as message types
+
+    // Query boundary (2.4): any side effect requires the CURRENT, un-retired
+    // scope. A result arriving through an old consumer must never settle a
+    // turn leased by a newer query (the 2026-11-05 defect 2 shape). A null
+    // scope means no query incarnation exists to discriminate against.
+    if (scope !== null && !this.isCurrentQueryScope(scope)) {
+      this.recordTranscriptDiagnostic({
+        phase: 'query_scope_stale',
+        detail: `epoch=${scope.epoch} type=${message.type}`,
+      });
+      return;
+    }
 
     if (message.type === 'user' && (message as SDKUserMessage & { isReplay?: boolean }).isReplay === true) {
       return;
@@ -1077,6 +1194,11 @@ export class ClaudianService implements ChatRuntime {
           : event;
 
         await this.deliverChunkToTurn(activeTurn, normalizedChunk);
+        // Post-await re-check (2.4): chunk delivery can await the feature
+        // projection; a scope/turn replaced mid-delivery must not keep routing.
+        if ((scope !== null && !this.isCurrentQueryScope(scope)) || this.runtimeTurns.get(activeTurn.id) !== activeTurn) {
+          return;
+        }
       }
     }
 
@@ -1088,6 +1210,17 @@ export class ClaudianService implements ChatRuntime {
     // session_init alone is not a completion signal for persistent queries.
     if (isTurnCompleteMessage(message)) {
       const result = message as SDKMessage & { session_id?: string; subtype?: string; is_error?: boolean };
+      // Pre-settlement scope re-check: the transform loop above may have
+      // awaited chunk delivery while the scope was retired/replaced. An old
+      // query's result must never settle a turn owned by a newer query.
+      if (scope !== null && !this.isCurrentQueryScope(scope)) {
+        this.recordTranscriptDiagnostic({
+          phase: 'query_scope_stale',
+          turnId: activeTurn.id,
+          detail: `result epoch=${scope.epoch}`,
+        });
+        return;
+      }
       if (activeTurn.recoveryGeneration !== undefined) {
         this.sessionManager.confirmRecovery(
           activeTurn.recoveryGeneration,
@@ -1379,6 +1512,9 @@ export class ClaudianService implements ChatRuntime {
       }
       return;
     }
+    // Query boundary: the turn was dispatched under this scope's epoch; lease
+    // release and delayed handoffs for it resolve against this scope only.
+    turn.queryEpoch = this.liveQueryScope()?.epoch;
     if (turn.phase === 'queued') {
       turn.phase = 'collecting';
       turn.dispatchedAt = Date.now();
@@ -1419,10 +1555,18 @@ export class ClaudianService implements ChatRuntime {
    * (v4 §3.3): cancel the turn that actually holds the lease, retry the
    * release once; only a lease stuck on an unknown turn closes the channel.
    * Never throws — the consumer loop must survive protocol errors.
+   *
+   * Query boundary (2.4): when an explicit channel is passed (the turn's own
+   * scope), an old-scope completion must never act on the live channel — no
+   * "lease mismatch → cancel the actual holder" escalation across scopes.
    */
-  private completeChannelTurn(turnId: string): void {
-    const channel = this.messageChannel;
+  private completeChannelTurn(turnId: string, channel: MessageChannel | null = this.messageChannel): void {
     if (!channel) {
+      return;
+    }
+    if (channel !== this.messageChannel) {
+      // Old-scope channel: its queue/lease are being torn down by the
+      // retirement path itself; cross-scope escalation is forbidden.
       return;
     }
     const result = channel.completeTurn(turnId);
@@ -1529,9 +1673,14 @@ export class ClaudianService implements ChatRuntime {
     turn.waiters.clear();
     this.runtimeTurns.delete(turnId);
 
-    // Holds the lease → release so the next queued message can flow.
-    if (this.messageChannel?.getActiveTurnId() === turnId) {
-      this.completeChannelTurn(turnId);
+    // Holds the lease → release so the next queued message can flow. The
+    // release resolves against the turn's OWN scope channel (2.4): an old
+    // turn's cancellation must never release or escalate on a newer channel.
+    const scope = this.currentQueryScope;
+    const oldScopeTurn = turn.queryEpoch !== undefined && scope !== null && scope.epoch !== turn.queryEpoch;
+    const releaseChannel = oldScopeTurn ? null : this.messageChannel;
+    if (releaseChannel?.getActiveTurnId() === turnId) {
+      this.completeChannelTurn(turnId, releaseChannel);
         if (turn.kind === 'auto') this.fireOnAutoTurnReleased(turnId);
     }
   }

@@ -25,7 +25,10 @@ export type TranscriptDiagnosticPhase =
   // spot (U-A: silent settles were unattributable).
   | 'cancel_request' | 'runtime_cancel' | 'query_close' | 'force_settle'
   | 'settle_watchdog_fire' | 'interrupt_sent' | 'settle_result' | 'reconcile_fix'
-  | 'run_phase' | 'turn_cancel' | 'stop_task_sent' | 'stop_task_outcome';
+  | 'run_phase' | 'turn_cancel' | 'stop_task_sent' | 'stop_task_outcome'
+  // Query boundary isolation (2026-11-05 fix 2): stale-scope routing refusals
+  // and rebuild milestones (retire/exit-confirmed/rebuild/restored).
+  | 'query_scope_stale' | 'query_retire' | 'query_exit_confirmed' | 'query_rebuilt';
 
 export interface TranscriptDiagnosticEvent {
   phase: TranscriptDiagnosticPhase;

@@ -16,7 +16,7 @@ const sdkMock = sdkModule as unknown as {
   setMockMessages: (messages: any[], options?: { appendResult?: boolean }) => void;
   resetMockMessages: () => void;
   query: typeof sdkModule.query;
-  getLastResponse: () => (AsyncGenerator<any> & { interrupt: jest.Mock; stopTask: jest.Mock }) | null;
+  getLastResponse: () => (AsyncGenerator<any> & { interrupt: jest.Mock; stopTask: jest.Mock; close: jest.Mock; pushLateMessage: (message: any) => void }) | null;
 };
 
 const RESULT_WATCHDOG_MS = 120_000;
@@ -663,6 +663,146 @@ describe('ClaudianService - P0-1 result-late watchdog', () => {
     expect(sdkMock.getLastResponse()?.interrupt).not.toHaveBeenCalled();
     const phases = await readDiagnosticPhases(diagDir);
     expect(phases.some(entry => entry.phase === 'settle_watchdog_fire')).toBe(false);
+  });
+
+  describe('query boundary isolation (2026-11-05 fix 2: old results must never settle new-query turns)', () => {
+    /** Installs a replacement query incarnation without the force-close side
+     * effects (the terminal state after a retirement/rebuild: new channel,
+     * new scope, old scope still holding its own state). */
+    function installReplacementQuery(service: ClaudianService): MessageChannel {
+      const messageChannel = new MessageChannel(() => {}, (info) => (service as any).handleTurnDequeued(info));
+      (service as any).messageChannel = messageChannel;
+      (service as any).persistentQuery = sdkMock.query({ prompt: messageChannel, options: {} as any });
+      (service as any).startResponseConsumer();
+      return messageChannel;
+    }
+
+    it('a result routed through an old scope never settles the turn leased by the new query', async () => {
+      sdkMock.setMockMessages([
+        { type: 'system', subtype: 'init', session_id: 'watch-session' },
+        { type: 'assistant', message: { content: [{ type: 'text', text: 'model reply' }] } },
+      ], { appendResult: false });
+      await startPersistentQuery(service);
+
+      const turnA = service.prepareTurn({ turnId: 'turn-scope-a', text: 'hello' });
+      const genA = service.query(turnA);
+      await genA.next();
+      const oldScope = (service as any).currentQueryScope;
+      expect(oldScope).not.toBeNull();
+
+      // New query incarnation replaces the slot; a fresh turn takes its lease.
+      installReplacementQuery(service);
+      const turnB = service.prepareTurn({ turnId: 'turn-scope-b', text: 'queued hello' });
+      const genB = service.query(turnB);
+      await genB.next();
+      await flushMicrotasks();
+      const channelB = (service as any).messageChannel as MessageChannel;
+      expect(channelB.getActiveTurnId()).toBe('turn-scope-b');
+
+      // The old consumer's late result arrives through the OLD scope.
+      await (service as any).routeMessage({ type: 'result', subtype: 'success', result: 'stale' }, oldScope);
+      await flushMicrotasks();
+
+      expect((service as any).runtimeTurns.get('turn-scope-b').phase).toBe('collecting');
+      const phases = await readDiagnosticPhases(diagDir);
+      expect(phases.some(entry => entry.phase === 'settle_result')).toBe(false);
+      expect(phases.some(entry => entry.phase === 'query_scope_stale')).toBe(true);
+      await service.completeUserTurnProjection('turn-scope-b');
+    });
+
+    it('a late result already in the old CLI pipe is dropped by the old consumer loop once the scope is replaced', async () => {
+      sdkMock.setMockMessages([
+        { type: 'system', subtype: 'init', session_id: 'watch-session' },
+        { type: 'assistant', message: { content: [{ type: 'text', text: 'model reply' }] } },
+      ], { appendResult: false });
+      await startPersistentQuery(service);
+
+      const turnA = service.prepareTurn({ turnId: 'turn-pipe-a', text: 'hello' });
+      const genA = service.query(turnA);
+      await genA.next();
+      const oldScope = (service as any).currentQueryScope;
+
+      // The old CLI already wrote its result line before the retirement
+      // reached it (buffered trailing output draining after close).
+      const oldQuery = sdkMock.getLastResponse()!;
+      oldQuery.pushLateMessage({ type: 'result', subtype: 'success', result: 'pipe residue' });
+
+      installReplacementQuery(service);
+      const turnB = service.prepareTurn({ turnId: 'turn-pipe-b', text: 'queued hello' });
+      const genB = service.query(turnB);
+      await genB.next();
+      await flushMicrotasks();
+
+      // Retire the old channel: its prompt iterable ends, the old generator
+      // drains the buffered result, and the old consumer loop must drop it.
+      (oldScope.channel as MessageChannel).close();
+      for (let i = 0; i < 20; i += 1) {
+        await Promise.resolve();
+        await Promise.resolve();
+      }
+
+      expect((service as any).runtimeTurns.get('turn-pipe-b').phase).toBe('collecting');
+      const phases = await readDiagnosticPhases(diagDir);
+      expect(phases.some(entry => entry.phase === 'settle_result')).toBe(false);
+      await service.completeUserTurnProjection('turn-pipe-b');
+    });
+
+    it("an old turn's cancellation never escalates onto the new channel's lease holder", async () => {
+      sdkMock.setMockMessages([
+        { type: 'system', subtype: 'init', session_id: 'watch-session' },
+        { type: 'assistant', message: { content: [{ type: 'text', text: 'model reply' }] } },
+      ], { appendResult: false });
+      await startPersistentQuery(service);
+
+      const turnA = service.prepareTurn({ turnId: 'turn-esc-a', text: 'hello' });
+      const genA = service.query(turnA);
+      await genA.next();
+      const turnAObserved = (service as any).runtimeTurns.get('turn-esc-a');
+
+      installReplacementQuery(service);
+      const turnB = service.prepareTurn({ turnId: 'turn-esc-b', text: 'queued hello' });
+      const genB = service.query(turnB);
+      await genB.next();
+      await flushMicrotasks();
+      const channelB = (service as any).messageChannel as MessageChannel;
+      expect(channelB.getActiveTurnId()).toBe('turn-esc-b');
+
+      // Cancelling the OLD turn (still holding old-scope state) must not run
+      // the mismatch path against the new channel's lease holder.
+      expect(turnAObserved.queryEpoch).not.toBe((service as any).currentQueryScope.epoch);
+      (service as any).cancelTurn('turn-esc-a', 'test_scope_isolation');
+
+      expect(channelB.getActiveTurnId()).toBe('turn-esc-b');
+      expect((service as any).runtimeTurns.has('turn-esc-b')).toBe(true);
+      const phases = await readDiagnosticPhases(diagDir);
+      expect(phases.some(entry => entry.phase === 'query_close' && String(entry.detail).includes('lease protocol error'))).toBe(false);
+    });
+
+    it("an old query's stdin error never closes the scope that replaced it", async () => {
+      sdkMock.setMockMessages([
+        { type: 'system', subtype: 'init', session_id: 'watch-session' },
+        { type: 'assistant', message: { content: [{ type: 'text', text: 'model reply' }] } },
+      ], { appendResult: false });
+      await startPersistentQuery(service);
+      const oldQuery = sdkMock.getLastResponse()!;
+      installReplacementQuery(service);
+      expect((service as any).currentQueryScope.query).not.toBe(oldQuery);
+
+      const closeSpy = jest.spyOn(service, 'closePersistentQuery');
+      let errorHandler: (error: NodeJS.ErrnoException) => void = () => {};
+      const stdinMock = {
+        on: jest.fn((event: string, handler: any) => { if (event === 'error') errorHandler = handler; }),
+        once: jest.fn(),
+        removeListener: jest.fn(),
+      };
+      (oldQuery as any).transport = { processStdin: stdinMock };
+      (service as any).attachPersistentQueryStdinErrorHandler(oldQuery as any);
+
+      errorHandler({ code: 'ECONNRESET', message: 'Connection reset' } as NodeJS.ErrnoException);
+      expect(closeSpy).not.toHaveBeenCalled();
+      expect((service as any).currentQueryScope).not.toBeNull();
+      closeSpy.mockRestore();
+    });
   });
 
   describe('B-(a) stopTask before interrupt (armed watchdog path)', () => {

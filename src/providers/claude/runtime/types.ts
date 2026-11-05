@@ -169,6 +169,12 @@ export interface RuntimeTurn {
   lastRoutedMessageAt: number | null;
   /** Recovery generation carried by the exact dispatch awaiting confirmation. */
   recoveryGeneration?: number;
+  /**
+   * Query epoch this turn was dispatched under (query boundary, 2.4). Lease
+   * release and delayed handoffs resolve against the scope that owns this
+   * epoch, so an old turn's completion can never act on a newer channel.
+   */
+  queryEpoch?: number;
 }
 
 export interface RuntimeTurnOptions {
