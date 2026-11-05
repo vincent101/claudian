@@ -2873,7 +2873,7 @@ export class ClaudianService implements ChatRuntime {
       // proof the CLI turn ended, and cancelling before the rebuild would
       // pump the queue into the same dead query. A result arriving later is
       // dropped by the stale-scope routing guard.
-      await this.retireAndRebuildQuery('result_watchdog');
+      await this.retireAndRebuildQuery('result_watchdog', turn.id);
       this.cancelTurn(turn.id, 'result_watchdog');
     } finally {
       attempt.phase = 'finished';
@@ -2908,17 +2908,17 @@ export class ClaudianService implements ChatRuntime {
    * the old result settle the NEXT turn. Single-flight — concurrent callers
    * (query/ensureReady/cold fallback) all wait on the same chain.
    */
-  retireAndRebuildQuery(reason: string): Promise<void> {
+  retireAndRebuildQuery(reason: string, exemptTurnId?: string): Promise<void> {
     if (this.queryRetirementChain) {
       return this.queryRetirementChain;
     }
-    this.queryRetirementChain = this.executeQueryRetirement(reason).finally(() => {
+    this.queryRetirementChain = this.executeQueryRetirement(reason, exemptTurnId).finally(() => {
       this.queryRetirementChain = null;
     });
     return this.queryRetirementChain;
   }
 
-  private async executeQueryRetirement(reason: string): Promise<void> {
+  private async executeQueryRetirement(reason: string, exemptTurnId?: string): Promise<void> {
     const scope = this.currentQueryScope;
     const query = this.persistentQuery;
     const channel = this.messageChannel;
@@ -2931,7 +2931,12 @@ export class ClaudianService implements ChatRuntime {
     // 2. Extract the never-dispatched queue BEFORE closing the input —
     //    canonical UUIDs, host aliases, merged payloads, order all survive.
     const unsent = channel.extractUnsentQueue();
-    channel.close();
+    // Baseline closePersistentQuery parity: close() reports every id that
+    // still held lease/queue state on the dying channel. The retirement
+    // caller settles its own stalled turn afterwards (exemptTurnId); any
+    // OTHER live holder is a protocol anomaly — it is settled below so its
+    // waiters cannot hang on a channel that will never route again.
+    const retiredChannelTurnIds = channel.close();
     // 3. Remove from the slot. A plain-cancel tombstone belonged to the dying
     //    channel; its 15s window must never fire against the replacement.
     if (this.cancelBoundaryTombstone) {
@@ -2947,6 +2952,16 @@ export class ClaudianService implements ChatRuntime {
       phase: 'query_retire',
       detail: `${reason} epoch=${scope.epoch} unsent=${unsent.length}`,
     });
+    // Anomaly fallback (the slot is already cleared, so cancelTurn's lease
+    // release is a no-op — settling never touches the replacement channel):
+    // a lease holder the retirement caller does not settle itself must not
+    // keep waiters parked on a dead channel.
+    for (const id of retiredChannelTurnIds) {
+      if (id === exemptTurnId) continue;
+      if (this.runtimeTurns.has(id)) {
+        this.cancelTurn(id, 'persistent_query_retired');
+      }
+    }
     // 4. Official close + abort (no extra interrupt — close terminates).
     //    Register the exit wait BEFORE close: the spawn exit notification can
     //    fire synchronously inside close() and must find its waiter.

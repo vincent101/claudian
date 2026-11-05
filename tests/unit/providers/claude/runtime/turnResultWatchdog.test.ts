@@ -1075,6 +1075,38 @@ describe('ClaudianService - P0-1 result-late watchdog', () => {
       expect(sdkMock.getQueryCallCount()).toBe(2);
       expect((service as any).persistentQuery).not.toBeNull();
     });
+
+    it('a channel-reported lease holder nobody settles is force-settled by the retirement, not left hanging', async () => {
+      sdkMock.setMockMessages([
+        { type: 'system', subtype: 'init', session_id: 'watch-session' },
+        { type: 'assistant', message: { content: [{ type: 'text', text: 'model reply' }] } },
+      ], { appendResult: false });
+      await startPersistentQuery(service);
+
+      const turn = service.prepareTurn({ turnId: 'turn-anomaly', text: 'hello' });
+      const gen = service.query(turn);
+      await gen.next();
+      const pendingNext = gen.next();
+      await flushMicrotasks();
+      // The turn is dispatched (holds the lease) and awaiting its result.
+      expect((service as any).messageChannel.getActiveTurnId()).toBe('turn-anomaly');
+
+      // Protocol-anomaly stand-in: the retirement caller's exempt id is NOT
+      // the channel-reported lease holder, so close()'s returned id has no
+      // other settler — the retirement's fallback must settle it.
+      await service.retireAndRebuildQuery('test anomaly retire', 'some-unrelated-turn');
+      await flushMicrotasks();
+
+      expect((await pendingNext).value).toEqual({ type: 'done' });
+      expect((service as any).runtimeTurns.has('turn-anomaly')).toBe(false);
+      // The rebuild itself still completes: one replacement CLI, no prohibition.
+      expect(sdkMock.getQueryCallCount()).toBe(2);
+      expect((service as any).queryStartProhibited).toBeNull();
+      expect((service as any).persistentQuery).not.toBeNull();
+      const phases = await readDiagnosticPhases(diagDir);
+      expect(phases.some(entry => entry.phase === 'turn_cancel' && entry.detail === 'persistent_query_retired')).toBe(true);
+      await gen.return(undefined);
+    });
   });
 
   describe('start single-flight and send prohibition (2026-11-05 spec 2.4 wiring)', () => {
