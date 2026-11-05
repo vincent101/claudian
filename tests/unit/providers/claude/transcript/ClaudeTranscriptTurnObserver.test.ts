@@ -914,6 +914,120 @@ describe('ClaudeTranscriptTurnObserver', () => {
       });
     });
   });
+
+  describe('compact boundary attribution (2026-11-04 d8912b5b: boundary flushes before the host /compact row)', () => {
+    function hostUserRow(uuid: string): string {
+      return JSON.stringify({ type: 'user', uuid, isSidechain: false, message: { role: 'user', content: 'hello' } });
+    }
+
+    function compactBoundaryLine(timestamp: string, lineOffset = 100): { line: string; lineOffset: number } {
+      return {
+        line: JSON.stringify({
+          type: 'system', subtype: 'compact_boundary', timestamp,
+          compactMetadata: { trigger: 'manual', durationMs: 137011 }, version: '2.1.227',
+        }),
+        lineOffset,
+      };
+    }
+
+    /** The #1 measured row order: boundary → continuation → caveat → the
+     * buffered /compact host row → stdout. The host row has NOT landed when
+     * the boundary is consumed. */
+    function compactTurnTail(boundaryTimestamp: string): { lines: string[]; lineOffsets: number[] } {
+      const rows = [
+        compactBoundaryLine(boundaryTimestamp, 100).line,
+        JSON.stringify({ type: 'user', uuid: 'compact-continuation', isSidechain: false, shouldQuery: false, message: { role: 'user', content: 'Conversation compacted' } }),
+        JSON.stringify({ type: 'user', uuid: 'compact-caveat', isSidechain: false, isMeta: true, userType: 'external', message: { role: 'user', content: 'caveat' } }),
+        JSON.stringify({ type: 'user', uuid: 'compact-cmd-row', isSidechain: false, message: { role: 'user', content: '/compact' } }),
+        JSON.stringify({ type: 'user', uuid: 'compact-stdout', isSidechain: false, isMeta: true, message: { role: 'user', content: 'Compacted Tip: You have access to Opus 1M.' } }),
+      ];
+      return { lines: rows, lineOffsets: rows.map((_, index) => 100 + index * 50) };
+    }
+
+    it('timestamps attribute the boundary to the live host turn whose own row has not landed yet (row order inverted)', async () => {
+      await writeFile(file, '');
+      const { observer, callbacks } = setup();
+      await observer.start(file);
+      observer.registerHostUserTranscriptId('compact-cmd-row');
+      observer.beginUserTurnProjection('turn-compact');
+      const generation = (observer as any).generation;
+
+      // Dispatch stamp is "now"; the boundary row carries a creation
+      // timestamp strictly after it (compaction ran for 2m17s after dispatch).
+      const dispatchedAt = Date.now();
+      const tail = compactTurnTail(new Date(dispatchedAt + 137_000).toISOString());
+      await (observer as any).consumeBatch({ ...tail, reset: false }, generation);
+
+      expect(callbacks.onHostTurnTerminalObserved).toHaveBeenCalledTimes(1);
+      expect(callbacks.onHostTurnTerminalObserved).toHaveBeenCalledWith('turn-compact', { kind: 'compact', cliVersion: '2.1.227' });
+      observer.stop();
+    });
+
+    it('T-cross-1: the previous turn\'s boundary residue (rowTimestamp ≤ dispatchedAt) never stamps the new turn', async () => {
+      await writeFile(file, '');
+      const { observer, callbacks } = setup();
+      await observer.start(file);
+      observer.registerHostUserTranscriptId('cross1-n2-row');
+      const dispatchedAt = Date.now();
+      observer.beginUserTurnProjection('turn-cross1-n2');
+      const generation = (observer as any).generation;
+
+      // Turn N-1's boundary was written before turn N was dispatched, but is
+      // batch-consumed only now (tail lag). Its row timestamp predates the
+      // dispatch: attribution must drop it.
+      const residue = compactBoundaryLine(new Date(dispatchedAt - 60_000).toISOString());
+      await (observer as any).consumeBatch(
+        { lines: [residue.line, hostUserRow('cross1-n2-row')], lineOffsets: [residue.lineOffset, 300], reset: false },
+        generation,
+      );
+      expect(callbacks.onHostTurnTerminalObserved).not.toHaveBeenCalled();
+      observer.stop();
+    });
+
+    it('T-cross-2: double compact dispatch — the stale boundary drops while the live boundary stamps once', async () => {
+      await writeFile(file, '');
+      const { observer, callbacks } = setup();
+      await observer.start(file);
+      observer.registerHostUserTranscriptId('cross2-n2-row');
+      const dispatchedN2 = Date.now();
+      observer.beginUserTurnProjection('turn-cross2-n2');
+      const generation = (observer as any).generation;
+
+      const stale = compactBoundaryLine(new Date(dispatchedN2 - 60_000).toISOString(), 100);
+      const live = compactBoundaryLine(new Date(dispatchedN2 + 30_000).toISOString(), 150);
+      await (observer as any).consumeBatch(
+        { lines: [stale.line, live.line, hostUserRow('cross2-n2-row')], lineOffsets: [stale.lineOffset, live.lineOffset, 300], reset: false },
+        generation,
+      );
+      expect(callbacks.onHostTurnTerminalObserved).toHaveBeenCalledTimes(1);
+      expect(callbacks.onHostTurnTerminalObserved).toHaveBeenCalledWith('turn-cross2-n2', { kind: 'compact', cliVersion: '2.1.227' });
+      observer.stop();
+    });
+
+    it('recovery replay of a boundary row never notifies the host callback (double insurance with the mapper guard)', async () => {
+      const dispatchedAt = Date.now();
+      await writeFile(file, `${compactBoundaryLine(new Date(dispatchedAt + 10_000).toISOString()).line}\n`);
+      const { observer, callbacks } = setup();
+      observer.beginUserTurnProjection('turn-compact-replay');
+      await observer.start(file);
+
+      expect(callbacks.onHostTurnTerminalObserved).not.toHaveBeenCalled();
+      observer.stop();
+    });
+
+    it('a boundary without a parseable timestamp never notifies (fail-safe)', async () => {
+      await writeFile(file, '');
+      const { observer, callbacks } = setup();
+      await observer.start(file);
+      observer.beginUserTurnProjection('turn-compact-nan');
+      const generation = (observer as any).generation;
+
+      const bad = compactBoundaryLine('not-a-timestamp');
+      await (observer as any).consumeBatch({ lines: [bad.line], lineOffsets: [bad.lineOffset], reset: false }, generation);
+      expect(callbacks.onHostTurnTerminalObserved).not.toHaveBeenCalled();
+      observer.stop();
+    });
+  });
 });
 
 describe('ClaudeTranscriptTurnObserver — reconciliation bypass (batch 1)', () => {

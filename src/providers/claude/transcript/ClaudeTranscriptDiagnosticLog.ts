@@ -21,9 +21,11 @@ export type TranscriptDiagnosticPhase =
   // Turn settlement & cancellation reliability (P0 batch, 2026-11-01):
   // cancel/close/settle/interrupt trace plus the SDK session-state (runPhase)
   // bypass. reconcile_fix is reserved for the P1-2 reconciler.
+  // 2026-11-04 d8912b5b follow-up: turn_cancel closes the cancelTurn blind
+  // spot (U-A: silent settles were unattributable).
   | 'cancel_request' | 'runtime_cancel' | 'query_close' | 'force_settle'
   | 'settle_watchdog_fire' | 'interrupt_sent' | 'settle_result' | 'reconcile_fix'
-  | 'run_phase';
+  | 'run_phase' | 'turn_cancel';
 
 export interface TranscriptDiagnosticEvent {
   phase: TranscriptDiagnosticPhase;
@@ -72,6 +74,10 @@ export interface TranscriptDiagnosticEvent {
   terminalSeenAgeMs?: number;
   /** Watchdog (settle_watchdog_fire): ms since the last chunk reached the turn. */
   lastChunkAgeMs?: number;
+  /** Watchdog (settle_watchdog_fire): which terminal evidence armed it (compact boundary vs stop_hook pair). */
+  evidenceKind?: 'compact' | 'stop_hook';
+  /** CLI version carried by the terminal-evidence transcript row (compact boundary rows carry it natively). */
+  cliVersion?: string;
   /** Free-form short context: query-close reason, run_phase state value, force-settle outcome. */
   detail?: string;
 }
@@ -121,7 +127,7 @@ export class ClaudeTranscriptDiagnosticLog {
 
   private serialize(event: TranscriptDiagnosticEvent): string {
     const clean: Record<string, unknown> = { ts: Date.now(), seq: ++this.seq, phase: event.phase };
-    for (const key of ['tabIdHash', 'turnIdHash', 'pageKeyHash', 'previousPageKeyHash', 'rangeStart', 'rangeEnd', 'generation', 'renderTicket', 'projectedWeight', 'leaseKind', 'batchBytes', 'batchLines', 'elapsedMs', 'errorName', 'buildId', 'mode', 'reason', 'outcome', 'trigger', 'identityRecovery', 'recoveredIdentityFields', 'offset', 'queueMs', 'bytes', 'totalBytes', 'entries', 'turns', 'turnCount', 'sourceBytes', 'projectedChars', 'oversizedTurns', 'hostAliases', 'sourceKind', 'queueLength', 'isStreaming', 'terminalSeenAgeMs', 'lastChunkAgeMs', 'detail'] as const) {
+    for (const key of ['tabIdHash', 'turnIdHash', 'pageKeyHash', 'previousPageKeyHash', 'rangeStart', 'rangeEnd', 'generation', 'renderTicket', 'projectedWeight', 'leaseKind', 'batchBytes', 'batchLines', 'elapsedMs', 'errorName', 'buildId', 'mode', 'reason', 'outcome', 'trigger', 'identityRecovery', 'recoveredIdentityFields', 'offset', 'queueMs', 'bytes', 'totalBytes', 'entries', 'turns', 'turnCount', 'sourceBytes', 'projectedChars', 'oversizedTurns', 'hostAliases', 'sourceKind', 'queueLength', 'isStreaming', 'terminalSeenAgeMs', 'lastChunkAgeMs', 'evidenceKind', 'cliVersion', 'detail'] as const) {
       const value = event[key];
       if (value !== undefined) clean[key] = typeof value === 'string' ? value.slice(0, 128) : value;
     }

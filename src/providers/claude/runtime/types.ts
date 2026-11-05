@@ -146,10 +146,14 @@ export interface RuntimeTurn {
   /**
    * P0-1 result-late watchdog: observer tick time at which the transcript
    * first showed this turn's terminal state (end_turn + stop-hook
-   * evidence). Null until then — a long turn without terminal evidence must
-   * never arm the watchdog (T4 red line).
+   * evidence, or a manual compact_boundary). Null until then — a long turn
+   * without terminal evidence must never arm the watchdog (T4 red line).
    */
   transcriptTerminalSeenAt: number | null;
+  /** Which terminal evidence stamped transcriptTerminalSeenAt (stop_hook pair is the pre-compact default). */
+  transcriptTerminalSource?: 'compact' | 'stop_hook';
+  /** CLI version carried by the terminal-evidence row (compact boundary evidence only). */
+  transcriptTerminalCliVersion?: string;
   /** P0-1 diagnostics: wall time of the last chunk delivered to this turn. */
   lastChunkAt: number | null;
   /**

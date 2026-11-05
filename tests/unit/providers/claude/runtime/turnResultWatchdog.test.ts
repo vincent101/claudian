@@ -513,4 +513,124 @@ describe('ClaudianService - P0-1 result-late watchdog', () => {
     const phases = await readDiagnosticPhases(diagDir);
     expect(phases.filter(entry => entry.phase === 'settle_watchdog_fire')).toHaveLength(1);
   });
+
+  it('T1c: manual compact boundary evidence arms the watchdog and force-settles the hung compact turn (d8912b5b row order)', async () => {
+    sdkMock.setMockMessages([
+      { type: 'system', subtype: 'init', session_id: 'watch-session' },
+      { type: 'assistant', message: { content: [{ type: 'text', text: 'model reply' }] } },
+    ], { appendResult: false });
+    await startPersistentQuery(service);
+
+    const turn = service.prepareTurn({ turnId: 'turn-t1c', text: '/compact' });
+    const gen = service.query(turn);
+    const first = await gen.next();
+    expect(first.value).toEqual(expect.objectContaining({ type: 'text', content: 'model reply' }));
+
+    service.beginUserTurnProjection('turn-t1c');
+    await flushMicrotasks();
+    const t1cUuid = (service as any).lastSentMessage.uuid as string;
+    (service as any).transcriptObserver.registerHostUserTranscriptId(t1cUuid);
+
+    let settled = false;
+    const settledNext = gen.next().then(value => {
+      settled = true;
+      return value;
+    });
+    await flushMicrotasks();
+
+    // A second message queues behind the hung lease (the d8912b5b user messages).
+    const queuedTurn = service.prepareTurn({ turnId: 'turn-t1c-q', text: 'queued hello' });
+    const queuedGen = service.query(queuedTurn);
+    let queuedResolved = false;
+    const queuedNext = queuedGen.next().then(value => {
+      queuedResolved = true;
+      return value;
+    });
+    await flushMicrotasks();
+
+    // #1 measured compact-turn row order: the boundary flushes BEFORE the
+    // buffered /compact host row (its UUID is known but the row is absent) —
+    // attribution must work off the boundary timestamp alone.
+    const boundaryTs = new Date(Date.now() + 137_000).toISOString();
+    const compactRows = [
+      JSON.stringify({ type: 'system', subtype: 'stop_hook_summary', isSidechain: false }),
+      JSON.stringify({ type: 'system', subtype: 'compact_boundary', isSidechain: false, timestamp: boundaryTs, compactMetadata: { trigger: 'manual', durationMs: 137011, postTokens: 12340 }, version: '2.1.227' }),
+      JSON.stringify({ type: 'user', uuid: 't1c-continuation', isSidechain: false, shouldQuery: false, message: { role: 'user', content: 'Conversation compacted' } }),
+      JSON.stringify({ type: 'user', uuid: 't1c-caveat', isSidechain: false, isMeta: true, userType: 'external', message: { role: 'user', content: 'caveat' } }),
+      JSON.stringify({ type: 'user', uuid: t1cUuid, isSidechain: false, message: { role: 'user', content: '/compact' } }),
+      JSON.stringify({ type: 'user', uuid: 't1c-stdout', isSidechain: false, isMeta: true, message: { role: 'user', content: 'Compacted Tip: You have access to Opus 1M.' } }),
+    ].join('\n') + '\n';
+    await appendFile(transcriptFile, compactRows);
+    await driveObserverTick();
+    expect((service as any).runtimeTurns.get('turn-t1c').transcriptTerminalSeenAt).not.toBeNull();
+
+    sdkMock.setMockMessages([
+      { type: 'assistant', message: { content: [{ type: 'text', text: 'queued reply' }] } },
+      { type: 'result', subtype: 'success', result: 'ok' },
+    ], { appendResult: false });
+
+    await jest.advanceTimersByTimeAsync(RESULT_WATCHDOG_MS);
+    const query = sdkMock.getLastResponse();
+    expect(query?.interrupt).toHaveBeenCalledTimes(1);
+
+    await jest.advanceTimersByTimeAsync(RESULT_WATCHDOG_GRACE_MS);
+    await flushMicrotasks();
+
+    expect(settled).toBe(true);
+    const settledValue = await settledNext;
+    expect(settledValue.value).toEqual({ type: 'done' });
+    expect((service as any).runtimeTurns.has('turn-t1c')).toBe(false);
+    expect(((service as any).messageChannel as MessageChannel).getActiveTurnId()).toBe('turn-t1c-q');
+    const queuedFirst = await queuedNext;
+    expect(queuedResolved).toBe(true);
+    expect(queuedFirst.value).toEqual(expect.objectContaining({ type: 'text', content: 'queued reply' }));
+    await service.completeUserTurnProjection('turn-t1c-q');
+    const queuedDone = await queuedGen.next();
+    expect(queuedDone.value).toEqual({ type: 'done' });
+
+    const phases = await readDiagnosticPhases(diagDir);
+    const fire = phases.filter(entry => entry.phase === 'settle_watchdog_fire');
+    expect(fire).toHaveLength(1);
+    expect(fire[0].evidenceKind).toBe('compact');
+    expect(fire[0].cliVersion).toBe('2.1.227');
+    expect(phases.some(entry => entry.phase === 'turn_cancel' && entry.detail === 'result_watchdog')).toBe(true);
+  });
+
+  it('T4c: auto compact (mid-turn compaction, turn keeps running) never arms the watchdog', async () => {
+    sdkMock.setMockMessages([
+      { type: 'system', subtype: 'init', session_id: 'watch-session' },
+      { type: 'assistant', message: { content: [{ type: 'text', text: 'working' }] } },
+    ], { appendResult: false });
+    await startPersistentQuery(service);
+
+    const turn = service.prepareTurn({ turnId: 'turn-t4c', text: 'long analysis' });
+    const gen = service.query(turn);
+    await gen.next();
+    service.beginUserTurnProjection('turn-t4c');
+    await flushMicrotasks();
+    const t4cUuid = (service as any).lastSentMessage.uuid as string;
+    (service as any).transcriptObserver.registerHostUserTranscriptId(t4cUuid);
+    await appendFile(transcriptFile, hostUserRowLine(t4cUuid));
+    await driveObserverTick();
+
+    let settled = false;
+    void gen.next().then(() => { settled = true; });
+    await flushMicrotasks();
+
+    // Auto compaction fires mid-turn; the boundary row is NOT terminal evidence.
+    await appendFile(transcriptFile, JSON.stringify({
+      type: 'system', subtype: 'compact_boundary', isSidechain: false,
+      timestamp: new Date(Date.now() + 5_000).toISOString(),
+      compactMetadata: { trigger: 'auto' }, version: '2.1.227',
+    }) + '\n');
+    await driveObserverTick();
+    expect((service as any).runtimeTurns.get('turn-t4c').transcriptTerminalSeenAt).toBeNull();
+
+    await jest.advanceTimersByTimeAsync(RESULT_WATCHDOG_MS + RESULT_WATCHDOG_GRACE_MS);
+    await flushMicrotasks();
+    expect(settled).toBe(false);
+    expect(sdkMock.getLastResponse()?.interrupt).not.toHaveBeenCalled();
+    const phases = await readDiagnosticPhases(diagDir);
+    expect(phases.some(entry => entry.phase === 'settle_watchdog_fire')).toBe(false);
+  });
 });

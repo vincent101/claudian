@@ -1462,6 +1462,10 @@ export class ClaudianService implements ChatRuntime {
     if (!turn) {
       return;
     }
+    // P0-2 blind-spot closure (2026-11-04 U-A): cancelTurn had no diagnostic
+    // at all, so silent settles like the d8912b5b host_only@11:46:08 could
+    // never be attributed. reason answers "who cancelled what, when".
+    this.recordTranscriptDiagnostic({ phase: 'turn_cancel', turnId, generation: turn.generation, detail: reason });
     this.noteTurnIdentitySettled(turnId);
     // Clear before branching so every cancellation exit drops stale defensive
     // attribution state. This cannot fix a missing notification result while
@@ -2264,6 +2268,8 @@ export class ClaudianService implements ChatRuntime {
       leaseKind: turn.kind,
       terminalSeenAgeMs: now - terminalSeenAt,
       ...(turn.lastChunkAt !== null ? { lastChunkAgeMs: now - turn.lastChunkAt } : {}),
+      evidenceKind: turn.transcriptTerminalSource ?? 'stop_hook',
+      ...(turn.transcriptTerminalCliVersion ? { cliVersion: turn.transcriptTerminalCliVersion } : {}),
     });
     // One interrupt so the CLI gets a chance to flush its belated result.
     if (this.persistentQuery && !this.shuttingDown) {
@@ -2711,7 +2717,7 @@ export class ClaudianService implements ChatRuntime {
         released: turnId => this._onAutoTurnReleased?.(turnId),
         cancelled: event => this._onAutoTurnCancelled?.(event),
         projectEmbeddedExternal: event => this._onEmbeddedExternal?.(event) ?? Promise.resolve(),
-        onHostTurnTerminalObserved: turnId => this.noteTranscriptTerminalSeen(turnId),
+        onHostTurnTerminalObserved: (turnId, evidence) => this.noteTranscriptTerminalSeen(turnId, evidence),
       }, () => true, this.transcriptDiagnosticLog, {
         // Observe-mode bypass: verdicts are recorded as diagnostics only.
         recordObservedStart: fact => this.turnReconciliation.recordObservedStart(fact),
@@ -2876,13 +2882,18 @@ export class ClaudianService implements ChatRuntime {
   /**
    * P0-1: stamp the observer tick time at which the transcript first showed
    * the host turn's terminal state. First-seen wins: later ticks (quiet
-   * settle, trailing rows) must not extend the threshold.
+   * settle, trailing rows) must not extend the threshold. The evidence
+   * payload (compact vs stop_hook, CLI version) only rides the compact path.
    */
-  private noteTranscriptTerminalSeen(turnId: string): void {
+  private noteTranscriptTerminalSeen(turnId: string, evidence?: { kind: 'compact' | 'stop_hook'; cliVersion?: string }): void {
     const turn = this.runtimeTurns.get(turnId);
     if (!turn || turn.phase === 'settled' || turn.phase === 'cancelled') return;
     if (turn.transcriptTerminalSeenAt === null) {
       turn.transcriptTerminalSeenAt = Date.now();
+      if (evidence) {
+        turn.transcriptTerminalSource = evidence.kind;
+        if (evidence.cliVersion) turn.transcriptTerminalCliVersion = evidence.cliVersion;
+      }
     }
   }
 

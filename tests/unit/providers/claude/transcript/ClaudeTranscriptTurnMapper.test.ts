@@ -494,4 +494,80 @@ describe('ClaudeTranscriptTurnMapper', () => {
       expect(facts).toContainEqual(expect.objectContaining({ type: 'observed_host_terminal', lineOffset: 120, replay: false }));
     });
   });
+
+  describe('compact boundary terminal evidence (2026-11-04 d8912b5b: compact turns never write end_turn)', () => {
+    const hostContext: TranscriptMapContext = { hostUserTurnActive: true };
+    const boundaryTs = '2026-11-04T11:46:03.171Z';
+
+    function compactBoundary(options?: { trigger?: string; timestamp?: string; version?: string }): SDKNativeMessage {
+      return {
+        type: 'system',
+        subtype: 'compact_boundary',
+        isSidechain: false,
+        timestamp: options?.timestamp ?? boundaryTs,
+        compactMetadata: { trigger: options?.trigger ?? 'manual', durationMs: 137011 },
+        version: options?.version ?? '2.1.227',
+      } as unknown as SDKNativeMessage;
+    }
+
+    it('emits the host terminal fact immediately for a manual boundary (arm+confirm in one row)', () => {
+      const mapper = new ClaudeTranscriptTurnMapper();
+      const facts = mapper.map(compactBoundary(), false, hostContext);
+      expect(facts).toContainEqual(expect.objectContaining({
+        type: 'observed_host_terminal',
+        terminalSource: 'compact',
+        rowTimestamp: Date.parse(boundaryTs),
+        cliVersion: '2.1.227',
+        replay: false,
+      }));
+      // Immediate emission: no candidate state survives (later continuation
+      // rows cannot destroy the evidence the way they would a candidate).
+      expect(mapper.hasTerminalCandidate()).toBe(false);
+    });
+
+    it('auto compact (mid-turn compaction, the turn keeps running) emits no fact', () => {
+      const mapper = new ClaudeTranscriptTurnMapper();
+      const facts = mapper.map(compactBoundary({ trigger: 'auto' }), false, hostContext);
+      expect(facts.some(fact => fact.type === 'observed_host_terminal')).toBe(false);
+      expect(mapper.hasTerminalCandidate()).toBe(false);
+    });
+
+    it('a boundary with a missing or unparseable timestamp emits no fact (fail-safe: degrade to current behavior)', () => {
+      const mapper = new ClaudeTranscriptTurnMapper();
+      expect(mapper.map(compactBoundary({ timestamp: 'not-a-timestamp' }), false, hostContext))
+        .toEqual([]);
+      const missing = compactBoundary() as unknown as Record<string, unknown>;
+      delete missing.timestamp;
+      expect(mapper.map(missing as unknown as SDKNativeMessage, false, hostContext))
+        .toEqual([]);
+    });
+
+    it('emits nothing without a live host turn, while an external turn is open, or behind an embedded external emission', () => {
+      const noHost = new ClaudeTranscriptTurnMapper();
+      expect(noHost.map(compactBoundary(), false, { hostUserTurnActive: false }).some(fact => fact.type === 'observed_host_terminal'))
+        .toBe(false);
+
+      const openExternal = new ClaudeTranscriptTurnMapper();
+      openExternal.map({ type: 'user', uuid: 'notif-open', isSidechain: false, origin: { kind: 'task-notification' }, message: { role: 'user', content: 'task' } }, false, hostContext);
+      expect(openExternal.map(compactBoundary(), false, hostContext).some(fact => fact.type === 'observed_host_terminal'))
+        .toBe(false);
+
+      const embedded = new ClaudeTranscriptTurnMapper();
+      embedded.map({ ...peer, uuid: 'peer-embedded-compact' }, false, hostContext);
+      expect(embedded.map(compactBoundary(), false, hostContext).some(fact => fact.type === 'observed_host_terminal'))
+        .toBe(false);
+    });
+
+    it('the buffered /compact host row landing after the boundary cannot retroactively retract the emitted fact', () => {
+      const mapper = new ClaudeTranscriptTurnMapper();
+      const facts = mapper.map(compactBoundary(), false, hostContext);
+      expect(facts).toHaveLength(1);
+
+      // The CLI buffers the /compact command line and flushes it after
+      // compaction completes: the host-row reset branch runs after emission.
+      const later = mapper.map({ type: 'user', uuid: 'compact-cmd-row', isSidechain: false, message: { role: 'user', content: '/compact' } }, false, hostContext);
+      expect(later.some(fact => fact.type === 'observed_host_terminal')).toBe(false);
+      expect(facts).toHaveLength(1);
+    });
+  });
 });

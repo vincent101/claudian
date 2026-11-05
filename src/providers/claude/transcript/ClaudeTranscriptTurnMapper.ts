@@ -73,11 +73,19 @@ export type TranscriptTurnFact =
        * Host rows never open a mapper turn, so the fact carries no identity:
        * the observer attaches the live hostUserTurnId when notifying the
        * runtime. Evidence = end_turn candidate confirmed by stop_hook_summary
-       * (or quiet-settled when no Stop hook writes a summary row).
+       * (or quiet-settled when no Stop hook writes a summary row), OR a
+       * manual compact_boundary row (compact turns never write end_turn —
+       * emitted immediately, no candidate state).
        */
       type: 'observed_host_terminal';
       lineOffset?: number;
       replay: boolean;
+      /** Present only for compact_boundary evidence (stop_hook facts stay unset). */
+      terminalSource?: 'compact';
+      /** Boundary row's creation timestamp (ISO 8601) as epoch ms — the observer attributes by timestamp, not offset. */
+      rowTimestamp?: number;
+      /** CLI version carried by the boundary row (retirement-evidence for the stopTask probe). */
+      cliVersion?: string;
     };
 
 export interface TranscriptMapContext {
@@ -332,6 +340,34 @@ export class ClaudeTranscriptTurnMapper {
       // that turn: its end_turn/summary only return emission ownership to
       // the host, they never arm the host candidate.
       if (endTurn || stopHookSummary) this.embeddedExternalEmission = false;
+      return;
+    }
+    const compactBoundary = message.type === 'system' && message.subtype === 'compact_boundary'
+      && (message as { compactMetadata?: { trigger?: unknown } }).compactMetadata?.trigger === 'manual';
+    if (compactBoundary) {
+      // Manual compact terminal evidence (2026-11-04 d8912b5b): compact turns
+      // never write end_turn/stop_hook_summary, so the boundary row itself is
+      // arm+confirm. Emitted IMMEDIATELY with no candidate state: the boundary
+      // lands before the buffered /compact host row and the continuation rows
+      // that follow would walk the host-row reset branch and destroy a
+      // candidate — immediate emission is structurally immune to that order.
+      // auto compact is a mid-turn non-terminal (turn keeps running): only
+      // trigger=manual qualifies (explicit exclusion, not ≠auto).
+      const timestamp = typeof message.timestamp === 'string' ? Date.parse(message.timestamp) : NaN;
+      if (!Number.isNaN(timestamp)) {
+        const version = (message as { version?: unknown }).version;
+        facts.push({
+          type: 'observed_host_terminal',
+          terminalSource: 'compact',
+          rowTimestamp: timestamp,
+          ...(typeof version === 'string' ? { cliVersion: version } : {}),
+          lineOffset: context.lineOffset,
+          replay,
+        });
+      }
+      // Unparseable timestamp: no fact (fail-safe — a timestamp-less boundary
+      // cannot pass the observer's dispatch attribution, degrading to the
+      // pre-compact behavior instead of guessing).
       return;
     }
     if (isStopHookBlockFeedback(message)) {

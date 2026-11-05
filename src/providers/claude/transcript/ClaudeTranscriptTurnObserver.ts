@@ -26,11 +26,13 @@ export interface ClaudeTranscriptObserverCallbacks {
   projectEmbeddedExternal: (event: AutoTurnStartedEvent) => Promise<void>;
   /**
    * P0-1 result-late watchdog terminal signal: the transcript showed the
-   * HOST user turn's terminal state (end_turn + stop-hook evidence) at this
-   * tick. Called with the live hostUserTurnId; the runtime stamps the tick
-   * time onto the turn.
+   * HOST user turn's terminal state (end_turn + stop-hook evidence, or a
+   * manual compact_boundary) at this tick. Called with the live
+   * hostUserTurnId; the runtime stamps the tick time onto the turn. The
+   * optional evidence payload only rides the compact path (kind + CLI
+   * version); stop_hook calls stay single-argument.
    */
-  onHostTurnTerminalObserved: (turnId: string) => void;
+  onHostTurnTerminalObserved: (turnId: string, evidence?: { kind: 'compact' | 'stop_hook'; cliVersion?: string }) => void;
 }
 
 /**
@@ -59,6 +61,10 @@ export class ClaudeTranscriptTurnObserver {
   private hostUserTurnId: string | null = null;
   private readonly hostUserTranscriptIds = new Set<string>();
   private lastHostUserOffset: number | null = null;
+  /** Wall clock of the live host turn's dispatch (beginUserTurnProjection) —
+   * compact boundary facts attribute by timestamp against this anchor, not by
+   * line offset (the boundary physically precedes the buffered /compact row). */
+  private hostUserTurnDispatchedAt: number | null = null;
   /** The live host turn's own user row has been observed on the transcript.
    * Terminal facts may only be attributed to a turn whose row is already on
    * disk — the previous turn's trailing rows can still flush after the
@@ -117,6 +123,7 @@ export class ClaudeTranscriptTurnObserver {
     this.hostUserTranscriptIds.clear();
     this.lastHostUserOffset = null;
     this.hostUserRowObserved = false;
+    this.hostUserTurnDispatchedAt = null;
     this.mapper.reset(this.generation);
   }
 
@@ -126,6 +133,7 @@ export class ClaudeTranscriptTurnObserver {
 
   beginUserTurnProjection(turnId: string): void {
     this.hostUserTurnId = turnId;
+    this.hostUserTurnDispatchedAt = Date.now();
     // A new host user turn is live CLI work: a previous cancel no longer
     // constrains turns that promote behind it.
     this.hostCancelled = false;
@@ -256,7 +264,30 @@ export class ClaudeTranscriptTurnObserver {
     for (const fact of facts) {
       if (fact.type !== 'observed_host_terminal' || fact.replay) continue;
       const hostTurnId = this.hostUserTurnId;
-      if (!hostTurnId || !this.hostUserRowObserved) continue;
+      if (!hostTurnId) continue;
+      if (fact.terminalSource === 'compact') {
+        // Compact attribution (2026-11-04 d8912b5b): the boundary row lands
+        // BEFORE the host's own buffered /compact row, so both stop_hook
+        // defenses (rowObserved, offset) would drop the live boundary. The
+        // boundary belongs to the live host turn iff its creation timestamp
+        // postdates the dispatch: manual compact can only produce a boundary
+        // during the turn that is compacting, while the previous turn's
+        // residue carries a timestamp that predates the new dispatch. A
+        // mismatch (CLI row-order drift) degrades to no stamp — never a
+        // false positive.
+        if (fact.rowTimestamp === undefined) continue;
+        if (this.hostUserTurnDispatchedAt === null || fact.rowTimestamp <= this.hostUserTurnDispatchedAt) continue;
+        try {
+          this.callbacks.onHostTurnTerminalObserved(hostTurnId, {
+            kind: 'compact',
+            ...(fact.cliVersion !== undefined ? { cliVersion: fact.cliVersion } : {}),
+          });
+        } catch {
+          // The bypass must never disturb the consume chain.
+        }
+        continue;
+      }
+      if (!this.hostUserRowObserved) continue;
       // Offset attribution when both anchors are known (live rows). A
       // recovery-claimed row (mid-turn observer restart) has no live offset:
       // every row the live reader can still deliver sits past the replayed
