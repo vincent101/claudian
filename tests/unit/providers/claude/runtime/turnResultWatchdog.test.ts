@@ -1211,7 +1211,7 @@ describe('ClaudianService - P0-1 result-late watchdog', () => {
       expect(query?.interrupt).not.toHaveBeenCalled();
 
       // The result flows inside the stop-task observation window.
-      const routedResult = (service as any).routeMessage({ type: 'result', subtype: 'success', result: 'ok' });
+      sdkMock.getLastResponse()!.pushStdoutMessage({ type: 'result', subtype: 'success', result: 'ok' });
       await flushMicrotasks();
       expect(settled).toBe(true);
 
@@ -1229,7 +1229,6 @@ describe('ClaudianService - P0-1 result-late watchdog', () => {
       expect(phases.some(entry => entry.phase === 'interrupt_sent')).toBe(false);
       expect(phases.some(entry => entry.phase === 'turn_cancel')).toBe(false);
       await service.completeUserTurnProjection('turn-tb1');
-      await routedResult;
     });
 
     it('TB2: stopTask without effect escalates to interrupt then force-settle and pumps the queue', async () => {
@@ -1461,11 +1460,10 @@ describe('ClaudianService - P0-1 result-late watchdog', () => {
       expect(sdkMock.getLastResponse()?.stopTask).toHaveBeenCalledTimes(1);
 
       await jest.advanceTimersByTimeAsync(7_000);
-      const routedResult = (service as any).routeMessage({ type: 'result', subtype: 'success', result: 'ok' });
+      sdkMock.getLastResponse()!.pushStdoutMessage({ type: 'result', subtype: 'success', result: 'ok' });
       await flushMicrotasks();
       expect((await settledNext).value).toEqual({ type: 'done' });
       await service.completeUserTurnProjection('turn-early');
-      await routedResult;
 
       await jest.advanceTimersByTimeAsync(STOP_TASK_GRACE_MS + RESULT_WATCHDOG_GRACE_MS);
       await flushMicrotasks();
@@ -2093,15 +2091,15 @@ describe('ClaudianService - P0-1 result-late watchdog', () => {
       const oldEpoch = (service as any).currentQueryScope?.epoch as number;
       expect(sdkMock.getLastResponse()?.stopTask).toHaveBeenCalledTimes(1);
 
-      // Replacement incarnation; a fresh turn takes the new lease.
-      const messageChannel = new MessageChannel(() => {}, (info) => (service as any).handleTurnDequeued(info));
-      (service as any).messageChannel = messageChannel;
-      (service as any).persistentQuery = sdkMock.query({ prompt: messageChannel, options: {} as any });
-      (service as any).startResponseConsumer();
+      // Queue the next input, then let the real bounded attempt retire and
+      // rebuild the scope while the OLD stopTask request remains pending.
       const turnB = service.prepareTurn({ turnId: 'turn-lr-b', text: 'queued hello' });
       const genB = service.query(turnB);
-      await genB.next();
+      const nextFirst = genB.next();
       await flushMicrotasks();
+      await jest.advanceTimersByTimeAsync(STOP_TASK_GRACE_MS + RESULT_WATCHDOG_GRACE_MS);
+      expect((await nextFirst).value).toEqual(expect.objectContaining({ type: 'text' }));
+      const messageChannel = (service as any).messageChannel as MessageChannel;
       expect(messageChannel.getActiveTurnId()).toBe('turn-lr-b');
 
       // The OLD control request rejects now: the diagnostic carries the
@@ -2117,8 +2115,12 @@ describe('ClaudianService - P0-1 result-late watchdog', () => {
       const rejectOutcome = phases.find(entry => entry.phase === 'stop_task_outcome' && entry.outcome === 'error');
       expect(rejectOutcome).toMatchObject({ queryEpoch: oldEpoch });
       expect(phases.some(entry => entry.phase === 'query_close')).toBe(false);
+      const nextQuery = sdkMock.getLastResponse()!;
+      expect(nextQuery.interrupt).not.toHaveBeenCalled();
+      nextQuery.pushStdoutMessage({ type: 'result', subtype: 'success', result: 'next own result' });
+      await flushMicrotasks();
       await service.completeUserTurnProjection('turn-lr-b');
-      void genB;
+      expect((await genB.next()).value).toEqual({ type: 'done' });
     });
   });
 });

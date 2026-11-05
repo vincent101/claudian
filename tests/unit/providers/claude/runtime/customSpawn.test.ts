@@ -268,6 +268,60 @@ describe('createCustomSpawnFunction', () => {
     expect(mockProcess.kill).toHaveBeenCalled();
   });
 
+  it('reports only a real exit, not abort/killed, before the buffered stdout grace expires', () => {
+    jest.useFakeTimers();
+    try {
+      const mockProcess = createMockProcess();
+      const stdout = { destroyed: false, push: jest.fn(), destroy: jest.fn(), once: jest.fn() };
+      mockProcess.stdout = stdout as unknown as NodeJS.ReadableStream;
+      spawnMock.mockReturnValue(mockProcess as unknown as ReturnType<typeof spawn>);
+      const onExit = jest.fn();
+      const controller = new AbortController();
+      createCustomSpawnFunction('/enhanced/path', onExit)({
+        command: 'node', args: ['cli.js'], cwd: '/tmp', env: {}, signal: controller.signal,
+      });
+
+      controller.abort();
+      mockProcess.killed = true;
+      expect(mockProcess.kill).toHaveBeenCalledTimes(1);
+      expect(onExit).not.toHaveBeenCalled();
+
+      const exitHandler = mockProcess.on.mock.calls.find(([event]) => event === 'exit')![1];
+      exitHandler(17);
+      expect(onExit).toHaveBeenCalledWith(17);
+      expect(stdout.destroy).not.toHaveBeenCalled();
+      jest.advanceTimersByTime(999);
+      expect(stdout.destroy).not.toHaveBeenCalled();
+      jest.advanceTimersByTime(1);
+      expect(stdout.push).toHaveBeenCalledWith(null);
+      expect(stdout.destroy).toHaveBeenCalledTimes(1);
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  it('a throwing exit notification cannot prevent the original stdout close path', () => {
+    jest.useFakeTimers();
+    try {
+      const mockProcess = createMockProcess();
+      const stdout = { destroyed: false, push: jest.fn(), destroy: jest.fn(), once: jest.fn() };
+      mockProcess.stdout = stdout as unknown as NodeJS.ReadableStream;
+      spawnMock.mockReturnValue(mockProcess as unknown as ReturnType<typeof spawn>);
+      const onExit = jest.fn(() => { throw new Error('notification failed'); });
+      createCustomSpawnFunction('/enhanced/path', onExit)({
+        command: 'node', args: ['cli.js'], cwd: '/tmp', env: {},
+      } as SpawnOptions);
+      const exitHandler = mockProcess.on.mock.calls.find(([event]) => event === 'exit')![1];
+      expect(() => exitHandler(null)).not.toThrow();
+      expect(onExit).toHaveBeenCalledWith(null);
+      jest.advanceTimersByTime(1000);
+      expect(stdout.push).toHaveBeenCalledWith(null);
+      expect(stdout.destroy).toHaveBeenCalledTimes(1);
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
   it('does not kill child when signal is not provided', () => {
     const mockProcess = createMockProcess();
     spawnMock.mockReturnValue(mockProcess as unknown as ReturnType<typeof spawn>);
