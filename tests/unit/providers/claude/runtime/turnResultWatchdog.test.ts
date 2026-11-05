@@ -728,6 +728,82 @@ describe('ClaudianService - P0-1 result-late watchdog', () => {
       await service.completeUserTurnProjection('turn-scope-b');
     });
 
+    it.each(['result', 'reject'] as const)('a retired consumer drops its late %s while the rebuilt next lease settles only on its own result', async (lateKind) => {
+      const delivered: unknown[] = [];
+      let deliverOldResult!: () => void;
+      const bufferedStdout = new Promise<void>(resolve => { deliverOldResult = resolve; });
+      const transportSpy = jest.spyOn(sdkMock, 'query');
+      const createTransport = transportSpy.getMockImplementation()!;
+      transportSpy.mockImplementationOnce((args) => {
+        const transport = createTransport(args);
+        const next = transport.next.bind(transport);
+        jest.spyOn(transport, 'next').mockImplementation(async (...input) => {
+          const item = await next(...input);
+          if (!item.done && item.value.type === 'result') {
+            await bufferedStdout;
+            if (lateKind === 'reject') throw new Error('late retired transport rejection');
+          }
+          if (!item.done) delivered.push(item.value);
+          return item;
+        });
+        return transport;
+      });
+      sdkMock.setMockMessages([
+        { type: 'system', subtype: 'init', session_id: 'watch-session' },
+        { type: 'assistant', message: { content: [{ type: 'text', text: 'old reply' }] } },
+      ], { appendResult: false });
+      await startPersistentQuery(service);
+      const oldQuery = sdkMock.getLastResponse()!;
+      const oldScope = (service as any).currentQueryScope;
+      const oldTurn = service.prepareTurn({ turnId: 'turn-real-old', text: 'old input' });
+      const oldGenerator = service.query(oldTurn);
+      await oldGenerator.next();
+      await armTerminalEvidence(service, oldTurn.turnId);
+      const oldDone = oldGenerator.next();
+
+      const nextTurn = service.prepareTurn({ turnId: 'turn-real-next', text: 'next input' });
+      const nextGenerator = service.query(nextTurn);
+      const nextFirst = nextGenerator.next();
+      await flushMicrotasks();
+      const oldConsumer = (service as any).responseConsumerPromise as Promise<void>;
+      // Only SDK transport timing is mocked: old stdout stays buffered until
+      // the next query has really dispatched. Production retirement closes
+      // the channel and confirms exit through the injected process event.
+      oldQuery.pushLateMessage({ type: 'result', subtype: 'success', result: 'old pipe residue' });
+      sdkMock.setMockMessages([
+        { type: 'assistant', message: { content: [{ type: 'text', text: 'next reply' }] } },
+      ], { appendResult: false });
+      await jest.advanceTimersByTimeAsync(RESULT_WATCHDOG_MS + RESULT_WATCHDOG_GRACE_MS);
+      await flushMicrotasks();
+      expect((await oldDone).value).toEqual({ type: 'done' });
+      expect((await nextFirst).value).toEqual(expect.objectContaining({ type: 'text', content: 'next reply' }));
+      const nextQuery = sdkMock.getLastResponse()!;
+      const nextChannel = (service as any).messageChannel as MessageChannel;
+      expect(nextQuery).not.toBe(oldQuery);
+      expect(oldScope.retired).toBe(true);
+      expect(nextChannel.getActiveTurnId()).toBe(nextTurn.turnId);
+      const liveTurn = (service as any).runtimeTurns.get(nextTurn.turnId);
+      const handler = [...liveTurn.waiters][0] as { onDone: () => void };
+      const onDone = jest.spyOn(handler, 'onDone');
+      deliverOldResult();
+      await oldConsumer;
+      expect(nextChannel.getActiveTurnId()).toBe(nextTurn.turnId);
+      expect(onDone).not.toHaveBeenCalled();
+      expect(sdkMock.getQueryCallCount()).toBe(2);
+      expect((service as any).persistentQuery).toBe(nextQuery);
+      expect((service as any).responseConsumerRunning).toBe(true);
+      expect((service as any).lastSentTurnId).toBe(nextTurn.turnId);
+      expect(delivered.filter((message: any) => message.type === 'result')).toHaveLength(lateKind === 'result' ? 1 : 0);
+      expect((await readDiagnosticPhases(diagDir)).filter(entry => entry.phase === 'settle_result')).toHaveLength(0);
+      nextQuery.pushStdoutMessage({ type: 'result', subtype: 'success', result: 'next own result' });
+      await flushMicrotasks();
+      await service.completeUserTurnProjection(nextTurn.turnId);
+      expect((await nextGenerator.next()).value).toEqual({ type: 'done' });
+      expect(onDone).toHaveBeenCalledTimes(1);
+      expect(nextChannel.getActiveTurnId()).toBeNull();
+      expect((await readDiagnosticPhases(diagDir)).filter(entry => entry.phase === 'settle_result')).toHaveLength(1);
+    });
+
     it('a late result already in the old CLI pipe is dropped by the old consumer loop once the scope is replaced', async () => {
       sdkMock.setMockMessages([
         { type: 'system', subtype: 'init', session_id: 'watch-session' },
@@ -925,8 +1001,9 @@ describe('ClaudianService - P0-1 result-late watchdog', () => {
         { type: 'assistant', message: { content: [{ type: 'text', text: 'model reply' }] } },
       ], { appendResult: false });
       await startPersistentQuery(service);
-      const rebuildSpy = jest.spyOn(service as any, 'startPersistentQuery');
-      rebuildSpy.mockImplementationOnce(async () => {
+      // Fail only the SDK transport creation; the production retirement and
+      // startup methods must execute, including their failure prohibition.
+      jest.spyOn(sdkMock, 'query').mockImplementationOnce(() => {
         throw new Error('rebuild failed: CLI unavailable');
       });
 
@@ -949,6 +1026,14 @@ describe('ClaudianService - P0-1 result-late watchdog', () => {
       const queuedSettled = await queuedNext;
       expect(queuedSettled.value).toEqual(expect.objectContaining({ type: 'error', content: 'rebuild failed: CLI unavailable' }));
       expect((service as any).persistentQuery).toBeNull();
+      expect((service as any).queryStartProhibited).toBe('query_rebuild_failed');
+      await expect(service.ensureReady()).rejects.toThrow('query_rebuild_failed');
+      for (const forceColdStart of [false, true]) {
+        const blocked = service.query('blocked after rebuild', undefined, undefined, { forceColdStart });
+        expect((await blocked.next()).value).toEqual(expect.objectContaining({ type: 'error' }));
+        await blocked.return(undefined);
+      }
+      expect(sdkMock.getQueryCallCount()).toBe(1);
       const phases = await readDiagnosticPhases(diagDir);
       expect(phases.some(entry => entry.phase === 'turn_cancel' && entry.detail === 'query_rebuild_failed')).toBe(true);
     });
@@ -959,16 +1044,11 @@ describe('ClaudianService - P0-1 result-late watchdog', () => {
         { type: 'assistant', message: { content: [{ type: 'text', text: 'model reply' }] } },
       ], { appendResult: false });
       await startPersistentQuery(service);
-      let releaseRebuild!: () => void;
-      const rebuildGate = new Promise<void>(resolve => { releaseRebuild = resolve; });
-      const rebuildSpy = jest.spyOn(service as any, 'startPersistentQuery');
-      const originalImpl = rebuildSpy.getMockImplementation()!;
-      rebuildSpy.mockImplementation(async (...args: unknown[]) => {
-        if ((service as any).persistentQuery === null) {
-          await rebuildGate;  // the rebuild itself is slow
-        }
-        return originalImpl.apply(service, args);
-      });
+      const oldScope = (service as any).currentQueryScope;
+      const oldQuery = sdkMock.getLastResponse()!;
+      // Delay only the process exit event. The real retirement/start gate
+      // stays pending until THIS old process reports exit.
+      oldQuery.close.mockImplementation(() => {});
 
       const turn = service.prepareTurn({ turnId: 'turn-gate', text: 'hello' });
       const gen = service.query(turn);
@@ -977,7 +1057,9 @@ describe('ClaudianService - P0-1 result-late watchdog', () => {
       const settledNext = gen.next();
       await flushMicrotasks();
 
-      await jest.advanceTimersByTimeAsync(RESULT_WATCHDOG_MS + STOP_TASK_GRACE_MS + RESULT_WATCHDOG_GRACE_MS);
+      // No stopTask candidates: retirement starts after the interrupt grace,
+      // so stop before the separate 15s process-exit timeout elapses.
+      await jest.advanceTimersByTimeAsync(RESULT_WATCHDOG_MS + RESULT_WATCHDOG_GRACE_MS);
       await flushMicrotasks();
 
       // The rebuild chain is parked on its gate; two concurrent ensureReady
@@ -985,7 +1067,7 @@ describe('ClaudianService - P0-1 result-late watchdog', () => {
       expect((service as any).persistentQuery).toBeNull();
       const ready1 = service.ensureReady();
       const ready2 = service.ensureReady();
-      releaseRebuild();
+      (service as any).notifyQueryProcessExit(oldScope.epoch);
       await Promise.all([ready1, ready2]);
       await flushMicrotasks();
 
@@ -1012,18 +1094,9 @@ describe('ClaudianService - P0-1 result-late watchdog', () => {
     });
 
     it('a close landing mid-start orphans the flight — no channel revival, no query spawn', async () => {
-      const optionsSpy = jest.spyOn(service as any, 'buildPersistentQueryOptions');
-      const originalOptions = optionsSpy.getMockImplementation()!;
-      let releaseOptions!: () => void;
-      const optionsGate = new Promise<void>(resolve => { releaseOptions = resolve; });
-      optionsSpy.mockImplementation(async (...args: unknown[]) => {
-        const result = await originalOptions.apply(service, args);
-        await optionsGate;
-        return result;
-      });
-
-      const startPromise = (service as any).startPersistentQuery('/mock/vault/path', '/usr/local/bin/claude');
-      await flushMicrotasks();
+      // The production options await yields naturally. Close synchronously
+      // before that microtask resumes; no startup/options method is mocked.
+      const startPromise = service.ensureReady();
       const channelInFlight = (service as any).messageChannel as MessageChannel;
       expect(channelInFlight).not.toBeNull();
       expect((service as any).persistentQueryStart).not.toBeNull();
@@ -1031,7 +1104,6 @@ describe('ClaudianService - P0-1 result-late watchdog', () => {
       // An explicit close tears the half-built slot down while the flight
       // is parked in its options await.
       (service as any).closePersistentQuery('test concurrent close');
-      releaseOptions();
       await startPromise;
 
       // The flight orphans: no query spawn, no channel left in the slot.
@@ -1058,11 +1130,23 @@ describe('ClaudianService - P0-1 result-late watchdog', () => {
       const settledNext = gen.next();
       await flushMicrotasks();
 
-      await jest.advanceTimersByTimeAsync(RESULT_WATCHDOG_MS + STOP_TASK_GRACE_MS + RESULT_WATCHDOG_GRACE_MS);
+      await jest.advanceTimersByTimeAsync(RESULT_WATCHDOG_MS + RESULT_WATCHDOG_GRACE_MS);
       await flushMicrotasks();
-      expect((await settledNext).value).toEqual({ type: 'done' });
+      // The old generator may await the production deferred-restart barrier,
+      // which joins retirement. Advance the exit timer before awaiting it.
+      // Explicit cold-start must join retirement too, not start a second CLI
+      // while the old process is still awaiting exit confirmation.
+      const cold = service.query('cold during retirement', undefined, undefined, { forceColdStart: true });
+      let coldSettled = false;
+      const coldNext = cold.next().then(value => { coldSettled = true; return value; });
+      for (let i = 0; i < 30; i += 1) await Promise.resolve();
+      expect(coldSettled).toBe(false);
+      expect(sdkMock.getQueryCallCount()).toBe(1);
       await jest.advanceTimersByTimeAsync(15_000 + 1_000);
       await flushMicrotasks();
+      expect((await settledNext).value).toEqual({ type: 'done' });
+      expect((await coldNext).value).toEqual(expect.objectContaining({ type: 'error' }));
+      await cold.return(undefined);
 
       // The prohibition is armed with its reason.
       expect((service as any).queryStartProhibited).toBe('query_exit_timeout');
@@ -1303,61 +1387,45 @@ describe('ClaudianService - P0-1 result-late watchdog', () => {
       expect(phases.filter(entry => entry.phase === 'stop_task_sent').every(entry => typeof entry.agentIdHash === 'string')).toBe(true);
     });
 
-    it('defect 1: chunks arriving inside the stop window never restart or extend the recovery chain', async () => {
+    it('defect 1: stdout chunks in BOTH observation windows leave interrupt at 15s and retirement at 30s', async () => {
       stubRunningAgents(service, [{ agentId: 'ag-chunk-burst', startedAt: Date.now() }]);
       sdkMock.setMockMessages([
         { type: 'system', subtype: 'init', session_id: 'watch-session' },
         { type: 'assistant', message: { content: [{ type: 'text', text: 'model reply' }] } },
       ], { appendResult: false });
       await startPersistentQuery(service);
-
-      const turn = service.prepareTurn({ turnId: 'turn-chunk-burst', text: 'hello' });
-      const gen = service.query(turn);
+      const gen = service.query(service.prepareTurn({ turnId: 'turn-chunk-burst', text: 'hello' }));
       await gen.next();
       await armTerminalEvidence(service, 'turn-chunk-burst');
-      let settled = false;
-      const settledNext = gen.next().then(value => {
-        settled = true;
-        return value;
-      });
+      const delivered: unknown[] = [];
+      const consume = (async () => {
+        for await (const chunk of gen) delivered.push(chunk);
+      })();
       await flushMicrotasks();
-
       await jest.advanceTimersByTimeAsync(RESULT_WATCHDOG_MS);
       const query = sdkMock.getLastResponse()!;
       expect(query.stopTask).toHaveBeenCalledTimes(1);
 
-      // The CLI keeps streaming ordinary chunks through the observation
-      // window — the old bug re-armed 120s via the resolved chunk-wait and
-      // fired a SECOND stop round on the same agent.
-      await jest.advanceTimersByTimeAsync(5_000);
-      await (service as any).routeMessage({ type: 'assistant', message: { id: 'm-chunk-1', content: [{ type: 'text', text: 'still working' }] } });
-      await flushMicrotasks();
-      await jest.advanceTimersByTimeAsync(10_000);
-      await (service as any).routeMessage({ type: 'assistant', message: { id: 'm-chunk-2', content: [{ type: 'text', text: 'more work' }] } });
-      await flushMicrotasks();
-      // The re-armed chunk-wait timer ticks at fire+120s: it must see the
-      // live attempt and do nothing.
-      await jest.advanceTimersByTimeAsync(105_000);
-      expect(query.stopTask).toHaveBeenCalledTimes(1);
-
-      await jest.advanceTimersByTimeAsync(STOP_TASK_GRACE_MS);
-      expect(query.interrupt).toHaveBeenCalledTimes(1);
-      await jest.advanceTimersByTimeAsync(RESULT_WATCHDOG_GRACE_MS);
-      await flushMicrotasks();
-      expect(settled).toBe(true);
-      // The parked next resolves with the streamed chunks; the force-settle
-      // then closes the generator with done.
-      await settledNext;
-      let settledValue: { value: unknown } = { value: null };
-      for (let i = 0; i < 5; i += 1) {
-        settledValue = await gen.next();
-        if ((settledValue.value as { type?: string })?.type === 'done') break;
+      // Production consumer receives stdout at fire+5/+10 and +20/+25;
+      // chunks wake the generator but never reset the recovery deadlines.
+      for (const elapsed of [5, 10, 15, 20, 25, 30]) {
+        await jest.advanceTimersByTimeAsync(5_000);
+        if ([5, 10, 20, 25].includes(elapsed)) {
+          query.pushStdoutMessage({ type: 'assistant', message: { id: `tail-${elapsed}`, content: [{ type: 'text', text: `tail at ${elapsed}s` }] } });
+          for (let i = 0; i < 40; i += 1) await Promise.resolve();
+        }
+        expect(query.stopTask).toHaveBeenCalledTimes(1);
+        expect(query.interrupt).toHaveBeenCalledTimes(elapsed < 15 ? 0 : 1);
+        expect(query.close).toHaveBeenCalledTimes(elapsed < 30 ? 0 : 1);
       }
-      expect(settledValue.value).toEqual({ type: 'done' });
-
+      await consume;
+      expect(delivered.filter(chunk => (chunk as { type?: string }).type === 'text')).toHaveLength(4);
+      expect(delivered).toContainEqual({ type: 'done' });
+      expect(sdkMock.getQueryCallCount()).toBe(2);
       const phases = await readDiagnosticPhases(diagDir);
       expect(phases.filter(entry => entry.phase === 'settle_watchdog_fire')).toHaveLength(1);
       expect(phases.filter(entry => entry.phase === 'stop_task_sent')).toHaveLength(1);
+      expect(phases.filter(entry => entry.phase === 'query_retire')).toHaveLength(1);
     });
 
     it('defect 1: a real result 7s into the observation window ends the attempt — the next queued turn runs with no interrupt, no cancel', async () => {

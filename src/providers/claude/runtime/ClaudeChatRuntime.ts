@@ -2268,6 +2268,12 @@ export class ClaudianService implements ChatRuntime {
       return;
     }
 
+    // Every send path joins the same lifecycle gate before choosing either
+    // persistent or cold-start. Checking only inside shouldUsePersistent
+    // would let forceColdStart bypass a retiring, possibly-live CLI (2.4).
+    if (this.queryRetirementChain) await this.queryRetirementChain;
+    if (this.persistentQueryStart) await this.persistentQueryStart;
+
     // Send prohibition (2.4): after a failed recovery (CLI never exited /
     // rebuild failed) no path may start another CLI — not persistent, not
     // cold-start. An explicit close/reset (session switch, reload) clears it.
