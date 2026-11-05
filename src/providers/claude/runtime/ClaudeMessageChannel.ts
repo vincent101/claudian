@@ -266,6 +266,30 @@ export class MessageChannel implements AsyncIterable<SDKUserMessage> {
     this.resolveNext = null;
   }
 
+  /**
+   * Takes every still-queued item out, preserving order, canonical UUIDs,
+   * host aliases, merged payloads, and attachment-replacement results. The
+   * lease is untouched — retirement closes the input afterwards; the rebuild
+   * restores these items onto the NEW channel verbatim (no replay of the
+   * already-dispatched input).
+   */
+  extractUnsentQueue(): PendingMessage[] {
+    const items = this.queue;
+    this.queue = [];
+    return items;
+  }
+
+  /** Puts previously extracted items back in order; a waiting consumer picks up immediately. */
+  restoreQueue(items: PendingMessage[]): void {
+    if (this.closed || items.length === 0) {
+      return;
+    }
+    for (const item of items) {
+      this.queue.push(item);
+    }
+    this.deliverNextIfWaiting();
+  }
+
   getQueueLength(): number {
     return this.queue.length;
   }

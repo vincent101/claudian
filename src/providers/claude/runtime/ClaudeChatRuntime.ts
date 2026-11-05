@@ -150,6 +150,8 @@ const STOP_TASK_TURN_SILENCE_MS = 30 * 60_000;
 const STOP_TASK_AGENT_MIN_AGE_MS = 2 * 60 * 60 * 1000;
 /** P0-3: escalate an interrupt the CLI never acknowledged. */
 const INTERRUPT_ACK_WATCHDOG_MS = 5_000;
+/** Retirement rebuild: max wait for the old CLI's real process exit. */
+const QUERY_EXIT_CONFIRM_TIMEOUT_MS = 15_000;
 
 /** Chunk-wait state of the queryViaPersistent generator loop. */
 interface ChunkWaitState {
@@ -204,8 +206,7 @@ interface QueryScope {
   retired: boolean;
   /** Prevents a second consumer loop on the same scope. */
   consumerStarted: boolean;
-  /** Resolved by the spawn exit notification once this scope's CLI truly exited. */
-  exitWaiters: Array<(code: number | null) => void>;
+  /** Set once this scope's CLI truly exited (spawn exit notification). */
   exitNotified: boolean;
 }
 
@@ -335,6 +336,10 @@ export class ClaudianService implements ChatRuntime {
   private currentQueryScope: QueryScope | null = null;
   private queryEpochCounter = 0;
   private stopTaskAttemptCounter = 0;
+  /** Single-flight retirement/rebuild chain: query()/ensureReady() wait on it (2.4 gate). */
+  private queryRetirementChain: Promise<void> | null = null;
+  /** Spawn-exit waiters per query epoch: retirement waits for the REAL exit, not abort flags. */
+  private scopeExitNotifications = new Map<number, { scope: QueryScope; waiters: Array<() => void> }>();
   /**
    * Turn-identity reconciliation (batch 1, observe mode): read-only bypass
    * recording host/observer facts and rate diagnostics. Never consulted by
@@ -560,6 +565,15 @@ export class ClaudianService implements ChatRuntime {
   async ensureReady(options?: ClaudeEnsureReadyOptions): Promise<boolean> {
     const vaultPath = getVaultPath(this.plugin.app);
 
+    // Retirement/start gate (2.4): a rebuild in flight owns the slot — never
+    // start a second CLI on top of it (concurrent ensureReady stays single).
+    if (this.queryRetirementChain) {
+      await this.queryRetirementChain;
+      if (this.persistentQuery) {
+        return false;
+      }
+    }
+
     // Track external context paths for dynamic updates (empty list clears)
     if (options && options.externalContextPaths !== undefined) {
       this.currentExternalContextPaths = options.externalContextPaths;
@@ -644,6 +658,10 @@ export class ClaudianService implements ChatRuntime {
     const config = this.buildPersistentQueryConfig(vaultPath, cliPath, externalContextPaths);
     this.currentConfig = config;
 
+    // Query-scope exit sink: the spawn callback lands here once THIS CLI
+    // truly exits; the binding to the scope happens right after creation.
+    const exitSink: { handler: ((code: number | null) => void) | null } = { handler: null };
+
     // await is intentional: yields to microtask queue so fire-and-forget callers
     // (e.g. setSessionId → ensureReady) don't synchronously set persistentQuery
     const resumeAtMessageId = this.pendingResumeAt;
@@ -652,13 +670,23 @@ export class ClaudianService implements ChatRuntime {
       cliPath,
       resumeSessionId,
       resumeAtMessageId,
-      externalContextPaths
+      externalContextPaths,
+      code => exitSink.handler?.(code)
     );
 
     this.persistentQuery = agentQuery({
       prompt: this.messageChannel,
       options,
     });
+
+    const scope = this.ensureQueryScope();
+    if (scope) {
+      exitSink.handler = () => {
+        // Epoch-bound notification: a retirement waiting on THIS scope
+        // resolves; a replaced scope (new epoch) is never falsely confirmed.
+        this.notifyQueryProcessExit(scope.epoch);
+      };
+    }
 
     if (this.pendingResumeAt === resumeAtMessageId) {
       this.pendingResumeAt = undefined;
@@ -687,7 +715,6 @@ export class ClaudianService implements ChatRuntime {
       abortController: this.queryAbortController ?? new AbortController(),
       retired: false,
       consumerStarted: false,
-      exitWaiters: [],
       exitNotified: false,
     };
     this.currentQueryScope = scope;
@@ -707,13 +734,17 @@ export class ClaudianService implements ChatRuntime {
     return this.currentQueryScope === scope && !scope.retired;
   }
 
-  /** Spawn exit notification (query-scope-bound): confirms the CLI truly exited. */
+  /**
+   * Spawn exit notification (query-scope-bound by epoch): resolves any
+   * retirement wait for THIS scope. Epoch isolation guarantees an old
+   * process's late exit can never mark a replacement scope as exited.
+   */
   notifyQueryProcessExit(scopeEpoch: number): void {
-    const scope = this.currentQueryScope;
-    if (!scope || scope.epoch !== scopeEpoch) return;
-    scope.exitNotified = true;
-    const waiters = scope.exitWaiters.splice(0);
-    for (const resolve of waiters) resolve(null);
+    const entry = this.scopeExitNotifications.get(scopeEpoch);
+    if (!entry) return;
+    this.scopeExitNotifications.delete(scopeEpoch);
+    entry.scope.exitNotified = true;
+    for (const resolve of entry.waiters.splice(0)) resolve();
   }
 
   private attachPersistentQueryStdinErrorHandler(query: Query): void {
@@ -903,7 +934,8 @@ export class ClaudianService implements ChatRuntime {
     cliPath: string,
     resumeSessionId?: string,
     resumeAtMessageId?: string,
-    externalContextPaths?: string[]
+    externalContextPaths?: string[],
+    onProcessExit?: (code: number | null) => void
   ): Options {
     const baseContext = this.buildQueryOptionsContext(vaultPath, cliPath);
     const hooks = this.buildHooks();
@@ -917,6 +949,7 @@ export class ClaudianService implements ChatRuntime {
       canUseTool: this.createApprovalCallback(),
       hooks,
       externalContextPaths,
+      onProcessExit,
     };
 
     return QueryOptionsBuilder.buildPersistentQueryOptions(ctx);
@@ -2096,6 +2129,12 @@ export class ClaudianService implements ChatRuntime {
     const shouldUsePersistent = !effectiveQueryOptions?.forceColdStart;
 
     if (shouldUsePersistent) {
+      // Retirement/start gate (2.4): the rebuild chain owns the slot until
+      // it finishes; a query arriving mid-rebuild must never cold-start
+      // around it.
+      if (this.queryRetirementChain) {
+        await this.queryRetirementChain;
+      }
       // Start persistent query if not running
       if (!this.persistentQuery && !this.shuttingDown) {
         await this.startPersistentQuery(
@@ -2575,8 +2614,12 @@ export class ClaudianService implements ChatRuntime {
         return;
       }
       attempt.phase = 'retiring';
-      // Terminal: force-settle so the lease releases and the queue pumps (a
-      // result arriving later is dropped lease-less by routeMessage).
+      // Terminal: retire the old query (extract+rebuild the unsent queue),
+      // then cancel this turn. Retiring FIRST matters: the lease is not a
+      // proof the CLI turn ended, and cancelling before the rebuild would
+      // pump the queue into the same dead query. A result arriving later is
+      // dropped by the stale-scope routing guard.
+      await this.retireAndRebuildQuery('result_watchdog');
       this.cancelTurn(turn.id, 'result_watchdog');
     } finally {
       attempt.phase = 'finished';
@@ -2602,6 +2645,143 @@ export class ClaudianService implements ChatRuntime {
   private attemptDelay(ms: number): Promise<void> {
     return new Promise<void>(resolve => {
       setTimeout(resolve, ms);
+    });
+  }
+
+  /**
+   * Watchdog force settlement = retire the old query and rebuild (2.4): the
+   * lease is NOT a proof the CLI turn ended, so cancel-and-reuse would let
+   * the old result settle the NEXT turn. Single-flight — concurrent callers
+   * (query/ensureReady/cold fallback) all wait on the same chain.
+   */
+  retireAndRebuildQuery(reason: string): Promise<void> {
+    if (this.queryRetirementChain) {
+      return this.queryRetirementChain;
+    }
+    this.queryRetirementChain = this.executeQueryRetirement(reason).finally(() => {
+      this.queryRetirementChain = null;
+    });
+    return this.queryRetirementChain;
+  }
+
+  private async executeQueryRetirement(reason: string): Promise<void> {
+    const scope = this.currentQueryScope;
+    const query = this.persistentQuery;
+    const channel = this.messageChannel;
+    if (!scope || !query || !channel) {
+      return;
+    }
+
+    // 1. Retire FIRST: routing stops, new dispatches are blocked.
+    scope.retired = true;
+    // 2. Extract the never-dispatched queue BEFORE closing the input —
+    //    canonical UUIDs, host aliases, merged payloads, order all survive.
+    const unsent = channel.extractUnsentQueue();
+    channel.close();
+    // 3. Remove from the slot.
+    this.currentQueryScope = null;
+    this.persistentQuery = null;
+    this.messageChannel = null;
+    this.queryAbortController = null;
+    this.responseConsumerRunning = false;
+    this.recordTranscriptDiagnostic({
+      phase: 'query_retire',
+      detail: `${reason} epoch=${scope.epoch} unsent=${unsent.length}`,
+    });
+    // 4. Official close + abort (no extra interrupt — close terminates).
+    //    Register the exit wait BEFORE close: the spawn exit notification can
+    //    fire synchronously inside close() and must find its waiter.
+    const exitWait = this.waitForScopeExit(scope);
+    try {
+      query.close();
+    } catch {
+      // Already-closed transports are fine; abort below is the backup.
+    }
+    scope.abortController.abort();
+
+    // 6a. Confirm the old CLI TRULY exited (abort/killed/loop-end are not proof).
+    const exited = await exitWait;
+    if (!exited) {
+      this.recordTranscriptDiagnostic({ phase: 'query_exit_confirmed', detail: `timeout epoch=${scope.epoch}` });
+      // Explicit failure: settle the affected unsent turns with an error and
+      // keep the send prohibition — never start a second CLI, never claim recovery.
+      const failure = new Error('The Claude CLI process did not exit after close; unsent input stays queued locally.');
+      for (const item of unsent) {
+        if (this.runtimeTurns.has(item.turnId)) {
+          this.cancelTurn(item.turnId, 'query_exit_timeout', failure);
+        }
+      }
+      return;
+    }
+    this.recordTranscriptDiagnostic({ phase: 'query_exit_confirmed', detail: `epoch=${scope.epoch}` });
+
+    // 6b. Rebuild under the original session configuration.
+    const vaultPath = getVaultPath(this.plugin.app);
+    const cliPath = this.plugin.getResolvedProviderCliPath('claude');
+    if (!vaultPath || !cliPath) {
+      const failure = new Error('Persistent query rebuild failed: vault path or CLI path unavailable.');
+      for (const item of unsent) {
+        if (this.runtimeTurns.has(item.turnId)) {
+          this.cancelTurn(item.turnId, 'query_rebuild_failed', failure);
+        }
+      }
+      return;
+    }
+    try {
+      await this.startPersistentQuery(
+        vaultPath,
+        cliPath,
+        this.sessionManager.getSessionId() ?? undefined,
+        this.currentExternalContextPaths
+      );
+    } catch (error) {
+      const failure = error instanceof Error ? error : new Error(String(error));
+      for (const item of unsent) {
+        if (this.runtimeTurns.has(item.turnId)) {
+          this.cancelTurn(item.turnId, 'query_rebuild_failed', failure);
+        }
+      }
+      return;
+    }
+
+    // 6c. Restore the never-sent queue onto the new channel (the already
+    //     dispatched input is never re-sent).
+    const rebuiltScope = this.liveQueryScope();
+    const newChannel = rebuiltScope?.channel ?? null;
+    if (newChannel && unsent.length > 0) {
+      newChannel.restoreQueue(unsent);
+      this.recordTranscriptDiagnostic({
+        phase: 'query_rebuilt',
+        detail: `epoch=${rebuiltScope?.epoch ?? 'none'} restored=${unsent.length}`,
+      });
+    } else {
+      this.recordTranscriptDiagnostic({ phase: 'query_rebuilt', detail: `epoch=${rebuiltScope?.epoch ?? 'none'} restored=0` });
+    }
+  }
+
+  /** Waits for the real spawn exit; resolves false on timeout (15s). */
+  private waitForScopeExit(scope: QueryScope): Promise<boolean> {
+    if (scope.exitNotified) {
+      return Promise.resolve(true);
+    }
+    return new Promise<boolean>(resolve => {
+      let timer: ReturnType<typeof setTimeout> | null = null;
+      const notify = () => {
+        if (timer !== null) clearTimeout(timer);
+        this.scopeExitNotifications.delete(scope.epoch);
+        resolve(true);
+      };
+      const entry = this.scopeExitNotifications.get(scope.epoch) ?? { scope, waiters: [] };
+      entry.waiters.push(notify);
+      this.scopeExitNotifications.set(scope.epoch, entry);
+      timer = setTimeout(() => {
+        const current = this.scopeExitNotifications.get(scope.epoch);
+        if (current && current.waiters.length > 0) {
+          current.waiters = current.waiters.filter(waiter => waiter !== notify);
+          if (current.waiters.length === 0) this.scopeExitNotifications.delete(scope.epoch);
+        }
+        resolve(scope.exitNotified);
+      }, QUERY_EXIT_CONFIRM_TIMEOUT_MS);
     });
   }
 

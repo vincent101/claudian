@@ -48,6 +48,8 @@ export interface PersistentQueryContext extends QueryOptionsContext {
   canUseTool?: CanUseTool;
   hooks: Options['hooks'];
   externalContextPaths?: string[];
+  /** Query-scope-bound CLI exit notification (retirement rebuild waits for the real exit). */
+  onProcessExit?: (code: number | null) => void;
 }
 
 export interface ColdStartQueryContext extends QueryOptionsContext {
@@ -136,6 +138,7 @@ export class QueryOptionsBuilder {
       ctx,
       ctx.settings.model,
       ctx.abortController,
+      ctx.onProcessExit,
     );
 
     options.disallowedTools = [
@@ -264,6 +267,7 @@ export class QueryOptionsBuilder {
     ctx: QueryOptionsContext,
     model: string,
     abortController?: AbortController,
+    onProcessExit?: (code: number | null) => void,
   ): { options: Options; claudeSettings: ReturnType<typeof getClaudeProviderSettings> } {
     const claudeSettings = getClaudeProviderSettings(ctx.settings as unknown as Record<string, unknown>);
     const systemPromptSettings: SystemPromptSettings = {
@@ -288,7 +292,7 @@ export class QueryOptionsBuilder {
     };
 
     QueryOptionsBuilder.applyExtraArgs(options, claudeSettings);
-    options.spawnClaudeCodeProcess = createCustomSpawnFunction(ctx.enhancedPath);
+    options.spawnClaudeCodeProcess = createCustomSpawnFunction(ctx.enhancedPath, onProcessExit);
 
     return { options, claudeSettings };
   }
