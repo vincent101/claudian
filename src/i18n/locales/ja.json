@@ -84,7 +84,7 @@
     "cancel": {
       "toolInterrupted": "中断されました",
       "interruptUnacknowledged": "CLI がキャンセルに応答しませんでした。画面が長時間復旧しない場合は、会話を再読み込みしてください。",
-      "boundaryHeld": "キャンセルされたターンが停止を確認していません。キューのメッセージは一時保留され、まもなく送信されます。"
+      "boundaryHeld": "キャンセルされたターンが停止を確認していません。キューのメッセージはターン終了が確認されるまで保留され、確認後にのみ送信されます。"
     },
     "history": {
       "loading": "Loading conversation…",

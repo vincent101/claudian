@@ -1841,7 +1841,9 @@ export class ClaudianService implements ChatRuntime {
    * the channel lease becomes the old turn's boundary tombstone. A late
    * result from that CLI turn settles nothing (the turn is gone); it only
    * releases the tombstone so the queue pumps. No result within the window
-   * → explicit notice, then release. The query itself is never closed.
+   * → explicit notice that the input stays staged; the lease is never
+   * released by the timeout — only the real result dissolves the tombstone.
+   * The query itself is never closed.
    */
   private completeUserCancelHandoffWithBoundary(turn: RuntimeTurn, barrier: UserTurnCompletionBarrier): void {
     turn.notificationResultPending = false;
@@ -1884,11 +1886,10 @@ export class ClaudianService implements ChatRuntime {
   private expireCancelBoundaryTombstone(turnId: string): void {
     const tombstone = this.cancelBoundaryTombstone;
     if (!tombstone || tombstone.turnId !== turnId) return;
-    this.cancelBoundaryTombstone = null;
-    const channel = this.messageChannel;
-    if (channel && channel.getActiveTurnId() === turnId) {
-      this.completeChannelTurn(turnId);
-    }
+    // 2.4 correction: the 15s timeout only PROMPTS that the input is staged.
+    // The tombstone stays armed and the lease stays held — only the real
+    // result dissolves it and pumps the queue. Releasing here would let the
+    // cancelled CLI turn race a fresh dispatch.
     this.recordTranscriptDiagnostic({ phase: 'turn_cancel', turnId, detail: 'cancel_boundary_timeout' });
     new Notice(t('chat.cancel.boundaryHeld'));
   }

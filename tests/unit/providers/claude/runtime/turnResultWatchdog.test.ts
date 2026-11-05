@@ -1719,7 +1719,7 @@ describe('ClaudianService - P0-1 result-late watchdog', () => {
       expect((service as any).runtimeTurns.has('turn-can-q')).toBe(true);
     });
 
-    it('15s without a result expires the tombstone with the input-held notice and pumps the queue', async () => {
+    it('15s without a result only prompts — the lease stays held until the real result pumps the queue', async () => {
       await setupCancelledTurnWithQueue();
 
       service.cancel();
@@ -1734,15 +1734,26 @@ describe('ClaudianService - P0-1 result-late watchdog', () => {
       await jest.advanceTimersByTimeAsync(15_000);
       await drainMicrotasks();
 
-      // Expiry: the notice fires and the queued input finally dispatches.
-      expect((service as any).cancelBoundaryTombstone).toBeNull();
-      expect(channel.getActiveTurnId()).toBe('turn-can-q');
+      // Timeout correction (2.4): the notice fires, but the tombstone stays
+      // armed and the queued input must NOT dispatch on the timeout — only
+      // the real result releases the lease.
+      expect((service as any).cancelBoundaryTombstone?.turnId).toBe('turn-can-a');
+      expect(channel.getActiveTurnId()).toBe('turn-can-a');
+      expect(channel.getQueuedTurnIds()).toContain('turn-can-q');
       const noticeCallsAfter = (Notice as jest.Mock).mock.calls.length;
       expect(noticeCallsAfter).toBeGreaterThan(noticeCallsBefore);
       const phases = await readDiagnosticPhases(diagDir);
       expect(phases.some(entry => entry.phase === 'turn_cancel' && entry.detail === 'cancel_boundary_timeout')).toBe(true);
       // The query was never closed by a plain cancel.
       expect(phases.some(entry => entry.phase === 'query_close')).toBe(false);
+
+      // The real result (however late) is the only pump: tombstone dissolves
+      // and the queued turn finally dispatches.
+      const query = sdkMock.getLastResponse()!;
+      query.pushStdoutMessage({ type: 'result', subtype: 'success', result: 'over' });
+      await drainMicrotasks();
+      expect((service as any).cancelBoundaryTombstone).toBeNull();
+      expect(channel.getActiveTurnId()).toBe('turn-can-q');
     });
 
     it('a result arriving before the handoff skips the tombstone window entirely', async () => {

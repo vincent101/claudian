@@ -84,7 +84,7 @@
     "cancel": {
       "toolInterrupted": "已中断",
       "interruptUnacknowledged": "CLI 未响应取消。若界面长时间未恢复，请重载会话。",
-      "boundaryHeld": "已取消的回合尚未确认停止。排队的消息暂时保留，稍后自动发出。"
+      "boundaryHeld": "已取消的回合尚未确认停止。排队的消息保持暂存，待该回合确认结束后才会发出。"
     },
     "history": {
       "loading": "正在加载会话…",

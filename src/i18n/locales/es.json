@@ -84,7 +84,7 @@
     "cancel": {
       "toolInterrupted": "Interrumpido",
       "interruptUnacknowledged": "La CLI no respondió a la cancelación. Si la interfaz tarda mucho en recuperarse, recarga la conversación.",
-      "boundaryHeld": "El turno cancelado no ha confirmado su parada. Tu mensaje en cola queda retenido y se enviará en breve."
+      "boundaryHeld": "El turno cancelado no ha confirmado su parada. Tu mensaje en cola queda retenido y solo se enviará cuando se confirme el fin del turno."
     },
     "history": {
       "loading": "Loading conversation…",
