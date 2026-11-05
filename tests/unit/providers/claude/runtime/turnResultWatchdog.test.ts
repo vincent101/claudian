@@ -600,6 +600,33 @@ describe('ClaudianService - P0-1 result-late watchdog', () => {
     expect(phases.some(entry => entry.phase === 'turn_cancel' && entry.detail === 'result_watchdog')).toBe(true);
   });
 
+  it('a compact command with zero SDK chunks recovers from the actual delayed boundary timestamp', async () => {
+    service.setSessionId('watch-session');
+    await (service as any).transcriptObserverRestartChain;
+    sdkMock.setMockMessages([{ type: 'system', subtype: 'init', session_id: 'watch-session' }], { appendResult: false });
+    await startPersistentQuery(service);
+    service.beginUserTurnProjection('turn-compact-no-chunk');
+    const gen = service.query(service.prepareTurn({ turnId: 'turn-compact-no-chunk', text: '/compact' }));
+    const done = gen.next();
+    await flushMicrotasks();
+    const turn = (service as any).runtimeTurns.get('turn-compact-no-chunk');
+    expect(turn.lastChunkAt).toBeNull();
+    expect(turn.phase).toBe('collecting');
+
+    await jest.advanceTimersByTimeAsync(137_000);
+    await appendFile(transcriptFile, `${JSON.stringify({
+      type: 'system', subtype: 'compact_boundary', timestamp: new Date(Date.now()).toISOString(),
+      compactMetadata: { trigger: 'manual', durationMs: 137000 }, version: '2.1.227',
+    })}\n`);
+    await driveObserverTick();
+    expect(turn.transcriptTerminalSeenAt).not.toBeNull();
+    await jest.advanceTimersByTimeAsync(RESULT_WATCHDOG_MS);
+    expect(sdkMock.getLastResponse()?.interrupt).toHaveBeenCalledTimes(1);
+    await jest.advanceTimersByTimeAsync(RESULT_WATCHDOG_GRACE_MS);
+    expect((await done).value).toEqual({ type: 'done' });
+    expect((service as any).runtimeTurns.has('turn-compact-no-chunk')).toBe(false);
+  });
+
   it('T4c: auto compact (mid-turn compaction, turn keeps running) never arms the watchdog', async () => {
     sdkMock.setMockMessages([
       { type: 'system', subtype: 'init', session_id: 'watch-session' },
