@@ -340,6 +340,10 @@ export class ClaudianService implements ChatRuntime {
   private queryRetirementChain: Promise<void> | null = null;
   /** Spawn-exit waiters per query epoch: retirement waits for the REAL exit, not abort flags. */
   private scopeExitNotifications = new Map<number, { scope: QueryScope; waiters: Array<() => void> }>();
+  /** Latest real dispatch description (observer rebuild restore anchor, fix 3). */
+  private currentDispatchDescriptor: DequeuedTurnInfo | null = null;
+  /** Live host projection turn id (observer rebuild restore, survives async observer start). */
+  private beginUserTurnProjectionTarget: string | null = null;
   /**
    * Turn-identity reconciliation (batch 1, observe mode): read-only bypass
    * recording host/observer facts and rate diagnostics. Never consulted by
@@ -1541,6 +1545,9 @@ export class ClaudianService implements ChatRuntime {
   }
 
   beginUserTurnProjection(turnId: string): void {
+    // Remember the target: the observer may not exist yet (async start after
+    // session init) — the rebuild restores the projection onto it (fix 3).
+    this.beginUserTurnProjectionTarget = turnId;
     this.transcriptObserver?.beginUserTurnProjection(turnId);
   }
 
@@ -1564,6 +1571,21 @@ export class ClaudianService implements ChatRuntime {
     } catch {
       // Reconciliation is a read-only bypass; lease handling must not depend on it.
     }
+    // Real dispatch anchor (fix 3): the channel stamps delivery time and the
+    // merge-safe command kind; the observer attributes compact boundary
+    // evidence against THIS, never the feature-begin timestamp.
+    this.currentDispatchDescriptor = info;
+    try {
+      this.transcriptObserver?.observeDispatch({
+        leaseTurnId: info.leaseTurnId,
+        canonicalUuid: info.canonicalTurnId,
+        hostTurnIds: info.hostTurnIds,
+        dispatchedAt: info.dispatchedAt,
+        isManualCompact: info.isManualCompact,
+      });
+    } catch {
+      // Observer dispatch notification is best-effort.
+    }
     const turnId = info.leaseTurnId;
     const turn = this.runtimeTurns.get(turnId);
     if (!turn) {
@@ -1582,9 +1604,9 @@ export class ClaudianService implements ChatRuntime {
     // Query boundary: the turn was dispatched under this scope's epoch; lease
     // release and delayed handoffs for it resolve against this scope only.
     turn.queryEpoch = this.liveQueryScope()?.epoch;
+    turn.dispatchedAt = info.dispatchedAt;
     if (turn.phase === 'queued') {
       turn.phase = 'collecting';
-      turn.dispatchedAt = Date.now();
     }
   }
 
@@ -3295,6 +3317,29 @@ export class ClaudianService implements ChatRuntime {
         if (this.transcriptObserver === observer) this.transcriptObserver = null;
         if (this.transcriptObserverTarget === target) this.transcriptObserverTarget = null;
         return;
+      }
+      // Observer rebuild (session init/switch): restore the CURRENT dispatch
+      // anchor AFTER start (start's internal stop would clear it). A late
+      // observer initialization must never stamp "now" in place of the real
+      // dispatch time, and the live host projection carries over (fix 3).
+      const savedDispatch = this.currentDispatchDescriptor;
+      const liveHostTurnId = this.beginUserTurnProjectionTarget;
+      if (liveHostTurnId && savedDispatch
+        && (savedDispatch.leaseTurnId === liveHostTurnId || savedDispatch.hostTurnIds.includes(liveHostTurnId))) {
+        observer.beginUserTurnProjection(liveHostTurnId);
+      }
+      if (savedDispatch) {
+        try {
+          observer.observeDispatch({
+            leaseTurnId: savedDispatch.leaseTurnId,
+            canonicalUuid: savedDispatch.canonicalTurnId,
+            hostTurnIds: savedDispatch.hostTurnIds,
+            dispatchedAt: savedDispatch.dispatchedAt,
+            isManualCompact: savedDispatch.isManualCompact,
+          });
+        } catch {
+          // Best-effort anchor restore.
+        }
       }
       if (target !== this.transcriptObserverTarget && this.transcriptObserver === observer) {
         observer.stop('session_switch');

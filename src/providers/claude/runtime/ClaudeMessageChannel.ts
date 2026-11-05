@@ -365,18 +365,29 @@ export class MessageChannel implements AsyncIterable<SDKUserMessage> {
     message: SDKUserMessage,
     hostTurnIds: string[],
   ): DequeuedTurnInfo {
+    return this.describeDispatch(leaseTurnId, message, hostTurnIds, this.extractTextContent(message));
+  }
+
+  private describePending(pending: PendingMessage): DequeuedTurnInfo {
+    // The FINAL sent payload decides the command kind — queue merges may have
+    // appended text after the original /compact was prepared.
+    const finalText = pending.type === 'text' ? pending.content : '';
+    return this.describeDispatch(pending.turnId, pending.message, pending.hostTurnIds, finalText);
+  }
+
+  /** All three dequeue paths report the REAL dispatch description (fix 3). */
+  private describeDispatch(
+    leaseTurnId: string,
+    message: SDKUserMessage,
+    hostTurnIds: string[],
+    finalText: string,
+  ): DequeuedTurnInfo {
     return {
       leaseTurnId,
       canonicalTurnId: message.uuid ?? '',
       hostTurnIds,
-    };
-  }
-
-  private describePending(pending: PendingMessage): DequeuedTurnInfo {
-    return {
-      leaseTurnId: pending.turnId,
-      canonicalTurnId: pending.message.uuid ?? '',
-      hostTurnIds: pending.hostTurnIds,
+      dispatchedAt: Date.now(),
+      isManualCompact: /^\/compact(\s|$)/i.test(finalText.trim()),
     };
   }
 

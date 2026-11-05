@@ -65,11 +65,19 @@ export type PendingMessage = PendingTextMessage | PendingAttachmentMessage;
  * Turn identity reported at dequeue (batch 1 §2.3). `canonicalTurnId` is the
  * transcript UUID of the dequeued SDK message — empty when the message carried
  * no UUID. `hostTurnIds` lists the lease owner first, merged aliases after.
+ * 2026-11-05 fix 3: the info also carries the REAL dispatch description —
+ * wall clock at dequeue delivery to the CLI transport, and whether the FINAL
+ * sent payload (post-merge) is a manual /compact command. Feature-begin
+ * timestamps must never stand in for these.
  */
 export interface DequeuedTurnInfo {
   leaseTurnId: string;
   canonicalTurnId: string;
   hostTurnIds: string[];
+  /** Real dispatch wall clock (dequeue delivery), the compact attribution anchor. */
+  dispatchedAt: number;
+  /** True when the FINAL sent payload (after merges) is a manual /compact command. */
+  isManualCompact: boolean;
 }
 
 /** Channel lease operation outcome. Occupancy conflicts are reported, never thrown. */

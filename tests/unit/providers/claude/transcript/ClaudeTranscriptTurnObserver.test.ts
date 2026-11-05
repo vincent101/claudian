@@ -681,8 +681,8 @@ describe('ClaudeTranscriptTurnObserver', () => {
       await writeFile(file, '');
       const { observer, callbacks } = setup();
       await observer.start(file);
-      observer.registerHostUserTranscriptId('host-watch-row');
       observer.beginUserTurnProjection('host-watch');
+      observer.registerHostUserTranscriptId('host-watch-row');
       const generation = (observer as any).generation;
 
       await (observer as any).consumeBatch(
@@ -699,8 +699,8 @@ describe('ClaudeTranscriptTurnObserver', () => {
       await writeFile(file, '');
       const { observer, callbacks } = setup();
       await observer.start(file);
-      observer.registerHostUserTranscriptId('host-done-row');
       observer.beginUserTurnProjection('host-done');
+      observer.registerHostUserTranscriptId('host-done-row');
       await observer.completeUserTurnProjection('host-done');
       const generation = (observer as any).generation;
 
@@ -717,8 +717,8 @@ describe('ClaudeTranscriptTurnObserver', () => {
       await writeFile(file, '');
       const { observer, callbacks } = setup();
       await observer.start(file);
-      observer.registerHostUserTranscriptId('host-block-row');
       observer.beginUserTurnProjection('host-block');
+      observer.registerHostUserTranscriptId('host-block-row');
       const generation = (observer as any).generation;
 
       const blocked = [
@@ -740,8 +740,8 @@ describe('ClaudeTranscriptTurnObserver', () => {
       await writeFile(file, '');
       const { observer, callbacks } = setup();
       await observer.start(file);
-      observer.registerHostUserTranscriptId('host-quiet-row');
       observer.beginUserTurnProjection('host-quiet');
+      observer.registerHostUserTranscriptId('host-quiet-row');
       const generation = (observer as any).generation;
 
       await (observer as any).consumeBatch(
@@ -783,8 +783,8 @@ describe('ClaudeTranscriptTurnObserver', () => {
         onHostTurnTerminalObserved: () => { order.push('throw'); throw new Error('host callback failure'); },
       }, () => true);
       await observer.start(file);
-      observer.registerHostUserTranscriptId('host-throw-row');
       observer.beginUserTurnProjection('host-throw');
+      observer.registerHostUserTranscriptId('host-throw-row');
       const generation = (observer as any).generation;
 
       await expect((observer as any).consumeBatch(
@@ -801,8 +801,8 @@ describe('ClaudeTranscriptTurnObserver', () => {
         const { observer, callbacks } = setup();
         await observer.start(file);
         observer.registerHostUserTranscriptId('n1-row');
-        observer.registerHostUserTranscriptId('n2-row');
         observer.beginUserTurnProjection('turn-n1');
+        observer.registerHostUserTranscriptId('n2-row');
         const generation = (observer as any).generation;
 
         // Turn n1: its user row lands, its end_turn lands — then the result
@@ -836,8 +836,8 @@ describe('ClaudeTranscriptTurnObserver', () => {
         const { observer, callbacks } = setup();
         await observer.start(file);
         observer.registerHostUserTranscriptId('stale-n1-row');
-        observer.registerHostUserTranscriptId('stale-n2-row');
         observer.beginUserTurnProjection('turn-stale-n1');
+        observer.registerHostUserTranscriptId('stale-n2-row');
         const generation = (observer as any).generation;
 
         await (observer as any).consumeBatch({ lines: [hostUserRow('stale-n1-row')], lineOffsets: [0], reset: false }, generation);
@@ -856,8 +856,8 @@ describe('ClaudeTranscriptTurnObserver', () => {
         const { observer, callbacks } = setup();
         await observer.start(file);
         observer.registerHostUserTranscriptId('quiet-n1-row');
-        observer.registerHostUserTranscriptId('quiet-n2-row');
         observer.beginUserTurnProjection('turn-quiet-n1');
+        observer.registerHostUserTranscriptId('quiet-n2-row');
         const generation = (observer as any).generation;
 
         await (observer as any).consumeBatch({ lines: [hostUserRow('quiet-n1-row')], lineOffsets: [0], reset: false }, generation);
@@ -876,8 +876,8 @@ describe('ClaudeTranscriptTurnObserver', () => {
         await writeFile(file, '');
         const { observer, callbacks } = setup();
         await observer.start(file);
-        observer.registerHostUserTranscriptId('guard-n2-row');
         observer.beginUserTurnProjection('turn-guard');
+        observer.registerHostUserTranscriptId('guard-n2-row');
         const generation = (observer as any).generation;
 
         // Mechanism-level shape (offsets deliberately non-monotonic): the
@@ -897,8 +897,8 @@ describe('ClaudeTranscriptTurnObserver', () => {
         const { observer, callbacks } = setup();
         await observer.start(file);
         observer.registerHostUserTranscriptId('retire-n1-row');
-        observer.registerHostUserTranscriptId('retire-n2-row');
         observer.beginUserTurnProjection('turn-retire-n1');
+        observer.registerHostUserTranscriptId('retire-n2-row');
         const generation = (observer as any).generation;
 
         await (observer as any).consumeBatch(
@@ -948,13 +948,15 @@ describe('ClaudeTranscriptTurnObserver', () => {
       await writeFile(file, '');
       const { observer, callbacks } = setup();
       await observer.start(file);
-      observer.registerHostUserTranscriptId('compact-cmd-row');
       observer.beginUserTurnProjection('turn-compact');
+      observer.registerHostUserTranscriptId('compact-cmd-row');
       const generation = (observer as any).generation;
 
-      // Dispatch stamp is "now"; the boundary row carries a creation
-      // timestamp strictly after it (compaction ran for 2m17s after dispatch).
+      // REAL dispatch anchor (fix 3): the channel stamped delivery; the
+      // boundary row carries a creation timestamp strictly after it
+      // (compaction ran for 2m17s after dispatch).
       const dispatchedAt = Date.now();
+      observer.observeDispatch({ leaseTurnId: 'turn-compact', canonicalUuid: 'compact-cmd-row', hostTurnIds: ['turn-compact'], dispatchedAt, isManualCompact: true });
       const tail = compactTurnTail(new Date(dispatchedAt + 137_000).toISOString());
       await (observer as any).consumeBatch({ ...tail, reset: false }, generation);
 
@@ -988,9 +990,10 @@ describe('ClaudeTranscriptTurnObserver', () => {
       await writeFile(file, '');
       const { observer, callbacks } = setup();
       await observer.start(file);
+      observer.beginUserTurnProjection('turn-cross2-n2');
       observer.registerHostUserTranscriptId('cross2-n2-row');
       const dispatchedN2 = Date.now();
-      observer.beginUserTurnProjection('turn-cross2-n2');
+      observer.observeDispatch({ leaseTurnId: 'turn-cross2-n2', canonicalUuid: 'cross2-n2-row', hostTurnIds: ['turn-cross2-n2'], dispatchedAt: dispatchedN2, isManualCompact: true });
       const generation = (observer as any).generation;
 
       const stale = compactBoundaryLine(new Date(dispatchedN2 - 60_000).toISOString(), 100);
@@ -1011,6 +1014,78 @@ describe('ClaudeTranscriptTurnObserver', () => {
       observer.beginUserTurnProjection('turn-compact-replay');
       await observer.start(file);
 
+      expect(callbacks.onHostTurnTerminalObserved).not.toHaveBeenCalled();
+      observer.stop();
+    });
+
+    it('defect 3: a feature-begin stamp never substitutes the real dispatch — boundary predating dispatch never stamps', async () => {
+      await writeFile(file, '');
+      const { observer, callbacks } = setup();
+      await observer.start(file);
+      observer.beginUserTurnProjection('turn-anchor');
+      observer.registerHostUserTranscriptId('anchor-row');
+      const generation = (observer as any).generation;
+
+      // begin at T0; the boundary lands at T+10s; the REAL dispatch happens
+      // at T+30s (feature begin awaited a projection lease before the
+      // message reached the CLI). The boundary predates the dispatch: it is
+      // residue of the previous turn, never this turn's terminal.
+      const beginAt = Date.now();
+      const boundaryAt = new Date(beginAt + 10_000).toISOString();
+      const dispatchAt = new Date(beginAt + 30_000).getTime();
+      observer.observeDispatch({ leaseTurnId: 'turn-anchor', canonicalUuid: 'anchor-row', hostTurnIds: ['turn-anchor'], dispatchedAt: dispatchAt, isManualCompact: true });
+
+      await (observer as any).consumeBatch(
+        { lines: [compactBoundaryLine(boundaryAt, 100).line], lineOffsets: [100], reset: false },
+        generation,
+      );
+      expect(callbacks.onHostTurnTerminalObserved).not.toHaveBeenCalled();
+      observer.stop();
+    });
+
+    it('defect 3: a boundary postdating the real dispatch stamps immediately, before the buffered host row lands', async () => {
+      await writeFile(file, '');
+      const { observer, callbacks } = setup();
+      await observer.start(file);
+      observer.beginUserTurnProjection('turn-late-dispatch');
+      observer.registerHostUserTranscriptId('late-dispatch-row');
+      const generation = (observer as any).generation;
+
+      const beginAt = Date.now();
+      const dispatchAt = beginAt + 30_000;
+      observer.observeDispatch({ leaseTurnId: 'turn-late-dispatch', canonicalUuid: 'late-dispatch-row', hostTurnIds: ['turn-late-dispatch'], dispatchedAt: dispatchAt, isManualCompact: true });
+
+      // The boundary flushes at dispatch+130s; the host's own /compact row is
+      // still buffered behind it. The stamp must not wait for the host row.
+      const tail = compactTurnTail(new Date(dispatchAt + 130_000).toISOString());
+      const linesWithoutHostRow = [tail.lines[0], tail.lines[1], tail.lines[2]];
+      await (observer as any).consumeBatch(
+        { lines: linesWithoutHostRow, lineOffsets: [100, 150, 200], reset: false },
+        generation,
+      );
+      expect(callbacks.onHostTurnTerminalObserved).toHaveBeenCalledTimes(1);
+      expect(callbacks.onHostTurnTerminalObserved).toHaveBeenCalledWith('turn-late-dispatch', { kind: 'compact', cliVersion: '2.1.227' });
+      observer.stop();
+    });
+
+    it('a manual boundary on a NON-compact dispatch never stamps (final payload decides, not the row)', async () => {
+      await writeFile(file, '');
+      const { observer, callbacks } = setup();
+      await observer.start(file);
+      observer.beginUserTurnProjection('turn-plain-input');
+      observer.registerHostUserTranscriptId('plain-row');
+      const generation = (observer as any).generation;
+
+      const dispatchAt = Date.now();
+      // A plain user turn whose dispatch happens to see the previous turn's
+      // manual compact boundary flush late: isManualCompact=false drops it.
+      observer.observeDispatch({ leaseTurnId: 'turn-plain-input', canonicalUuid: 'plain-row', hostTurnIds: ['turn-plain-input'], dispatchedAt: dispatchAt, isManualCompact: false });
+
+      const boundary = compactBoundaryLine(new Date(dispatchAt + 60_000).toISOString());
+      await (observer as any).consumeBatch(
+        { lines: [boundary.line, hostUserRow('plain-row')], lineOffsets: [boundary.lineOffset, 300], reset: false },
+        generation,
+      );
       expect(callbacks.onHostTurnTerminalObserved).not.toHaveBeenCalled();
       observer.stop();
     });
@@ -1060,8 +1135,8 @@ describe('ClaudeTranscriptTurnObserver', () => {
         onHostTurnTerminalRetracted: retracted,
       }, () => true);
       await observer.start(file);
-      observer.registerHostUserTranscriptId('retract-row');
       observer.beginUserTurnProjection('turn-retract');
+      observer.registerHostUserTranscriptId('retract-row');
       const generation = (observer as any).generation;
 
       await (observer as any).consumeBatch(
@@ -1089,8 +1164,8 @@ describe('ClaudeTranscriptTurnObserver', () => {
         onHostTurnTerminalRetracted: retracted,
       }, () => true);
       await observer.start(file);
-      observer.registerHostUserTranscriptId('retract-same-row');
       observer.beginUserTurnProjection('turn-retract-same');
+      observer.registerHostUserTranscriptId('retract-same-row');
       const generation = (observer as any).generation;
 
       await (observer as any).consumeBatch(

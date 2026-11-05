@@ -658,7 +658,7 @@ describe('MessageChannel', () => {
       channel.completeTurn('user-1');
       await iterator.next();
 
-      expect(dequeuedPayloads[1]).toEqual({
+      expect(dequeuedPayloads[1]).toMatchObject({
         leaseTurnId: 'user-2',
         canonicalTurnId: 'uuid-second',
         hostTurnIds: ['user-2', 'user-3'],
@@ -671,7 +671,7 @@ describe('MessageChannel', () => {
       channel.enqueue('user-1', createTextUserMessage('hello', 'uuid-live'));
       await pending;
 
-      expect(dequeuedPayloads[0]).toEqual({
+      expect(dequeuedPayloads[0]).toMatchObject({
         leaseTurnId: 'user-1',
         canonicalTurnId: 'uuid-live',
         hostTurnIds: ['user-1'],
@@ -690,7 +690,7 @@ describe('MessageChannel', () => {
       channel.completeTurn('user-1');
       await iterator.next();
 
-      expect(dequeuedPayloads[1]).toEqual({
+      expect(dequeuedPayloads[1]).toMatchObject({
         leaseTurnId: 'user-2',
         canonicalTurnId: 'uuid-att-one',
         hostTurnIds: ['user-2', 'user-3'],
@@ -707,7 +707,7 @@ describe('MessageChannel', () => {
       channel.completeTurn('user-1');
       await iterator.next();
 
-      expect(dequeuedPayloads[1]).toEqual({
+      expect(dequeuedPayloads[1]).toMatchObject({
         leaseTurnId: 'user-2',
         canonicalTurnId: '',
         hostTurnIds: ['user-2'],
@@ -765,6 +765,43 @@ describe('MessageChannel', () => {
       expect(ids).toEqual(['user-1', 'user-2']);
       expect(channel.getActiveTurnId()).toBeNull();
       expect(channel.getQueueLength()).toBe(0);
+    });
+  });
+
+  describe('dispatch description (2026-11-05 fix 3: final payload decides the command kind)', () => {
+    it('stamps the real dispatch time and merges-safe /compact detection on every dequeue path', async () => {
+      const iterator = channel[Symbol.asyncIterator]();
+      const firstPromise = iterator.next();
+      channel.enqueue('turn-plain', createTextUserMessage('hello', 'uuid-plain'));
+      await firstPromise;
+      expect(dequeuedPayloads[0].dispatchedAt).toBeGreaterThan(0);
+      expect(dequeuedPayloads[0].isManualCompact).toBe(false);
+
+      // Queued manual /compact then a merged follow-up: the FINAL payload
+      // still leads with /compact, so the dispatch description says compact.
+      channel.enqueue('turn-compact', createTextUserMessage('/compact', 'uuid-compact'));
+      channel.enqueue('turn-follow', createTextUserMessage('and summarize twice'));
+      channel.completeTurn('turn-plain');
+      const second = await iterator.next();
+      expect(second.value.message.content).toBe('/compact\n\nand summarize twice');
+      expect(dequeuedPayloads[1].isManualCompact).toBe(true);
+      expect(dequeuedPayloads[1].dispatchedAt).toBeGreaterThanOrEqual(dequeuedPayloads[0].dispatchedAt);
+
+      // Plain merged text never looks like compact even when it mentions it.
+      channel.enqueue('turn-mention', createTextUserMessage('please run /compact for me'));
+      channel.completeTurn('turn-compact');
+      await iterator.next();
+      expect(dequeuedPayloads[2].isManualCompact).toBe(false);
+    });
+
+    it('immediate delivery to a waiting consumer reports the manual compact payload', async () => {
+      const iterator = channel[Symbol.asyncIterator]();
+      const pending = iterator.next();
+      channel.enqueue('turn-live-compact', createTextUserMessage('/compact keep notes', 'uuid-live-compact'));
+      await pending;
+      expect(dequeuedPayloads[0].isManualCompact).toBe(true);
+      expect(dequeuedPayloads[0].canonicalTurnId).toBe('uuid-live-compact');
+      expect(dequeuedPayloads[0].dispatchedAt).toBeGreaterThan(0);
     });
   });
 

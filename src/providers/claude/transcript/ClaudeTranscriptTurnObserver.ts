@@ -70,10 +70,15 @@ export class ClaudeTranscriptTurnObserver {
   private hostUserTurnId: string | null = null;
   private readonly hostUserTranscriptIds = new Set<string>();
   private lastHostUserOffset: number | null = null;
-  /** Wall clock of the live host turn's dispatch (beginUserTurnProjection) —
-   * compact boundary facts attribute by timestamp against this anchor, not by
-   * line offset (the boundary physically precedes the buffered /compact row). */
-  private hostUserTurnDispatchedAt: number | null = null;
+  /**
+   * REAL dispatch description of the live host turn (2026-11-05 fix 3):
+   * stamped by the channel at dequeue delivery, NOT by the feature layer's
+   * beginUserTurnProjection (which can await projection leases long before
+   * the message reaches the CLI). Compact boundary facts attribute by
+   * timestamp against dispatchedAt; host-row matching is limited to the
+   * dispatch's canonical UUID. Null until the dispatch lands ("unsent").
+   */
+  private hostDispatch: { leaseTurnId: string; canonicalUuid: string; hostTurnIds: string[]; dispatchedAt: number; isManualCompact: boolean } | null = null;
   /** The live host turn's own user row has been observed on the transcript.
    * Terminal facts may only be attributed to a turn whose row is already on
    * disk — the previous turn's trailing rows can still flush after the
@@ -132,7 +137,7 @@ export class ClaudeTranscriptTurnObserver {
     this.hostUserTranscriptIds.clear();
     this.lastHostUserOffset = null;
     this.hostUserRowObserved = false;
-    this.hostUserTurnDispatchedAt = null;
+    this.hostDispatch = null;
     this.mapper.reset(this.generation);
   }
 
@@ -140,12 +145,50 @@ export class ClaudeTranscriptTurnObserver {
     this.hostUserTranscriptIds.add(transcriptUserId);
   }
 
+  /**
+   * The channel dequeued a host input onto the CLI transport (fix 3): the
+   * REAL dispatch anchor. Feature-begin timestamps are "unsent" until this
+   * lands. A descriptor whose turn ids cover the live hostUserTurnId binds
+   * to it; one from a foreign turn replaces the stale anchor only when the
+   * live turn switched past it.
+   */
+  observeDispatch(descriptor: { leaseTurnId: string; canonicalUuid: string; hostTurnIds: string[]; dispatchedAt: number; isManualCompact: boolean }): void {
+    const liveTurn = this.hostUserTurnId;
+    const belongsToLiveTurn = liveTurn !== null
+      && (descriptor.leaseTurnId === liveTurn || descriptor.hostTurnIds.includes(liveTurn));
+    if (liveTurn !== null && !belongsToLiveTurn) {
+      // Dispatch of a turn that is not the live host projection (merged
+      // queue members report through their canonical lease owner): keep the
+      // anchor only when it belongs; a foreign dispatch is ignored.
+      return;
+    }
+    this.hostDispatch = descriptor;
+    // Host-row matching is limited to the CURRENT dispatch: its canonical
+    // UUID is the only row that can land for it — a new dispatch retires
+    // every row identity registered for earlier turns (residue defense).
+    this.hostUserTranscriptIds.clear();
+    this.hostUserTranscriptIds.add(descriptor.canonicalUuid);
+  }
+
+  /** The dispatch descriptor the observer currently anchors on (rebuild restore). */
+  currentDispatch(): { leaseTurnId: string; canonicalUuid: string; hostTurnIds: string[]; dispatchedAt: number; isManualCompact: boolean } | null {
+    return this.hostDispatch;
+  }
+
   beginUserTurnProjection(turnId: string): void {
-    this.hostUserTurnId = turnId;
-    this.hostUserTurnDispatchedAt = Date.now();
+    const previousDispatch = this.hostDispatch;
+    const carriesTurn = previousDispatch !== null
+      && (previousDispatch.leaseTurnId === turnId || previousDispatch.hostTurnIds.includes(turnId));
     // A new host user turn is live CLI work: a previous cancel no longer
     // constrains turns that promote behind it.
     this.hostCancelled = false;
+    if (!carriesTurn) {
+      // The new turn is UNSENT: the previous turn's dispatch anchor no longer
+      // applies. Registered row identities stay until this turn's dispatch
+      // replaces them (enqueue-time registrations precede that dispatch).
+      this.hostDispatch = null;
+    }
+    this.hostUserTurnId = turnId;
     // Reviewer #1 cross-turn residue: this turn switch is the authoritative
     // reset point for host terminal attribution. Any unconfirmed candidate
     // belongs to the previous turn (queue release required its settlement),
@@ -294,17 +337,18 @@ export class ClaudeTranscriptTurnObserver {
       const hostTurnId = this.hostUserTurnId;
       if (!hostTurnId) continue;
       if (fact.terminalSource === 'compact') {
-        // Compact attribution (2026-11-04 d8912b5b): the boundary row lands
-        // BEFORE the host's own buffered /compact row, so both stop_hook
-        // defenses (rowObserved, offset) would drop the live boundary. The
-        // boundary belongs to the live host turn iff its creation timestamp
-        // postdates the dispatch: manual compact can only produce a boundary
-        // during the turn that is compacting, while the previous turn's
-        // residue carries a timestamp that predates the new dispatch. A
-        // mismatch (CLI row-order drift) degrades to no stamp — never a
-        // false positive.
-        if (fact.rowTimestamp === undefined) continue;
-        if (this.hostUserTurnDispatchedAt === null || fact.rowTimestamp <= this.hostUserTurnDispatchedAt) continue;
+        // Compact attribution (fix 3, five conditions): live non-replay ✓,
+        // the current host matches the dispatch description, the FINAL sent
+        // payload is a manual /compact, the boundary trigger is manual, and
+        // the boundary row timestamp postdates the REAL dispatch. The
+        // boundary lands before the host's own buffered /compact row, so the
+        // stop_hook defenses (rowObserved, offset) would drop it; a
+        // mismatch on any condition degrades to no stamp — never a false
+        // positive. Feature-begin timestamps never stand in for dispatchedAt.
+        const dispatch = this.hostDispatch;
+        if (dispatch === null || !fact.rowTimestamp || fact.rowTimestamp <= dispatch.dispatchedAt) continue;
+        if (!dispatch.isManualCompact) continue;
+        if (dispatch.leaseTurnId !== hostTurnId && !dispatch.hostTurnIds.includes(hostTurnId)) continue;
         try {
           this.callbacks.onHostTurnTerminalObserved(hostTurnId, {
             kind: 'compact',
