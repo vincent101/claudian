@@ -97,7 +97,7 @@ function hostUserRowLine(uuid: string): string {
 function hostTerminalRows(): string {
   return [
     JSON.stringify({ type: 'assistant', uuid: 'host-a1', isSidechain: false, message: { id: 'host-m1', role: 'assistant', content: [{ type: 'text', text: 'done' }], stop_reason: 'end_turn' } }),
-    JSON.stringify({ type: 'system', subtype: 'stop_hook_summary' }),
+    JSON.stringify({ type: 'system', subtype: 'stop_hook_summary', version: '2.1.227' }),
   ].join('\n') + '\n';
 }
 
@@ -240,6 +240,7 @@ describe('ClaudianService - P0-1 result-late watchdog', () => {
 
     const phases = await readDiagnosticPhases(diagDir);
     expect(phases.filter(entry => entry.phase === 'settle_watchdog_fire')).toHaveLength(1);
+    expect(phases.find(entry => entry.phase === 'settle_watchdog_fire')).toMatchObject({ evidenceKind: 'stop_hook', cliVersion: '2.1.227' });
     // Only the queued turn settles via its real result; the stalled turn's
     // settlement came from the watchdog, never from a result message.
     expect(phases.filter(entry => entry.phase === 'settle_result')).toHaveLength(1);
@@ -638,8 +639,8 @@ describe('ClaudianService - P0-1 result-late watchdog', () => {
   });
 
   describe('B-(a) stopTask before interrupt (armed watchdog path)', () => {
-    function stubRunningAgents(service: ClaudianService, agents: Array<{ agentId: string; startedAt: number }>, pendingApproval = false): void {
-      service.setSubagentHookProvider(() => ({ hasRunning: agents.length > 0, runningAgents: agents, pendingApproval }));
+    function stubRunningAgents(service: ClaudianService, agents: Array<{ agentId: string; startedAt: number }>): void {
+      service.setSubagentHookProvider(() => ({ hasRunning: agents.length > 0, runningAgents: agents }));
     }
 
     async function armTerminalEvidence(service: ClaudianService, turnId: string): Promise<void> {
@@ -800,6 +801,63 @@ describe('ClaudianService - P0-1 result-late watchdog', () => {
       expect(phases.some(entry => entry.phase === 'turn_cancel' && entry.detail === 'result_watchdog')).toBe(true);
     });
 
+    it('cancel during the stopTask observation window never reports settled_by_result or sends a late interrupt', async () => {
+      stubRunningAgents(service, [{ agentId: 'cancel-agent', startedAt: Date.now() }]);
+      sdkMock.setMockMessages([
+        { type: 'system', subtype: 'init', session_id: 'watch-session' },
+        { type: 'assistant', message: { content: [{ type: 'text', text: 'reply' }] } },
+      ], { appendResult: false });
+      await startPersistentQuery(service);
+      const gen = service.query(service.prepareTurn({ turnId: 'turn-window-cancel', text: 'hello' }));
+      await gen.next();
+      await armTerminalEvidence(service, 'turn-window-cancel');
+      const done = gen.next();
+      await flushMicrotasks();
+      await jest.advanceTimersByTimeAsync(RESULT_WATCHDOG_MS);
+      expect(sdkMock.getLastResponse()?.stopTask).toHaveBeenCalledTimes(1);
+      (service as any).cancelTurn('turn-window-cancel', 'test_cancel');
+      await jest.advanceTimersByTimeAsync(STOP_TASK_GRACE_MS);
+      expect((await done).value).toEqual({ type: 'done' });
+      expect(sdkMock.getLastResponse()?.interrupt).not.toHaveBeenCalled();
+      const phases = await readDiagnosticPhases(diagDir);
+      expect(phases.some(entry => entry.phase === 'stop_task_outcome' && entry.outcome === 'settled_by_result')).toBe(false);
+    });
+
+    it('concurrently sends every stopTask even if the first control request never resolves, then falls back on time', async () => {
+      stubRunningAgents(service, [
+        { agentId: 'blocked-control', startedAt: Date.now() },
+        { agentId: 'refused-control', startedAt: Date.now() },
+        { agentId: 'normal-control', startedAt: Date.now() },
+      ]);
+      sdkMock.setMockMessages([
+        { type: 'system', subtype: 'init', session_id: 'watch-session' },
+        { type: 'assistant', message: { content: [{ type: 'text', text: 'reply' }] } },
+      ], { appendResult: false });
+      await startPersistentQuery(service);
+      const gen = service.query(service.prepareTurn({ turnId: 'turn-concurrent', text: 'hello' }));
+      await gen.next();
+      await armTerminalEvidence(service, 'turn-concurrent');
+      const done = gen.next();
+      await flushMicrotasks();
+      const query = sdkMock.getLastResponse()!;
+      query.stopTask.mockImplementation((agentId: string) => {
+        if (agentId === 'blocked-control') return new Promise<void>(() => {});
+        if (agentId === 'refused-control') return Promise.reject(new Error('stop_task_refused'));
+        return Promise.resolve();
+      });
+      await jest.advanceTimersByTimeAsync(RESULT_WATCHDOG_MS);
+      expect(query.stopTask.mock.calls.map(call => call[0])).toEqual(['blocked-control', 'refused-control', 'normal-control']);
+      expect(query.interrupt).not.toHaveBeenCalled();
+      await jest.advanceTimersByTimeAsync(STOP_TASK_GRACE_MS);
+      expect(query.interrupt).toHaveBeenCalledTimes(1);
+      await jest.advanceTimersByTimeAsync(RESULT_WATCHDOG_GRACE_MS);
+      expect((await done).value).toEqual({ type: 'done' });
+      const phases = await readDiagnosticPhases(diagDir);
+      expect(phases.filter(entry => entry.phase === 'stop_task_sent')).toHaveLength(3);
+      expect(phases.some(entry => entry.phase === 'stop_task_outcome' && entry.outcome === 'error' && entry.cliVersion === '2.1.227')).toBe(true);
+      expect(phases.filter(entry => entry.phase === 'stop_task_sent').every(entry => typeof entry.agentIdHash === 'string')).toBe(true);
+    });
+
     it('TB7: no candidates at fire time skips the stopTask window — the interrupt chain stays exactly the current shape', async () => {
       sdkMock.setMockMessages([
         { type: 'system', subtype: 'init', session_id: 'watch-session' },
@@ -842,7 +900,6 @@ describe('ClaudianService - P0-1 result-late watchdog', () => {
       service.setSubagentHookProvider(() => ({
         hasRunning: true,
         runningAgents: [{ agentId: 'ag-zombie', startedAt: Date.now() - 3 * STOP_TASK_AGENT_MIN_AGE_MS }],
-        pendingApproval: false,
       }));
       sdkMock.setMockMessages([
         { type: 'system', subtype: 'init', session_id: 'watch-session' },
@@ -858,8 +915,10 @@ describe('ClaudianService - P0-1 result-late watchdog', () => {
       let settled = false;
       void gen.next().then(() => { settled = true; });
       await flushMicrotasks();
+      await appendFile(transcriptFile, `${JSON.stringify({ type: 'system', subtype: 'stop_hook_summary', version: '2.1.311' })}\n`);
+      await driveObserverTick();
 
-      // No terminal evidence, no chunks for 31 minutes, agent age > 2h.
+      // No terminal evidence, no chunks for 32 minutes, agent age > 2h.
       await jest.advanceTimersByTimeAsync(STOP_TASK_TURN_SILENCE_MS + RESULT_WATCHDOG_MS);
       await flushMicrotasks();
 
@@ -872,7 +931,7 @@ describe('ClaudianService - P0-1 result-late watchdog', () => {
 
       const phases = await readDiagnosticPhases(diagDir);
       expect(phases.filter(entry => entry.phase === 'stop_task_sent')).toHaveLength(1);
-      expect(phases.some(entry => entry.phase === 'stop_task_outcome')).toBe(true);
+      expect(phases.some(entry => entry.phase === 'stop_task_outcome' && entry.cliVersion === '2.1.311')).toBe(true);
       expect(phases.some(entry => entry.phase === 'interrupt_sent')).toBe(false);
       expect(phases.some(entry => entry.phase === 'turn_cancel')).toBe(false);
       expect(phases.some(entry => entry.phase === 'settle_watchdog_fire')).toBe(false);
@@ -882,7 +941,6 @@ describe('ClaudianService - P0-1 result-late watchdog', () => {
       service.setSubagentHookProvider(() => ({
         hasRunning: true,
         runningAgents: [{ agentId: 'ag-zombie-2', startedAt: Date.now() - 3 * STOP_TASK_AGENT_MIN_AGE_MS }],
-        pendingApproval: false,
       }));
       sdkMock.setMockMessages([
         { type: 'system', subtype: 'init', session_id: 'watch-session' },
@@ -913,7 +971,7 @@ describe('ClaudianService - P0-1 result-late watchdog', () => {
     it('TB3 red line: a 48-minute sync blocking Agent (never in runningAgents) plus 31 minutes of silence probes nothing', async () => {
       // The sync blocking agent is structurally absent from the async map —
       // only async (run_in_background) agents are ever stopTask candidates.
-      service.setSubagentHookProvider(() => ({ hasRunning: false, runningAgents: [], pendingApproval: false }));
+      service.setSubagentHookProvider(() => ({ hasRunning: false, runningAgents: [] }));
       sdkMock.setMockMessages([
         { type: 'system', subtype: 'init', session_id: 'watch-session' },
         { type: 'assistant', message: { content: [{ type: 'text', text: 'working' }] } },
@@ -945,7 +1003,6 @@ describe('ClaudianService - P0-1 result-late watchdog', () => {
       service.setSubagentHookProvider(() => ({
         hasRunning: true,
         runningAgents: [{ agentId: 'ag-approval-guard', startedAt: Date.now() - 3 * STOP_TASK_AGENT_MIN_AGE_MS }],
-        pendingApproval: true,
       }));
       sdkMock.setMockMessages([
         { type: 'system', subtype: 'init', session_id: 'watch-session' },
@@ -981,7 +1038,6 @@ describe('ClaudianService - P0-1 result-late watchdog', () => {
       service.setSubagentHookProvider(() => ({
         hasRunning: true,
         runningAgents: [{ agentId: 'ag-young', startedAt: Date.now() }],
-        pendingApproval: false,
       }));
       sdkMock.setMockMessages([
         { type: 'system', subtype: 'init', session_id: 'watch-session' },

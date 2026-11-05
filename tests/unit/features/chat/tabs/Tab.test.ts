@@ -1513,6 +1513,7 @@ describe('Tab - Service Callbacks', () => {
       tab.controllers.streamController = { handleAsyncSubagentNotification } as any;
       tab.services.subagentManager = {
         hasRunningSubagents: jest.fn().mockReturnValue(false),
+        getRunningAsyncAgents: jest.fn().mockReturnValue([{ agentId: 'live-agent', startedAt: 100 }]),
         handleTaskNotification,
       } as any;
 
@@ -1529,6 +1530,12 @@ describe('Tab - Service Callbacks', () => {
       tab.service = service as any;
 
       setupServiceCallbacks(tab, plugin);
+
+      const getState = service.setSubagentHookProvider.mock.calls[0][0];
+      expect(getState().runningAgents).toEqual([{ agentId: 'live-agent', startedAt: 100 }]);
+      expect(tab.services.subagentManager.hasRunningSubagents).not.toHaveBeenCalled();
+      expect(getState().hasRunning).toBe(false);
+      expect(tab.services.subagentManager.hasRunningSubagents).toHaveBeenCalledTimes(1);
 
       const notify = service.setSubagentNotificationHandler.mock.calls[0][0];
       notify('agent-1', 'completed', 'done');

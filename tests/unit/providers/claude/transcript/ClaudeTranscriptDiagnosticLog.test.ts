@@ -82,6 +82,22 @@ describe('ClaudeTranscriptDiagnosticLog', () => {
     expect(content).toContain('"rangeEnd":5');
   });
 
+  it('persists compact and stopTask diagnostic fields without raw agent identifiers', async () => {
+    const log = new ClaudeTranscriptDiagnosticLog(vault);
+    const agentIdHash = log.hashId('private-agent-id');
+    log.record({ phase: 'settle_watchdog_fire', evidenceKind: 'compact', cliVersion: '2.1.311', agentCandidateCount: 2 });
+    log.record({ phase: 'stop_task_sent', agentIdHash });
+    log.record({ phase: 'stop_task_outcome', outcome: 'settled_by_result', cliVersion: '2.1.311', agentCandidateCount: 2 });
+    log.record({ phase: 'turn_cancel', generation: 4, detail: 'result_watchdog' });
+    const content = await readFile(join(vault, '.claudian/diagnostics/transcript-tail.current.jsonl'), 'utf8');
+    expect(content).toContain('"evidenceKind":"compact"');
+    expect(content).toContain('"cliVersion":"2.1.311"');
+    expect(content).toContain('"agentCandidateCount":2');
+    expect(content).toContain(`"agentIdHash":"${agentIdHash}"`);
+    expect(content).toContain('"outcome":"settled_by_result"');
+    expect(content).not.toContain('private-agent-id');
+  });
+
   it('keeps each serialized event within one kilobyte', async () => {
     const log = new ClaudeTranscriptDiagnosticLog(vault);
     log.record({ phase: 'callback_error', errorName: 'X'.repeat(10_000) });

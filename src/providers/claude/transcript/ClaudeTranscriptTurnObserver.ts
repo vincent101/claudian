@@ -33,6 +33,8 @@ export interface ClaudeTranscriptObserverCallbacks {
    * version); stop_hook calls stay single-argument.
    */
   onHostTurnTerminalObserved: (turnId: string, evidence?: { kind: 'compact' | 'stop_hook'; cliVersion?: string }) => void;
+  /** Diagnostic-only CLI version from live transcript rows, including non-terminal hook-block turns. */
+  onCliVersionObserved?: (version: string) => void;
 }
 
 /**
@@ -191,6 +193,14 @@ export class ClaudeTranscriptTurnObserver {
     for (let index = 0; index < batch.lines.length; index += 1) {
       const line = batch.lines[index];
       const lineOffset = batch.lineOffsets?.[index];
+      if (this.callbacks.onCliVersionObserved) {
+        try {
+          const row = JSON.parse(line) as { version?: unknown };
+          if (typeof row.version === 'string') this.callbacks.onCliVersionObserved(row.version);
+        } catch {
+          // Version telemetry never affects mapping or ownership.
+        }
+      }
       this.observeHostUserRow(line, lineOffset);
       const facts = this.mapper.mapLine(line, false, {
         hostUserTurnActive: this.hostUserTurnId !== null,

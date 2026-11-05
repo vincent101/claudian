@@ -280,6 +280,7 @@ export class ClaudianService implements ChatRuntime {
   private transcriptObserverStartOffset: number | null = null;
   private historyRecoverySource: (() => FullHistoryIterable) | null = null;
   private transcriptDiagnosticLog: ClaudeTranscriptDiagnosticLog | null = null;
+  private transcriptCliVersion: string | undefined;
   /**
    * Turn-identity reconciliation (batch 1, observe mode): read-only bypass
    * recording host/observer facts and rate diagnostics. Never consulted by
@@ -2289,7 +2290,7 @@ export class ClaudianService implements ChatRuntime {
       terminalSeenAgeMs: now - terminalSeenAt,
       ...(turn.lastChunkAt !== null ? { lastChunkAgeMs: now - turn.lastChunkAt } : {}),
       evidenceKind: turn.transcriptTerminalSource ?? 'stop_hook',
-      ...(turn.transcriptTerminalCliVersion ? { cliVersion: turn.transcriptTerminalCliVersion } : {}),
+      ...((turn.transcriptTerminalCliVersion ?? this.transcriptCliVersion) ? { cliVersion: turn.transcriptTerminalCliVersion ?? this.transcriptCliVersion } : {}),
       agentCandidateCount: candidates.length,
     });
     if (candidates.length > 0 && this.persistentQuery && !this.shuttingDown) {
@@ -2298,11 +2299,11 @@ export class ClaudianService implements ChatRuntime {
       // very recovery chain intended to unpark the query.
       void this.sendStopTasks(turn, candidates, 'result_watchdog');
       await new Promise<void>(resolve => setTimeout(resolve, STOP_TASK_GRACE_MS));
-      if (state.done && turn.phase !== 'cancelled') {
+      if (state.done && state.error === null && (turn.phase === 'projecting' || turn.phase === 'settled')) {
         this.recordTranscriptDiagnostic({
           phase: 'stop_task_outcome', turnId: turn.id, generation: turn.generation,
           outcome: 'settled_by_result', agentCandidateCount: candidates.length,
-          ...(turn.transcriptTerminalCliVersion ? { cliVersion: turn.transcriptTerminalCliVersion } : {}),
+          ...((turn.transcriptTerminalCliVersion ?? this.transcriptCliVersion) ? { cliVersion: turn.transcriptTerminalCliVersion ?? this.transcriptCliVersion } : {}),
         });
       }
       if (state.resolveChunk !== settle || state.done) return;
@@ -2311,7 +2312,7 @@ export class ClaudianService implements ChatRuntime {
       this.recordTranscriptDiagnostic({
         phase: 'stop_task_outcome', turnId: turn.id, generation: turn.generation,
         outcome: 'no_candidates', agentCandidateCount: 0,
-        ...(turn.transcriptTerminalCliVersion ? { cliVersion: turn.transcriptTerminalCliVersion } : {}),
+        ...((turn.transcriptTerminalCliVersion ?? this.transcriptCliVersion) ? { cliVersion: turn.transcriptTerminalCliVersion ?? this.transcriptCliVersion } : {}),
       });
     }
     // One interrupt so the CLI gets a chance to flush its belated result.
@@ -2360,7 +2361,7 @@ export class ClaudianService implements ChatRuntime {
           this.recordTranscriptDiagnostic({
             phase: 'stop_task_outcome', turnId: turn.id, generation: turn.generation,
             agentIdHash: this.transcriptDiagnosticLog?.hashId(agent.agentId), outcome: 'sent', detail: context,
-            ...(turn.transcriptTerminalCliVersion ? { cliVersion: turn.transcriptTerminalCliVersion } : {}),
+            ...((turn.transcriptTerminalCliVersion ?? this.transcriptCliVersion) ? { cliVersion: turn.transcriptTerminalCliVersion ?? this.transcriptCliVersion } : {}),
           });
         }
       } catch (error) {
@@ -2370,7 +2371,7 @@ export class ClaudianService implements ChatRuntime {
           phase: 'stop_task_outcome', turnId: turn.id, generation: turn.generation,
           agentIdHash: this.transcriptDiagnosticLog?.hashId(agent.agentId), outcome: 'error', detail: context,
           errorName: error instanceof Error ? error.name : 'UnknownError',
-          ...(turn.transcriptTerminalCliVersion ? { cliVersion: turn.transcriptTerminalCliVersion } : {}),
+          ...((turn.transcriptTerminalCliVersion ?? this.transcriptCliVersion) ? { cliVersion: turn.transcriptTerminalCliVersion ?? this.transcriptCliVersion } : {}),
         });
       }
     }));
@@ -2790,6 +2791,7 @@ export class ClaudianService implements ChatRuntime {
     const target = ready ? getSDKSessionPath(vaultPath!, sessionId!) : null;
     if (target === this.transcriptObserverTarget && (target === null || this.transcriptObserver)) return;
     this.transcriptObserverTarget = target;
+    this.transcriptCliVersion = undefined;
     this.transcriptObserverRestartChain = this.transcriptObserverRestartChain.then(async () => {
       if (target !== this.transcriptObserverTarget) return;
       this.transcriptObserver?.stop('session_switch');
@@ -2805,6 +2807,7 @@ export class ClaudianService implements ChatRuntime {
         cancelled: event => this._onAutoTurnCancelled?.(event),
         projectEmbeddedExternal: event => this._onEmbeddedExternal?.(event) ?? Promise.resolve(),
         onHostTurnTerminalObserved: (turnId, evidence) => this.noteTranscriptTerminalSeen(turnId, evidence),
+        onCliVersionObserved: version => { this.transcriptCliVersion = version; },
       }, () => true, this.transcriptDiagnosticLog, {
         // Observe-mode bypass: verdicts are recorded as diagnostics only.
         recordObservedStart: fact => this.turnReconciliation.recordObservedStart(fact),
