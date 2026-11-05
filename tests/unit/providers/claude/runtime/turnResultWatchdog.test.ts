@@ -804,6 +804,73 @@ describe('ClaudianService - P0-1 result-late watchdog', () => {
       expect((await readDiagnosticPhases(diagDir)).filter(entry => entry.phase === 'settle_result')).toHaveLength(1);
     });
 
+    it('a runtime handoff resuming after a retirement never escalates on the replacement lease', async () => {
+      // The projection barrier parks the runtime handoff across the feature
+      // await; a retirement + new dispatch may land inside that window.
+      service.setOnAutoTurnStarted(() => {});
+      sdkMock.setMockMessages([
+        { type: 'system', subtype: 'init', session_id: 'watch-session' },
+        { type: 'assistant', message: { content: [{ type: 'text', text: 'old reply' }] } },
+      ], { appendResult: false });
+      await startPersistentQuery(service);
+      const oldChannel = (service as any).messageChannel as MessageChannel;
+
+      const turnA = service.prepareTurn({ turnId: 'turn-handoff-a', text: 'hello' });
+      const genA = service.query(turnA);
+      await genA.next();
+      const genADone = genA.next();
+
+      // The real result settles the feature side but parks the runtime
+      // handoff on the feature projection barrier.
+      sdkMock.getLastResponse()!.pushStdoutMessage({ type: 'result', subtype: 'success', result: 'ok' });
+      await flushMicrotasks();
+      expect((await genADone).value).toEqual({ type: 'done' });
+      // The lease is still held — the handoff is parked mid-settle.
+      expect(oldChannel.getActiveTurnId()).toBe('turn-handoff-a');
+
+      // A retirement rebuilds the query during the parked handoff; the
+      // parked turn is the retirement's own exempt settle.
+      await service.retireAndRebuildQuery('test handoff retire', 'turn-handoff-a');
+      await flushMicrotasks();
+      expect(sdkMock.getQueryCallCount()).toBe(2);
+
+      // A new turn dispatches on the replacement channel and takes the lease.
+      sdkMock.setMockMessages([
+        { type: 'assistant', message: { content: [{ type: 'text', text: 'next reply' }] } },
+      ], { appendResult: false });
+      const turnC = service.prepareTurn({ turnId: 'turn-handoff-c', text: 'next' });
+      const genC = service.query(turnC);
+      const cFirst = genC.next();
+      await flushMicrotasks();
+      const newChannel = (service as any).messageChannel as MessageChannel;
+      expect(newChannel).not.toBe(oldChannel);
+      expect((await cFirst).value).toEqual(expect.objectContaining({ type: 'text', content: 'next reply' }));
+      expect(newChannel.getActiveTurnId()).toBe('turn-handoff-c');
+      const cDone = genC.next();
+      let cSettled = false;
+      void cDone.then(() => { cSettled = true; });
+      await flushMicrotasks();
+
+      // The parked handoff resumes: it must neither release nor escalate a
+      // lease mismatch into cancelling the replacement's live turn.
+      await service.completeUserTurnProjection('turn-handoff-a');
+      await flushMicrotasks();
+      expect(cSettled).toBe(false);
+      expect(newChannel.getActiveTurnId()).toBe('turn-handoff-c');
+      expect((service as any).runtimeTurns.has('turn-handoff-c')).toBe(true);
+      const phases = await readDiagnosticPhases(diagDir);
+      expect(phases.some(entry => entry.detail === 'complete_turn_mismatch')).toBe(false);
+      expect(phases.some(entry => entry.phase === 'turn_cancel' && entry.turnId === 'turn-handoff-c')).toBe(false);
+
+      // The new turn settles only on its own result — and its own handoff
+      // (same-scope) still releases the lease normally.
+      sdkMock.getLastResponse()!.pushStdoutMessage({ type: 'result', subtype: 'success', result: 'ok' });
+      await flushMicrotasks();
+      expect((await cDone).value).toEqual({ type: 'done' });
+      await service.completeUserTurnProjection('turn-handoff-c');
+      expect(newChannel.getActiveTurnId()).toBeNull();
+    });
+
     it('a late result already in the old CLI pipe is dropped by the old consumer loop once the scope is replaced', async () => {
       sdkMock.setMockMessages([
         { type: 'system', subtype: 'init', session_id: 'watch-session' },
@@ -1105,6 +1172,60 @@ describe('ClaudianService - P0-1 result-late watchdog', () => {
       expect((service as any).persistentQuery).not.toBeNull();
       const phases = await readDiagnosticPhases(diagDir);
       expect(phases.some(entry => entry.phase === 'turn_cancel' && entry.detail === 'persistent_query_retired')).toBe(true);
+      await gen.return(undefined);
+    });
+
+    it('a user-turn handoff resuming after a retirement never escalates on the replacement channel', async () => {
+      // The projection barrier is what parks the settle on an await — arm it
+      // through the production lifecycle callback.
+      service.setOnAutoTurnStarted(() => {});
+      sdkMock.setMockMessages([
+        { type: 'system', subtype: 'init', session_id: 'watch-session' },
+        { type: 'assistant', message: { content: [{ type: 'text', text: 'model reply' }] } },
+      ], { appendResult: false });
+      await startPersistentQuery(service);
+
+      const turn = service.prepareTurn({ turnId: 'turn-handoff', text: 'hello' });
+      const gen = service.query(turn);
+      await gen.next();
+      await flushMicrotasks();
+
+      // The old turn's real result arrives — settleTurnAtResult parks on the
+      // feature barrier BEFORE its runtime handoff releases the lease.
+      sdkMock.getLastResponse()!.pushStdoutMessage({ type: 'result', subtype: 'success', result: 'ok' });
+      await flushMicrotasks();
+      expect((service as any).runtimeTurns.has('turn-handoff')).toBe(true);
+
+      // While the handoff is parked, the query retires and rebuilds; the old
+      // turn is the lease holder the retirement must NOT pre-settle.
+      await service.retireAndRebuildQuery('test handoff retire', 'turn-handoff');
+      await flushMicrotasks();
+
+      // A new dispatch takes the replacement channel's lease.
+      const turnNew = service.prepareTurn({ turnId: 'turn-new', text: 'next' });
+      const genNew = service.query(turnNew);
+      await genNew.next();
+      await flushMicrotasks();
+      expect((service as any).messageChannel.getActiveTurnId()).toBe('turn-new');
+      expect((service as any).runtimeTurns.has('turn-new')).toBe(true);
+
+      // Resuming the parked handoff must not release — or escalate a lease
+      // mismatch by cancelling — the new turn on the replacement channel.
+      await service.completeUserTurnProjection('turn-handoff');
+      await flushMicrotasks();
+      expect((service as any).messageChannel.getActiveTurnId()).toBe('turn-new');
+      expect((service as any).runtimeTurns.has('turn-handoff')).toBe(false);
+      const phases = await readDiagnosticPhases(diagDir);
+      expect(phases.some(entry => entry.phase === 'turn_cancel' && entry.detail === 'complete_turn_mismatch')).toBe(false);
+
+      // The new turn settles only on its own result (its own barrier completes
+      // the handoff and releases the lease).
+      sdkMock.getLastResponse()!.pushStdoutMessage({ type: 'result', subtype: 'success', result: 'new ok' });
+      const settledNew = await genNew.next();
+      expect(settledNew.value).toEqual({ type: 'done' });
+      await service.completeUserTurnProjection('turn-new');
+      await flushMicrotasks();
+      expect((service as any).messageChannel.getActiveTurnId()).toBeNull();
       await gen.return(undefined);
     });
   });

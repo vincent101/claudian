@@ -826,6 +826,22 @@ export class ClaudianService implements ChatRuntime {
     return this.currentQueryScope === scope && !scope.retired;
   }
 
+  /** Query boundary (2.4): a turn dispatched under a retired/replaced scope. */
+  private isOldScopeTurn(turn: RuntimeTurn): boolean {
+    const scope = this.currentQueryScope;
+    return turn.queryEpoch !== undefined && scope !== null && scope.epoch !== turn.queryEpoch;
+  }
+
+  /**
+   * The channel a turn's settlement may act on — null for old-scope turns.
+   * Every completion path (settle, handoff, cancel) must release through
+   * this so a lease handed to a replacement channel is never escalated on
+   * from behind a retired scope.
+   */
+  private turnReleaseChannel(turn: RuntimeTurn): MessageChannel | null {
+    return this.isOldScopeTurn(turn) ? null : this.messageChannel;
+  }
+
   /**
    * Spawn exit notification (query-scope-bound by epoch): resolves any
    * retirement wait for THIS scope. Epoch isolation guarantees an old
@@ -1613,7 +1629,7 @@ export class ClaudianService implements ChatRuntime {
         this.completeUserRuntimeHandoff(turn, barrier);
       } else {
         this.runtimeTurns.delete(turn.id);
-        this.completeChannelTurn(turn.id);
+        this.completeChannelTurn(turn.id, this.turnReleaseChannel(turn));
       }
       return;
     }
@@ -1645,7 +1661,7 @@ export class ClaudianService implements ChatRuntime {
     this.runtimeTurns.delete(turn.id);
     // Step 6: release the lease so the async iterator may dequeue the next
     // queued user message.
-    this.completeChannelTurn(turn.id);
+    this.completeChannelTurn(turn.id, this.turnReleaseChannel(turn));
     // Step 7: release remains the only feature queue pump. If a pending
     // external turn was promoted, its newly acquired feature lease blocks it.
     if (turn.kind === 'auto') {
@@ -1674,7 +1690,10 @@ export class ClaudianService implements ChatRuntime {
     // missing notification result before a host result reaches routeMessage.
     turn.notificationResultPending = false;
     this.runtimeTurns.delete(turn.id);
-    this.completeChannelTurn(turn.id);
+    // Query boundary (2.4), mirroring the cancel handoff: a handoff that
+    // resumes after a retirement/rebuild must never release — or escalate a
+    // lease mismatch — on the replacement channel.
+    this.completeChannelTurn(turn.id, this.turnReleaseChannel(turn));
     barrier.resolveRuntimeHandoffDone();
     this.userTurnCompletionBarriers.delete(turn.id);
   }
@@ -1912,9 +1931,7 @@ export class ClaudianService implements ChatRuntime {
     // Holds the lease → release so the next queued message can flow. The
     // release resolves against the turn's OWN scope channel (2.4): an old
     // turn's cancellation must never release or escalate on a newer channel.
-    const scope = this.currentQueryScope;
-    const oldScopeTurn = turn.queryEpoch !== undefined && scope !== null && scope.epoch !== turn.queryEpoch;
-    const releaseChannel = oldScopeTurn ? null : this.messageChannel;
+    const releaseChannel = this.turnReleaseChannel(turn);
     if (releaseChannel?.getActiveTurnId() === turnId) {
       this.completeChannelTurn(turnId, releaseChannel);
         if (turn.kind === 'auto') this.fireOnAutoTurnReleased(turnId);
@@ -1954,9 +1971,8 @@ export class ClaudianService implements ChatRuntime {
     this.runtimeTurns.delete(turn.id);
     // Query boundary (2.4): an old-scope turn's handoff must never tombstone
     // the replacement channel — its lease lived on the retired channel.
-    const scope = this.currentQueryScope;
-    const oldScopeTurn = turn.queryEpoch !== undefined && scope !== null && scope.epoch !== turn.queryEpoch;
-    const channel = oldScopeTurn ? null : this.messageChannel;
+    const oldScopeTurn = this.isOldScopeTurn(turn);
+    const channel = this.turnReleaseChannel(turn);
     const holdsLease = channel !== null && channel.getActiveTurnId() === turn.id;
     if (holdsLease && channel && !turn.sawTerminalResult) {
       if (this.cancelBoundaryTombstone) clearTimeout(this.cancelBoundaryTombstone.timer);
