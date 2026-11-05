@@ -1494,8 +1494,9 @@ export class ClaudianService implements ChatRuntime {
       // Plain-cancel isolation (2.4): while the tombstone owns this lease the
       // release is forbidden here — chunks from the still-running cancelled
       // turn would pump the queue into it. Only the real result (routeMessage
-      // dissolves the tombstone first, then this branch releases) or the 15s
-      // window may release.
+      // dissolves the tombstone first, then this branch releases) may
+      // release; the 15s window only prompts that the input stays staged —
+      // it never releases.
       if (this.cancelBoundaryTombstone?.turnId === activeTurnId) {
         return null;
       }
