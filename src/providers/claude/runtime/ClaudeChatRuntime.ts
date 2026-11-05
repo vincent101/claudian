@@ -1145,19 +1145,17 @@ export class ClaudianService implements ChatRuntime {
             this.crashRecoveryAttempted = true;
             try {
               await this.ensureReady({ force: true, preserveHandlers: true });
-              // Scope may have been replaced by the restart itself.
-              if (!this.isCurrentQueryScope(scope)) {
-                return;
-              }
+              // Crash recovery is a LEGITIMATE cross-scope rebuild: the close
+              // above retired THIS consumer's own scope by design, so the
+              // isCurrentQueryScope guard must not run here — the replay
+              // targets the freshly rebuilt channel and its own preserved
+              // turn, never a third party's scope.
               if (!this.messageChannel) {
                 throw new Error('Persistent query restart did not create message channel', {
                   cause: error,
                 });
               }
               await this.applyDynamicUpdates(this.lastSentQueryOptions ?? undefined, { preserveHandlers: true });
-              if (!this.isCurrentQueryScope(scope)) {
-                return;
-              }
               // Replay on the same turnId so the preserved handler/turn stay
               // bound to one lease across the restart.
               const replayTurnId = this.lastSentTurnId;
@@ -1177,7 +1175,10 @@ export class ClaudianService implements ChatRuntime {
               if (isSessionExpiredError(restartError)) {
                 this.sessionManager.invalidateSession();
               }
-              if (this.isCurrentQueryScope(scope) && handler) {
+              // The turn MUST settle even though this scope retired itself
+              // during the failed restart — a dropped onError hangs the
+              // user's generator forever.
+              if (handler) {
                 handler.onError(errorInstance);
               }
               return;
