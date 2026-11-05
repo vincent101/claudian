@@ -70,30 +70,23 @@ function makeService(): ClaudianService {
   return new ClaudianService(makeMockPlugin(), mcpManager);
 }
 
-/** Real MessageChannel + mock SDK query, mirroring turnLeaseRelease.test.ts. */
+/**
+ * REALITY GATE (2026-11-05 spec §4): start via the production
+ * startPersistentQuery — single-flight gate, real MessageChannel, real
+ * query-scope, real response consumer. Only the SDK transport (agentQuery)
+ * and the process-exit event injection stay mocked.
+ */
 async function startPersistentQuery(service: ClaudianService): Promise<MessageChannel> {
-  const startSpy = jest.spyOn(service as any, 'startPersistentQuery');
-  startSpy.mockImplementation(async (...args: unknown[]) => {
-    const [vaultPath, cliPath] = args as [string, string];
-    const messageChannel = new MessageChannel(() => {}, info => (service as any).handleTurnDequeued(info));
-    (service as any).messageChannel = messageChannel;
-    (service as any).persistentQuery = sdkMock.query({
-      prompt: messageChannel,
-      options: { cwd: vaultPath, pathToClaudeCodeExecutable: cliPath } as any,
-    });
-    (service as any).currentConfig = (service as any).buildPersistentQueryConfig(vaultPath, cliPath, []);
-    (service as any).startResponseConsumer();
-    // Process-event simulation: Query.close() terminates the CLI subprocess,
-    // so the spawn exit notification fires (the retirement rebuild waits on it).
-    const scope = (service as any).currentQueryScope;
-    if (scope) {
-      const gen = (service as any).persistentQuery;
-      gen.close.mockImplementation(() => {
-        (service as any).notifyQueryProcessExit(scope.epoch);
-      });
-    }
-  });
   await service.ensureReady();
+  // Process-event simulation: Query.close() terminates the CLI subprocess,
+  // so the spawn exit notification fires (the retirement rebuild waits on it).
+  const scope = (service as any).currentQueryScope;
+  const gen = (service as any).persistentQuery;
+  if (scope && gen) {
+    gen.close.mockImplementation(() => {
+      (service as any).notifyQueryProcessExit(scope.epoch);
+    });
+  }
   return (service as any).messageChannel as MessageChannel;
 }
 
@@ -974,7 +967,7 @@ describe('ClaudianService - P0-1 result-late watchdog', () => {
         if ((service as any).persistentQuery === null) {
           await rebuildGate;  // the rebuild itself is slow
         }
-        return originalImpl(...args);
+        return originalImpl.apply(service, args);
       });
 
       const turn = service.prepareTurn({ turnId: 'turn-gate', text: 'hello' });
@@ -999,6 +992,103 @@ describe('ClaudianService - P0-1 result-late watchdog', () => {
       expect((await settledNext).value).toEqual({ type: 'done' });
       expect(sdkMock.getQueryCallCount()).toBe(2);
       expect((service as any).persistentQuery).not.toBeNull();
+    });
+  });
+
+  describe('start single-flight and send prohibition (2026-11-05 spec 2.4 wiring)', () => {
+    it('concurrent ensureReady calls join the same start flight — one channel, one agentQuery call', async () => {
+      sdkMock.setMockMessages([
+        { type: 'system', subtype: 'init', session_id: 'watch-session' },
+        { type: 'assistant', message: { content: [{ type: 'text', text: 'model reply' }] } },
+      ], { appendResult: false });
+      const ready1 = service.ensureReady();
+      const ready2 = service.ensureReady();
+      await Promise.all([ready1, ready2]);
+      await flushMicrotasks();
+
+      expect(sdkMock.getQueryCallCount()).toBe(1);
+      expect((service as any).persistentQuery).not.toBeNull();
+      expect((service as any).persistentQueryStart).toBeNull();
+    });
+
+    it('a close landing mid-start orphans the flight — no channel revival, no query spawn', async () => {
+      const optionsSpy = jest.spyOn(service as any, 'buildPersistentQueryOptions');
+      const originalOptions = optionsSpy.getMockImplementation()!;
+      let releaseOptions!: () => void;
+      const optionsGate = new Promise<void>(resolve => { releaseOptions = resolve; });
+      optionsSpy.mockImplementation(async (...args: unknown[]) => {
+        const result = await originalOptions.apply(service, args);
+        await optionsGate;
+        return result;
+      });
+
+      const startPromise = (service as any).startPersistentQuery('/mock/vault/path', '/usr/local/bin/claude');
+      await flushMicrotasks();
+      const channelInFlight = (service as any).messageChannel as MessageChannel;
+      expect(channelInFlight).not.toBeNull();
+      expect((service as any).persistentQueryStart).not.toBeNull();
+
+      // An explicit close tears the half-built slot down while the flight
+      // is parked in its options await.
+      (service as any).closePersistentQuery('test concurrent close');
+      releaseOptions();
+      await startPromise;
+
+      // The flight orphans: no query spawn, no channel left in the slot.
+      expect(sdkMock.getQueryCallCount()).toBe(0);
+      expect((service as any).persistentQuery).toBeNull();
+      expect((service as any).messageChannel).toBeNull();
+      expect((service as any).persistentQueryStart).toBeNull();
+    });
+
+    it('exit-timeout prohibition blocks every query path with an explicit error until an explicit close clears it', async () => {
+      sdkMock.setMockMessages([
+        { type: 'system', subtype: 'init', session_id: 'watch-session' },
+        { type: 'assistant', message: { content: [{ type: 'text', text: 'model reply' }] } },
+      ], { appendResult: false });
+      await startPersistentQuery(service);
+      const oldGen = sdkMock.getLastResponse()!;
+      // Process-event simulation: the CLI process never reports exit.
+      oldGen.close.mockImplementation(() => {});
+
+      const turn = service.prepareTurn({ turnId: 'turn-proh', text: 'hello' });
+      const gen = service.query(turn);
+      await gen.next();
+      await armTerminalEvidence(service, 'turn-proh');
+      const settledNext = gen.next();
+      await flushMicrotasks();
+
+      await jest.advanceTimersByTimeAsync(RESULT_WATCHDOG_MS + STOP_TASK_GRACE_MS + RESULT_WATCHDOG_GRACE_MS);
+      await flushMicrotasks();
+      expect((await settledNext).value).toEqual({ type: 'done' });
+      await jest.advanceTimersByTimeAsync(15_000 + 1_000);
+      await flushMicrotasks();
+
+      // The prohibition is armed with its reason.
+      expect((service as any).queryStartProhibited).toBe('query_exit_timeout');
+      expect(sdkMock.getQueryCallCount()).toBe(1);
+
+      // A new query gets the explicit error — no persistent start, no
+      // cold-start fallback spawning a second CLI.
+      const blockedTurn = service.prepareTurn({ turnId: 'turn-proh-b', text: 'blocked' });
+      const blockedGen = service.query(blockedTurn);
+      const blockedFirst = await blockedGen.next();
+      expect(blockedFirst.value).toEqual(expect.objectContaining({ type: 'error' }));
+      expect((blockedFirst.value as { content?: string }).content).toContain('blocked after a failed query recovery');
+      expect(sdkMock.getQueryCallCount()).toBe(1);
+
+      // An explicit close clears the prohibition; the next start succeeds.
+      (service as any).closePersistentQuery('test explicit reset');
+      expect((service as any).queryStartProhibited).toBeNull();
+      sdkMock.setMockMessages([
+        { type: 'system', subtype: 'init', session_id: 'watch-session-2' },
+        { type: 'assistant', message: { content: [{ type: 'text', text: 'revived reply' }] } },
+      ], { appendResult: false });
+      const revivedTurn = service.prepareTurn({ turnId: 'turn-proh-r', text: 'revived' });
+      const revivedGen = service.query(revivedTurn);
+      const revivedFirst = await revivedGen.next();
+      expect(revivedFirst.value).not.toEqual(expect.objectContaining({ type: 'error' }));
+      expect(sdkMock.getQueryCallCount()).toBe(2);
     });
   });
 

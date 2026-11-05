@@ -355,6 +355,20 @@ export class ClaudianService implements ChatRuntime {
    */
   private cancelBoundaryTombstone: { turnId: string; timer: ReturnType<typeof setTimeout> } | null = null;
   /**
+   * Persistent-query start single-flight (2.4): concurrent callers (ensureReady
+   * fire-and-forget, query, rewind, retirement rebuild) must all join the
+   * SAME start attempt — a second entry during the options await would build
+   * a second channel and race the first into the slot.
+   */
+  private persistentQueryStart: Promise<void> | null = null;
+  /**
+   * Send prohibition (2.4): a retirement whose CLI never exited (15s timeout)
+   * or whose rebuild failed locks ALL query starts — persistent and
+   * cold-start alike. Starting a second CLI over a possibly-live one is
+   * never an option; only an explicit close/reset clears this.
+   */
+  private queryStartProhibited: string | null = null;
+  /**
    * Turn-identity reconciliation (batch 1, observe mode): read-only bypass
    * recording host/observer facts and rate diagnostics. Never consulted by
    * settlement, promotion, or notification paths.
@@ -643,6 +657,9 @@ export class ClaudianService implements ChatRuntime {
 
   /**
    * Starts the persistent query for the active chat conversation.
+   * Single-flight gate (2.4): concurrent callers join the in-flight attempt;
+   * the send prohibition turns starts into explicit errors instead of
+   * spawning a second CLI over a possibly-live one.
    */
   private async startPersistentQuery(
     vaultPath: string,
@@ -653,7 +670,34 @@ export class ClaudianService implements ChatRuntime {
     if (this.persistentQuery) {
       return;
     }
+    if (this.queryStartProhibited) {
+      throw new Error(
+        `Claude session start is blocked after a failed query recovery (${this.queryStartProhibited}). Reload the conversation or reset the session to recover.`
+      );
+    }
+    if (this.persistentQueryStart) {
+      return this.persistentQueryStart;
+    }
+    const gated = this.executePersistentQueryStart(
+      vaultPath,
+      cliPath,
+      resumeSessionId,
+      externalContextPaths
+    ).finally(() => {
+      if (this.persistentQueryStart === gated) {
+        this.persistentQueryStart = null;
+      }
+    });
+    this.persistentQueryStart = gated;
+    return gated;
+  }
 
+  private async executePersistentQueryStart(
+    vaultPath: string,
+    cliPath: string,
+    resumeSessionId?: string,
+    externalContextPaths?: string[]
+  ): Promise<void> {
     this.shuttingDown = false;
     this.vaultPath = vaultPath;
 
@@ -679,6 +723,8 @@ export class ClaudianService implements ChatRuntime {
     // await is intentional: yields to microtask queue so fire-and-forget callers
     // (e.g. setSessionId → ensureReady) don't synchronously set persistentQuery
     const resumeAtMessageId = this.pendingResumeAt;
+    const channel = this.messageChannel;
+    const abortController = this.queryAbortController;
     const options = await this.buildPersistentQueryOptions(
       vaultPath,
       cliPath,
@@ -687,6 +733,16 @@ export class ClaudianService implements ChatRuntime {
       externalContextPaths,
       code => exitSink.handler?.(code)
     );
+
+    // Slot identity re-check after the options await (2.4): a concurrent
+    // close/reset (or anything that took the slot down during the await)
+    // must orphan this attempt instead of reviving it — the channel it
+    // built is discarded closed, never spawning a CLI nobody owns.
+    if (this.persistentQuery !== null || this.messageChannel !== channel || this.queryAbortController !== abortController) {
+      channel.close();
+      abortController.abort();
+      return;
+    }
 
     this.persistentQuery = agentQuery({
       prompt: this.messageChannel,
@@ -709,6 +765,17 @@ export class ClaudianService implements ChatRuntime {
 
     this.startResponseConsumer();
     this.notifyReadyStateChange();
+  }
+
+  /**
+   * Send prohibition (2.4): set when a retirement lost the CLI (exit timeout
+   * or rebuild failure). Blocks every start path — starting a second CLI over
+   * a possibly-live one is never an option. Cleared only by an explicit
+   * close/reset.
+   */
+  private setQueryStartProhibited(reason: string): void {
+    this.queryStartProhibited = reason;
+    this.recordTranscriptDiagnostic({ phase: 'query_start_prohibited', detail: reason });
   }
 
   /**
@@ -801,6 +868,18 @@ export class ClaudianService implements ChatRuntime {
     this.abortUserTurnCompletionBarriers();
     const scope = this.currentQueryScope;
     if (!this.persistentQuery) {
+      // A start may be mid-flight: it has built the channel and the abort
+      // controller but not yet the query. Tear the half-built slot down so
+      // the start's post-await identity re-check orphans it (2.4) — a query
+      // must never revive after an explicit close. A channel holding an
+      // active turn cannot be a mid-flight start (no dispatch happens
+      // before the query exists) — it is left untouched. Idempotent for
+      // the plain already-closed case (all fields are null there).
+      if (this.messageChannel && this.messageChannel.getActiveTurnId() === null) {
+        this.messageChannel = null;
+        this.queryAbortController = null;
+      }
+      this.queryStartProhibited = null;
       return;
     }
 
@@ -871,6 +950,10 @@ export class ClaudianService implements ChatRuntime {
       clearTimeout(this.cancelBoundaryTombstone.timer);
       this.cancelBoundaryTombstone = null;
     }
+    // Explicit teardown clears the send prohibition: forced restarts, session
+    // resets/switches and plugin cleanup all route through here, and each of
+    // them intentionally owns the slot's lifecycle from scratch.
+    this.queryStartProhibited = null;
     this.responseConsumerRunning = false;
     this.responseConsumerPromise = null;
     this.currentConfig = null;
@@ -2184,6 +2267,17 @@ export class ClaudianService implements ChatRuntime {
       return;
     }
 
+    // Send prohibition (2.4): after a failed recovery (CLI never exited /
+    // rebuild failed) no path may start another CLI — not persistent, not
+    // cold-start. An explicit close/reset (session switch, reload) clears it.
+    if (this.queryStartProhibited) {
+      yield {
+        type: 'error',
+        content: `Claude session start is blocked after a failed query recovery (${this.queryStartProhibited}). Reload the conversation or reset the session to recover.`,
+      };
+      return;
+    }
+
     // Register the user RuntimeTurn for this query (both persistent and
     // cold-start paths consume it). Deletion happens at settlement, cancel or
     // generator cleanup — never by re-generating the id.
@@ -2256,11 +2350,19 @@ export class ClaudianService implements ChatRuntime {
       }
       // Start persistent query if not running
       if (!this.persistentQuery && !this.shuttingDown) {
-        await this.startPersistentQuery(
-          vaultPath,
-          resolvedClaudePath,
-          this.sessionManager.getSessionId() ?? undefined
-        );
+        try {
+          await this.startPersistentQuery(
+            vaultPath,
+            resolvedClaudePath,
+            this.sessionManager.getSessionId() ?? undefined
+          );
+        } catch (error) {
+          yield {
+            type: 'error',
+            content: error instanceof Error ? error.message : 'Failed to start the Claude session',
+          };
+          return;
+        }
       }
 
       if (this.persistentQuery && !this.shuttingDown) {
@@ -2833,6 +2935,7 @@ export class ClaudianService implements ChatRuntime {
     const exited = await exitWait;
     if (!exited) {
       this.recordTranscriptDiagnostic({ phase: 'query_exit_confirmed', detail: `timeout epoch=${scope.epoch}` });
+      this.setQueryStartProhibited('query_exit_timeout');
       // Explicit failure: settle the affected unsent turns with an error and
       // keep the send prohibition — never start a second CLI, never claim recovery.
       const failure = new Error('The Claude CLI process did not exit after close; unsent input stays queued locally.');
@@ -2849,6 +2952,7 @@ export class ClaudianService implements ChatRuntime {
     const vaultPath = getVaultPath(this.plugin.app);
     const cliPath = this.plugin.getResolvedProviderCliPath('claude');
     if (!vaultPath || !cliPath) {
+      this.setQueryStartProhibited('query_rebuild_failed');
       const failure = new Error('Persistent query rebuild failed: vault path or CLI path unavailable.');
       for (const item of unsent) {
         if (this.runtimeTurns.has(item.turnId)) {
@@ -2865,6 +2969,7 @@ export class ClaudianService implements ChatRuntime {
         this.currentExternalContextPaths
       );
     } catch (error) {
+      this.setQueryStartProhibited('query_rebuild_failed');
       const failure = error instanceof Error ? error : new Error(String(error));
       for (const item of unsent) {
         if (this.runtimeTurns.has(item.turnId)) {

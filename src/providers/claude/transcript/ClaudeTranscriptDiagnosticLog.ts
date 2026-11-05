@@ -27,8 +27,10 @@ export type TranscriptDiagnosticPhase =
   | 'settle_watchdog_fire' | 'interrupt_sent' | 'settle_result' | 'reconcile_fix'
   | 'run_phase' | 'turn_cancel' | 'stop_task_sent' | 'stop_task_outcome'
   // Query boundary isolation (2026-11-05 fix 2): stale-scope routing refusals
-  // and rebuild milestones (retire/exit-confirmed/rebuild/restored).
+  // and rebuild milestones (retire/exit-confirmed/rebuild/restored), plus the
+  // send prohibition locking starts after a failed recovery (2.4).
   | 'query_scope_stale' | 'query_retire' | 'query_exit_confirmed' | 'query_rebuilt'
+  | 'query_start_prohibited'
   // Terminal-evidence retraction (fix 1): strong continuation proof un-arms
   // a stamped terminal so the watchdog can re-arm on the new terminal.
   | 'host_terminal_retracted';
