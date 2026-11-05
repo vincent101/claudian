@@ -602,6 +602,14 @@ export class ClaudianService implements ChatRuntime {
       }
     }
 
+    // Send prohibition (2.4): force/config restarts close FIRST — that close
+    // must never clear the prohibition and start a second CLI over the
+    // possibly-live orphan. Fail fast here; only explicit reset/switch/cleanup
+    // entries (which pass clearStartProhibition) can lift it.
+    if (this.queryStartProhibited && !this.persistentQuery) {
+      throw new Error(this.queryStartBlockedMessage());
+    }
+
     // Track external context paths for dynamic updates (empty list clears)
     if (options && options.externalContextPaths !== undefined) {
       this.currentExternalContextPaths = options.externalContextPaths;
@@ -671,9 +679,7 @@ export class ClaudianService implements ChatRuntime {
       return;
     }
     if (this.queryStartProhibited) {
-      throw new Error(
-        `Claude session start is blocked after a failed query recovery (${this.queryStartProhibited}). Reload the conversation or reset the session to recover.`
-      );
+      throw new Error(this.queryStartBlockedMessage());
     }
     if (this.persistentQueryStart) {
       return this.persistentQueryStart;
@@ -778,6 +784,11 @@ export class ClaudianService implements ChatRuntime {
     this.recordTranscriptDiagnostic({ phase: 'query_start_prohibited', detail: reason });
   }
 
+  /** Single source of the blocked-start message (ensureReady, start, send paths). */
+  private queryStartBlockedMessage(): string {
+    return `Claude session start is blocked after a failed query recovery (${this.queryStartProhibited}). Reload the conversation or reset the session to recover.`;
+  }
+
   /**
    * Query boundary: materializes the scope for the query currently sitting in
    * the slot fields. Idempotent — the lazy attach also serves the test seams
@@ -879,7 +890,12 @@ export class ClaudianService implements ChatRuntime {
         this.messageChannel = null;
         this.queryAbortController = null;
       }
-      this.queryStartProhibited = null;
+      // Only an explicit recovery entry may lift the prohibition here; a
+      // zombie stdin error or internal close must not revive starts over a
+      // possibly-live orphaned CLI (2.4).
+      if (options?.clearStartProhibition) {
+        this.queryStartProhibited = null;
+      }
       return;
     }
 
@@ -950,10 +966,13 @@ export class ClaudianService implements ChatRuntime {
       clearTimeout(this.cancelBoundaryTombstone.timer);
       this.cancelBoundaryTombstone = null;
     }
-    // Explicit teardown clears the send prohibition: forced restarts, session
-    // resets/switches and plugin cleanup all route through here, and each of
-    // them intentionally owns the slot's lifecycle from scratch.
-    this.queryStartProhibited = null;
+    // Explicit teardown may lift the send prohibition — but only the explicit
+    // recovery entries (session reset/switch, plugin cleanup) pass the flag.
+    // Internal closes (force restarts, stdin errors, session invalidation)
+    // must never revive starts over a possibly-live orphaned CLI (2.4).
+    if (options?.clearStartProhibition) {
+      this.queryStartProhibited = null;
+    }
     this.responseConsumerRunning = false;
     this.responseConsumerPromise = null;
     this.currentConfig = null;
@@ -2280,7 +2299,7 @@ export class ClaudianService implements ChatRuntime {
     if (this.queryStartProhibited) {
       yield {
         type: 'error',
-        content: `Claude session start is blocked after a failed query recovery (${this.queryStartProhibited}). Reload the conversation or reset the session to recover.`,
+        content: this.queryStartBlockedMessage(),
       };
       return;
     }
@@ -3374,8 +3393,10 @@ export class ClaudianService implements ChatRuntime {
    * Closes the persistent query since session is changing.
    */
   resetSession() {
-    // Close persistent query (new session will use cold-start resume)
-    this.closePersistentQuery('session reset');
+    // Close persistent query (new session will use cold-start resume).
+    // Reset is an explicit recovery entry: it owns the slot lifecycle from
+    // scratch and may lift a send prohibition left by a failed recovery.
+    this.closePersistentQuery('session reset', { clearStartProhibition: true });
     this.turnReconciliation.advanceSessionGeneration();
 
     // Reset crash recovery for fresh start
@@ -3457,9 +3478,11 @@ export class ClaudianService implements ChatRuntime {
     const currentId = this.sessionManager.getSessionId();
     const sessionChanged = currentId !== id;
 
-    // Close synchronously when session changes
+    // Close synchronously when session changes. A session switch (reload,
+    // restore) is an explicit recovery entry: it may lift a send prohibition
+    // left by a failed recovery and start the new session fresh.
     if (sessionChanged) {
-      this.closePersistentQuery('session switch');
+      this.closePersistentQuery('session switch', { clearStartProhibition: true });
       this.crashRecoveryAttempted = false;
       // Bindings are scoped to the session generation: late events from the
       // old session must never hit the new session's map (batch 1 §2.4).
@@ -3577,8 +3600,9 @@ export class ClaudianService implements ChatRuntime {
     this.transcriptObserver?.stop('plugin_cleanup');
     this.transcriptObserver = null;
     this.turnReconciliation.advanceSessionGeneration();
-    // Close persistent query
-    this.closePersistentQuery('plugin cleanup');
+    // Close persistent query. Plugin teardown is an explicit recovery entry:
+    // the next plugin load owns the slot lifecycle from scratch.
+    this.closePersistentQuery('plugin cleanup', { clearStartProhibition: true });
 
     // Cancel any in-flight cold-start query
     this.cancel();

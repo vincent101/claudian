@@ -388,7 +388,9 @@ describe('ClaudianService', () => {
 
       service.cleanup();
 
-      expect(closePersistentQuerySpy).toHaveBeenCalledWith('plugin cleanup');
+      // Plugin teardown is an explicit recovery entry: it may lift a send
+      // prohibition left by a failed recovery.
+      expect(closePersistentQuerySpy).toHaveBeenCalledWith('plugin cleanup', { clearStartProhibition: true });
       expect(cancelSpy).toHaveBeenCalled();
     });
   });

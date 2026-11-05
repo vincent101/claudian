@@ -1161,8 +1161,9 @@ describe('ClaudianService - P0-1 result-late watchdog', () => {
       expect((blockedFirst.value as { content?: string }).content).toContain('blocked after a failed query recovery');
       expect(sdkMock.getQueryCallCount()).toBe(1);
 
-      // An explicit close clears the prohibition; the next start succeeds.
-      (service as any).closePersistentQuery('test explicit reset');
+      // An explicit recovery entry (session reset) clears the prohibition;
+      // the next start succeeds.
+      service.resetSession();
       expect((service as any).queryStartProhibited).toBeNull();
       sdkMock.setMockMessages([
         { type: 'system', subtype: 'init', session_id: 'watch-session-2' },
@@ -1173,6 +1174,46 @@ describe('ClaudianService - P0-1 result-late watchdog', () => {
       const revivedFirst = await revivedGen.next();
       expect(revivedFirst.value).not.toEqual(expect.objectContaining({ type: 'error' }));
       expect(sdkMock.getQueryCallCount()).toBe(2);
+    });
+
+    it('a forced ensureReady cannot clear the send prohibition — no second CLI over the orphan', async () => {
+      sdkMock.setMockMessages([
+        { type: 'system', subtype: 'init', session_id: 'watch-session' },
+        { type: 'assistant', message: { content: [{ type: 'text', text: 'model reply' }] } },
+      ], { appendResult: false });
+      await startPersistentQuery(service);
+      // Fail only the SDK transport creation; the production retirement and
+      // startup methods must execute, arming the prohibition for real.
+      jest.spyOn(sdkMock, 'query').mockImplementationOnce(() => {
+        throw new Error('rebuild failed: CLI unavailable');
+      });
+
+      const turn = service.prepareTurn({ turnId: 'turn-force-block', text: 'hello' });
+      const gen = service.query(turn);
+      await gen.next();
+      await armTerminalEvidence(service, 'turn-force-block');
+      const settledNext = gen.next();
+      await flushMicrotasks();
+
+      await jest.advanceTimersByTimeAsync(RESULT_WATCHDOG_MS + STOP_TASK_GRACE_MS + RESULT_WATCHDOG_GRACE_MS);
+      await flushMicrotasks();
+      expect((await settledNext).value).toEqual({ type: 'done' });
+      expect((service as any).queryStartProhibited).toBe('query_rebuild_failed');
+
+      // A forced restart closes first — that close must not lift the
+      // prohibition and start a second CLI over the possibly-live orphan.
+      await expect(service.ensureReady({ force: true })).rejects.toThrow('blocked after a failed query recovery');
+      expect((service as any).queryStartProhibited).toBe('query_rebuild_failed');
+      expect(sdkMock.getQueryCallCount()).toBe(1);
+
+      // Internal (non-explicit) closes must not lift it either: a zombie
+      // stdin error from the orphan cannot revive starts.
+      (service as any).closePersistentQuery('zombie stdin error');
+      expect((service as any).queryStartProhibited).toBe('query_rebuild_failed');
+
+      // The explicit recovery entry (reset) lifts it.
+      service.resetSession();
+      expect((service as any).queryStartProhibited).toBeNull();
     });
   });
 

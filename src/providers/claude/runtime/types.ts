@@ -242,6 +242,13 @@ export function createRuntimeTurn(options: RuntimeTurnOptions): RuntimeTurn {
 
 export interface ClosePersistentQueryOptions {
   preserveHandlers?: boolean;
+  /**
+   * Only the explicit recovery entries (session reset/switch, plugin
+   * cleanup) may lift the send prohibition. Internal closes (force
+   * restarts, stdin errors, session invalidation) must never revive
+   * starts over a possibly-live orphaned CLI.
+   */
+  clearStartProhibition?: boolean;
 }
 
 export interface ClaudeEnsureReadyOptions extends ChatRuntimeEnsureReadyOptions {
