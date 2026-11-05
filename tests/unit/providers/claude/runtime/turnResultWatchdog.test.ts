@@ -16,11 +16,14 @@ const sdkMock = sdkModule as unknown as {
   setMockMessages: (messages: any[], options?: { appendResult?: boolean }) => void;
   resetMockMessages: () => void;
   query: typeof sdkModule.query;
-  getLastResponse: () => (AsyncGenerator<any> & { interrupt: jest.Mock }) | null;
+  getLastResponse: () => (AsyncGenerator<any> & { interrupt: jest.Mock; stopTask: jest.Mock }) | null;
 };
 
 const RESULT_WATCHDOG_MS = 120_000;
 const RESULT_WATCHDOG_GRACE_MS = 15_000;
+const STOP_TASK_GRACE_MS = 15_000;
+const STOP_TASK_TURN_SILENCE_MS = 30 * 60_000;
+const STOP_TASK_AGENT_MIN_AGE_MS = 2 * 60 * 60 * 1000;
 
 function makeMockPlugin(): ClaudianPlugin {
   const storageMock = {
@@ -632,5 +635,365 @@ describe('ClaudianService - P0-1 result-late watchdog', () => {
     expect(sdkMock.getLastResponse()?.interrupt).not.toHaveBeenCalled();
     const phases = await readDiagnosticPhases(diagDir);
     expect(phases.some(entry => entry.phase === 'settle_watchdog_fire')).toBe(false);
+  });
+
+  describe('B-(a) stopTask before interrupt (armed watchdog path)', () => {
+    function stubRunningAgents(service: ClaudianService, agents: Array<{ agentId: string; startedAt: number }>, pendingApproval = false): void {
+      service.setSubagentHookProvider(() => ({ hasRunning: agents.length > 0, runningAgents: agents, pendingApproval }));
+    }
+
+    async function armTerminalEvidence(service: ClaudianService, turnId: string): Promise<void> {
+      service.beginUserTurnProjection(turnId);
+      await flushMicrotasks();
+      const uuid = (service as any).lastSentMessage.uuid as string;
+      (service as any).transcriptObserver.registerHostUserTranscriptId(uuid);
+      await appendFile(transcriptFile, hostUserRowLine(uuid) + hostTerminalRows());
+      await driveObserverTick();
+    }
+
+    it('TB1: stopTask to all running background agents (no age floor) then a result inside the window settles with no interrupt', async () => {
+      stubRunningAgents(service, [
+        { agentId: 'ag-fresh', startedAt: Date.now() },
+        { agentId: 'ag-old', startedAt: Date.now() - 3 * STOP_TASK_AGENT_MIN_AGE_MS },
+      ]);
+      sdkMock.setMockMessages([
+        { type: 'system', subtype: 'init', session_id: 'watch-session' },
+        { type: 'assistant', message: { content: [{ type: 'text', text: 'model reply' }] } },
+      ], { appendResult: false });
+      await startPersistentQuery(service);
+
+      const turn = service.prepareTurn({ turnId: 'turn-tb1', text: 'hello' });
+      const gen = service.query(turn);
+      await gen.next();
+      await armTerminalEvidence(service, 'turn-tb1');
+      let settled = false;
+      const settledNext = gen.next().then(value => {
+        settled = true;
+        return value;
+      });
+      await flushMicrotasks();
+
+      await jest.advanceTimersByTimeAsync(RESULT_WATCHDOG_MS);
+      const query = sdkMock.getLastResponse();
+      expect(query?.stopTask).toHaveBeenCalledTimes(2);
+      expect(query?.stopTask).toHaveBeenCalledWith('ag-fresh');
+      expect(query?.stopTask).toHaveBeenCalledWith('ag-old');
+      expect(query?.interrupt).not.toHaveBeenCalled();
+
+      // The result flows inside the stop-task observation window.
+      await (service as any).routeMessage({ type: 'result', subtype: 'success', result: 'ok' });
+      await flushMicrotasks();
+      expect(settled).toBe(true);
+
+      await jest.advanceTimersByTimeAsync(STOP_TASK_GRACE_MS);
+      await flushMicrotasks();
+      const settledValue = await settledNext;
+      expect(settledValue.value).toEqual({ type: 'done' });
+
+      const phases = await readDiagnosticPhases(diagDir);
+      expect(phases.filter(entry => entry.phase === 'stop_task_sent')).toHaveLength(2);
+      const outcomes = phases.filter(entry => entry.phase === 'stop_task_outcome');
+      expect(outcomes).toHaveLength(1);
+      expect(outcomes[0].outcome).toBe('settled_by_result');
+      expect(phases.some(entry => entry.phase === 'settle_result')).toBe(true);
+      expect(phases.some(entry => entry.phase === 'interrupt_sent')).toBe(false);
+      expect(phases.some(entry => entry.phase === 'turn_cancel')).toBe(false);
+      await service.completeUserTurnProjection('turn-tb1');
+    });
+
+    it('TB2: stopTask without effect escalates to interrupt then force-settle and pumps the queue', async () => {
+      stubRunningAgents(service, [{ agentId: 'ag-stuck', startedAt: Date.now() - STOP_TASK_AGENT_MIN_AGE_MS }]);
+      sdkMock.setMockMessages([
+        { type: 'system', subtype: 'init', session_id: 'watch-session' },
+        { type: 'assistant', message: { content: [{ type: 'text', text: 'model reply' }] } },
+      ], { appendResult: false });
+      await startPersistentQuery(service);
+
+      const turn = service.prepareTurn({ turnId: 'turn-tb2', text: 'hello' });
+      const gen = service.query(turn);
+      await gen.next();
+      await armTerminalEvidence(service, 'turn-tb2');
+      let settled = false;
+      const settledNext = gen.next().then(value => {
+        settled = true;
+        return value;
+      });
+      await flushMicrotasks();
+
+      const queuedTurn = service.prepareTurn({ turnId: 'turn-tb2-q', text: 'queued hello' });
+      const queuedGen = service.query(queuedTurn);
+      let queuedResolved = false;
+      const queuedNext = queuedGen.next().then(value => {
+        queuedResolved = true;
+        return value;
+      });
+      await flushMicrotasks();
+
+      sdkMock.setMockMessages([
+        { type: 'assistant', message: { content: [{ type: 'text', text: 'queued reply' }] } },
+        { type: 'result', subtype: 'success', result: 'ok' },
+      ], { appendResult: false });
+
+      await jest.advanceTimersByTimeAsync(RESULT_WATCHDOG_MS);
+      expect(sdkMock.getLastResponse()?.stopTask).toHaveBeenCalledTimes(1);
+      // No result during the stop-task window.
+      await jest.advanceTimersByTimeAsync(STOP_TASK_GRACE_MS);
+      expect(sdkMock.getLastResponse()?.interrupt).toHaveBeenCalledTimes(1);
+
+      await jest.advanceTimersByTimeAsync(RESULT_WATCHDOG_GRACE_MS);
+      await flushMicrotasks();
+      expect(settled).toBe(true);
+      const settledValue = await settledNext;
+      expect(settledValue.value).toEqual({ type: 'done' });
+      const queuedFirst = await queuedNext;
+      expect(queuedResolved).toBe(true);
+      expect(queuedFirst.value).toEqual(expect.objectContaining({ type: 'text', content: 'queued reply' }));
+      await service.completeUserTurnProjection('turn-tb2-q');
+      const queuedDone = await queuedGen.next();
+      expect(queuedDone.value).toEqual({ type: 'done' });
+
+      const phases = await readDiagnosticPhases(diagDir);
+      expect(phases.some(entry => entry.phase === 'stop_task_sent')).toBe(true);
+      expect(phases.some(entry => entry.phase === 'stop_task_outcome' && entry.outcome === 'settled_by_result')).toBe(false);
+      expect(phases.some(entry => entry.phase === 'turn_cancel' && entry.detail === 'result_watchdog')).toBe(true);
+    });
+
+    it('TB6: a stopTask rejection (StopTaskError shape) is benign — outcome=error, chain still escalates to cancel', async () => {
+      stubRunningAgents(service, [{ agentId: 'ag-refused', startedAt: Date.now() - STOP_TASK_AGENT_MIN_AGE_MS }]);
+      sdkMock.setMockMessages([
+        { type: 'system', subtype: 'init', session_id: 'watch-session' },
+        { type: 'assistant', message: { content: [{ type: 'text', text: 'model reply' }] } },
+      ], { appendResult: false });
+      await startPersistentQuery(service);
+
+      const turn = service.prepareTurn({ turnId: 'turn-tb6', text: 'hello' });
+      const gen = service.query(turn);
+      await gen.next();
+      await armTerminalEvidence(service, 'turn-tb6');
+      let settled = false;
+      const settledNext = gen.next().then(value => {
+        settled = true;
+        return value;
+      });
+      await flushMicrotasks();
+
+      const query = sdkMock.getLastResponse();
+      query?.stopTask.mockRejectedValueOnce(new Error('stop_task_refused: No task found with ID'));
+      await jest.advanceTimersByTimeAsync(RESULT_WATCHDOG_MS);
+      await flushMicrotasks();
+
+      await jest.advanceTimersByTimeAsync(STOP_TASK_GRACE_MS);
+      await flushMicrotasks();
+      expect(query?.interrupt).toHaveBeenCalledTimes(1);
+
+      await jest.advanceTimersByTimeAsync(RESULT_WATCHDOG_GRACE_MS);
+      await flushMicrotasks();
+      expect(settled).toBe(true);
+      const settledValue = await settledNext;
+      expect(settledValue.value).toEqual({ type: 'done' });
+
+      const phases = await readDiagnosticPhases(diagDir);
+      const outcomes = phases.filter(entry => entry.phase === 'stop_task_outcome');
+      expect(outcomes).toHaveLength(1);
+      expect(outcomes[0].outcome).toBe('error');
+      expect(phases.some(entry => entry.phase === 'turn_cancel' && entry.detail === 'result_watchdog')).toBe(true);
+    });
+
+    it('TB7: no candidates at fire time skips the stopTask window — the interrupt chain stays exactly the current shape', async () => {
+      sdkMock.setMockMessages([
+        { type: 'system', subtype: 'init', session_id: 'watch-session' },
+        { type: 'assistant', message: { content: [{ type: 'text', text: 'model reply' }] } },
+      ], { appendResult: false });
+      await startPersistentQuery(service);
+
+      const turn = service.prepareTurn({ turnId: 'turn-tb7', text: 'hello' });
+      const gen = service.query(turn);
+      await gen.next();
+      await armTerminalEvidence(service, 'turn-tb7');
+      let settled = false;
+      const settledNext = gen.next().then(value => {
+        settled = true;
+        return value;
+      });
+      await flushMicrotasks();
+
+      await jest.advanceTimersByTimeAsync(RESULT_WATCHDOG_MS);
+      const query = sdkMock.getLastResponse();
+      expect(query?.stopTask).not.toHaveBeenCalled();
+      expect(query?.interrupt).toHaveBeenCalledTimes(1);
+
+      await jest.advanceTimersByTimeAsync(RESULT_WATCHDOG_GRACE_MS);
+      await flushMicrotasks();
+      expect(settled).toBe(true);
+      const settledValue = await settledNext;
+      expect(settledValue.value).toEqual({ type: 'done' });
+
+      const phases = await readDiagnosticPhases(diagDir);
+      const outcomes = phases.filter(entry => entry.phase === 'stop_task_outcome');
+      expect(outcomes).toHaveLength(1);
+      expect(outcomes[0].outcome).toBe('no_candidates');
+      expect(phases.filter(entry => entry.phase === 'stop_task_sent')).toHaveLength(0);
+    });
+  });
+
+  describe('B-(b) silent-turn stopTask probe (hook-block shape, no terminal evidence)', () => {
+    it('TB4: silent turn + stale running background agent probes once with stopTask only — never interrupt, never cancel', async () => {
+      service.setSubagentHookProvider(() => ({
+        hasRunning: true,
+        runningAgents: [{ agentId: 'ag-zombie', startedAt: Date.now() - 3 * STOP_TASK_AGENT_MIN_AGE_MS }],
+        pendingApproval: false,
+      }));
+      sdkMock.setMockMessages([
+        { type: 'system', subtype: 'init', session_id: 'watch-session' },
+        { type: 'assistant', message: { content: [{ type: 'text', text: 'working' }] } },
+      ], { appendResult: false });
+      await startPersistentQuery(service);
+
+      const turn = service.prepareTurn({ turnId: 'turn-tb4', text: 'hello' });
+      const gen = service.query(turn);
+      await gen.next();
+      service.beginUserTurnProjection('turn-tb4');
+      await flushMicrotasks();
+      let settled = false;
+      void gen.next().then(() => { settled = true; });
+      await flushMicrotasks();
+
+      // No terminal evidence, no chunks for 31 minutes, agent age > 2h.
+      await jest.advanceTimersByTimeAsync(STOP_TASK_TURN_SILENCE_MS + 60_000);
+      await flushMicrotasks();
+
+      const query = sdkMock.getLastResponse();
+      expect(query?.stopTask).toHaveBeenCalledTimes(1);
+      expect(query?.stopTask).toHaveBeenCalledWith('ag-zombie');
+      expect(query?.interrupt).not.toHaveBeenCalled();
+      expect(settled).toBe(false);
+      expect((service as any).runtimeTurns.has('turn-tb4')).toBe(true);
+
+      const phases = await readDiagnosticPhases(diagDir);
+      expect(phases.filter(entry => entry.phase === 'stop_task_sent')).toHaveLength(1);
+      expect(phases.some(entry => entry.phase === 'stop_task_outcome')).toBe(true);
+      expect(phases.some(entry => entry.phase === 'interrupt_sent')).toBe(false);
+      expect(phases.some(entry => entry.phase === 'turn_cancel')).toBe(false);
+      expect(phases.some(entry => entry.phase === 'settle_watchdog_fire')).toBe(false);
+    });
+
+    it('TB5: the turn-level latch never probes a second time on later ticks', async () => {
+      service.setSubagentHookProvider(() => ({
+        hasRunning: true,
+        runningAgents: [{ agentId: 'ag-zombie-2', startedAt: Date.now() - 3 * STOP_TASK_AGENT_MIN_AGE_MS }],
+        pendingApproval: false,
+      }));
+      sdkMock.setMockMessages([
+        { type: 'system', subtype: 'init', session_id: 'watch-session' },
+        { type: 'assistant', message: { content: [{ type: 'text', text: 'working' }] } },
+      ], { appendResult: false });
+      await startPersistentQuery(service);
+
+      const turn = service.prepareTurn({ turnId: 'turn-tb5', text: 'hello' });
+      const gen = service.query(turn);
+      await gen.next();
+      service.beginUserTurnProjection('turn-tb5');
+      await flushMicrotasks();
+      void gen.next();
+      await flushMicrotasks();
+
+      await jest.advanceTimersByTimeAsync(STOP_TASK_TURN_SILENCE_MS + 60_000);
+      await flushMicrotasks();
+      expect(sdkMock.getLastResponse()?.stopTask).toHaveBeenCalledTimes(1);
+
+      // Another hour of silence: the latch holds.
+      await jest.advanceTimersByTimeAsync(STOP_TASK_TURN_SILENCE_MS + 60_000);
+      await flushMicrotasks();
+      expect(sdkMock.getLastResponse()?.stopTask).toHaveBeenCalledTimes(1);
+      expect(sdkMock.getLastResponse()?.interrupt).not.toHaveBeenCalled();
+      expect((service as any).runtimeTurns.has('turn-tb5')).toBe(true);
+    });
+
+    it('TB3 red line: a 48-minute sync blocking Agent (never in runningAgents) plus 31 minutes of silence probes nothing', async () => {
+      // The sync blocking agent is structurally absent from the async map —
+      // only async (run_in_background) agents are ever stopTask candidates.
+      service.setSubagentHookProvider(() => ({ hasRunning: false, runningAgents: [], pendingApproval: false }));
+      sdkMock.setMockMessages([
+        { type: 'system', subtype: 'init', session_id: 'watch-session' },
+        { type: 'assistant', message: { content: [{ type: 'text', text: 'working' }] } },
+      ], { appendResult: false });
+      await startPersistentQuery(service);
+
+      const turn = service.prepareTurn({ turnId: 'turn-tb3', text: 'run a blocking Agent' });
+      const gen = service.query(turn);
+      await gen.next();
+      service.beginUserTurnProjection('turn-tb3');
+      await flushMicrotasks();
+      let settled = false;
+      void gen.next().then(() => { settled = true; });
+      await flushMicrotasks();
+
+      await jest.advanceTimersByTimeAsync(48 * 60_000 + 60_000);
+      await flushMicrotasks();
+
+      expect(sdkMock.getLastResponse()?.stopTask).not.toHaveBeenCalled();
+      expect(sdkMock.getLastResponse()?.interrupt).not.toHaveBeenCalled();
+      expect(settled).toBe(false);
+      expect((service as any).runtimeTurns.has('turn-tb3')).toBe(true);
+      const phases = await readDiagnosticPhases(diagDir);
+      expect(phases.some(entry => entry.phase === 'stop_task_sent')).toBe(false);
+      expect(phases.some(entry => entry.phase === 'stop_task_outcome')).toBe(false);
+    });
+
+    it('H2 guard: a pending canUseTool approval wait suppresses the probe (the turn is parked on user input, not CLI-dead)', async () => {
+      service.setSubagentHookProvider(() => ({
+        hasRunning: true,
+        runningAgents: [{ agentId: 'ag-approval-guard', startedAt: Date.now() - 3 * STOP_TASK_AGENT_MIN_AGE_MS }],
+        pendingApproval: true,
+      }));
+      sdkMock.setMockMessages([
+        { type: 'system', subtype: 'init', session_id: 'watch-session' },
+        { type: 'assistant', message: { content: [{ type: 'text', text: 'working' }] } },
+      ], { appendResult: false });
+      await startPersistentQuery(service);
+
+      const turn = service.prepareTurn({ turnId: 'turn-approval-guard', text: 'hello' });
+      const gen = service.query(turn);
+      await gen.next();
+      service.beginUserTurnProjection('turn-approval-guard');
+      await flushMicrotasks();
+      void gen.next();
+      await flushMicrotasks();
+
+      await jest.advanceTimersByTimeAsync(STOP_TASK_TURN_SILENCE_MS + 60_000);
+      await flushMicrotasks();
+
+      expect(sdkMock.getLastResponse()?.stopTask).not.toHaveBeenCalled();
+      expect((service as any).runtimeTurns.has('turn-approval-guard')).toBe(true);
+      const phases = await readDiagnosticPhases(diagDir);
+      expect(phases.some(entry => entry.phase === 'stop_task_sent')).toBe(false);
+    });
+
+    it('a fresh running background agent (age < 2h) is not a probe candidate', async () => {
+      service.setSubagentHookProvider(() => ({
+        hasRunning: true,
+        runningAgents: [{ agentId: 'ag-young', startedAt: Date.now() }],
+        pendingApproval: false,
+      }));
+      sdkMock.setMockMessages([
+        { type: 'system', subtype: 'init', session_id: 'watch-session' },
+        { type: 'assistant', message: { content: [{ type: 'text', text: 'working' }] } },
+      ], { appendResult: false });
+      await startPersistentQuery(service);
+
+      const turn = service.prepareTurn({ turnId: 'turn-young-agent', text: 'hello' });
+      const gen = service.query(turn);
+      await gen.next();
+      service.beginUserTurnProjection('turn-young-agent');
+      await flushMicrotasks();
+      void gen.next();
+      await flushMicrotasks();
+
+      await jest.advanceTimersByTimeAsync(STOP_TASK_TURN_SILENCE_MS + 60_000);
+      await flushMicrotasks();
+
+      expect(sdkMock.getLastResponse()?.stopTask).not.toHaveBeenCalled();
+      expect((service as any).runtimeTurns.has('turn-young-agent')).toBe(true);
+    });
   });
 });

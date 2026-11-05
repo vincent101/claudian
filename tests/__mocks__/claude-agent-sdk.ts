@@ -122,6 +122,7 @@ let mockSupportedCommands: Array<{ name: string; description: string; argumentHi
 let mockRewindFilesImpl: ((userMessageId: string, options?: { dryRun?: boolean }) => Promise<any>) | null = null;
 let lastResponse: (AsyncGenerator<any> & {
   interrupt: jest.Mock;
+  stopTask: jest.Mock;
   setModel: jest.Mock;
   setMaxThinkingTokens: jest.Mock;
   setPermissionMode: jest.Mock;
@@ -309,6 +310,7 @@ export function query({ prompt, options }: { prompt: any; options: Options }): A
 
   const gen = generator() as AsyncGenerator<any> & {
     interrupt: jest.Mock;
+    stopTask: jest.Mock;
     setModel: jest.Mock;
     setMaxThinkingTokens: jest.Mock;
     setPermissionMode: jest.Mock;
@@ -318,6 +320,7 @@ export function query({ prompt, options }: { prompt: any; options: Options }): A
     rewindFiles: jest.Mock | ((userMessageId: string, options?: { dryRun?: boolean }) => Promise<any>);
   };
   gen.interrupt = jest.fn().mockResolvedValue(undefined);
+  gen.stopTask = jest.fn().mockResolvedValue(undefined);
   // Dynamic update methods for persistent queries
   gen.setModel = jest.fn().mockResolvedValue(undefined);
   gen.setMaxThinkingTokens = jest.fn().mockResolvedValue(undefined);
