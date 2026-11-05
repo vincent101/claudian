@@ -154,6 +154,10 @@ export interface RuntimeTurn {
   transcriptTerminalSource?: 'compact' | 'stop_hook';
   /** CLI version carried by the terminal-evidence row (compact boundary evidence only). */
   transcriptTerminalCliVersion?: string;
+  /** Wall time of channel dequeue; silence must not include time queued behind another turn. */
+  dispatchedAt: number;
+  /** One silent-turn probe per logical turn, never automatic escalation without evidence. */
+  stopTaskProbeSent: boolean;
   /** P0-1 diagnostics: wall time of the last chunk delivered to this turn. */
   lastChunkAt: number | null;
   /**
@@ -193,6 +197,8 @@ export function createRuntimeTurn(options: RuntimeTurnOptions): RuntimeTurn {
     mergedInto: null,
     notificationResultPending: false,
     transcriptTerminalSeenAt: null,
+    dispatchedAt: Date.now(),
+    stopTaskProbeSent: false,
     lastChunkAt: null,
     lastRoutedMessageAt: null,
   };

@@ -145,6 +145,9 @@ type QueryOptions = ChatRuntimeQueryOptions;
  */
 const RESULT_WATCHDOG_MS = 120_000;
 const RESULT_WATCHDOG_GRACE_MS = 15_000;
+const STOP_TASK_GRACE_MS = 15_000;
+const STOP_TASK_TURN_SILENCE_MS = 30 * 60_000;
+const STOP_TASK_AGENT_MIN_AGE_MS = 2 * 60 * 60 * 1000;
 /** P0-3: escalate an interrupt the CLI never acknowledged. */
 const INTERRUPT_ACK_WATCHDOG_MS = 5_000;
 
@@ -197,6 +200,8 @@ export class ClaudianService implements ChatRuntime {
   private abortController: AbortController | null = null;
   private approvalCallback: ApprovalCallback | null = null;
   private approvalDismisser: (() => void) | null = null;
+  /** canUseTool callbacks pending on approval, questions, or plan-exit input. */
+  private pendingCanUseToolCount = 0;
   private askUserQuestionCallback: AskUserQuestionCallback | null = null;
   private exitPlanModeCallback: ExitPlanModeCallback | null = null;
   private permissionModeSyncCallback: ((sdkMode: string) => void) | null = null;
@@ -1375,6 +1380,7 @@ export class ClaudianService implements ChatRuntime {
     }
     if (turn.phase === 'queued') {
       turn.phase = 'collecting';
+      turn.dispatchedAt = Date.now();
     }
   }
 
@@ -2248,8 +2254,21 @@ export class ClaudianService implements ChatRuntime {
     if (this.runtimeTurns.get(turn.id) !== turn) return;
     const terminalSeenAt = turn.transcriptTerminalSeenAt;
     if (terminalSeenAt === null) {
-      // T4 red line: no transcript terminal evidence — a legitimately long
-      // turn (blocking Agent/TaskOutput) keeps waiting.
+      // No evidence permits only the one-shot background-agent probe. A
+      // blocking sync Agent is absent from the candidate list, and a pending
+      // permission/question wait suppresses the probe altogether.
+      const now = Date.now();
+      if (turn.phase === 'collecting' && !turn.stopTaskProbeSent && this.pendingCanUseToolCount === 0
+        && now - Math.max(turn.lastChunkAt ?? turn.dispatchedAt, turn.dispatchedAt) > STOP_TASK_TURN_SILENCE_MS
+        && this.persistentQuery && !this.shuttingDown) {
+        const candidates = this.getRunningAgentCandidates()
+          .filter(agent => now - agent.startedAt > STOP_TASK_AGENT_MIN_AGE_MS);
+        if (candidates.length > 0) {
+          turn.stopTaskProbeSent = true;
+          void this.sendStopTasks(turn, candidates, 'silent_probe');
+        }
+      }
+      // T4 red line: a probe never interrupts or force-settles an unproven turn.
       arm();
       return;
     }
@@ -2261,6 +2280,7 @@ export class ClaudianService implements ChatRuntime {
       arm(RESULT_WATCHDOG_MS - (now - terminalSeenAt));
       return;
     }
+    const candidates = this.getRunningAgentCandidates();
     this.recordTranscriptDiagnostic({
       phase: 'settle_watchdog_fire',
       turnId: turn.id,
@@ -2270,7 +2290,30 @@ export class ClaudianService implements ChatRuntime {
       ...(turn.lastChunkAt !== null ? { lastChunkAgeMs: now - turn.lastChunkAt } : {}),
       evidenceKind: turn.transcriptTerminalSource ?? 'stop_hook',
       ...(turn.transcriptTerminalCliVersion ? { cliVersion: turn.transcriptTerminalCliVersion } : {}),
+      agentCandidateCount: candidates.length,
     });
+    if (candidates.length > 0 && this.persistentQuery && !this.shuttingDown) {
+      // Send all candidates concurrently before the observation window. Do
+      // not await an unacknowledged control request: it must not strand the
+      // very recovery chain intended to unpark the query.
+      void this.sendStopTasks(turn, candidates, 'result_watchdog');
+      await new Promise<void>(resolve => setTimeout(resolve, STOP_TASK_GRACE_MS));
+      if (state.done && turn.phase !== 'cancelled') {
+        this.recordTranscriptDiagnostic({
+          phase: 'stop_task_outcome', turnId: turn.id, generation: turn.generation,
+          outcome: 'settled_by_result', agentCandidateCount: candidates.length,
+          ...(turn.transcriptTerminalCliVersion ? { cliVersion: turn.transcriptTerminalCliVersion } : {}),
+        });
+      }
+      if (state.resolveChunk !== settle || state.done) return;
+      if (this.runtimeTurns.get(turn.id) !== turn) return;
+    } else if (candidates.length === 0) {
+      this.recordTranscriptDiagnostic({
+        phase: 'stop_task_outcome', turnId: turn.id, generation: turn.generation,
+        outcome: 'no_candidates', agentCandidateCount: 0,
+        ...(turn.transcriptTerminalCliVersion ? { cliVersion: turn.transcriptTerminalCliVersion } : {}),
+      });
+    }
     // One interrupt so the CLI gets a chance to flush its belated result.
     if (this.persistentQuery && !this.shuttingDown) {
       this.recordTranscriptDiagnostic({ phase: 'interrupt_sent', turnId: turn.id, generation: turn.generation, detail: 'result_watchdog' });
@@ -2287,6 +2330,50 @@ export class ClaudianService implements ChatRuntime {
     if (state.resolveChunk !== settle || state.done) return;
     if (this.runtimeTurns.get(turn.id) !== turn) return;
     this.cancelTurn(turn.id, 'result_watchdog');
+  }
+
+  private getRunningAgentCandidates(): Array<{ agentId: string; startedAt: number }> {
+    try {
+      // Read only runningAgents: hasRunning is a lazy getter with stale
+      // cleanup, so accessing it would orphanize the candidates before send.
+      return this._subagentStateProvider?.().runningAgents ?? [];
+    } catch {
+      return [];
+    }
+  }
+
+  private async sendStopTasks(
+    turn: RuntimeTurn,
+    candidates: Array<{ agentId: string; startedAt: number }>,
+    context: 'result_watchdog' | 'silent_probe',
+  ): Promise<void> {
+    const query = this.persistentQuery;
+    if (!query || this.shuttingDown) return;
+    await Promise.allSettled(candidates.map(async agent => {
+      this.recordTranscriptDiagnostic({
+        phase: 'stop_task_sent', turnId: turn.id, generation: turn.generation,
+        agentIdHash: this.transcriptDiagnosticLog?.hashId(agent.agentId), detail: context,
+      });
+      try {
+        await query.stopTask(agent.agentId);
+        if (context === 'silent_probe') {
+          this.recordTranscriptDiagnostic({
+            phase: 'stop_task_outcome', turnId: turn.id, generation: turn.generation,
+            agentIdHash: this.transcriptDiagnosticLog?.hashId(agent.agentId), outcome: 'sent', detail: context,
+            ...(turn.transcriptTerminalCliVersion ? { cliVersion: turn.transcriptTerminalCliVersion } : {}),
+          });
+        }
+      } catch (error) {
+        // CLI 2.1.311 may reject missing tasks. A rejected stop is benign:
+        // retain diagnostic evidence and let the recovery chain continue.
+        this.recordTranscriptDiagnostic({
+          phase: 'stop_task_outcome', turnId: turn.id, generation: turn.generation,
+          agentIdHash: this.transcriptDiagnosticLog?.hashId(agent.agentId), outcome: 'error', detail: context,
+          errorName: error instanceof Error ? error.name : 'UnknownError',
+          ...(turn.transcriptTerminalCliVersion ? { cliVersion: turn.transcriptTerminalCliVersion } : {}),
+        });
+      }
+    }));
   }
 
   /**
@@ -2943,7 +3030,7 @@ export class ClaudianService implements ChatRuntime {
   }
 
   private createApprovalCallback(): CanUseTool {
-    return createClaudeApprovalCallback({
+    const callback = createClaudeApprovalCallback({
       getAllowedTools: () => this.currentAllowedTools,
       getApprovalCallback: () => this.approvalCallback,
       getAskUserQuestionCallback: () => this.askUserQuestionCallback,
@@ -2957,6 +3044,14 @@ export class ClaudianService implements ChatRuntime {
         }
       },
     });
+    return async (...args) => {
+      this.pendingCanUseToolCount += 1;
+      try {
+        return await callback(...args);
+      } finally {
+        this.pendingCanUseToolCount -= 1;
+      }
+    };
   }
 
   private resolveSDKPermissionMode(mode: PermissionMode): SDKPermissionMode {

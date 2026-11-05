@@ -25,7 +25,7 @@ export type TranscriptDiagnosticPhase =
   // spot (U-A: silent settles were unattributable).
   | 'cancel_request' | 'runtime_cancel' | 'query_close' | 'force_settle'
   | 'settle_watchdog_fire' | 'interrupt_sent' | 'settle_result' | 'reconcile_fix'
-  | 'run_phase' | 'turn_cancel';
+  | 'run_phase' | 'turn_cancel' | 'stop_task_sent' | 'stop_task_outcome';
 
 export interface TranscriptDiagnosticEvent {
   phase: TranscriptDiagnosticPhase;
@@ -46,7 +46,7 @@ export interface TranscriptDiagnosticEvent {
   buildId?: string;
   mode?: 'worker' | 'direct';
   reason?: 'oversized' | 'malformed' | 'no_conversation' | 'no_lease' | 'provider_without_index' | 'stale' | 'grant_timeout' | 'identity_missing' | 'alias_remap' | 'canonical_rebind' | 'range_mismatch' | 'rekey_conflict';
-  outcome?: 'rebuilt' | 'cache_hit' | 'not_applicable' | 'failed';
+  outcome?: 'rebuilt' | 'cache_hit' | 'not_applicable' | 'failed' | 'settled_by_result' | 'error' | 'no_candidates' | 'sent';
   /** Which surface forced a search snapshot refresh (search panel default). */
   trigger?: 'search' | 'rewind' | 'fork';
   /** How the oversized-row identity was recovered (field names only, never values). */
@@ -78,6 +78,8 @@ export interface TranscriptDiagnosticEvent {
   evidenceKind?: 'compact' | 'stop_hook';
   /** CLI version carried by the terminal-evidence transcript row (compact boundary rows carry it natively). */
   cliVersion?: string;
+  agentIdHash?: string;
+  agentCandidateCount?: number;
   /** Free-form short context: query-close reason, run_phase state value, force-settle outcome. */
   detail?: string;
 }
@@ -127,7 +129,7 @@ export class ClaudeTranscriptDiagnosticLog {
 
   private serialize(event: TranscriptDiagnosticEvent): string {
     const clean: Record<string, unknown> = { ts: Date.now(), seq: ++this.seq, phase: event.phase };
-    for (const key of ['tabIdHash', 'turnIdHash', 'pageKeyHash', 'previousPageKeyHash', 'rangeStart', 'rangeEnd', 'generation', 'renderTicket', 'projectedWeight', 'leaseKind', 'batchBytes', 'batchLines', 'elapsedMs', 'errorName', 'buildId', 'mode', 'reason', 'outcome', 'trigger', 'identityRecovery', 'recoveredIdentityFields', 'offset', 'queueMs', 'bytes', 'totalBytes', 'entries', 'turns', 'turnCount', 'sourceBytes', 'projectedChars', 'oversizedTurns', 'hostAliases', 'sourceKind', 'queueLength', 'isStreaming', 'terminalSeenAgeMs', 'lastChunkAgeMs', 'evidenceKind', 'cliVersion', 'detail'] as const) {
+    for (const key of ['tabIdHash', 'turnIdHash', 'pageKeyHash', 'previousPageKeyHash', 'rangeStart', 'rangeEnd', 'generation', 'renderTicket', 'projectedWeight', 'leaseKind', 'batchBytes', 'batchLines', 'elapsedMs', 'errorName', 'buildId', 'mode', 'reason', 'outcome', 'trigger', 'identityRecovery', 'recoveredIdentityFields', 'offset', 'queueMs', 'bytes', 'totalBytes', 'entries', 'turns', 'turnCount', 'sourceBytes', 'projectedChars', 'oversizedTurns', 'hostAliases', 'sourceKind', 'queueLength', 'isStreaming', 'terminalSeenAgeMs', 'lastChunkAgeMs', 'evidenceKind', 'cliVersion', 'agentIdHash', 'agentCandidateCount', 'detail'] as const) {
       const value = event[key];
       if (value !== undefined) clean[key] = typeof value === 'string' ? value.slice(0, 128) : value;
     }

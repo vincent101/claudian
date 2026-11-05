@@ -619,6 +619,14 @@ export class SubagentManager {
   // Hook State
   // ============================================
 
+  public getRunningAsyncAgents(): Array<{ agentId: string; startedAt: number }> {
+    // The recovery probe must see stale running entries before the Stop hook
+    // orphanizes them. Never call hasRunningSubagents from this snapshot.
+    return Array.from(this.activeAsyncSubagents.entries())
+      .filter(([, subagent]) => subagent.asyncStatus === 'running')
+      .map(([agentId, subagent]) => ({ agentId, startedAt: subagent.startedAt ?? 0 }));
+  }
+
   public hasRunningSubagents(): boolean {
     // stale-hook patch（2026-08-09，自运行中 main.js 移植）：进程退出丢失状态的 agent 会永远卡在 Map 里，
     // 导致 stop hook 永久 block。超过 STALE_MS 无生命的 "running" 条目视为僵尸清理放行；

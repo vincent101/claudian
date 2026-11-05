@@ -1816,6 +1816,32 @@ Only this is the final result.
   // Fix 2: Task Notification Settlement
   // ============================================
 
+  describe('read-only running background-agent recovery candidates', () => {
+    it('excludes sync and pending tasks, preserves stale running records, and returns detached snapshots', () => {
+      const { manager, updates } = createManager();
+      manager.handleTaskToolUse('sync-task', { run_in_background: false }, null);
+      manager.handleTaskToolUse('pending-task', { run_in_background: true }, null);
+      manager.handleTaskToolUse('running-task', { run_in_background: true }, null);
+      manager.handleTaskToolResult('running-task', JSON.stringify({ agent_id: 'running-agent' }));
+      const record = manager.getByTaskId('running-task')!;
+      record.startedAt = Date.now() - 3 * 60 * 60_000;
+      const updateCount = updates.length;
+      const cleanup = jest.spyOn(manager, 'hasRunningSubagents');
+
+      const snapshot = manager.getRunningAsyncAgents();
+      expect(snapshot).toEqual([{ agentId: 'running-agent', startedAt: record.startedAt }]);
+      snapshot[0].startedAt = 0;
+      expect(manager.getRunningAsyncAgents()[0].startedAt).toBe(record.startedAt);
+      expect(cleanup).not.toHaveBeenCalled();
+      expect(record.asyncStatus).toBe('running');
+      expect(updates).toHaveLength(updateCount);
+
+      manager.handleTaskNotification('running-agent', 'stopped');
+      expect(manager.getRunningAsyncAgents()).toEqual([]);
+      expect(record.asyncStatus).toBe('error');
+    });
+  });
+
   describe('task notification settlement (fix 2)', () => {
     const setupRunning = (manager: SubagentManager, parentEl: any, taskToolId: string, agentId: string) => {
       manager.handleTaskToolUse(taskToolId, { description: 'Background', run_in_background: true }, parentEl);

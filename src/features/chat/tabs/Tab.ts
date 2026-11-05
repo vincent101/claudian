@@ -2004,7 +2004,10 @@ export function setupServiceCallbacks(tab: TabData, plugin: ClaudianPlugin): voi
     );
     tab.service.setSubagentHookProvider(
       () => ({
-        hasRunning: tab.services.subagentManager.hasRunningSubagents(),
+        // Stop reads this getter and retains its existing stale cleanup. The
+        // probe reads runningAgents only, without invoking that cleanup.
+        get hasRunning() { return tab.services.subagentManager.hasRunningSubagents(); },
+        runningAgents: tab.services.subagentManager.getRunningAsyncAgents(),
       })
     );
     // Fix 2 (通知直接销账) + 0823 工具明细修复: terminal task-notifications go

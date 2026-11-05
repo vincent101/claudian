@@ -103,6 +103,8 @@ export interface ChatRewindResult {
 
 export interface SubagentRuntimeState {
   hasRunning: boolean;
+  /** Read-only snapshot of running background agents; excludes sync and pending launches. */
+  runningAgents?: Array<{ agentId: string; startedAt: number }>;
 }
 
 /**

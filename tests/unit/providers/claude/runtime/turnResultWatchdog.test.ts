@@ -73,7 +73,7 @@ async function startPersistentQuery(service: ClaudianService): Promise<MessageCh
   const startSpy = jest.spyOn(service as any, 'startPersistentQuery');
   startSpy.mockImplementation(async (...args: unknown[]) => {
     const [vaultPath, cliPath] = args as [string, string];
-    const messageChannel = new MessageChannel();
+    const messageChannel = new MessageChannel(() => {}, info => (service as any).handleTurnDequeued(info));
     (service as any).messageChannel = messageChannel;
     (service as any).persistentQuery = sdkMock.query({
       prompt: messageChannel,
@@ -681,7 +681,7 @@ describe('ClaudianService - P0-1 result-late watchdog', () => {
       expect(query?.interrupt).not.toHaveBeenCalled();
 
       // The result flows inside the stop-task observation window.
-      await (service as any).routeMessage({ type: 'result', subtype: 'success', result: 'ok' });
+      const routedResult = (service as any).routeMessage({ type: 'result', subtype: 'success', result: 'ok' });
       await flushMicrotasks();
       expect(settled).toBe(true);
 
@@ -699,6 +699,7 @@ describe('ClaudianService - P0-1 result-late watchdog', () => {
       expect(phases.some(entry => entry.phase === 'interrupt_sent')).toBe(false);
       expect(phases.some(entry => entry.phase === 'turn_cancel')).toBe(false);
       await service.completeUserTurnProjection('turn-tb1');
+      await routedResult;
     });
 
     it('TB2: stopTask without effect escalates to interrupt then force-settle and pumps the queue', async () => {
@@ -859,7 +860,7 @@ describe('ClaudianService - P0-1 result-late watchdog', () => {
       await flushMicrotasks();
 
       // No terminal evidence, no chunks for 31 minutes, agent age > 2h.
-      await jest.advanceTimersByTimeAsync(STOP_TASK_TURN_SILENCE_MS + 60_000);
+      await jest.advanceTimersByTimeAsync(STOP_TASK_TURN_SILENCE_MS + RESULT_WATCHDOG_MS);
       await flushMicrotasks();
 
       const query = sdkMock.getLastResponse();
@@ -897,12 +898,12 @@ describe('ClaudianService - P0-1 result-late watchdog', () => {
       void gen.next();
       await flushMicrotasks();
 
-      await jest.advanceTimersByTimeAsync(STOP_TASK_TURN_SILENCE_MS + 60_000);
+      await jest.advanceTimersByTimeAsync(STOP_TASK_TURN_SILENCE_MS + RESULT_WATCHDOG_MS);
       await flushMicrotasks();
       expect(sdkMock.getLastResponse()?.stopTask).toHaveBeenCalledTimes(1);
 
       // Another hour of silence: the latch holds.
-      await jest.advanceTimersByTimeAsync(STOP_TASK_TURN_SILENCE_MS + 60_000);
+      await jest.advanceTimersByTimeAsync(STOP_TASK_TURN_SILENCE_MS + RESULT_WATCHDOG_MS);
       await flushMicrotasks();
       expect(sdkMock.getLastResponse()?.stopTask).toHaveBeenCalledTimes(1);
       expect(sdkMock.getLastResponse()?.interrupt).not.toHaveBeenCalled();
@@ -951,6 +952,9 @@ describe('ClaudianService - P0-1 result-late watchdog', () => {
         { type: 'assistant', message: { content: [{ type: 'text', text: 'working' }] } },
       ], { appendResult: false });
       await startPersistentQuery(service);
+      let resolveApproval!: (decision: 'allow') => void;
+      service.setApprovalCallback(() => new Promise(resolve => { resolveApproval = resolve; }));
+      const approvalWait = (service as any).createApprovalCallback()('Bash', { command: 'pwd' }, { signal: new AbortController().signal, toolUseID: 'guard-tool' });
 
       const turn = service.prepareTurn({ turnId: 'turn-approval-guard', text: 'hello' });
       const gen = service.query(turn);
@@ -960,13 +964,17 @@ describe('ClaudianService - P0-1 result-late watchdog', () => {
       void gen.next();
       await flushMicrotasks();
 
-      await jest.advanceTimersByTimeAsync(STOP_TASK_TURN_SILENCE_MS + 60_000);
+      await jest.advanceTimersByTimeAsync(STOP_TASK_TURN_SILENCE_MS + RESULT_WATCHDOG_MS);
       await flushMicrotasks();
 
       expect(sdkMock.getLastResponse()?.stopTask).not.toHaveBeenCalled();
       expect((service as any).runtimeTurns.has('turn-approval-guard')).toBe(true);
       const phases = await readDiagnosticPhases(diagDir);
       expect(phases.some(entry => entry.phase === 'stop_task_sent')).toBe(false);
+      resolveApproval('allow');
+      await approvalWait;
+      await jest.advanceTimersByTimeAsync(RESULT_WATCHDOG_MS);
+      expect(sdkMock.getLastResponse()?.stopTask).toHaveBeenCalledWith('ag-approval-guard');
     });
 
     it('a fresh running background agent (age < 2h) is not a probe candidate', async () => {
@@ -989,7 +997,7 @@ describe('ClaudianService - P0-1 result-late watchdog', () => {
       void gen.next();
       await flushMicrotasks();
 
-      await jest.advanceTimersByTimeAsync(STOP_TASK_TURN_SILENCE_MS + 60_000);
+      await jest.advanceTimersByTimeAsync(STOP_TASK_TURN_SILENCE_MS + RESULT_WATCHDOG_MS);
       await flushMicrotasks();
 
       expect(sdkMock.getLastResponse()?.stopTask).not.toHaveBeenCalled();
