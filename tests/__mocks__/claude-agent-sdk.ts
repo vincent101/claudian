@@ -131,6 +131,8 @@ let lastResponse: (AsyncGenerator<any> & {
   setMcpServers: jest.Mock;
   supportedCommands: jest.Mock;
   rewindFiles: jest.Mock | ((userMessageId: string, options?: { dryRun?: boolean }) => Promise<any>);
+  pushLateMessage: (message: any) => void;
+  pushStdoutMessage: (message: any) => void;
 }) | null = null;
 
 // Crash simulation control
@@ -299,17 +301,45 @@ export function query({ prompt, options }: { prompt: any; options: Options }): A
   // when the transport closed (real shape: buffered stdout drains after the
   // channel ends). Tests push these to simulate old-scope late arrivals.
   const lateMessages: any[] = [];
+  // Real-time stdout: the CLI streams output independent of input timing, so
+  // these surface the moment tests push them (pushLateMessage only flushes on
+  // the next input round or channel end). Use for chunks/results that arrive
+  // asynchronously while the query waits for input.
+  const stdoutMessages: any[] = [];
+  let wakeStdout: (() => void) | null = null;
+  let inflightInput: Promise<IteratorResult<any>> | null = null;
 
   const generator = async function* () {
     if (isAsyncIterable(prompt)) {
-      for await (const _ of prompt) {
-        void _; // Consume async iterable input
-        const messages = getMessagesForPrompt();
-        yield* emitMessages(messages, options);
-        for (const late of lateMessages.splice(0)) yield late;
+      const iterator = prompt[Symbol.asyncIterator]() as AsyncIterator<any>;
+      for (;;) {
+        while (stdoutMessages.length > 0) {
+          yield stdoutMessages.shift()!;
+        }
+        if (inflightInput === null) {
+          inflightInput = iterator.next();
+        }
+        const stdoutSignal = new Promise<void>(resolve => {
+          wakeStdout = () => { wakeStdout = null; resolve(); };
+        });
+        const winner = await Promise.race([
+          inflightInput.then(res => ({ input: res })),
+          stdoutSignal.then(() => null),
+        ]);
+        if (winner !== null) {
+          inflightInput = null;
+          if (winner.input.done) {
+            for (const late of lateMessages.splice(0)) yield late;
+            for (const late of stdoutMessages.splice(0)) yield late;
+            return;
+          }
+          void winner.input.value; // Consume async iterable input
+          const messages = getMessagesForPrompt();
+          yield* emitMessages(messages, options);
+          for (const late of lateMessages.splice(0)) yield late;
+        }
+        // stdout won the race: loop back and drain stdoutMessages first.
       }
-      for (const late of lateMessages.splice(0)) yield late;
-      return;
     }
 
     const messages = getMessagesForPrompt();
@@ -328,12 +358,18 @@ export function query({ prompt, options }: { prompt: any; options: Options }): A
     setMcpServers: jest.Mock;
     supportedCommands: jest.Mock;
     rewindFiles: jest.Mock | ((userMessageId: string, options?: { dryRun?: boolean }) => Promise<any>);
+    pushLateMessage: (message: any) => void;
+    pushStdoutMessage: (message: any) => void;
   };
   gen.interrupt = jest.fn().mockResolvedValue(undefined);
   gen.stopTask = jest.fn().mockResolvedValue(undefined);
   gen.close = jest.fn().mockImplementation(() => {});
   (gen as { pushLateMessage?: (message: any) => void }).pushLateMessage = (message: any) => {
     lateMessages.push(message);
+  };
+  (gen as { pushStdoutMessage?: (message: any) => void }).pushStdoutMessage = (message: any) => {
+    stdoutMessages.push(message);
+    wakeStdout?.();
   };
   // Dynamic update methods for persistent queries
   gen.setModel = jest.fn().mockResolvedValue(undefined);

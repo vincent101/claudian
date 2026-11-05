@@ -4602,7 +4602,7 @@ describe('ClaudianService', () => {
       (service as any).runtimeTurns.clear();
     });
 
-    it('cancel() wakes the feature but holds the lease until projection acknowledgement', async () => {
+    it('cancel() wakes the feature and hands the lease to the boundary tombstone until the real result', async () => {
       service.setOnAutoTurnStarted(() => {});
       const channel = (service as any).messageChannel as MessageChannel;
       const turn = createRuntimeTurn({ id: 'user-active-cancel', kind: 'user', phase: 'collecting' });
@@ -4624,7 +4624,11 @@ describe('ClaudianService', () => {
       expect(channel.getActiveTurnId()).toBe('user-active-cancel');
       await service.completeUserTurnProjection('user-active-cancel');
       expect((service as any).runtimeTurns.has('user-active-cancel')).toBe(false);
-      expect(channel.getActiveTurnId()).toBeNull();
+      // Plain-cancel boundary (2026-11-05 spec 2.4): the handoff plants a
+      // tombstone, not a release — the lease holds until the cancelled CLI
+      // turn's real result or the 15s window, never at handoff itself.
+      expect(channel.getActiveTurnId()).toBe('user-active-cancel');
+      expect((service as any).cancelBoundaryTombstone?.turnId).toBe('user-active-cancel');
     });
 
     it('a cancelled user turn still hands its metadata to the feature layer', () => {

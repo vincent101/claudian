@@ -1863,9 +1863,11 @@ export class ClaudianService implements ChatRuntime {
         phase: 'turn_cancel', turnId: turn.id, generation: turn.generation,
         detail: 'user_cancel_boundary_held',
       });
-    } else {
+    } else if (!oldScopeTurn) {
       this.completeChannelTurn(turn.id);
     }
+    // An old-scope turn owns no release on the live channel — its lease died
+    // with the retired channel (2.4: no cross-scope escalation).
     barrier.resolveRuntimeHandoffDone();
     this.userTurnCompletionBarriers.delete(turn.id);
   }

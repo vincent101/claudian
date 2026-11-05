@@ -2,6 +2,7 @@ import '@/providers';
 
 import * as sdkModule from '@anthropic-ai/claude-agent-sdk';
 import { appendFile, mkdtemp, readFile, rm, writeFile } from 'fs/promises';
+import { Notice } from 'obsidian';
 import { tmpdir } from 'os';
 import { join } from 'path';
 
@@ -17,7 +18,7 @@ const sdkMock = sdkModule as unknown as {
   resetMockMessages: () => void;
   query: typeof sdkModule.query;
   getQueryCallCount: () => number;
-  getLastResponse: () => (AsyncGenerator<any> & { interrupt: jest.Mock; stopTask: jest.Mock; close: jest.Mock; pushLateMessage: (message: any) => void }) | null;
+  getLastResponse: () => (AsyncGenerator<any> & { interrupt: jest.Mock; stopTask: jest.Mock; close: jest.Mock; pushLateMessage: (message: any) => void; pushStdoutMessage: (message: any) => void }) | null;
 };
 
 const RESULT_WATCHDOG_MS = 120_000;
@@ -1652,6 +1653,155 @@ describe('ClaudianService - P0-1 result-late watchdog', () => {
 
       expect(sdkMock.getLastResponse()?.stopTask).not.toHaveBeenCalled();
       expect((service as any).runtimeTurns.has('turn-young-agent')).toBe(true);
+    });
+  });
+
+  describe('plain user-cancel boundary isolation (2026-11-05 spec 2.4: a cancelled lease is not a CLI boundary end)', () => {
+    /** Standard shape: one dispatched turn holding the lease, one queued behind it. */
+    async function setupCancelledTurnWithQueue(): Promise<void> {
+      sdkMock.setMockMessages([
+        { type: 'system', subtype: 'init', session_id: 'watch-session' },
+        { type: 'assistant', message: { content: [{ type: 'text', text: 'model reply' }] } },
+      ], { appendResult: false });
+      await startPersistentQuery(service);
+
+      const turnA = service.prepareTurn({ turnId: 'turn-can-a', text: 'hello' });
+      const genA = service.query(turnA);
+      await genA.next();
+      await flushMicrotasks();
+
+      const queuedTurn = service.prepareTurn({ turnId: 'turn-can-q', text: 'queued hello' });
+      void service.query(queuedTurn).next();
+      await flushMicrotasks();
+    }
+
+    async function drainMicrotasks(): Promise<void> {
+      for (let i = 0; i < 30; i += 1) {
+        await Promise.resolve();
+        await Promise.resolve();
+      }
+    }
+
+    it('late chunks never release the tombstone; the real result dissolves it and pumps the queue', async () => {
+      await setupCancelledTurnWithQueue();
+      const channel = (service as any).messageChannel as MessageChannel;
+      expect(channel.getActiveTurnId()).toBe('turn-can-a');
+      expect(channel.getQueueLength()).toBe(1);
+
+      service.cancel();
+      await service.completeUserTurnProjection('turn-can-a');
+      await flushMicrotasks();
+
+      // The tombstone owns the lease: the queued input must not dispatch.
+      expect(channel.getActiveTurnId()).toBe('turn-can-a');
+      expect((service as any).cancelBoundaryTombstone?.turnId).toBe('turn-can-a');
+      expect(channel.getQueuedTurnIds()).toContain('turn-can-q');
+
+      // The cancelled CLI turn keeps streaming — that is evidence it is
+      // STILL running, so the lease must hold (defect-2 shape guard).
+      const query = sdkMock.getLastResponse()!;
+      query.pushStdoutMessage({ type: 'assistant', message: { content: [{ type: 'text', text: 'still running' }] } });
+      await drainMicrotasks();
+      expect(channel.getActiveTurnId()).toBe('turn-can-a');
+      expect(channel.getQueuedTurnIds()).toContain('turn-can-q');
+
+      // The REAL result proves the CLI turn ended: tombstone dissolves, the
+      // result settles nothing, the queue pumps exactly once.
+      query.pushStdoutMessage({ type: 'result', subtype: 'success', result: 'over' });
+      await drainMicrotasks();
+      expect((service as any).cancelBoundaryTombstone).toBeNull();
+      expect(channel.getActiveTurnId()).toBe('turn-can-q');
+      const phases = await readDiagnosticPhases(diagDir);
+      expect(phases.some(entry => entry.phase === 'turn_cancel' && entry.detail === 'cancel_boundary_result_arrived')).toBe(true);
+      // The late result must never settle the cancelled turn (it is gone) nor
+      // pre-settle the queued turn now holding the lease.
+      expect(phases.some(entry => entry.phase === 'settle_result')).toBe(false);
+      expect((service as any).runtimeTurns.has('turn-can-q')).toBe(true);
+    });
+
+    it('15s without a result expires the tombstone with the input-held notice and pumps the queue', async () => {
+      await setupCancelledTurnWithQueue();
+
+      service.cancel();
+      await service.completeUserTurnProjection('turn-can-a');
+      await flushMicrotasks();
+
+      const channel = (service as any).messageChannel as MessageChannel;
+      expect((service as any).cancelBoundaryTombstone?.turnId).toBe('turn-can-a');
+
+      const noticeCallsBefore = (Notice as jest.Mock).mock.calls.length;
+
+      await jest.advanceTimersByTimeAsync(15_000);
+      await drainMicrotasks();
+
+      // Expiry: the notice fires and the queued input finally dispatches.
+      expect((service as any).cancelBoundaryTombstone).toBeNull();
+      expect(channel.getActiveTurnId()).toBe('turn-can-q');
+      const noticeCallsAfter = (Notice as jest.Mock).mock.calls.length;
+      expect(noticeCallsAfter).toBeGreaterThan(noticeCallsBefore);
+      const phases = await readDiagnosticPhases(diagDir);
+      expect(phases.some(entry => entry.phase === 'turn_cancel' && entry.detail === 'cancel_boundary_timeout')).toBe(true);
+      // The query was never closed by a plain cancel.
+      expect(phases.some(entry => entry.phase === 'query_close')).toBe(false);
+    });
+
+    it('a result arriving before the handoff skips the tombstone window entirely', async () => {
+      await setupCancelledTurnWithQueue();
+
+      service.cancel();
+      await flushMicrotasks();
+      // The turn is cancelled but its projection handoff has NOT landed. The
+      // real result arrives now (cancelled-phase gate records it).
+      const query = sdkMock.getLastResponse()!;
+      query.pushStdoutMessage({ type: 'result', subtype: 'success', result: 'over' });
+      await drainMicrotasks();
+      const turnA = (service as any).runtimeTurns.get('turn-can-a');
+      expect(turnA?.sawTerminalResult).toBe(true);
+
+      await service.completeUserTurnProjection('turn-can-a');
+      await drainMicrotasks();
+
+      // Handoff: the CLI turn provably ended — no 15s window, direct release.
+      expect((service as any).cancelBoundaryTombstone).toBeNull();
+      const channel = (service as any).messageChannel as MessageChannel;
+      expect(channel.getActiveTurnId()).toBe('turn-can-q');
+    });
+
+    it("an old-scope turn's cancel handoff never tombstones the replacement channel", async () => {
+      await startPersistentQuery(service);
+      const turnA = service.prepareTurn({ turnId: 'turn-can-old', text: 'hello' });
+      const genA = service.query(turnA);
+      await genA.next();
+      const oldScope = (service as any).currentQueryScope;
+
+      // Replace the query incarnation; a fresh turn takes the new lease.
+      const channelB = (() => {
+        const messageChannel = new MessageChannel(() => {}, (info) => (service as any).handleTurnDequeued(info));
+        (service as any).messageChannel = messageChannel;
+        (service as any).persistentQuery = sdkMock.query({ prompt: messageChannel, options: {} as any });
+        (service as any).startResponseConsumer();
+        return messageChannel;
+      })();
+      const turnB = service.prepareTurn({ turnId: 'turn-can-new', text: 'queued hello' });
+      const genB = service.query(turnB);
+      await genB.next();
+      await flushMicrotasks();
+      expect(channelB.getActiveTurnId()).toBe('turn-can-new');
+      expect((service as any).runtimeTurns.get('turn-can-old').queryEpoch).not.toBe(
+        (service as any).currentQueryScope.epoch,
+      );
+
+      // Plain-cancel the OLD turn after its scope is gone: the handoff must
+      // not plant a tombstone on the replacement channel.
+      (service as any).cancelTurn('turn-can-old', 'user_cancel');
+      await service.completeUserTurnProjection('turn-can-old');
+      await flushMicrotasks();
+
+      expect((service as any).cancelBoundaryTombstone).toBeNull();
+      expect(channelB.getActiveTurnId()).toBe('turn-can-new');
+      expect((service as any).runtimeTurns.has('turn-can-new')).toBe(true);
+      void oldScope;
+      void genB;
     });
   });
 });
