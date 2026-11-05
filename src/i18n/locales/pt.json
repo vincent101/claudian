@@ -83,7 +83,8 @@
     },
     "cancel": {
       "toolInterrupted": "Interrompido",
-      "interruptUnacknowledged": "A CLI não respondeu ao cancelamento. Se a interface demorar muito a recuperar, recarregue a conversa."
+      "interruptUnacknowledged": "A CLI não respondeu ao cancelamento. Se a interface demorar muito a recuperar, recarregue a conversa.",
+      "boundaryHeld": "O turno cancelado não confirmou a parada. Sua mensagem na fila fica retida e será enviada em breve."
     },
     "history": {
       "loading": "Loading conversation…",

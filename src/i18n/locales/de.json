@@ -83,7 +83,8 @@
     },
     "cancel": {
       "toolInterrupted": "Abgebrochen",
-      "interruptUnacknowledged": "Die CLI hat auf den Abbruch nicht reagiert. Falls die Oberfläche lange nicht reagiert, laden Sie die Konversation neu."
+      "interruptUnacknowledged": "Die CLI hat auf den Abbruch nicht reagiert. Falls die Oberfläche lange nicht reagiert, laden Sie die Konversation neu.",
+      "boundaryHeld": "Der abgebrochene Durchlauf hat sein Stoppen nicht bestätigt. Die wartende Nachricht wird kurz gehalten und dann gesendet."
     },
     "history": {
       "loading": "Loading conversation…",

@@ -83,7 +83,8 @@
     },
     "cancel": {
       "toolInterrupted": "已中斷",
-      "interruptUnacknowledged": "CLI 未回應取消。若介面長時間未恢復，請重新載入會話。"
+      "interruptUnacknowledged": "CLI 未回應取消。若介面長時間未恢復，請重新載入會話。",
+      "boundaryHeld": "已取消的回合尚未確認停止。排隊的訊息暫時保留，稍後自動發出。"
     },
     "history": {
       "loading": "正在載入對話…",

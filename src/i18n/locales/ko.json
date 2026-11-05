@@ -83,7 +83,8 @@
     },
     "cancel": {
       "toolInterrupted": "중단됨",
-      "interruptUnacknowledged": "CLI가 취소에 응답하지 않았습니다. 화면이 오랫동안 복구되지 않으면 대화를 다시 로드하세요."
+      "interruptUnacknowledged": "CLI가 취소에 응답하지 않았습니다. 화면이 오랫동안 복구되지 않으면 대화를 다시 로드하세요.",
+      "boundaryHeld": "취소된 턴이 중지를 확인하지 않았습니다. 대기 중인 메시지는 잠시 보관되었다 곧 전송됩니다."
     },
     "history": {
       "loading": "Loading conversation…",

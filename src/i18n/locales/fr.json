@@ -83,7 +83,8 @@
     },
     "cancel": {
       "toolInterrupted": "Interrompu",
-      "interruptUnacknowledged": "L'interface CLI n'a pas répondu à l'annulation. Si l'interface reste inactive longtemps, rechargez la conversation."
+      "interruptUnacknowledged": "L'interface CLI n'a pas répondu à l'annulation. Si l'interface reste inactive longtemps, rechargez la conversation.",
+      "boundaryHeld": "Le tour annulé n'a pas confirmé son arrêt. Votre message en file est retenu et partira sous peu."
     },
     "history": {
       "loading": "Loading conversation…",

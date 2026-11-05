@@ -152,6 +152,8 @@ const STOP_TASK_AGENT_MIN_AGE_MS = 2 * 60 * 60 * 1000;
 const INTERRUPT_ACK_WATCHDOG_MS = 5_000;
 /** Retirement rebuild: max wait for the old CLI's real process exit. */
 const QUERY_EXIT_CONFIRM_TIMEOUT_MS = 15_000;
+/** Plain user-cancel isolation: how long the old-turn boundary may hold the lease. */
+const CANCEL_BOUNDARY_TIMEOUT_MS = 15_000;
 
 /** Chunk-wait state of the queryViaPersistent generator loop. */
 interface ChunkWaitState {
@@ -344,6 +346,14 @@ export class ClaudianService implements ChatRuntime {
   private currentDispatchDescriptor: DequeuedTurnInfo | null = null;
   /** Live host projection turn id (observer rebuild restore, survives async observer start). */
   private beginUserTurnProjectionTarget: string | null = null;
+  /**
+   * Plain user-cancel boundary tombstone (2.4): a cancelled turn's lease is
+   * NOT proof the CLI turn ended — the queued input must not dispatch into
+   * the same still-running CLI turn. The lease holds until the old turn's
+   * REAL result arrives (unknown-lease release) or the window expires with
+   * an explicit "input held" notice. Never auto-closes the query.
+   */
+  private cancelBoundaryTombstone: { turnId: string; timer: ReturnType<typeof setTimeout> } | null = null;
   /**
    * Turn-identity reconciliation (batch 1, observe mode): read-only bypass
    * recording host/observer facts and rate diagnostics. Never consulted by
@@ -857,6 +867,10 @@ export class ClaudianService implements ChatRuntime {
     this.messageChannel = null;
     this.queryAbortController = null;
     this.currentQueryScope = null;
+    if (this.cancelBoundaryTombstone) {
+      clearTimeout(this.cancelBoundaryTombstone.timer);
+      this.cancelBoundaryTombstone = null;
+    }
     this.responseConsumerRunning = false;
     this.responseConsumerPromise = null;
     this.currentConfig = null;
@@ -1174,6 +1188,17 @@ export class ClaudianService implements ChatRuntime {
       return;
     }
 
+    // Plain-cancel isolation (2.4): the cancelled turn's boundary tombstone
+    // dissolves ONLY on that CLI turn's real result. Chunks still streaming
+    // from the cancelled turn prove it is running; releasing on them would
+    // dispatch the queued input into that live turn (the defect-2 shape).
+    if (this.cancelBoundaryTombstone && isTurnCompleteMessage(message)) {
+      const tombstonedLease = this.messageChannel?.getActiveTurnId();
+      if (tombstonedLease === this.cancelBoundaryTombstone.turnId) {
+        this.settleCancelBoundaryTombstone(tombstonedLease);
+      }
+    }
+
     const turn = this.resolveActiveTurn();
     const user = message.type === 'user' ? message as SDKUserMessage : null;
     if (user?.origin) {
@@ -1202,7 +1227,13 @@ export class ClaudianService implements ChatRuntime {
     // activity on the turn — recorded before the cancelled-phase gate so a
     // trailing result being dropped still counts as an interrupt response.
     turn.lastRoutedMessageAt = Date.now();
-    if (turn.phase === 'cancelled' && isTurnCompleteMessage(message)) return;
+    if (turn.phase === 'cancelled' && isTurnCompleteMessage(message)) {
+      // Plain-cancel boundary (2.4): the CLI turn is provably over — the
+      // handoff skips the 15s tombstone window instead of holding the
+      // queued input for a result that already arrived.
+      turn.sawTerminalResult = true;
+      return;
+    }
     const activeTurn = turn;
 
     // Result attribution (2.3.2 fix ①): a result armed as belonging to an
@@ -1357,6 +1388,14 @@ export class ClaudianService implements ChatRuntime {
     if (!turn) {
       // Lease held for a turn unknown to the runtime (cancelled/crashed
       // earlier). v4 §3.3: settle that queue item, keep the consumer alive.
+      // Plain-cancel isolation (2.4): while the tombstone owns this lease the
+      // release is forbidden here — chunks from the still-running cancelled
+      // turn would pump the queue into it. Only the real result (routeMessage
+      // dissolves the tombstone first, then this branch releases) or the 15s
+      // window may release.
+      if (this.cancelBoundaryTombstone?.turnId === activeTurnId) {
+        return null;
+      }
       this.completeChannelTurn(activeTurnId);
     }
     return turn;
@@ -1791,10 +1830,65 @@ export class ClaudianService implements ChatRuntime {
     turn.waiters.clear();
     void barrier.featureFinished.then(async () => {
       await this.executeDeferredRestartIfAny(turn.id);
-      this.completeUserRuntimeHandoff(turn, barrier);
+      this.completeUserCancelHandoffWithBoundary(turn, barrier);
     }).catch(() => {
-      this.completeUserRuntimeHandoff(turn, barrier);
+      this.completeUserCancelHandoffWithBoundary(turn, barrier);
     });
+  }
+
+  /**
+   * Plain-cancel handoff (2.4 isolation): local cancellation proceeds, but
+   * the channel lease becomes the old turn's boundary tombstone. A late
+   * result from that CLI turn settles nothing (the turn is gone); it only
+   * releases the tombstone so the queue pumps. No result within the window
+   * → explicit notice, then release. The query itself is never closed.
+   */
+  private completeUserCancelHandoffWithBoundary(turn: RuntimeTurn, barrier: UserTurnCompletionBarrier): void {
+    turn.notificationResultPending = false;
+    this.runtimeTurns.delete(turn.id);
+    // Query boundary (2.4): an old-scope turn's handoff must never tombstone
+    // the replacement channel — its lease lived on the retired channel.
+    const scope = this.currentQueryScope;
+    const oldScopeTurn = turn.queryEpoch !== undefined && scope !== null && scope.epoch !== turn.queryEpoch;
+    const channel = oldScopeTurn ? null : this.messageChannel;
+    const holdsLease = channel !== null && channel.getActiveTurnId() === turn.id;
+    if (holdsLease && channel && !turn.sawTerminalResult) {
+      if (this.cancelBoundaryTombstone) clearTimeout(this.cancelBoundaryTombstone.timer);
+      const tombstone = {
+        turnId: turn.id,
+        timer: setTimeout(() => this.expireCancelBoundaryTombstone(turn.id), CANCEL_BOUNDARY_TIMEOUT_MS),
+      };
+      this.cancelBoundaryTombstone = tombstone;
+      this.recordTranscriptDiagnostic({
+        phase: 'turn_cancel', turnId: turn.id, generation: turn.generation,
+        detail: 'user_cancel_boundary_held',
+      });
+    } else {
+      this.completeChannelTurn(turn.id);
+    }
+    barrier.resolveRuntimeHandoffDone();
+    this.userTurnCompletionBarriers.delete(turn.id);
+  }
+
+  /** The old turn's real result arrived: the tombstone dissolves silently and the queue pumps. */
+  private settleCancelBoundaryTombstone(turnId: string): void {
+    const tombstone = this.cancelBoundaryTombstone;
+    if (!tombstone || tombstone.turnId !== turnId) return;
+    clearTimeout(tombstone.timer);
+    this.cancelBoundaryTombstone = null;
+    this.recordTranscriptDiagnostic({ phase: 'turn_cancel', turnId, detail: 'cancel_boundary_result_arrived' });
+  }
+
+  private expireCancelBoundaryTombstone(turnId: string): void {
+    const tombstone = this.cancelBoundaryTombstone;
+    if (!tombstone || tombstone.turnId !== turnId) return;
+    this.cancelBoundaryTombstone = null;
+    const channel = this.messageChannel;
+    if (channel && channel.getActiveTurnId() === turnId) {
+      this.completeChannelTurn(turnId);
+    }
+    this.recordTranscriptDiagnostic({ phase: 'turn_cancel', turnId, detail: 'cancel_boundary_timeout' });
+    new Notice(t('chat.cancel.boundaryHeld'));
   }
 
   /** Cancels every live turn plus any turn still holding channel state. */
@@ -2700,7 +2794,12 @@ export class ClaudianService implements ChatRuntime {
     //    canonical UUIDs, host aliases, merged payloads, order all survive.
     const unsent = channel.extractUnsentQueue();
     channel.close();
-    // 3. Remove from the slot.
+    // 3. Remove from the slot. A plain-cancel tombstone belonged to the dying
+    //    channel; its 15s window must never fire against the replacement.
+    if (this.cancelBoundaryTombstone) {
+      clearTimeout(this.cancelBoundaryTombstone.timer);
+      this.cancelBoundaryTombstone = null;
+    }
     this.currentQueryScope = null;
     this.persistentQuery = null;
     this.messageChannel = null;

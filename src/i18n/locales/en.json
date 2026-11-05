@@ -83,7 +83,8 @@
     },
     "cancel": {
       "toolInterrupted": "Interrupted",
-      "interruptUnacknowledged": "Claude did not respond to the cancellation. If the interface stays unresponsive for a long time, reload the conversation."
+      "interruptUnacknowledged": "Claude did not respond to the cancellation. If the interface stays unresponsive for a long time, reload the conversation.",
+      "boundaryHeld": "The cancelled turn has not confirmed it stopped. Your queued message is held and will send shortly."
     },
     "history": {
       "loading": "Loading conversation…",

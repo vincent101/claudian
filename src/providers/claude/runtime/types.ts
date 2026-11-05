@@ -187,6 +187,13 @@ export interface RuntimeTurn {
    * CLI responded, even while the feature projection is still closing.
    */
   lastRoutedMessageAt: number | null;
+  /**
+   * Plain-cancel boundary (2.4): a real result reached this cancelled turn's
+   * lease before the projection handoff landed. The CLI turn is provably
+   * over, so the tombstone window is skipped at handoff instead of holding
+   * the queued input for another 15s.
+   */
+  sawTerminalResult?: boolean;
   /** Recovery generation carried by the exact dispatch awaiting confirmation. */
   recoveryGeneration?: number;
   /**
