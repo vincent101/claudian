@@ -1028,6 +1028,84 @@ describe('ClaudeTranscriptTurnObserver', () => {
       observer.stop();
     });
   });
+
+  describe('host terminal retraction notification (2026-11-05 fix 1)', () => {
+    function hostUserRow(uuid: string): string {
+      return JSON.stringify({ type: 'user', uuid, isSidechain: false, message: { role: 'user', content: 'hello' } });
+    }
+
+    function hostEndTurn(assistantId: string): string {
+      return JSON.stringify({ type: 'assistant', uuid: `a-${assistantId}`, message: { id: assistantId, role: 'assistant', content: [{ type: 'text', text: 'done' }], stop_reason: 'end_turn' } });
+    }
+
+    function stopHookSummary(): string {
+      return JSON.stringify({ type: 'system', subtype: 'stop_hook_summary' });
+    }
+
+    function blockFeedback(): string {
+      return JSON.stringify({ type: 'user', isMeta: true, userType: 'external', message: { role: 'user', content: 'Stop hook feedback: Background subagent still running' } });
+    }
+
+    it('notifies the runtime with the live hostUserTurnId when strong continuation proof retracts the terminal', async () => {
+      await writeFile(file, '');
+      const retracted = jest.fn();
+      const observer = new ClaudeTranscriptTurnObserver({
+        started: () => true,
+        chunk: async () => {},
+        finished: async () => {},
+        released: () => {},
+        cancelled: () => {},
+        projectEmbeddedExternal: async () => {},
+        onHostTurnTerminalObserved: () => {},
+        onHostTurnTerminalRetracted: retracted,
+      }, () => true);
+      await observer.start(file);
+      observer.registerHostUserTranscriptId('retract-row');
+      observer.beginUserTurnProjection('turn-retract');
+      const generation = (observer as any).generation;
+
+      await (observer as any).consumeBatch(
+        { lines: [hostUserRow('retract-row'), hostEndTurn('m-retract'), stopHookSummary()], lineOffsets: [0, 100, 200], reset: false },
+        generation,
+      );
+
+      await (observer as any).consumeBatch({ lines: [blockFeedback()], lineOffsets: [300], reset: false }, generation);
+      expect(retracted).toHaveBeenCalledTimes(1);
+      expect(retracted).toHaveBeenCalledWith('turn-retract', 'stop_hook_block');
+      observer.stop();
+    });
+
+    it('a retraction for the same assistant instance never notifies, replay retraction never notifies', async () => {
+      await writeFile(file, '');
+      const retracted = jest.fn();
+      const observer = new ClaudeTranscriptTurnObserver({
+        started: () => true,
+        chunk: async () => {},
+        finished: async () => {},
+        released: () => {},
+        cancelled: () => {},
+        projectEmbeddedExternal: async () => {},
+        onHostTurnTerminalObserved: () => {},
+        onHostTurnTerminalRetracted: retracted,
+      }, () => true);
+      await observer.start(file);
+      observer.registerHostUserTranscriptId('retract-same-row');
+      observer.beginUserTurnProjection('turn-retract-same');
+      const generation = (observer as any).generation;
+
+      await (observer as any).consumeBatch(
+        { lines: [hostUserRow('retract-same-row'), hostEndTurn('m-same'), stopHookSummary()], lineOffsets: [0, 100, 200], reset: false },
+        generation,
+      );
+      // Same assistant instance: not continuation proof.
+      await (observer as any).consumeBatch(
+        { lines: [JSON.stringify({ type: 'assistant', uuid: 'a-same-tail', message: { id: 'm-same', role: 'assistant', content: [{ type: 'text', text: 'tail' }] } })], lineOffsets: [300], reset: false },
+        generation,
+      );
+      expect(retracted).not.toHaveBeenCalled();
+      observer.stop();
+    });
+  });
 });
 
 describe('ClaudeTranscriptTurnObserver — reconciliation bypass (batch 1)', () => {

@@ -160,6 +160,35 @@ interface ChunkWaitState {
 }
 
 /**
+ * Independent recovery attempt (2026-11-05 fix 1): the stopTask→interrupt→
+ * cancel chain runs on its OWN timers, decoupled from the generator's
+ * chunk-wait timer. Identity is frozen at creation — turn, generation,
+ * query epoch, evidence revision, CLI version — and every liveness check
+ * re-verifies all of them, so chunks arriving mid-window (the old
+ * resolveChunk-as-recovery-identity bug) can never restart or extend the
+ * chain, and a late stopTask response can never read mutated identity.
+ */
+interface StopTaskRecoveryAttempt {
+  readonly attemptId: number;
+  readonly turnId: string;
+  readonly generation: number;
+  readonly queryEpoch: number | undefined;
+  readonly evidenceRevision: number;
+  readonly cliVersion: string | undefined;
+  phase: 'observing_stop' | 'observing_interrupt' | 'retiring' | 'finished';
+}
+
+/** Frozen diagnostic context for stopTask sends (2026-11-05 fix 4). */
+interface StopTaskDiagnosticSnapshot {
+  turnId: string;
+  generation: number;
+  queryEpoch: number | undefined;
+  attemptId: number | null;
+  cliVersion: string | undefined;
+  sentAt: number;
+}
+
+/**
  * Query boundary (2026-11-05 fix 2): one scope per persistent query
  * incarnation. Every consumer/routing/handoff side effect must verify it
  * still acts on the CURRENT, un-retired scope — a result arriving through an
@@ -305,6 +334,7 @@ export class ClaudianService implements ChatRuntime {
   /** Query boundary isolation (2.4): the live persistent-query scope, null when retired/absent. */
   private currentQueryScope: QueryScope | null = null;
   private queryEpochCounter = 0;
+  private stopTaskAttemptCounter = 0;
   /**
    * Turn-identity reconciliation (batch 1, observe mode): read-only bypass
    * recording host/observer facts and rate diagnostics. Never consulted by
@@ -1372,6 +1402,10 @@ export class ClaudianService implements ChatRuntime {
     // hardest signal to separate from cancel/force settlement in the case
     // post-mortem (the CLI never reached this line during the 5m18s stall).
     this.recordTranscriptDiagnostic({ phase: 'settle_result', turnId: turn.id, generation: turn.generation, leaseKind: turn.kind });
+    // Attempt teardown: a REAL result settles the turn — any live recovery
+    // attempt ends here and its outcome attribution reads this flag.
+    turn.terminalSettlementKind = 'result';
+    turn.recoveryAttemptId = null;
     this.noteTurnIdentitySettled(turn.id);
     // Defensive only: terminal cleanup cannot prove attribution when the
     // notification result itself never arrives; the dual-track state machine
@@ -1617,6 +1651,10 @@ export class ClaudianService implements ChatRuntime {
     // at all, so silent settles like the d8912b5b host_only@11:46:08 could
     // never be attributed. reason answers "who cancelled what, when".
     this.recordTranscriptDiagnostic({ phase: 'turn_cancel', turnId, generation: turn.generation, detail: reason });
+    // Attempt teardown: a cancelled turn ends any live recovery attempt and
+    // records HOW the turn ended for the attempt's result-attribution check.
+    turn.terminalSettlementKind = 'cancel';
+    turn.recoveryAttemptId = null;
     this.noteTurnIdentitySettled(turnId);
     // Clear before branching so every cancellation exit drops stale defensive
     // attribution state. This cannot fix a missing notification result while
@@ -2402,6 +2440,12 @@ export class ClaudianService implements ChatRuntime {
     if (state.resolveChunk !== settle || state.done) return;
     // The turn left the registry (settled/cancelled elsewhere): stop ticking.
     if (this.runtimeTurns.get(turn.id) !== turn) return;
+    // Fix 1 (2026-11-05): once an independent attempt owns the chain, the
+    // chunk-wait timer must NOT re-fire — a chunk resolving the wait used to
+    // re-arm 120s and fire a SECOND stop round on the same agents. The
+    // generator stays parked: the attempt's terminal (cancelTurn/result
+    // settle) resolves the waiters' onDone which wakes it.
+    if (turn.recoveryAttemptId !== null) return;
     const terminalSeenAt = turn.transcriptTerminalSeenAt;
     if (terminalSeenAt === null) {
       // No evidence permits only the one-shot background-agent probe. A
@@ -2415,7 +2459,10 @@ export class ClaudianService implements ChatRuntime {
           .filter(agent => now - agent.startedAt > STOP_TASK_AGENT_MIN_AGE_MS);
         if (candidates.length > 0) {
           turn.stopTaskProbeSent = true;
-          void this.sendStopTasks(turn, candidates, 'silent_probe');
+          // Shared per-logical-turn registry (B-(a)/(b)): the armed recovery
+          // later filters out ids the probe already stopped.
+          for (const agent of candidates) turn.stopTaskSentAgentIds.add(agent.agentId);
+          void this.sendStopTasks(turn, candidates, 'silent_probe', null);
         }
       }
       // T4 red line: a probe never interrupts or force-settles an unproven turn.
@@ -2430,56 +2477,132 @@ export class ClaudianService implements ChatRuntime {
       arm(RESULT_WATCHDOG_MS - (now - terminalSeenAt));
       return;
     }
+    // Fire: hand the chain to an INDEPENDENT attempt with frozen identity.
+    this.startStopTaskRecovery(turn, now);
+  }
+
+  /**
+   * Fix 1 (2026-11-05): the recovery chain runs as an independent attempt —
+   * its own timers, its own liveness checks, decoupled from the generator's
+   * chunk-wait timer. resolveChunk only wakes the generator; it never
+   * participates in attempt survival.
+   */
+  private startStopTaskRecovery(turn: RuntimeTurn, firedAt: number): void {
+    const scope = this.currentQueryScope;
+    const attempt: StopTaskRecoveryAttempt = {
+      attemptId: ++this.stopTaskAttemptCounter,
+      turnId: turn.id,
+      generation: turn.generation,
+      queryEpoch: scope?.epoch,
+      evidenceRevision: turn.evidenceRevision,
+      cliVersion: turn.transcriptTerminalCliVersion ?? this.transcriptCliVersion,
+      phase: 'observing_stop',
+    };
+    turn.recoveryAttemptId = attempt.attemptId;
     const candidates = this.getRunningAgentCandidates();
+    const unsent = candidates.filter(agent => !turn.stopTaskSentAgentIds.has(agent.agentId));
     this.recordTranscriptDiagnostic({
       phase: 'settle_watchdog_fire',
       turnId: turn.id,
-      generation: turn.generation,
+      generation: attempt.generation,
       leaseKind: turn.kind,
-      terminalSeenAgeMs: now - terminalSeenAt,
-      ...(turn.lastChunkAt !== null ? { lastChunkAgeMs: now - turn.lastChunkAt } : {}),
+      terminalSeenAgeMs: firedAt - (turn.transcriptTerminalSeenAt ?? firedAt),
+      ...(turn.lastChunkAt !== null ? { lastChunkAgeMs: firedAt - turn.lastChunkAt } : {}),
       evidenceKind: turn.transcriptTerminalSource ?? 'stop_hook',
-      ...((turn.transcriptTerminalCliVersion ?? this.transcriptCliVersion) ? { cliVersion: turn.transcriptTerminalCliVersion ?? this.transcriptCliVersion } : {}),
-      agentCandidateCount: candidates.length,
+      ...(attempt.cliVersion ? { cliVersion: attempt.cliVersion } : {}),
+      agentCandidateCount: unsent.length,
+      queryEpoch: attempt.queryEpoch,
+      attemptId: attempt.attemptId,
     });
-    if (candidates.length > 0 && this.persistentQuery && !this.shuttingDown) {
-      // Send all candidates concurrently before the observation window. Do
-      // not await an unacknowledged control request: it must not strand the
-      // very recovery chain intended to unpark the query.
-      void this.sendStopTasks(turn, candidates, 'result_watchdog');
-      await new Promise<void>(resolve => setTimeout(resolve, STOP_TASK_GRACE_MS));
-      if (state.done && state.error === null && (turn.phase === 'projecting' || turn.phase === 'settled')) {
+    void this.runStopTaskRecovery(turn, attempt, unsent);
+  }
+
+  /** Full re-verification of every frozen identity dimension. */
+  private attemptAlive(turn: RuntimeTurn, attempt: StopTaskRecoveryAttempt): boolean {
+    if (this.runtimeTurns.get(turn.id) !== turn) return false;
+    if (turn.phase === 'settled' || turn.phase === 'cancelled') return false;
+    if (turn.recoveryAttemptId !== attempt.attemptId) return false;
+    if (turn.evidenceRevision !== attempt.evidenceRevision) return false;
+    if ((this.currentQueryScope?.epoch ?? undefined) !== attempt.queryEpoch) return false;
+    return true;
+  }
+
+  private async runStopTaskRecovery(
+    turn: RuntimeTurn,
+    attempt: StopTaskRecoveryAttempt,
+    unsent: Array<{ agentId: string; startedAt: number }>,
+  ): Promise<void> {
+    try {
+      const scope = this.currentQueryScope;
+      let sentAny = false;
+      if (unsent.length > 0 && scope && !this.shuttingDown) {
+        sentAny = true;
+        // Register BEFORE the SDK call: a reject or a never-settling request
+        // must never trigger a re-send of the same agent id (fix 1).
+        for (const agent of unsent) turn.stopTaskSentAgentIds.add(agent.agentId);
+        void this.sendStopTasks(turn, unsent, 'result_watchdog', attempt);
+      } else {
         this.recordTranscriptDiagnostic({
-          phase: 'stop_task_outcome', turnId: turn.id, generation: turn.generation,
-          outcome: 'settled_by_result', agentCandidateCount: candidates.length,
-          ...((turn.transcriptTerminalCliVersion ?? this.transcriptCliVersion) ? { cliVersion: turn.transcriptTerminalCliVersion ?? this.transcriptCliVersion } : {}),
+          phase: 'stop_task_outcome', turnId: attempt.turnId, generation: attempt.generation,
+          outcome: 'no_candidates', agentCandidateCount: 0,
+          queryEpoch: attempt.queryEpoch, attemptId: attempt.attemptId,
+          ...(attempt.cliVersion ? { cliVersion: attempt.cliVersion } : {}),
         });
       }
-      if (state.resolveChunk !== settle || state.done) return;
-      if (this.runtimeTurns.get(turn.id) !== turn) return;
-    } else if (candidates.length === 0) {
+      if (sentAny) {
+        // Observation window: attempt-owned timer — chunk arrivals never
+        // reset or extend it (fix 1).
+        await this.attemptDelay(STOP_TASK_GRACE_MS);
+        if (!this.attemptAlive(turn, attempt)) {
+          this.noteAttemptTerminatedByResult(turn, attempt, unsent.length);
+          return;
+        }
+      }
+      attempt.phase = 'observing_interrupt';
+      const interruptScope = this.currentQueryScope;
+      if (interruptScope && interruptScope.query === scope?.query && !this.shuttingDown) {
+        this.recordTranscriptDiagnostic({
+          phase: 'interrupt_sent', turnId: attempt.turnId, generation: attempt.generation,
+          detail: 'result_watchdog', queryEpoch: attempt.queryEpoch, attemptId: attempt.attemptId,
+        });
+        void interruptScope.query.interrupt().catch(() => {
+          // Silence abort/interrupt errors
+        });
+      }
+      await this.attemptDelay(RESULT_WATCHDOG_GRACE_MS);
+      if (!this.attemptAlive(turn, attempt)) {
+        this.noteAttemptTerminatedByResult(turn, attempt, unsent.length);
+        return;
+      }
+      attempt.phase = 'retiring';
+      // Terminal: force-settle so the lease releases and the queue pumps (a
+      // result arriving later is dropped lease-less by routeMessage).
+      this.cancelTurn(turn.id, 'result_watchdog');
+    } finally {
+      attempt.phase = 'finished';
+      if (this.runtimeTurns.get(turn.id) === turn && turn.recoveryAttemptId === attempt.attemptId) {
+        turn.recoveryAttemptId = null;
+      }
+    }
+  }
+
+  private noteAttemptTerminatedByResult(turn: RuntimeTurn, attempt: StopTaskRecoveryAttempt, candidateCount: number): void {
+    // settled_by_result means a REAL result settled the turn inside the
+    // observation window — time order alone never implies causation.
+    if (turn.terminalSettlementKind === 'result') {
       this.recordTranscriptDiagnostic({
-        phase: 'stop_task_outcome', turnId: turn.id, generation: turn.generation,
-        outcome: 'no_candidates', agentCandidateCount: 0,
-        ...((turn.transcriptTerminalCliVersion ?? this.transcriptCliVersion) ? { cliVersion: turn.transcriptTerminalCliVersion ?? this.transcriptCliVersion } : {}),
+        phase: 'stop_task_outcome', turnId: attempt.turnId, generation: attempt.generation,
+        outcome: 'settled_by_result', agentCandidateCount: candidateCount,
+        queryEpoch: attempt.queryEpoch, attemptId: attempt.attemptId,
+        ...(attempt.cliVersion ? { cliVersion: attempt.cliVersion } : {}),
       });
     }
-    // One interrupt so the CLI gets a chance to flush its belated result.
-    if (this.persistentQuery && !this.shuttingDown) {
-      this.recordTranscriptDiagnostic({ phase: 'interrupt_sent', turnId: turn.id, generation: turn.generation, detail: 'result_watchdog' });
-      void this.persistentQuery.interrupt().catch(() => {
-        // Silence abort/interrupt errors
-      });
-    }
-    await new Promise<void>(resolve => {
-      setTimeout(resolve, RESULT_WATCHDOG_GRACE_MS);
+  }
+
+  private attemptDelay(ms: number): Promise<void> {
+    return new Promise<void>(resolve => {
+      setTimeout(resolve, ms);
     });
-    // Grace over and the wait is still parked on this turn: force-settle so
-    // the lease releases and the queue pumps (a result arriving later is
-    // dropped lease-less by routeMessage).
-    if (state.resolveChunk !== settle || state.done) return;
-    if (this.runtimeTurns.get(turn.id) !== turn) return;
-    this.cancelTurn(turn.id, 'result_watchdog');
   }
 
   private getRunningAgentCandidates(): Array<{ agentId: string; startedAt: number }> {
@@ -2492,35 +2615,55 @@ export class ClaudianService implements ChatRuntime {
     }
   }
 
+  /**
+   * Fix 4 (2026-11-05): the diagnostic context is an IMMUTABLE snapshot taken
+   * before the send. A late stopTask response must never read the turn's
+   * mutated generation or the current CLI version — sent/success/reject/
+   * outcome events all carry the frozen copy.
+   */
   private async sendStopTasks(
     turn: RuntimeTurn,
     candidates: Array<{ agentId: string; startedAt: number }>,
     context: 'result_watchdog' | 'silent_probe',
+    attempt: StopTaskRecoveryAttempt | null,
   ): Promise<void> {
-    const query = this.persistentQuery;
+    const query = attempt ? this.currentQueryScope?.query : this.persistentQuery;
     if (!query || this.shuttingDown) return;
+    const snapshot: StopTaskDiagnosticSnapshot = {
+      turnId: turn.id,
+      generation: attempt ? attempt.generation : turn.generation,
+      queryEpoch: attempt ? attempt.queryEpoch : this.currentQueryScope?.epoch,
+      attemptId: attempt ? attempt.attemptId : null,
+      cliVersion: attempt ? attempt.cliVersion : (turn.transcriptTerminalCliVersion ?? this.transcriptCliVersion),
+      sentAt: Date.now(),
+    };
+    const log = this.transcriptDiagnosticLog;
     await Promise.allSettled(candidates.map(async agent => {
       this.recordTranscriptDiagnostic({
-        phase: 'stop_task_sent', turnId: turn.id, generation: turn.generation,
-        agentIdHash: this.transcriptDiagnosticLog?.hashId(agent.agentId), detail: context,
+        phase: 'stop_task_sent', turnId: snapshot.turnId, generation: snapshot.generation,
+        agentIdHash: log?.hashId(agent.agentId), detail: context,
+        queryEpoch: snapshot.queryEpoch, attemptId: snapshot.attemptId ?? undefined,
+        ...(snapshot.cliVersion ? { cliVersion: snapshot.cliVersion } : {}),
       });
       try {
         await query.stopTask(agent.agentId);
         if (context === 'silent_probe') {
           this.recordTranscriptDiagnostic({
-            phase: 'stop_task_outcome', turnId: turn.id, generation: turn.generation,
-            agentIdHash: this.transcriptDiagnosticLog?.hashId(agent.agentId), outcome: 'sent', detail: context,
-            ...((turn.transcriptTerminalCliVersion ?? this.transcriptCliVersion) ? { cliVersion: turn.transcriptTerminalCliVersion ?? this.transcriptCliVersion } : {}),
+            phase: 'stop_task_outcome', turnId: snapshot.turnId, generation: snapshot.generation,
+            agentIdHash: log?.hashId(agent.agentId), outcome: 'sent', detail: context,
+            queryEpoch: snapshot.queryEpoch, attemptId: snapshot.attemptId ?? undefined,
+            ...(snapshot.cliVersion ? { cliVersion: snapshot.cliVersion } : {}),
           });
         }
       } catch (error) {
         // CLI 2.1.311 may reject missing tasks. A rejected stop is benign:
         // retain diagnostic evidence and let the recovery chain continue.
         this.recordTranscriptDiagnostic({
-          phase: 'stop_task_outcome', turnId: turn.id, generation: turn.generation,
-          agentIdHash: this.transcriptDiagnosticLog?.hashId(agent.agentId), outcome: 'error', detail: context,
+          phase: 'stop_task_outcome', turnId: snapshot.turnId, generation: snapshot.generation,
+          agentIdHash: log?.hashId(agent.agentId), outcome: 'error', detail: context,
           errorName: error instanceof Error ? error.name : 'UnknownError',
-          ...((turn.transcriptTerminalCliVersion ?? this.transcriptCliVersion) ? { cliVersion: turn.transcriptTerminalCliVersion ?? this.transcriptCliVersion } : {}),
+          queryEpoch: snapshot.queryEpoch, attemptId: snapshot.attemptId ?? undefined,
+          ...(snapshot.cliVersion ? { cliVersion: snapshot.cliVersion } : {}),
         });
       }
     }));
@@ -2956,6 +3099,7 @@ export class ClaudianService implements ChatRuntime {
         cancelled: event => this._onAutoTurnCancelled?.(event),
         projectEmbeddedExternal: event => this._onEmbeddedExternal?.(event) ?? Promise.resolve(),
         onHostTurnTerminalObserved: (turnId, evidence) => this.noteTranscriptTerminalSeen(turnId, evidence),
+        onHostTurnTerminalRetracted: (turnId, reason) => this.noteTranscriptTerminalRetracted(turnId, reason),
         onCliVersionObserved: version => { this.transcriptCliVersion = version; },
       }, () => true, this.transcriptDiagnosticLog, {
         // Observe-mode bypass: verdicts are recorded as diagnostics only.
@@ -3133,6 +3277,26 @@ export class ClaudianService implements ChatRuntime {
         turn.transcriptTerminalSource = evidence.kind;
         if (evidence.cliVersion) turn.transcriptTerminalCliVersion = evidence.cliVersion;
       }
+    }
+  }
+
+  /**
+   * Fix 1 (2026-11-05): strong continuation proof retracts the stamped
+   * terminal evidence. The watchdog can re-arm on the turn's NEW terminal;
+   * any live recovery attempt freezes out via the evidence revision bump
+   * (its liveness check re-verifies the revision).
+   */
+  private noteTranscriptTerminalRetracted(turnId: string, reason: string): void {
+    const turn = this.runtimeTurns.get(turnId);
+    if (!turn || turn.phase === 'settled' || turn.phase === 'cancelled') return;
+    if (turn.transcriptTerminalSeenAt !== null) {
+      turn.transcriptTerminalSeenAt = null;
+      turn.transcriptTerminalSource = undefined;
+      turn.transcriptTerminalCliVersion = undefined;
+      turn.evidenceRevision += 1;
+      this.recordTranscriptDiagnostic({
+        phase: 'host_terminal_retracted', turnId, generation: turn.generation, detail: reason,
+      });
     }
   }
 

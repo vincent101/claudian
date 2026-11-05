@@ -570,4 +570,108 @@ describe('ClaudeTranscriptTurnMapper', () => {
       expect(facts).toHaveLength(1);
     });
   });
+
+  describe('host terminal retraction (2026-11-05 fix 1: strong continuation proof only)', () => {
+    const hostContext: TranscriptMapContext = { hostUserTurnActive: true };
+
+    function hostUserRow(): SDKNativeMessage {
+      return { type: 'user', uuid: 'host-uuid-r', isSidechain: false, message: { role: 'user', content: 'hello' } };
+    }
+
+    function hostEndTurn(assistantId = 'host-m-r1'): SDKNativeMessage {
+      return { type: 'assistant', uuid: `a-${assistantId}`, isSidechain: false, message: { id: assistantId, role: 'assistant', content: [{ type: 'text', text: 'done' }], stop_reason: 'end_turn' } };
+    }
+
+    function stopHookSummary(): SDKNativeMessage {
+      return { type: 'system', subtype: 'stop_hook_summary', isSidechain: false };
+    }
+
+    function blockFeedback(): SDKNativeMessage {
+      return { type: 'user', isMeta: true, userType: 'external', isSidechain: false, message: { role: 'user', content: 'Stop hook feedback: Background subagent still running' } };
+    }
+
+    it('a Stop-hook block feedback after the emitted terminal retracts it', () => {
+      const mapper = new ClaudeTranscriptTurnMapper();
+      mapper.map(hostUserRow(), false, hostContext);
+      mapper.map(hostEndTurn(), false, hostContext);
+      expect(mapper.map(stopHookSummary(), false, hostContext)).toContainEqual(expect.objectContaining({ type: 'observed_host_terminal' }));
+
+      const facts = mapper.map(blockFeedback(), false, hostContext);
+      expect(facts).toContainEqual(expect.objectContaining({
+        type: 'observed_host_terminal_retracted', reason: 'stop_hook_block', replay: false,
+      }));
+    });
+
+    it('a NEW main assistant request after the emitted terminal retracts it; the same assistant instance does not', () => {
+      const mapper = new ClaudeTranscriptTurnMapper();
+      mapper.map(hostUserRow(), false, hostContext);
+      mapper.map(hostEndTurn(), false, hostContext);
+      mapper.map(stopHookSummary(), false, hostContext);
+
+      // Same assistant instance (stream continuation rows keep the id): no retraction.
+      expect(mapper.map({ type: 'assistant', uuid: 'a-cont', isSidechain: false, message: { id: 'host-m-r1', role: 'assistant', content: [{ type: 'text', text: 'tail' }] } }, false, hostContext).some(fact => fact.type === 'observed_host_terminal_retracted')).toBe(false);
+
+      // A NEW main assistant request (different message id): continuation proof.
+      const facts = mapper.map({ type: 'assistant', uuid: 'a-new', isSidechain: false, message: { id: 'host-m-r2', role: 'assistant', content: [{ type: 'text', text: 'new request' }] } }, false, hostContext);
+      expect(facts).toContainEqual(expect.objectContaining({
+        type: 'observed_host_terminal_retracted', reason: 'new_assistant_request', assistantInstanceId: 'host-m-r2', replay: false,
+      }));
+    });
+
+    it('ordinary trailing rows never retract: text tails, usage, notifications, compact continuation shapes', () => {
+      const mapper = new ClaudeTranscriptTurnMapper();
+      mapper.map(hostUserRow(), false, hostContext);
+      mapper.map(hostEndTurn(), false, hostContext);
+      mapper.map(stopHookSummary(), false, hostContext);
+
+      const ordinaryRows: SDKNativeMessage[] = [
+        { type: 'user', uuid: 'notif-r', isSidechain: false, origin: { kind: 'task-notification' }, message: { role: 'user', content: 'task done' } },
+        { type: 'user', uuid: 'compact-cont', isSidechain: false, shouldQuery: false, message: { role: 'user', content: 'Conversation compacted' } },
+        { type: 'user', uuid: 'compact-stdout', isSidechain: false, isMeta: true, message: { role: 'user', content: 'Compacted Tip: You have access to Opus 1M.' } },
+      ];
+      for (const row of ordinaryRows) {
+        expect(mapper.map(row, false, hostContext).some(fact => fact.type === 'observed_host_terminal_retracted')).toBe(false);
+      }
+    });
+
+    it('a compact boundary emission is retracted only by a new main assistant request, not by its tail rows', () => {
+      const mapper = new ClaudeTranscriptTurnMapper();
+      const boundary = {
+        type: 'system', subtype: 'compact_boundary', isSidechain: false,
+        timestamp: '2026-11-04T11:46:03.171Z', compactMetadata: { trigger: 'manual' }, version: '2.1.227',
+      } as unknown as SDKNativeMessage;
+      expect(mapper.map(boundary, false, hostContext).some(fact => fact.type === 'observed_host_terminal')).toBe(true);
+
+      expect(mapper.map({ type: 'user', uuid: 'c-cont', isSidechain: false, shouldQuery: false, message: { role: 'user', content: 'Conversation compacted' } }, false, hostContext).some(fact => fact.type === 'observed_host_terminal_retracted')).toBe(false);
+
+      const facts = mapper.map({ type: 'assistant', uuid: 'a-after-compact', isSidechain: false, message: { id: 'm-after-compact', role: 'assistant', content: [{ type: 'text', text: 'next round' }] } }, false, hostContext);
+      expect(facts).toContainEqual(expect.objectContaining({ type: 'observed_host_terminal_retracted', reason: 'new_assistant_request' }));
+    });
+
+    it('after retraction the turn re-arms on its new terminal (end_turn + summary again)', () => {
+      const mapper = new ClaudeTranscriptTurnMapper();
+      mapper.map(hostUserRow(), false, hostContext);
+      mapper.map(hostEndTurn(), false, hostContext);
+      mapper.map(stopHookSummary(), false, hostContext);
+      mapper.map(blockFeedback(), false, hostContext);
+
+      // The turn continues: a new end_turn re-arms, a new summary re-emits.
+      expect(mapper.map({ ...hostEndTurn('host-m-r3') }, false, hostContext).some(fact => fact.type === 'observed_host_terminal')).toBe(false);
+      const facts = mapper.map(stopHookSummary(), false, hostContext);
+      expect(facts).toContainEqual(expect.objectContaining({ type: 'observed_host_terminal', replay: false }));
+    });
+
+    it('a newer host user row clears the emitted state (the next turn starts fresh)', () => {
+      const mapper = new ClaudeTranscriptTurnMapper();
+      mapper.map(hostUserRow(), false, hostContext);
+      mapper.map(hostEndTurn(), false, hostContext);
+      mapper.map(stopHookSummary(), false, hostContext);
+
+      const nextTurn = mapper.map({ ...hostUserRow(), uuid: 'host-uuid-r2' }, false, hostContext);
+      expect(nextTurn.some(fact => fact.type === 'observed_host_terminal_retracted')).toBe(false);
+
+      // The old turn's block feedback is now foreign residue: no retraction.
+      expect(mapper.map(blockFeedback(), false, hostContext).some(fact => fact.type === 'observed_host_terminal_retracted')).toBe(false);
+    });
+  });
 });

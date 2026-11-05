@@ -28,7 +28,10 @@ export type TranscriptDiagnosticPhase =
   | 'run_phase' | 'turn_cancel' | 'stop_task_sent' | 'stop_task_outcome'
   // Query boundary isolation (2026-11-05 fix 2): stale-scope routing refusals
   // and rebuild milestones (retire/exit-confirmed/rebuild/restored).
-  | 'query_scope_stale' | 'query_retire' | 'query_exit_confirmed' | 'query_rebuilt';
+  | 'query_scope_stale' | 'query_retire' | 'query_exit_confirmed' | 'query_rebuilt'
+  // Terminal-evidence retraction (fix 1): strong continuation proof un-arms
+  // a stamped terminal so the watchdog can re-arm on the new terminal.
+  | 'host_terminal_retracted';
 
 export interface TranscriptDiagnosticEvent {
   phase: TranscriptDiagnosticPhase;
@@ -83,6 +86,10 @@ export interface TranscriptDiagnosticEvent {
   cliVersion?: string;
   agentIdHash?: string;
   agentCandidateCount?: number;
+  /** Query epoch of the scope the recovery action acted on (frozen at send time). */
+  queryEpoch?: number;
+  /** Independent recovery attempt id (null for the silent probe's diagnostics). */
+  attemptId?: number;
   /** Free-form short context: query-close reason, run_phase state value, force-settle outcome. */
   detail?: string;
 }
@@ -132,7 +139,7 @@ export class ClaudeTranscriptDiagnosticLog {
 
   private serialize(event: TranscriptDiagnosticEvent): string {
     const clean: Record<string, unknown> = { ts: Date.now(), seq: ++this.seq, phase: event.phase };
-    for (const key of ['tabIdHash', 'turnIdHash', 'pageKeyHash', 'previousPageKeyHash', 'rangeStart', 'rangeEnd', 'generation', 'renderTicket', 'projectedWeight', 'leaseKind', 'batchBytes', 'batchLines', 'elapsedMs', 'errorName', 'buildId', 'mode', 'reason', 'outcome', 'trigger', 'identityRecovery', 'recoveredIdentityFields', 'offset', 'queueMs', 'bytes', 'totalBytes', 'entries', 'turns', 'turnCount', 'sourceBytes', 'projectedChars', 'oversizedTurns', 'hostAliases', 'sourceKind', 'queueLength', 'isStreaming', 'terminalSeenAgeMs', 'lastChunkAgeMs', 'evidenceKind', 'cliVersion', 'agentIdHash', 'agentCandidateCount', 'detail'] as const) {
+    for (const key of ['tabIdHash', 'turnIdHash', 'pageKeyHash', 'previousPageKeyHash', 'rangeStart', 'rangeEnd', 'generation', 'renderTicket', 'projectedWeight', 'leaseKind', 'batchBytes', 'batchLines', 'elapsedMs', 'errorName', 'buildId', 'mode', 'reason', 'outcome', 'trigger', 'identityRecovery', 'recoveredIdentityFields', 'offset', 'queueMs', 'bytes', 'totalBytes', 'entries', 'turns', 'turnCount', 'sourceBytes', 'projectedChars', 'oversizedTurns', 'hostAliases', 'sourceKind', 'queueLength', 'isStreaming', 'terminalSeenAgeMs', 'lastChunkAgeMs', 'evidenceKind', 'cliVersion', 'agentIdHash', 'agentCandidateCount', 'queryEpoch', 'attemptId', 'detail'] as const) {
       const value = event[key];
       if (value !== undefined) clean[key] = typeof value === 'string' ? value.slice(0, 128) : value;
     }

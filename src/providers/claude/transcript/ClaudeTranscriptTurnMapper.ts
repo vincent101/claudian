@@ -86,6 +86,21 @@ export type TranscriptTurnFact =
       rowTimestamp?: number;
       /** CLI version carried by the boundary row (retirement-evidence for the stopTask probe). */
       cliVersion?: string;
+    }
+  | {
+      /**
+       * Terminal-evidence retraction (2026-11-05 fix 1): a strong continuation
+       * proof (Stop-hook block feedback, or a NEW main assistant request
+       * distinguishable from the terminal one) arrived after the terminal
+       * fact was emitted. Ordinary trailing rows (text tails, usage,
+       * notifications, local-command rows) never retract.
+       */
+      type: 'observed_host_terminal_retracted';
+      reason: 'stop_hook_block' | 'new_assistant_request';
+      /** Distinguisher of the continuing assistant request (message id / uuid). */
+      assistantInstanceId?: string;
+      lineOffset?: number;
+      replay: boolean;
     };
 
 export interface TranscriptMapContext {
@@ -158,6 +173,15 @@ export class ClaudeTranscriptTurnMapper {
   /** Offset of the row that armed the host candidate: the fact inherits it so
    * the observer can attribute the terminal to the turn owning that row. */
   private hostTerminalCandidateOffset?: number;
+  /** A host terminal fact was EMITTED for the current host turn: from here,
+   * only strong continuation proof (block feedback / a new main assistant
+   * request distinguishable from the terminal one) retracts it. */
+  private hostTerminalEmitted = false;
+  /** Assistant message id of the terminal request the emission relied on
+   * (undefined for compact evidence — compact turns have no terminal assistant). */
+  private hostTerminalEmittedAssistantId?: string;
+  /** Assistant message id of the row that armed the pending candidate. */
+  private hostTerminalCandidateAssistantId?: string;
   /**
    * An embedded external turn (hostUserTurnActive + showUser start diverted
    * into the embedded queue) owns transcript emission until its own
@@ -172,6 +196,9 @@ export class ClaudeTranscriptTurnMapper {
     this.active = null;
     this.hostTerminalCandidate = false;
     this.hostTerminalCandidateOffset = undefined;
+    this.hostTerminalCandidateAssistantId = undefined;
+    this.hostTerminalEmitted = false;
+    this.hostTerminalEmittedAssistantId = undefined;
     this.embeddedExternalEmission = false;
   }
 
@@ -180,10 +207,14 @@ export class ClaudeTranscriptTurnMapper {
    * the turn that just ended (queue release requires its settlement), so it
    * must never arm the next turn's result-late watchdog (reviewer #1: the
    * previous turn's stop_hook_summary can be flushed by the next dispatch).
+   * The previous turn's emitted-terminal state dies with it too.
    */
   clearHostTerminalCandidate(): void {
     this.hostTerminalCandidate = false;
     this.hostTerminalCandidateOffset = undefined;
+    this.hostTerminalCandidateAssistantId = undefined;
+    this.hostTerminalEmitted = false;
+    this.hostTerminalEmittedAssistantId = undefined;
   }
 
   mapLine(line: string, replay = false, context: TranscriptMapContext = { hostUserTurnActive: false }): TranscriptTurnFact[] {
@@ -235,6 +266,9 @@ export class ClaudeTranscriptTurnMapper {
       // settled for this row to dispatch (queue release requires settle).
       this.hostTerminalCandidate = false;
       this.hostTerminalCandidateOffset = undefined;
+      this.hostTerminalCandidateAssistantId = undefined;
+      this.hostTerminalEmitted = false;
+      this.hostTerminalEmittedAssistantId = undefined;
       this.embeddedExternalEmission = false;
       facts.push({
         type: 'observed_start',
@@ -306,6 +340,9 @@ export class ClaudeTranscriptTurnMapper {
       this.hostTerminalCandidate = false;
       facts.push({ type: 'observed_host_terminal', lineOffset: this.hostTerminalCandidateOffset, replay });
       this.hostTerminalCandidateOffset = undefined;
+      this.hostTerminalEmitted = true;
+      this.hostTerminalEmittedAssistantId = this.hostTerminalCandidateAssistantId;
+      this.hostTerminalCandidateAssistantId = undefined;
     }
     return facts;
   }
@@ -364,26 +401,61 @@ export class ClaudeTranscriptTurnMapper {
           lineOffset: context.lineOffset,
           replay,
         });
+        this.hostTerminalEmitted = true;
+        this.hostTerminalEmittedAssistantId = undefined;
       }
       // Unparseable timestamp: no fact (fail-safe — a timestamp-less boundary
       // cannot pass the observer's dispatch attribution, degrading to the
       // pre-compact behavior instead of guessing).
       return;
     }
+    if (this.hostTerminalEmitted) {
+      // Fix 1 (2026-11-05): after a terminal fact was emitted, only STRONG
+      // continuation proof retracts it — a Stop-hook block feedback, or a
+      // NEW main assistant request distinguishable from the terminal one.
+      // Ordinary trailing rows (text tails, usage, notifications,
+      // local-command rows, compact continuation shapes) never retract.
+      const blockFeedback = isStopHookBlockFeedback(message);
+      const assistantId = message.type === 'assistant' ? message.message?.id ?? message.uuid : undefined;
+      const newAssistantRequest = message.type === 'assistant'
+        && assistantId !== undefined
+        && assistantId !== this.hostTerminalEmittedAssistantId;
+      if (blockFeedback || newAssistantRequest) {
+        this.hostTerminalEmitted = false;
+        this.hostTerminalEmittedAssistantId = undefined;
+        facts.push({
+          type: 'observed_host_terminal_retracted',
+          reason: blockFeedback ? 'stop_hook_block' : 'new_assistant_request',
+          ...(assistantId !== undefined ? { assistantInstanceId: assistantId } : {}),
+          lineOffset: context.lineOffset,
+          replay,
+        });
+        // Fall through: the row itself continues the normal candidate logic
+        // (block feedback clears the candidate; a new request's end_turn
+        // re-arms it, so the watchdog can re-arm on the NEW terminal).
+      } else {
+        return;
+      }
+    }
     if (isStopHookBlockFeedback(message)) {
       this.hostTerminalCandidate = false;
       this.hostTerminalCandidateOffset = undefined;
+      this.hostTerminalCandidateAssistantId = undefined;
       return;
     }
     if (endTurn) {
       this.hostTerminalCandidate = true;
       this.hostTerminalCandidateOffset = context.lineOffset;
+      this.hostTerminalCandidateAssistantId = message.message?.id ?? message.uuid;
       return;
     }
     if (stopHookSummary && this.hostTerminalCandidate) {
       this.hostTerminalCandidate = false;
       facts.push({ type: 'observed_host_terminal', lineOffset: context.lineOffset, replay });
       this.hostTerminalCandidateOffset = undefined;
+      this.hostTerminalEmitted = true;
+      this.hostTerminalEmittedAssistantId = this.hostTerminalCandidateAssistantId;
+      this.hostTerminalCandidateAssistantId = undefined;
     }
   }
 

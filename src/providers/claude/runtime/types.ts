@@ -158,6 +158,18 @@ export interface RuntimeTurn {
   dispatchedAt: number;
   /** One silent-turn probe per logical turn, never automatic escalation without evidence. */
   stopTaskProbeSent: boolean;
+  /**
+   * Agent ids already stopped for this LOGICAL turn (2026-11-05 fix 1):
+   * shared by every recovery attempt and the silent probe — an id is sent at
+   * most once even after terminal retraction and re-arming.
+   */
+  stopTaskSentAgentIds: Set<string>;
+  /** Active independent recovery attempt id, null when none owns the chain. */
+  recoveryAttemptId: number | null;
+  /** Bumped on every terminal-evidence retraction; freezes out stale attempts. */
+  evidenceRevision: number;
+  /** How the turn finally ended ('result' | 'cancel') — closes the U-A attribution gap. */
+  terminalSettlementKind?: 'result' | 'cancel';
   /** P0-1 diagnostics: wall time of the last chunk delivered to this turn. */
   lastChunkAt: number | null;
   /**
@@ -205,6 +217,9 @@ export function createRuntimeTurn(options: RuntimeTurnOptions): RuntimeTurn {
     transcriptTerminalSeenAt: null,
     dispatchedAt: Date.now(),
     stopTaskProbeSent: false,
+    stopTaskSentAgentIds: new Set(),
+    recoveryAttemptId: null,
+    evidenceRevision: 0,
     lastChunkAt: null,
     lastRoutedMessageAt: null,
   };

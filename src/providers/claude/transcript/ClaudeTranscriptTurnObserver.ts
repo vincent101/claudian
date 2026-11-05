@@ -33,6 +33,13 @@ export interface ClaudeTranscriptObserverCallbacks {
    * version); stop_hook calls stay single-argument.
    */
   onHostTurnTerminalObserved: (turnId: string, evidence?: { kind: 'compact' | 'stop_hook'; cliVersion?: string }) => void;
+  /**
+   * Terminal-evidence retraction (2026-11-05 fix 1): strong continuation
+   * proof arrived after a terminal fact was emitted for the live host turn.
+   * The runtime un-stamps the terminal so the watchdog can re-arm on the
+   * turn's NEW terminal; stale recovery attempts freeze out.
+   */
+  onHostTurnTerminalRetracted?: (turnId: string, reason: string) => void;
   /** Diagnostic-only CLI version from live transcript rows, including non-terminal hook-block turns. */
   onCliVersionObserved?: (version: string) => void;
 }
@@ -272,6 +279,17 @@ export class ClaudeTranscriptTurnObserver {
    */
   private reportHostTerminal(facts: ReturnType<ClaudeTranscriptTurnMapper['mapLine']>): void {
     for (const fact of facts) {
+      if (fact.type === 'observed_host_terminal_retracted') {
+        if (fact.replay) continue;
+        const hostTurnId = this.hostUserTurnId;
+        if (!hostTurnId) continue;
+        try {
+          this.callbacks.onHostTurnTerminalRetracted?.(hostTurnId, fact.reason);
+        } catch {
+          // The bypass must never disturb the consume chain.
+        }
+        continue;
+      }
       if (fact.type !== 'observed_host_terminal' || fact.replay) continue;
       const hostTurnId = this.hostUserTurnId;
       if (!hostTurnId) continue;
