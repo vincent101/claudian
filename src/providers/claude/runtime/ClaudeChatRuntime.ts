@@ -2493,9 +2493,11 @@ export class ClaudianService implements ChatRuntime {
           // eligible for crash-recovery replay either. onError flips
           // state.done, so the loop below is skipped and the error is
           // yielded on the shared drain path.
-          this.lastSentMessage = null;
-          this.lastSentQueryOptions = null;
-          this.lastSentTurnId = null;
+          if (this.lastSentTurnId === turn.id) {
+            this.lastSentMessage = null;
+            this.lastSentQueryOptions = null;
+            this.lastSentTurnId = null;
+          }
           handler.onError(new Error('Message queue is full; the newest message was dropped.'));
         } else if (enqueueResult.canonicalTurnId !== turn.id) {
           // Merged into an already queued item (text merge / attachment
@@ -2547,10 +2549,14 @@ export class ClaudianService implements ChatRuntime {
         yield { type: 'error', content: state.error.message };
       }
 
-      // Clear message tracking after completion
-      this.lastSentMessage = null;
-      this.lastSentQueryOptions = null;
-      this.lastSentTurnId = null;
+      // Clear message tracking after completion — ownership-checked (2.4): a
+      // late generator finishing behind a retirement/rebuild must not wipe
+      // the replacement dispatch's crash-replay anchor.
+      if (this.lastSentTurnId === turn.id) {
+        this.lastSentMessage = null;
+        this.lastSentQueryOptions = null;
+        this.lastSentTurnId = null;
+      }
 
       yield { type: 'done' };
     } finally {

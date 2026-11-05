@@ -1804,4 +1804,152 @@ describe('ClaudianService - P0-1 result-late watchdog', () => {
       void genB;
     });
   });
+
+  describe('observer rebuild anchor restore (2026-11-05 fix 3: a late observer init must not stamp "now")', () => {
+    it('a rebuild after dispatch restores the REAL dispatchedAt and the live host projection — terminal rows still arm the watchdog', async () => {
+      sdkMock.setMockMessages([
+        { type: 'system', subtype: 'init', session_id: 'watch-session' },
+        { type: 'assistant', message: { content: [{ type: 'text', text: 'model reply' }] } },
+      ], { appendResult: false });
+      await startPersistentQuery(service);
+
+      const turn = service.prepareTurn({ turnId: 'turn-anch-a', text: 'hello' });
+      const gen = service.query(turn);
+      await gen.next();
+      await flushMicrotasks();
+      service.beginUserTurnProjection('turn-anch-a');
+      await flushMicrotasks();
+      const descriptor = (service as any).currentDispatchDescriptor;
+      expect(descriptor?.leaseTurnId).toBe('turn-anch-a');
+      const realDispatchedAt = descriptor.dispatchedAt as number;
+      void gen.next();
+
+      // Ten seconds pass, then the observer is rebuilt (late init / re-init
+      // shape): the restore must anchor on the REAL dispatch clock, never on
+      // the rebuild moment.
+      await jest.advanceTimersByTimeAsync(10_000);
+      // Mirror the real rebuild teardown: the old reader must be stopped
+      // (releasing its fs watch handles) before the slot is replaced, or the
+      // worker leaks the handle and jest cannot exit.
+      (service as any).transcriptObserver?.stop('test_rebuild');
+      (service as any).transcriptObserver = null;
+      (service as any).transcriptObserverTarget = null;
+      (service as any).restartTranscriptObserver('watch-session');
+      // observer.start awaits real fs I/O (recover/prime); awaiting the chain
+      // promise suspends the test while libuv completes the reads.
+      await (service as any).transcriptObserverRestartChain;
+      for (let i = 0; i < 50; i += 1) await Promise.resolve();
+
+      const observer = (service as any).transcriptObserver;
+      expect(observer).not.toBeNull();
+      expect(observer.currentDispatch()).toMatchObject({
+        leaseTurnId: 'turn-anch-a',
+        canonicalUuid: descriptor.canonicalTurnId,
+        dispatchedAt: realDispatchedAt,
+      });
+
+      // The live host projection carried over the rebuild: the host row and
+      // terminal rows landing afterwards still arm the watchdog on the live
+      // turn (attribution requires the projection, not just the anchor).
+      const uuid = descriptor.canonicalTurnId as string;
+      await appendFile(transcriptFile, hostUserRowLine(uuid) + hostTerminalRows());
+      await driveObserverTick();
+      const turnObserved = (service as any).runtimeTurns.get('turn-anch-a');
+      expect(turnObserved?.transcriptTerminalSeenAt).not.toBeNull();
+    });
+  });
+
+  describe('matrix completion (2026-11-05 spec §3): close-in-window teardown and cross-scope late reject', () => {
+    it('closePersistentQuery inside the stop window tears the attempt down — no late interrupt is ever sent', async () => {
+      service.setSubagentHookProvider(() => ({
+        hasRunning: true,
+        runningAgents: [{ agentId: 'ag-close', startedAt: Date.now() - STOP_TASK_AGENT_MIN_AGE_MS }],
+      }));
+      sdkMock.setMockMessages([
+        { type: 'system', subtype: 'init', session_id: 'watch-session' },
+        { type: 'assistant', message: { content: [{ type: 'text', text: 'model reply' }] } },
+      ], { appendResult: false });
+      await startPersistentQuery(service);
+
+      const turn = service.prepareTurn({ turnId: 'turn-close-a', text: 'hello' });
+      const gen = service.query(turn);
+      await gen.next();
+      await armTerminalEvidence(service, 'turn-close-a');
+      void gen.next();
+      await flushMicrotasks();
+
+      await jest.advanceTimersByTimeAsync(RESULT_WATCHDOG_MS);
+      const query = sdkMock.getLastResponse()!;
+      expect(query.stopTask).toHaveBeenCalledTimes(1);
+
+      // External close (reload / session switch) lands INSIDE the 15s stop
+      // window: the attempt dies with the turn, the chain never continues.
+      service.closePersistentQuery('test close in window');
+
+      await jest.advanceTimersByTimeAsync(STOP_TASK_GRACE_MS + RESULT_WATCHDOG_GRACE_MS + 60_000);
+      await flushMicrotasks();
+
+      expect(query.interrupt).not.toHaveBeenCalled();
+      expect(query.stopTask).toHaveBeenCalledTimes(1);
+      const phases = await readDiagnosticPhases(diagDir);
+      expect(phases.some(entry => entry.phase === 'interrupt_sent')).toBe(false);
+    });
+
+    it('a stopTask promise rejecting after the scope was replaced records the frozen identity and touches nothing on the new scope', async () => {
+      service.setSubagentHookProvider(() => ({
+        hasRunning: true,
+        runningAgents: [{ agentId: 'ag-latereject', startedAt: Date.now() - STOP_TASK_AGENT_MIN_AGE_MS }],
+      }));
+      sdkMock.setMockMessages([
+        { type: 'system', subtype: 'init', session_id: 'watch-session' },
+        { type: 'assistant', message: { content: [{ type: 'text', text: 'model reply' }] } },
+      ], { appendResult: false });
+      await startPersistentQuery(service);
+
+      const turn = service.prepareTurn({ turnId: 'turn-lr-a', text: 'hello' });
+      const gen = service.query(turn);
+      await gen.next();
+      await armTerminalEvidence(service, 'turn-lr-a');
+      void gen.next();
+      await flushMicrotasks();
+
+      // Hold the stopTask control request pending so its rejection can be
+      // delivered after the query incarnation is replaced.
+      let rejectStop!: (error: Error) => void;
+      sdkMock.getLastResponse()!.stopTask.mockImplementationOnce(
+        () => new Promise<void>((_, reject) => { rejectStop = reject; }),
+      );
+
+      await jest.advanceTimersByTimeAsync(RESULT_WATCHDOG_MS);
+      const oldEpoch = (service as any).currentQueryScope?.epoch as number;
+      expect(sdkMock.getLastResponse()?.stopTask).toHaveBeenCalledTimes(1);
+
+      // Replacement incarnation; a fresh turn takes the new lease.
+      const messageChannel = new MessageChannel(() => {}, (info) => (service as any).handleTurnDequeued(info));
+      (service as any).messageChannel = messageChannel;
+      (service as any).persistentQuery = sdkMock.query({ prompt: messageChannel, options: {} as any });
+      (service as any).startResponseConsumer();
+      const turnB = service.prepareTurn({ turnId: 'turn-lr-b', text: 'queued hello' });
+      const genB = service.query(turnB);
+      await genB.next();
+      await flushMicrotasks();
+      expect(messageChannel.getActiveTurnId()).toBe('turn-lr-b');
+
+      // The OLD control request rejects now: the diagnostic carries the
+      // frozen attempt identity (old epoch), and nothing on the new scope
+      // moves — no close, no cancel, no interrupt of turn-lr-b.
+      rejectStop(new Error('StopTaskError: agent not found'));
+      await flushMicrotasks();
+      for (let i = 0; i < 30; i += 1) await Promise.resolve();
+
+      expect((service as any).runtimeTurns.get('turn-lr-b')?.phase).toBe('collecting');
+      expect(messageChannel.getActiveTurnId()).toBe('turn-lr-b');
+      const phases = await readDiagnosticPhases(diagDir);
+      const rejectOutcome = phases.find(entry => entry.phase === 'stop_task_outcome' && entry.outcome === 'error');
+      expect(rejectOutcome).toMatchObject({ queryEpoch: oldEpoch });
+      expect(phases.some(entry => entry.phase === 'query_close')).toBe(false);
+      await service.completeUserTurnProjection('turn-lr-b');
+      void genB;
+    });
+  });
 });
