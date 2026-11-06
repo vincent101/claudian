@@ -615,6 +615,12 @@ export async function initializeTabService(
       tab.draftProviderId = null;
     }
     tab.lifecycleState = 'bound_active';
+    // Every binding transition must leave the selector scoped to the bound
+    // provider: direct callers such as hydrateTab do not wrap this call in
+    // ensureServiceInitialized, so the mixed blank-period list would otherwise
+    // stay clickable on a bound tab (same-label presets across providers make
+    // the foreign entry indistinguishable and trip the bound-session guard).
+    refreshTabProviderUI(tab, plugin);
   } catch (error) {
     // Clean up partial state on failure
     unsubscribeReadyState?.();
