@@ -280,7 +280,23 @@ describe('ModelPresetSettings', () => {
     const reordered = harness.rows();
     expect(rowInputs(reordered[2]).model.value).toBe('fable');
     expect(rowInputs(reordered[3]).model.value).toBe('opus');
-    // Reorder alone does not dirty the commit state.
+    expect(getClaudeProviderSettings(harness.settingsBag).modelPresets.map(p => p.model))
+      .toEqual(['haiku', 'sonnet', 'fable', 'opus']);
+    expect(harness.saveSettings).toHaveBeenCalledTimes(1);
+    expect(harness.refreshModelSelectors).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not save when a move is a boundary no-op', async () => {
+    const harness = createHarness();
+    const rows = harness.rows();
+    const before = rows.map(row => rowInputs(row).model.value);
+
+    rowButton(rows[0], 'claudian-model-preset-move-up').trigger('click');
+    await flushAsync();
+    rowButton(harness.rows()[3], 'claudian-model-preset-move-down').trigger('click');
+    await flushAsync();
+
+    expect(harness.rows().map(row => rowInputs(row).model.value)).toEqual(before);
     expect(harness.saveSettings).not.toHaveBeenCalled();
   });
 

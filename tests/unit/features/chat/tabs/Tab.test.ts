@@ -31,6 +31,7 @@ import {
 } from '@/features/chat/tabs/Tab';
 import { t } from '@/i18n/i18n';
 import {
+  DEFAULT_CODEX_MINI_MODEL,
   DEFAULT_CODEX_PRIMARY_MODEL,
   DEFAULT_CODEX_PRIMARY_MODEL_LABEL,
 } from '@/providers/codex/types/models';
@@ -675,15 +676,18 @@ describe('Tab - Creation', () => {
       expect(tab.controllers.navigationController).toBeNull();
     });
 
-    it('should derive the blank-tab provider from the default draft model', () => {
+    it('does not infer the blank-tab provider from a leftover cross-provider top-level model', () => {
       const plugin = createMockPlugin();
+      // Leftover Codex top-level model under a Claude settings provider: the
+      // blank draft must fall back to a valid Claude pair, never guess Codex.
       plugin.settings.model = DEFAULT_CODEX_PRIMARY_MODEL;
 
       const tab = createTab(createMockOptions({ plugin }));
 
       expect(tab.lifecycleState).toBe('blank');
-      expect(tab.draftModel).toBe(DEFAULT_CODEX_PRIMARY_MODEL);
-      expect(tab.providerId).toBe('codex');
+      expect(tab.providerId).toBe('claude');
+      expect(tab.draftProviderId).toBe('claude');
+      expect(tab.draftModel).toBe('haiku');
     });
 
     it('should resolve draft model from defaultProviderId via projection', () => {
@@ -919,7 +923,11 @@ describe('Tab - Service Initialization', () => {
       jest.spyOn(ProviderRegistry, 'createTitleGenerationService').mockReturnValue({ cancel: jest.fn() } as any);
       jest.spyOn(ProviderRegistry, 'getTaskResultInterpreter').mockReturnValue({} as any);
       getChatUIConfigSpy.mockReturnValue({
-        getModelOptions: jest.fn().mockReturnValue([]),
+        getModelOptions: jest.fn().mockReturnValue([
+        { value: 'sonnet', label: 'Sonnet' },
+        { value: 'opus', label: 'Opus' },
+        { value: DEFAULT_CODEX_PRIMARY_MODEL, label: DEFAULT_CODEX_PRIMARY_MODEL_LABEL },
+      ]),
         ownsModel: jest.fn().mockReturnValue(false),
         isAdaptiveReasoningModel: jest.fn().mockReturnValue(false),
         getReasoningOptions: jest.fn().mockReturnValue([]),
@@ -1032,7 +1040,7 @@ describe('Tab - Service Initialization', () => {
       expect(mockSlashCommandDropdown.resetSdkSkillsCache).toHaveBeenCalled();
     });
 
-    it('rebinds blank-tab helper services when a newly enabled provider takes over the draft model', () => {
+    it('keeps the explicit claude draft pair when a newly enabled provider shares the draft model id', () => {
       const createInstructionRefineServiceSpy = jest.spyOn(ProviderRegistry, 'createInstructionRefineService')
         .mockReturnValue({ cancel: jest.fn(), resetConversation: jest.fn() } as any);
       const createTitleGenerationServiceSpy = jest.spyOn(ProviderRegistry, 'createTitleGenerationService')
@@ -1066,9 +1074,12 @@ describe('Tab - Service Initialization', () => {
 
       onProviderAvailabilityChanged(tab, plugin);
 
-      expect(tab.providerId).toBe('codex');
-      expect(createInstructionRefineServiceSpy).toHaveBeenLastCalledWith(plugin, 'codex');
-      expect(createTitleGenerationServiceSpy).toHaveBeenLastCalledWith(plugin, 'codex');
+      // The draft pair is explicit: enabling Codex must not re-denominate it.
+      expect(tab.providerId).toBe('claude');
+      expect(tab.draftProviderId).toBe('claude');
+      expect(tab.draftModel).toBe(DEFAULT_CODEX_PRIMARY_MODEL);
+      expect(createInstructionRefineServiceSpy).toHaveBeenLastCalledWith(plugin, 'claude');
+      expect(createTitleGenerationServiceSpy).toHaveBeenLastCalledWith(plugin, 'claude');
     });
 
     it('surfaces provider-scoped model settings for inactive-provider tabs and saves back to that provider snapshot', async () => {
@@ -1127,7 +1138,7 @@ describe('Tab - Service Initialization', () => {
         effortLevel: 'medium',
       }));
 
-      await toolbarCallbacks.onModelChange(DEFAULT_CODEX_PRIMARY_MODEL);
+      await toolbarCallbacks.onModelChange({ providerId: 'codex', modelId: DEFAULT_CODEX_PRIMARY_MODEL });
 
       expect(plugin.settings.model).toBe('claude-sonnet-4-5');
       expect(plugin.settings.savedProviderModel).toEqual(expect.objectContaining({
@@ -1235,8 +1246,10 @@ describe('Tab - Service Initialization', () => {
 
       expect(tab.lifecycleState).toBe('blank');
       expect(tab.conversationId).toBeNull();
-      // Draft model is resolved via provider projection, not raw settings.model
-      expect(tab.draftModel).toBe(plugin.settings.savedProviderModel.claude);
+      // Draft pair is a valid claude selection: the persisted saved model is
+      // not in the option list, so the default falls back to a usable model.
+      expect(tab.draftProviderId).toBe('claude');
+      expect(tab.draftModel).toBe('haiku');
       expect(tab.serviceInitialized).toBe(false);
     });
 
@@ -2695,7 +2708,10 @@ describe('Tab - UI Callback Wiring', () => {
       const constructorCall = SlashCommandDropdown.mock.calls[0];
       const opts = constructorCall[3];
 
-      expect(Array.from(opts.hiddenCommands)).toEqual(['analyze']);
+      // Blank tabs read their provider from tab.providerId (the settings
+      // provider), never from a leftover cross-provider top-level model.
+      expect(tab.providerId).toBe('claude');
+      expect(Array.from(opts.hiddenCommands)).toEqual(['commit']);
     });
   });
 });
@@ -3688,7 +3704,7 @@ describe('Tab - Blank Tab Model Selector', () => {
     } as any));
 
     const result = getBlankTabModelOptions({ codexEnabled: false });
-    expect(result).toEqual(claudeModels.map(m => ({ ...m, group: 'Claude' })));
+    expect(result).toEqual(claudeModels.map(m => ({ ...m, group: 'Claude', providerId: 'claude' })));
   });
 
   it('returns Claude + Codex models when Codex is enabled', () => {
@@ -3711,13 +3727,17 @@ describe('Tab - Blank Tab Model Selector', () => {
 
     const result = getBlankTabModelOptions({ codexEnabled: true });
     expect(result).toEqual([
-      ...codexModels.map(m => ({ ...m, group: 'Codex' })),
-      ...claudeModels.map(m => ({ ...m, group: 'Claude' })),
+      ...codexModels.map(m => ({ ...m, group: 'Codex', providerId: 'codex' })),
+      ...claudeModels.map(m => ({ ...m, group: 'Claude', providerId: 'claude' })),
     ]);
   });
 });
 
 describe('Tab - Cross-Provider Model Rejection', () => {
+  afterEach(() => {
+    jest.restoreAllMocks();
+  });
+
   it('rejects cross-provider model change on bound tab via toolbar onModelChange', async () => {
     jest.spyOn(ProviderRegistry, 'createInstructionRefineService').mockReturnValue({ cancel: jest.fn(), resetConversation: jest.fn() } as any);
     jest.spyOn(ProviderRegistry, 'createTitleGenerationService').mockReturnValue({ cancel: jest.fn() } as any);
@@ -3740,7 +3760,7 @@ describe('Tab - Cross-Provider Model Rejection', () => {
     expect(toolbarCallbacks).toBeDefined();
 
     // Attempt cross-provider model change (Claude -> Codex)
-    await toolbarCallbacks.onModelChange(DEFAULT_CODEX_PRIMARY_MODEL);
+    await toolbarCallbacks.onModelChange({ providerId: 'codex', modelId: DEFAULT_CODEX_PRIMARY_MODEL });
 
     // Should show a Notice rejecting it
     expect(Notice).toHaveBeenCalledWith(expect.stringContaining('Cannot switch provider'));
@@ -3754,7 +3774,11 @@ describe('Tab - Cross-Provider Model Rejection', () => {
     jest.spyOn(ProviderRegistry, 'createTitleGenerationService').mockReturnValue({ cancel: jest.fn() } as any);
     jest.spyOn(ProviderRegistry, 'getTaskResultInterpreter').mockReturnValue({} as any);
     jest.spyOn(ProviderRegistry, 'getChatUIConfig').mockReturnValue({
-      getModelOptions: jest.fn().mockReturnValue([]),
+      getModelOptions: jest.fn().mockReturnValue([
+        { value: 'sonnet', label: 'Sonnet' },
+        { value: 'opus', label: 'Opus' },
+        { value: DEFAULT_CODEX_PRIMARY_MODEL, label: DEFAULT_CODEX_PRIMARY_MODEL_LABEL },
+      ]),
       ownsModel: jest.fn((model: string) => model.startsWith('gpt-') || /^o\d/.test(model)),
       isAdaptiveReasoningModel: jest.fn().mockReturnValue(false),
       getReasoningOptions: jest.fn().mockReturnValue([]),
@@ -3781,7 +3805,7 @@ describe('Tab - Cross-Provider Model Rejection', () => {
     const toolbarCallbacks = toolbarModule.createInputToolbar.mock.calls.at(-1)?.[1];
 
     // Same-provider model change (Claude -> Claude)
-    await toolbarCallbacks.onModelChange('opus');
+    await toolbarCallbacks.onModelChange({ providerId: 'claude', modelId: 'opus' });
 
     expect(Notice).not.toHaveBeenCalled();
     expect(plugin.saveSettings).toHaveBeenCalled();
@@ -3792,7 +3816,11 @@ describe('Tab - Cross-Provider Model Rejection', () => {
     jest.spyOn(ProviderRegistry, 'createTitleGenerationService').mockReturnValue({ cancel: jest.fn() } as any);
     jest.spyOn(ProviderRegistry, 'getTaskResultInterpreter').mockReturnValue({} as any);
     jest.spyOn(ProviderRegistry, 'getChatUIConfig').mockReturnValue({
-      getModelOptions: jest.fn().mockReturnValue([]),
+      getModelOptions: jest.fn().mockReturnValue([
+        { value: 'sonnet', label: 'Sonnet' },
+        { value: 'opus', label: 'Opus' },
+        { value: DEFAULT_CODEX_PRIMARY_MODEL, label: DEFAULT_CODEX_PRIMARY_MODEL_LABEL },
+      ]),
       ownsModel: jest.fn((model: string) => model.startsWith('gpt-') || /^o\d/.test(model)),
       isAdaptiveReasoningModel: jest.fn().mockReturnValue(false),
       getReasoningOptions: jest.fn().mockReturnValue([]),
@@ -3827,7 +3855,7 @@ describe('Tab - Cross-Provider Model Rejection', () => {
     };
     const toolbarCallbacks = toolbarModule.createInputToolbar.mock.calls.at(-1)?.[1];
 
-    await toolbarCallbacks.onModelChange('opus');
+    await toolbarCallbacks.onModelChange({ providerId: 'claude', modelId: 'opus' });
 
     // Explicit switch semantics: the newly selected model wins over both the
     // stored fallback window and the previous model's authoritative window.
@@ -3845,12 +3873,20 @@ describe('Tab - Cross-Provider Model Rejection', () => {
 });
 
 describe('Tab - Blank Tab Draft Model Change', () => {
+  afterEach(() => {
+    jest.restoreAllMocks();
+  });
+
   it('updates draft model and provider without creating runtime', async () => {
     jest.spyOn(ProviderRegistry, 'createInstructionRefineService').mockReturnValue({ cancel: jest.fn(), resetConversation: jest.fn() } as any);
     jest.spyOn(ProviderRegistry, 'createTitleGenerationService').mockReturnValue({ cancel: jest.fn() } as any);
     jest.spyOn(ProviderRegistry, 'getTaskResultInterpreter').mockReturnValue({} as any);
     jest.spyOn(ProviderRegistry, 'getChatUIConfig').mockReturnValue({
-      getModelOptions: jest.fn().mockReturnValue([]),
+      getModelOptions: jest.fn().mockReturnValue([
+        { value: 'sonnet', label: 'Sonnet' },
+        { value: 'opus', label: 'Opus' },
+        { value: DEFAULT_CODEX_PRIMARY_MODEL, label: DEFAULT_CODEX_PRIMARY_MODEL_LABEL },
+      ]),
       ownsModel: jest.fn((model: string) => model.startsWith('gpt-') || /^o\d/.test(model)),
       isAdaptiveReasoningModel: jest.fn().mockReturnValue(false),
       getReasoningOptions: jest.fn().mockReturnValue([]),
@@ -3875,9 +3911,10 @@ describe('Tab - Blank Tab Draft Model Change', () => {
     const toolbarCallbacks = toolbarModule.createInputToolbar.mock.calls.at(-1)?.[1];
 
     // Switch to Codex model on blank tab
-    await toolbarCallbacks.onModelChange(DEFAULT_CODEX_PRIMARY_MODEL);
+    await toolbarCallbacks.onModelChange({ providerId: 'codex', modelId: DEFAULT_CODEX_PRIMARY_MODEL });
 
     expect(tab.draftModel).toBe(DEFAULT_CODEX_PRIMARY_MODEL);
+    expect(tab.draftProviderId).toBe('codex');
     expect(tab.providerId).toBe('codex');
     // No runtime should have been created
     expect(tab.service).toBeNull();
@@ -3890,7 +3927,11 @@ describe('Tab - Blank Tab Draft Model Change', () => {
     jest.spyOn(ProviderRegistry, 'createTitleGenerationService').mockReturnValue({ cancel: jest.fn() } as any);
     jest.spyOn(ProviderRegistry, 'getTaskResultInterpreter').mockReturnValue({} as any);
     jest.spyOn(ProviderRegistry, 'getChatUIConfig').mockReturnValue({
-      getModelOptions: jest.fn().mockReturnValue([]),
+      getModelOptions: jest.fn().mockReturnValue([
+        { value: 'sonnet', label: 'Sonnet' },
+        { value: 'opus', label: 'Opus' },
+        { value: DEFAULT_CODEX_PRIMARY_MODEL, label: DEFAULT_CODEX_PRIMARY_MODEL_LABEL },
+      ]),
       ownsModel: jest.fn((model: string) => model.startsWith('gpt-') || /^o\d/.test(model)),
       isAdaptiveReasoningModel: jest.fn().mockReturnValue(false),
       getReasoningOptions: jest.fn().mockReturnValue([]),
@@ -3913,7 +3954,7 @@ describe('Tab - Blank Tab Draft Model Change', () => {
 
     mockServiceTierToggle.updateDisplay.mockClear();
 
-    await toolbarCallbacks.onModelChange(DEFAULT_CODEX_PRIMARY_MODEL);
+    await toolbarCallbacks.onModelChange({ providerId: 'codex', modelId: DEFAULT_CODEX_PRIMARY_MODEL });
 
     expect(mockServiceTierToggle.updateDisplay).toHaveBeenCalled();
   });
@@ -3937,7 +3978,7 @@ describe('Tab - Blank Tab Draft Model Change', () => {
     const toolbarCallbacks = toolbarModule.createInputToolbar.mock.calls.at(-1)?.[1];
 
     let settled = false;
-    const changePromise = toolbarCallbacks.onModelChange('gpt-5.4')
+    const changePromise = toolbarCallbacks.onModelChange({ providerId: 'codex', modelId: 'gpt-5.4-mini' })
       .then(() => { settled = true; });
 
     await Promise.resolve();
@@ -3956,20 +3997,12 @@ describe('Tab - Blank Tab Draft Model Change', () => {
     jest.spyOn(ProviderRegistry, 'createInstructionRefineService').mockReturnValue({ cancel: jest.fn(), resetConversation: jest.fn() } as any);
     jest.spyOn(ProviderRegistry, 'createTitleGenerationService').mockReturnValue({ cancel: jest.fn() } as any);
     jest.spyOn(ProviderRegistry, 'getTaskResultInterpreter').mockReturnValue({} as any);
-    jest.spyOn(ProviderRegistry, 'resolveProviderForModel').mockImplementation((model: string) => {
-      if (model.startsWith('opencode:')) {
-        return 'opencode';
-      }
-      if (model.startsWith('gpt-') || /^o\d/.test(model)) {
-        return 'codex';
-      }
-      return 'claude';
-    });
 
     const plugin = createMockPlugin();
     plugin.settings.providerConfigs = {
       opencode: {
         enabled: true,
+        visibleModels: ['openai/gpt-5', 'anthropic/claude-sonnet-4'],
       },
     };
     plugin.settings.savedProviderModel = {
@@ -3994,7 +4027,7 @@ describe('Tab - Blank Tab Draft Model Change', () => {
     const toolbarCallbacks = toolbarModule.createInputToolbar.mock.calls.at(-1)?.[1];
 
     let settled = false;
-    const changePromise = toolbarCallbacks.onModelChange('opencode:anthropic/claude-sonnet-4')
+    const changePromise = toolbarCallbacks.onModelChange({ providerId: 'opencode', modelId: 'opencode:anthropic/claude-sonnet-4' })
       .then(() => { settled = true; });
 
     await Promise.resolve();
@@ -4047,10 +4080,10 @@ describe('Tab - Blank Tab Draft Model Change', () => {
     };
     const toolbarCallbacks = toolbarModule.createInputToolbar.mock.calls.at(-1)?.[1];
 
-    await toolbarCallbacks.onModelChange('gpt-5.4-mini');
+    await toolbarCallbacks.onModelChange({ providerId: 'codex', modelId: 'gpt-5.4-mini' });
     expect(plugin.settings.savedProviderServiceTier.codex).toBe('fast');
 
-    await toolbarCallbacks.onModelChange(DEFAULT_CODEX_PRIMARY_MODEL);
+    await toolbarCallbacks.onModelChange({ providerId: 'codex', modelId: DEFAULT_CODEX_PRIMARY_MODEL });
     expect(plugin.settings.savedProviderServiceTier.codex).toBe('fast');
   });
 
@@ -4059,7 +4092,11 @@ describe('Tab - Blank Tab Draft Model Change', () => {
     jest.spyOn(ProviderRegistry, 'createTitleGenerationService').mockReturnValue({ cancel: jest.fn() } as any);
     jest.spyOn(ProviderRegistry, 'getTaskResultInterpreter').mockReturnValue({} as any);
     jest.spyOn(ProviderRegistry, 'getChatUIConfig').mockReturnValue({
-      getModelOptions: jest.fn().mockReturnValue([]),
+      getModelOptions: jest.fn().mockReturnValue([
+        { value: 'sonnet', label: 'Sonnet' },
+        { value: 'opus', label: 'Opus' },
+        { value: DEFAULT_CODEX_PRIMARY_MODEL, label: DEFAULT_CODEX_PRIMARY_MODEL_LABEL },
+      ]),
       ownsModel: jest.fn((model: string) => model.startsWith('gpt-') || /^o\d/.test(model)),
       isAdaptiveReasoningModel: jest.fn().mockReturnValue(false),
       getReasoningOptions: jest.fn().mockReturnValue([]),
@@ -4126,7 +4163,7 @@ describe('Tab - Blank Tab Draft Model Change', () => {
     const toolbarCallbacks = toolbarModule.createInputToolbar.mock.calls.at(-1)?.[1];
 
     // Switch to Codex model → should swap catalog
-    await toolbarCallbacks.onModelChange(DEFAULT_CODEX_PRIMARY_MODEL);
+    await toolbarCallbacks.onModelChange({ providerId: 'codex', modelId: DEFAULT_CODEX_PRIMARY_MODEL });
 
     expect(setProviderCatalogSpy).toHaveBeenCalledTimes(1);
     const [config, getEntries] = setProviderCatalogSpy.mock.calls[0];
@@ -4143,7 +4180,11 @@ describe('Tab - Blank Tab Draft Model Change', () => {
     jest.spyOn(ProviderRegistry, 'createTitleGenerationService').mockReturnValue({ cancel: jest.fn() } as any);
     jest.spyOn(ProviderRegistry, 'getTaskResultInterpreter').mockReturnValue({} as any);
     jest.spyOn(ProviderRegistry, 'getChatUIConfig').mockReturnValue({
-      getModelOptions: jest.fn().mockReturnValue([]),
+      getModelOptions: jest.fn().mockReturnValue([
+        { value: 'sonnet', label: 'Sonnet' },
+        { value: 'opus', label: 'Opus' },
+        { value: DEFAULT_CODEX_PRIMARY_MODEL, label: DEFAULT_CODEX_PRIMARY_MODEL_LABEL },
+      ]),
       ownsModel: jest.fn((model: string) => model.startsWith('gpt-') || /^o\d/.test(model)),
       isAdaptiveReasoningModel: jest.fn().mockReturnValue(false),
       getReasoningOptions: jest.fn().mockReturnValue([]),
@@ -4218,7 +4259,7 @@ describe('Tab - Blank Tab Draft Model Change', () => {
     };
     const toolbarCallbacks = toolbarModule.createInputToolbar.mock.calls.at(-1)?.[1];
 
-    await toolbarCallbacks.onModelChange(DEFAULT_CODEX_PRIMARY_MODEL);
+    await toolbarCallbacks.onModelChange({ providerId: 'codex', modelId: DEFAULT_CODEX_PRIMARY_MODEL });
 
     expect(setHiddenCommandsSpy).toHaveBeenCalledWith(new Set(['analyze']));
   });
@@ -4230,7 +4271,11 @@ describe('Tab - Blank Tab Draft Model Change', () => {
       .mockReturnValue({ cancel: jest.fn() } as any);
     jest.spyOn(ProviderRegistry, 'getTaskResultInterpreter').mockReturnValue({} as any);
     jest.spyOn(ProviderRegistry, 'getChatUIConfig').mockReturnValue({
-      getModelOptions: jest.fn().mockReturnValue([]),
+      getModelOptions: jest.fn().mockReturnValue([
+        { value: 'sonnet', label: 'Sonnet' },
+        { value: 'opus', label: 'Opus' },
+        { value: DEFAULT_CODEX_PRIMARY_MODEL, label: DEFAULT_CODEX_PRIMARY_MODEL_LABEL },
+      ]),
       ownsModel: jest.fn((model: string) => model.startsWith('gpt-') || /^o\d/.test(model)),
       isAdaptiveReasoningModel: jest.fn().mockReturnValue(false),
       getReasoningOptions: jest.fn().mockReturnValue([]),
@@ -4258,8 +4303,8 @@ describe('Tab - Blank Tab Draft Model Change', () => {
     const initialInstructionCalls = createInstructionRefineServiceSpy.mock.calls.length;
     const initialTitleCalls = createTitleGenerationServiceSpy.mock.calls.length;
 
-    await toolbarCallbacks.onModelChange(DEFAULT_CODEX_PRIMARY_MODEL);
-    await toolbarCallbacks.onModelChange('opus');
+    await toolbarCallbacks.onModelChange({ providerId: 'codex', modelId: DEFAULT_CODEX_PRIMARY_MODEL });
+    await toolbarCallbacks.onModelChange({ providerId: 'claude', modelId: 'opus' });
 
     expect(staleService.cleanup).toHaveBeenCalledTimes(1);
     expect(tab.service).toBeNull();
@@ -4267,6 +4312,61 @@ describe('Tab - Blank Tab Draft Model Change', () => {
     expect(tab.providerId).toBe('claude');
     expect(createInstructionRefineServiceSpy.mock.calls.length).toBeGreaterThan(initialInstructionCalls);
     expect(createTitleGenerationServiceSpy.mock.calls.length).toBeGreaterThan(initialTitleCalls);
+  });
+
+  it('resets the draft to a full valid pair when the draft provider is disabled', () => {
+    jest.spyOn(ProviderRegistry, 'createInstructionRefineService').mockReturnValue({ cancel: jest.fn(), resetConversation: jest.fn() } as any);
+    jest.spyOn(ProviderRegistry, 'createTitleGenerationService').mockReturnValue({ cancel: jest.fn() } as any);
+    jest.spyOn(ProviderRegistry, 'getTaskResultInterpreter').mockReturnValue({} as any);
+
+    const plugin = createMockPlugin();
+    const tab = createTab(createMockOptions({ plugin }));
+    initializeTabUI(tab, plugin);
+
+    // Explicit codex draft pair (a codex-only model ID).
+    tab.draftModel = DEFAULT_CODEX_MINI_MODEL;
+    tab.draftProviderId = 'codex';
+    tab.providerId = 'codex';
+
+    plugin.settings.codexEnabled = false;
+
+    onProviderAvailabilityChanged(tab, plugin);
+
+    expect(Notice).toHaveBeenCalledWith(expect.stringContaining('has been reset'));
+    expect(tab.providerId).toBe('claude');
+    expect(tab.draftProviderId).toBe('claude');
+    expect(tab.draftModel).toBe('haiku');
+  });
+
+  it('resets the draft to a full valid pair when the draft model leaves the provider presets', () => {
+    jest.spyOn(ProviderRegistry, 'createInstructionRefineService').mockReturnValue({ cancel: jest.fn(), resetConversation: jest.fn() } as any);
+    jest.spyOn(ProviderRegistry, 'createTitleGenerationService').mockReturnValue({ cancel: jest.fn() } as any);
+    jest.spyOn(ProviderRegistry, 'getTaskResultInterpreter').mockReturnValue({} as any);
+
+    const plugin = createMockPlugin();
+    const tab = createTab(createMockOptions({ plugin }));
+    initializeTabUI(tab, plugin);
+
+    tab.draftModel = DEFAULT_CODEX_MINI_MODEL;
+    tab.draftProviderId = 'codex';
+    tab.providerId = 'codex';
+
+    // Codex stays enabled, but the draft model disappears from its presets.
+    plugin.settings.providerConfigs = {
+      codex: {
+        enabled: true,
+        modelPresets: [{ label: 'Codex Primary', model: DEFAULT_CODEX_PRIMARY_MODEL }],
+      },
+    };
+
+    onProviderAvailabilityChanged(tab, plugin);
+
+    expect(Notice).toHaveBeenCalledWith(expect.stringContaining('has been reset'));
+    // Codex stays enabled and owns the fallback order, so the reset lands on
+    // a full valid codex pair — never a same-ID claude mis-attribution.
+    expect(tab.providerId).toBe('codex');
+    expect(tab.draftProviderId).toBe('codex');
+    expect(tab.draftModel).toBe(DEFAULT_CODEX_PRIMARY_MODEL);
   });
 });
 

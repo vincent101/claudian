@@ -159,7 +159,8 @@
       "moveLeft": "Move left",
       "moveRight": "Move right",
       "close": "Close",
-      "boundProviderSwitch": "Cannot switch provider on a bound session. Start a new tab instead."
+      "boundProviderSwitch": "Cannot switch provider on a bound session. Start a new tab instead.",
+      "draftModelReset": "The draft model selection could not be restored unambiguously or is no longer available. It has been reset; please select a model again."
     },
     "input": {
       "placeholder": "How can I help you today?",

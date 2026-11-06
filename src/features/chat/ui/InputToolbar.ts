@@ -5,6 +5,8 @@ import type { McpServerManager } from '../../../core/mcp/McpServerManager';
 import type {
   ProviderCapabilities,
   ProviderChatUIConfig,
+  ProviderModelOption,
+  ProviderModelSelection,
   ProviderModeSelectorConfig,
   ProviderPermissionModeToggleConfig,
   ProviderReasoningOption,
@@ -29,7 +31,9 @@ export interface ToolbarSettings {
 }
 
 export interface ToolbarCallbacks {
-  onModelChange: (model: string) => Promise<void>;
+  onModelChange: (selection: ProviderModelSelection) => Promise<void>;
+  getModelSelection: () => ProviderModelSelection;
+  getModelOptions: () => ProviderModelOption[];
   onModeChange: (mode: string) => Promise<void>;
   onThinkingBudgetChange: (budget: string) => Promise<void>;
   onEffortLevelChange: (effort: string) => Promise<void>;
@@ -52,13 +56,8 @@ export class ModelSelector {
     this.render();
   }
 
-  private getAvailableModels() {
-    const settings = this.callbacks.getSettings();
-    const uiConfig = this.callbacks.getUIConfig();
-    return uiConfig.getModelOptions({
-      ...settings,
-      environmentVariables: this.callbacks.getEnvironmentVariables?.(),
-    });
+  private getAvailableModels(): ProviderModelOption[] {
+    return this.callbacks.getModelOptions();
   }
 
   private render() {
@@ -73,9 +72,9 @@ export class ModelSelector {
 
   updateDisplay() {
     if (!this.buttonEl) return;
-    const currentModel = this.callbacks.getSettings().model;
+    const currentSelection = this.callbacks.getModelSelection();
     const models = this.getAvailableModels();
-    const modelInfo = models.find(m => m.value === currentModel);
+    const modelInfo = models.find(m => m.providerId === currentSelection.providerId && m.value === currentSelection.modelId);
 
     const displayModel = modelInfo || models[0];
 
@@ -89,7 +88,7 @@ export class ModelSelector {
     if (!this.dropdownEl) return;
     this.dropdownEl.empty();
 
-    const currentModel = this.callbacks.getSettings().model;
+    const currentSelection = this.callbacks.getModelSelection();
     const models = this.getAvailableModels();
     const reversed = [...models].reverse();
 
@@ -102,7 +101,7 @@ export class ModelSelector {
       }
 
       const option = this.dropdownEl.createDiv({ cls: 'claudian-model-option' });
-      if (model.value === currentModel) {
+      if (model.providerId === currentSelection.providerId && model.value === currentSelection.modelId) {
         option.addClass('selected');
       }
 
@@ -121,7 +120,7 @@ export class ModelSelector {
 
       option.addEventListener('click', async (e) => {
         e.stopPropagation();
-        await this.callbacks.onModelChange(model.value);
+        await this.callbacks.onModelChange({ providerId: model.providerId, modelId: model.value });
         this.updateDisplay();
         this.renderOptions();
       });

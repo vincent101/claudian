@@ -226,16 +226,11 @@ export class ProviderSettingsCoordinator {
     const currentServiceTier = typeof settings.serviceTier === 'string' ? settings.serviceTier : undefined;
     const currentBudget = typeof settings.thinkingBudget === 'string' ? settings.thinkingBudget : undefined;
     const modelOptions = uiConfig.getModelOptions(settings);
-    const isDefaultModelOfAnotherProvider = currentModel.length > 0
-      && ProviderRegistry.getRegisteredProviderIds()
-        .filter(id => id !== providerId)
-        .some(id => ProviderRegistry.getChatUIConfig(id).isDefaultModel(currentModel));
-    const canReuseCurrentModel = currentModel.length > 0
-      && !isDefaultModelOfAnotherProvider
-      && (
-        shouldPreferCurrentProjection
-        || modelOptions.some(option => option.value === currentModel)
-      );
+    // The top-level projection belongs only to settingsProvider: it is reused
+    // wholesale (never vetoed because another provider exposes an identical
+    // model ID), while other providers must not inherit it.
+    const canReuseCurrentModel = shouldPreferCurrentProjection
+      && currentModel.length > 0;
     const fallbackModel = canReuseCurrentModel
       ? currentModel
       : (modelOptions[0]?.value ?? currentModel);

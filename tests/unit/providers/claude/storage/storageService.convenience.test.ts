@@ -374,6 +374,27 @@ describe('StorageService convenience methods', () => {
       expect(result!.openTabs[0].conversationId).toBeNull();
     });
 
+    it('preserves draftModel and draftProviderId pairs through validation', async () => {
+      const state = {
+        openTabs: [
+          { tabId: 'tab-1', conversationId: null, draftModel: 'gpt-5.5', draftProviderId: 'codex' },
+          { tabId: 'tab-2', conversationId: null, draftModel: 'haiku', draftProviderId: 123 },
+          { tabId: 'tab-3', conversationId: null, draftModel: 'haiku', draftProviderId: '' },
+        ],
+        activeTabId: 'tab-1',
+      };
+      const { plugin } = createMockPlugin({
+        dataJson: { tabManagerState: state },
+      });
+      const storage = new StorageService(plugin);
+
+      const result = await storage.getTabManagerState();
+      expect(result!.openTabs[0]).toMatchObject({ draftModel: 'gpt-5.5', draftProviderId: 'codex' });
+      // Invalid or empty provider ids are dropped, not coerced into a pair.
+      expect(result!.openTabs[1]).not.toHaveProperty('draftProviderId');
+      expect(result!.openTabs[2]).not.toHaveProperty('draftProviderId');
+    });
+
     it('normalizes non-string activeTabId to null', async () => {
       const state = {
         openTabs: [{ tabId: 'tab-1', conversationId: 'conv-1' }],

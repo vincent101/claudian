@@ -87,7 +87,12 @@ export interface ProviderSettingsReconciler {
 
 /** Tab manager state persisted across restarts. */
 export interface AppTabManagerState {
-  openTabs: Array<{ tabId: string; conversationId: string | null; draftModel?: string | null }>;
+  openTabs: Array<{
+    tabId: string;
+    conversationId: string | null;
+    draftModel?: string | null;
+    draftProviderId?: ProviderId | null;
+  }>;
   activeTabId: string | null;
 }
 
@@ -176,6 +181,15 @@ export interface ProviderUIOption {
   group?: string;
   /** Per-option icon override (e.g. when mixing providers in a single dropdown). */
   providerIcon?: ProviderIconSvg;
+}
+
+export interface ProviderModelSelection {
+  providerId: ProviderId;
+  modelId: string;
+}
+
+export interface ProviderModelOption extends ProviderUIOption {
+  providerId: ProviderId;
 }
 
 export interface ProviderPathIconSvg {

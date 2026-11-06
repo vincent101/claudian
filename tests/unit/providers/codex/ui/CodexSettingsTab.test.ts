@@ -694,6 +694,76 @@ describe('CodexSettingsTab', () => {
     expect(mockSaveSettings).not.toHaveBeenCalled();
   });
 
+  it('saves arrow-only ordering through the Codex binding and restores it on reopen', async () => {
+    const plugin = createPlugin();
+    const context = createContext(plugin);
+    const original = plugin.settings.providerConfigs.codex.modelPresets.map((p: object) => ({ ...p }));
+    codexSettingsTabRenderer.render(createContainer(), context);
+
+    rowButton(presetRows(presetEditorInfo(plugin))[2], 'claudian-model-preset-move-up').trigger('click');
+    await flushAsync();
+
+    expect(plugin.settings.providerConfigs.codex.modelPresets)
+      .toEqual([original[0], original[2], original[1]]);
+    expect(mockSaveSettings).toHaveBeenCalledTimes(1);
+    expect(context.refreshModelSelectors).toHaveBeenCalledTimes(1);
+    expect(plugin.settings.model).toBe('my-custom-model');
+
+    createdSettings.length = 0;
+    codexSettingsTabRenderer.render(createContainer(), context);
+    expect(presetRows(presetEditorInfo(plugin)).map(row => rowInput(row, 'claudian-model-preset-model').value))
+      .toEqual(['gpt-5.4-mini', 'my-custom-model', 'gpt-5.5']);
+
+    rowButton(presetRows(presetEditorInfo(plugin))[1], 'claudian-model-preset-move-down').trigger('click');
+    await flushAsync();
+    expect(plugin.settings.providerConfigs.codex.modelPresets).toEqual(original);
+    expect(mockSaveSettings).toHaveBeenCalledTimes(2);
+  });
+
+  it('saves the final moved order after a preceding input blur with an in-flight save', async () => {
+    const plugin = createPlugin();
+    const context = createContext(plugin);
+    const saves: Array<Array<{ model: string }>> = [];
+    let finishFirst!: () => void;
+    mockSaveSettings
+      .mockImplementationOnce(() => {
+        saves.push(plugin.settings.providerConfigs.codex.modelPresets.map((p: object) => ({ ...p })));
+        return new Promise<void>(resolve => { finishFirst = resolve; });
+      })
+      .mockImplementationOnce(async () => {
+        saves.push(plugin.settings.providerConfigs.codex.modelPresets.map((p: object) => ({ ...p })));
+      });
+    codexSettingsTabRenderer.render(createContainer(), context);
+    const row = presetRows(presetEditorInfo(plugin))[2];
+    const input = rowInput(row, 'claudian-model-preset-label');
+    input.value = 'Edited Custom';
+    input.trigger('blur');
+    rowButton(row, 'claudian-model-preset-move-up').trigger('click');
+    await flushAsync();
+    finishFirst();
+    await flushAsync();
+
+    expect(saves.map(presets => presets.map(p => p.model)))
+      .toEqual([
+        ['gpt-5.4-mini', 'gpt-5.5', 'my-custom-model'],
+        ['gpt-5.4-mini', 'my-custom-model', 'gpt-5.5'],
+      ]);
+    expect(plugin.settings.providerConfigs.codex.modelPresets[1].label).toBe('Edited Custom');
+    expect(context.refreshModelSelectors).toHaveBeenCalledTimes(2);
+  });
+
+  it('does not save boundary arrow clicks', async () => {
+    const plugin = createPlugin();
+    const context = createContext(plugin);
+    codexSettingsTabRenderer.render(createContainer(), context);
+    const rows = presetRows(presetEditorInfo(plugin));
+    rowButton(rows[0], 'claudian-model-preset-move-up').trigger('click');
+    rowButton(rows[2], 'claudian-model-preset-move-down').trigger('click');
+    await flushAsync();
+    expect(mockSaveSettings).not.toHaveBeenCalled();
+    expect(context.refreshModelSelectors).not.toHaveBeenCalled();
+  });
+
   it('restores the two factory presets from the reset button', async () => {
     Object.defineProperty(process, 'platform', { value: 'darwin' });
     const plugin = createPlugin();

@@ -159,7 +159,8 @@
       "moveLeft": "向左移動",
       "moveRight": "向右移動",
       "close": "關閉分頁",
-      "boundProviderSwitch": "已綁定的會話無法切換提供商，請改開新分頁。"
+      "boundProviderSwitch": "已綁定的會話無法切換提供商，請改開新分頁。",
+      "draftModelReset": "草稿模型選擇無法明確還原或已不可用；已重置，請重新選擇模型。"
     },
     "input": {
       "placeholder": "今天我能幫你做什麼？",

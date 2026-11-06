@@ -159,7 +159,8 @@
       "moveLeft": "Move left",
       "moveRight": "Move right",
       "close": "Close",
-      "boundProviderSwitch": "Cannot switch provider on a bound session. Start a new tab instead."
+      "boundProviderSwitch": "Cannot switch provider on a bound session. Start a new tab instead.",
+      "draftModelReset": "Le modèle du brouillon ne peut pas être restauré sans ambiguïté ou n’est plus disponible. La sélection a été réinitialisée ; veuillez choisir à nouveau un modèle."
     },
     "input": {
       "placeholder": "How can I help you today?",

@@ -18,6 +18,8 @@ jest.mock('fs');
 function createMockCallbacks() {
   return {
     onModelChange: jest.fn(),
+    getModelSelection: jest.fn(() => ({ providerId: 'claude', modelId: 'haiku' })),
+    getModelOptions: jest.fn(() => [{ providerId: 'claude', value: 'haiku', label: 'Haiku' }]),
     onModeChange: jest.fn().mockResolvedValue(undefined),
     onThinkingBudgetChange: jest.fn(),
     onEffortLevelChange: jest.fn().mockResolvedValue(undefined),

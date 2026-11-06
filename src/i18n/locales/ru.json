@@ -159,7 +159,8 @@
       "moveLeft": "Move left",
       "moveRight": "Move right",
       "close": "Close",
-      "boundProviderSwitch": "Cannot switch provider on a bound session. Start a new tab instead."
+      "boundProviderSwitch": "Cannot switch provider on a bound session. Start a new tab instead.",
+      "draftModelReset": "Выбор модели черновика нельзя однозначно восстановить или модель больше недоступна. Выбор сброшен; выберите модель заново."
     },
     "input": {
       "placeholder": "How can I help you today?",

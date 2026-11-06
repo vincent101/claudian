@@ -57,6 +57,7 @@ function isTabManagerViewHost(value: unknown): value is TabManagerViewHost {
 type CreateTabOptions = {
   activate?: boolean;
   draftModel?: string;
+  draftProviderId?: ProviderId;
 };
 
 type OpenConversationOptions = {
@@ -211,7 +212,7 @@ export class TabManager implements TabManagerInterface {
       return null;
     }
 
-    const { activate = true, draftModel } = options;
+    const { activate = true, draftModel, draftProviderId } = options;
 
     const conversation = conversationId
       ? this.plugin.getConversationSync(conversationId) ?? undefined
@@ -229,6 +230,7 @@ export class TabManager implements TabManagerInterface {
       conversation: conversation ?? undefined,
       tabId,
       ...(typeof draftModel === 'string' ? { draftModel } : {}),
+      ...(typeof draftProviderId === 'string' ? { draftProviderId } : {}),
       defaultProviderId,
       onStreamingChanged: (isStreaming) => {
         // UI busy-state sync only: false also fires on cancel, invalidation
@@ -975,7 +977,7 @@ export class TabManager implements TabManagerInterface {
       if (tab.conversationId) persistedConversationIds.add(tab.conversationId);
       openTabs.push({
         ...(tab.lifecycleState === 'blank' && tab.draftModel
-          ? { draftModel: tab.draftModel }
+          ? { draftModel: tab.draftModel, draftProviderId: tab.providerId }
           : {}),
         tabId: tab.id,
         conversationId: tab.conversationId,
@@ -1009,6 +1011,7 @@ export class TabManager implements TabManagerInterface {
           await this.createTab(tabState.conversationId, tabState.tabId, {
             activate: false,
             ...(typeof tabState.draftModel === 'string' ? { draftModel: tabState.draftModel } : {}),
+            ...(typeof tabState.draftProviderId === 'string' ? { draftProviderId: tabState.draftProviderId } : {}),
           });
         } catch {
           // Continue restoring other tabs

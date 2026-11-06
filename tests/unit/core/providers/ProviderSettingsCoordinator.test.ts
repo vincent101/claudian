@@ -189,6 +189,43 @@ describe('ProviderSettingsCoordinator', () => {
       expect(settings.permissionMode).toBe('normal');
     });
 
+    it('keeps same-ID projections isolated per provider', () => {
+      // Both providers expose the same model ID; the top-level projection
+      // belongs to the settings provider and must not leak to the other.
+      const settings: Record<string, unknown> = {
+        settingsProvider: 'claude',
+        providerConfigs: {
+          codex: {
+            enabled: true,
+            modelPresets: [
+              { label: 'Codex First', model: 'codex-first' },
+              { label: 'Shared', model: 'shared-model' },
+            ],
+          },
+        },
+        model: 'shared-model',
+        effortLevel: 'high',
+        permissionMode: 'yolo',
+        savedProviderModel: { claude: 'shared-model' },
+        savedProviderEffort: { claude: 'high' },
+      };
+
+      const claudeSnapshot = ProviderSettingsCoordinator.getProviderSettingsSnapshot(settings, 'claude');
+      expect(claudeSnapshot.model).toBe('shared-model');
+      expect(claudeSnapshot.effortLevel).toBe('high');
+
+      const codexSnapshot = ProviderSettingsCoordinator.getProviderSettingsSnapshot(settings, 'codex');
+      // Codex has no saved values: it falls back to its own first option,
+      // never inheriting the claude-owned top-level projection — not even
+      // when the shared ID is one of its own options.
+      expect(codexSnapshot.model).toBe('codex-first');
+      expect(codexSnapshot.model).not.toBe(settings.model);
+      expect(codexSnapshot.effortLevel).not.toBe('high');
+
+      // The top-level projection itself stays untouched for claude.
+      expect(settings.model).toBe('shared-model');
+    });
+
     it('migrates a saved legacy Codex model before projecting provider state', () => {
       const settings: Record<string, unknown> = {
         settingsProvider: 'claude',

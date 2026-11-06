@@ -1673,6 +1673,7 @@ describe('TabManager - Persistence', () => {
           tabId: 'blank-opencode',
           conversationId: null,
           draftModel: 'opencode:google/gemini-3.1-pro-preview',
+          draftProviderId: 'opencode',
         }],
       });
     });
@@ -2068,7 +2069,7 @@ describe('TabManager - SDK Commands', () => {
     expect(readyClaudeService.getSupportedCommands).not.toHaveBeenCalled();
   });
 
-  it('should resolve blank-tab SDK command provider from draftModel instead of stale providerId', async () => {
+  it('should resolve blank-tab SDK command provider from the explicit provider pair, not a foreign runtime', async () => {
     const claudeCommands = [{ id: 'sdk:commit', name: 'commit', content: '' }];
     const readyClaudeService = {
       providerId: 'claude',
@@ -2080,7 +2081,8 @@ describe('TabManager - SDK Commands', () => {
         id: `tab-${n}`,
         lifecycleState: n === 2 ? 'blank' : 'bound_cold',
         draftModel: n === 2 ? DEFAULT_CODEX_PRIMARY_MODEL : null,
-        providerId: 'claude',
+        draftProviderId: n === 2 ? 'codex' : null,
+        providerId: n === 2 ? 'codex' : 'claude',
         service: n === 1 ? readyClaudeService : null,
       }),
     });
@@ -2654,7 +2656,7 @@ describe('TabManager - Provider Command Catalog', () => {
     expect(entries[0].displayPrefix).toBe('$');
   });
 
-  it('should resolve the blank-tab catalog from draftModel instead of stale providerId', async () => {
+  it('should resolve the blank-tab catalog from the explicit provider pair, not the default provider', async () => {
     const claudeCatalog = {
       listDropdownEntries: jest.fn().mockResolvedValue([
         {
@@ -2684,7 +2686,8 @@ describe('TabManager - Provider Command Catalog', () => {
         id: 'tab-1',
         lifecycleState: 'blank',
         draftModel: DEFAULT_CODEX_PRIMARY_MODEL,
-        providerId: 'claude',
+        draftProviderId: 'codex',
+        providerId: 'codex',
       }),
     });
 

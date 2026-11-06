@@ -159,7 +159,8 @@
       "moveLeft": "왼쪽으로 이동",
       "moveRight": "오른쪽으로 이동",
       "close": "탭 닫기",
-      "boundProviderSwitch": "바인딩된 세션에서는 프로바이더를 전환할 수 없습니다. 새 탭을 열어 주세요."
+      "boundProviderSwitch": "바인딩된 세션에서는 프로바이더를 전환할 수 없습니다. 새 탭을 열어 주세요.",
+      "draftModelReset": "초안의 모델 선택을 명확하게 복원할 수 없거나 더 이상 사용할 수 없습니다. 초기화했으니 모델을 다시 선택해 주세요."
     },
     "input": {
       "placeholder": "오늘은 무엇을 도와드릴까요?",

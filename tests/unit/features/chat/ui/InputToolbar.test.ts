@@ -149,25 +149,33 @@ function createMockUIConfig() {
 }
 
 function createMockCallbacks(overrides: Record<string, any> = {}) {
-  return {
+  // Hoisted mocks break the self-referential initializer cycle (TS7022/TS7024).
+  const getSettings = jest.fn().mockReturnValue({
+    model: 'sonnet',
+    thinkingBudget: 'low',
+    effortLevel: 'high',
+    serviceTier: 'default',
+    permissionMode: 'normal',
+    selectedMode: 'build',
+    enableOpus1M: false,
+    enableSonnet1M: false,
+  });
+  const getEnvironmentVariables = jest.fn().mockReturnValue('');
+  const getUIConfig = jest.fn().mockReturnValue(createMockUIConfig());
+  const callbacks = {
+    getModelSelection: jest.fn(() => ({ providerId: 'claude', modelId: getSettings().model })),
+    getModelOptions: jest.fn(() => getUIConfig().getModelOptions({
+      ...getSettings(), environmentVariables: getEnvironmentVariables(),
+    }).map((option: any) => ({ ...option, providerId: 'claude' }))),
     onModelChange: jest.fn().mockResolvedValue(undefined),
     onModeChange: jest.fn().mockResolvedValue(undefined),
     onThinkingBudgetChange: jest.fn().mockResolvedValue(undefined),
     onEffortLevelChange: jest.fn().mockResolvedValue(undefined),
     onServiceTierChange: jest.fn().mockResolvedValue(undefined),
     onPermissionModeChange: jest.fn().mockResolvedValue(undefined),
-    getSettings: jest.fn().mockReturnValue({
-      model: 'sonnet',
-      thinkingBudget: 'low',
-      effortLevel: 'high',
-      serviceTier: 'default',
-      permissionMode: 'normal',
-      selectedMode: 'build',
-      enableOpus1M: false,
-      enableSonnet1M: false,
-    }),
-    getEnvironmentVariables: jest.fn().mockReturnValue(''),
-    getUIConfig: jest.fn().mockReturnValue(createMockUIConfig()),
+    getSettings,
+    getEnvironmentVariables,
+    getUIConfig,
     getCapabilities: jest.fn().mockReturnValue({
       providerId: 'claude',
       supportsPersistentRuntime: true,
@@ -180,6 +188,7 @@ function createMockCallbacks(overrides: Record<string, any> = {}) {
     }),
     ...overrides,
   };
+  return callbacks;
 }
 
 describe('ModelSelector', () => {
@@ -248,7 +257,7 @@ describe('ModelSelector', () => {
     const opusOption = options.find((o: any) => o.children[0]?.textContent === 'Opus');
 
     await opusOption?.dispatchEvent('click', { stopPropagation: () => {} });
-    expect(callbacks.onModelChange).toHaveBeenCalledWith('opus');
+    expect(callbacks.onModelChange).toHaveBeenCalledWith({ providerId: 'claude', modelId: 'opus' });
   });
 
   it('should always show brand color on model button', () => {

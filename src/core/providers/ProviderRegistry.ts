@@ -131,39 +131,6 @@ export class ProviderRegistry {
     return this.getEnabledProviderIds(settings)[0] ?? DEFAULT_CHAT_PROVIDER_ID;
   }
 
-  static resolveProviderForModel(
-    model: string,
-    settings: Record<string, unknown> = {},
-    options: {
-      onlyEnabledProviders?: boolean;
-      fallbackProviderId?: ProviderId;
-    } = {},
-  ): ProviderId {
-    const providerIds = options.onlyEnabledProviders
-      ? this.getEnabledProviderIds(settings)
-      : this.getRegisteredProviderIds();
-    const fallbackProviderId = (
-      options.fallbackProviderId
-      && (!options.onlyEnabledProviders || this.isEnabled(options.fallbackProviderId, settings))
-    )
-      ? options.fallbackProviderId
-      : (options.onlyEnabledProviders
-        ? this.resolveSettingsProviderId(settings)
-        : DEFAULT_CHAT_PROVIDER_ID);
-
-    for (const providerId of providerIds) {
-      if (providerId === fallbackProviderId) {
-        continue;
-      }
-
-      if (this.getChatUIConfig(providerId).ownsModel(model, settings)) {
-        return providerId;
-      }
-    }
-
-    return fallbackProviderId;
-  }
-
   static getCustomModelIds(envVars: Record<string, string>): Set<string> {
     const ids = new Set<string>();
     for (const providerId of this.getRegisteredProviderIds()) {

@@ -4,6 +4,7 @@ import { Notice } from 'obsidian';
 import { ClaudianSettingsStorage, type StoredClaudianSettings } from '../../../app/settings/ClaudianSettingsStorage';
 import { SESSIONS_PATH, SessionStorage } from '../../../core/bootstrap/SessionStorage';
 import { CLAUDIAN_STORAGE_PATH } from '../../../core/bootstrap/StoragePaths';
+import type { AppTabManagerState } from '../../../core/providers/types';
 import { VaultFileAdapter } from '../../../core/storage/VaultFileAdapter';
 import type {
   SlashCommand,
@@ -135,7 +136,7 @@ export class StorageService {
       return null;
     }
 
-    const validatedTabs: Array<{ tabId: string; conversationId: string | null; draftModel?: string | null }> = [];
+    const validatedTabs: AppTabManagerState['openTabs'] = [];
     for (const tab of state.openTabs) {
       if (!tab || typeof tab !== 'object') {
         continue; // Skip invalid entries
@@ -150,6 +151,9 @@ export class StorageService {
           typeof tabObj.conversationId === 'string' ? tabObj.conversationId : null,
         ...(typeof tabObj.draftModel === 'string'
           ? { draftModel: tabObj.draftModel }
+          : {}),
+        ...(typeof tabObj.draftProviderId === 'string' && tabObj.draftProviderId.trim()
+          ? { draftProviderId: tabObj.draftProviderId }
           : {}),
       });
     }
@@ -174,7 +178,4 @@ export class StorageService {
   }
 }
 
-export interface TabManagerPersistedState {
-  openTabs: Array<{ tabId: string; conversationId: string | null; draftModel?: string | null }>;
-  activeTabId: string | null;
-}
+export type TabManagerPersistedState = AppTabManagerState;

@@ -1,6 +1,6 @@
 import type { Component, WorkspaceLeaf } from 'obsidian';
 
-import type { HistoryLoadProgress, InstructionRefineService, ProviderId, TitleGenerationService } from '../../../core/providers/types';
+import type { AppTabManagerState, HistoryLoadProgress, InstructionRefineService, ProviderId, TitleGenerationService } from '../../../core/providers/types';
 import type { ChatRuntime } from '../../../core/runtime/ChatRuntime';
 import type { SlashCommandDropdown } from '../../../shared/components/SlashCommandDropdown';
 import type { AutoTurnProjectionController } from '../controllers/AutoTurnProjectionController';
@@ -251,9 +251,10 @@ export interface TabData {
 
   /**
    * Draft model selected in a blank tab (before first send).
-   * Used to derive provider on first send. Null after binding.
+   * Paired with draftProviderId; null after binding.
    */
   draftModel: string | null;
+  draftProviderId: ProviderId | null;
 
   /** Active provider for this tab's current conversation/runtime. */
   providerId: ProviderId;
@@ -316,19 +317,12 @@ export type TabProviderContext = Pick<TabData, 'conversationId' | 'service' | 'p
 /**
  * Persisted tab state for restoration on plugin reload.
  */
-export interface PersistedTabState {
-  tabId: TabId;
-  conversationId: string | null;
-  draftModel?: string | null;
-}
+export type PersistedTabState = AppTabManagerState['openTabs'][number];
 
 /**
  * Tab manager state persisted to data.json.
  */
-export interface PersistedTabManagerState {
-  openTabs: PersistedTabState[];
-  activeTabId: TabId | null;
-}
+export type PersistedTabManagerState = AppTabManagerState;
 
 /**
  * Callbacks for tab state changes.

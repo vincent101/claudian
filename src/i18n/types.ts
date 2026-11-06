@@ -127,6 +127,7 @@ export type TranslationKey =
   | 'chat.tabs.moveRight'
   | 'chat.tabs.close'
   | 'chat.tabs.boundProviderSwitch'
+  | 'chat.tabs.draftModelReset'
 
   // Chat - Fork
   | 'chat.fork.ariaLabel'

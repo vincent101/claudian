@@ -159,7 +159,8 @@
       "moveLeft": "Move left",
       "moveRight": "Move right",
       "close": "Close",
-      "boundProviderSwitch": "Cannot switch provider on a bound session. Start a new tab instead."
+      "boundProviderSwitch": "Cannot switch provider on a bound session. Start a new tab instead.",
+      "draftModelReset": "La selección del modelo del borrador no se pudo restaurar sin ambigüedad o ya no está disponible. Se ha restablecido; selecciona un modelo de nuevo."
     },
     "input": {
       "placeholder": "How can I help you today?",

@@ -159,7 +159,8 @@
       "moveLeft": "向左移动",
       "moveRight": "向右移动",
       "close": "关闭标签页",
-      "boundProviderSwitch": "已绑定的会话无法切换提供商，请改开新标签页。"
+      "boundProviderSwitch": "已绑定的会话无法切换提供商，请改开新标签页。",
+      "draftModelReset": "草稿模型选择无法明确还原或已不可用；已重置，请重新选择模型。"
     },
     "input": {
       "placeholder": "今天我能帮你做什么？",
