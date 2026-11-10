@@ -253,6 +253,9 @@ export class AutoTurnProjectionController {
   async chunk(event: AutoTurnChunkEvent): Promise<void> {
     const active = this.active;
     if (!active || !this.isCurrent(active, event.turnId, event.generation)) return;
+    // Stall watchdog progress evidence (2026-11-10): a chunk — even a buffered
+    // pre-mount or duplicate replay one — proves the auto turn's CLI is alive.
+    this.deps.turnCoordinator.touch(event.turnId);
     if (event.replay && this.isDuplicateReplayChunk(active, event)) return;
     if (!active.mounted) {
       // Pre-mount (live lease still queued behind a stored transaction):

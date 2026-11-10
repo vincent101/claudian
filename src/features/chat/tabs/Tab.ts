@@ -1710,6 +1710,14 @@ export function initializeTabControllers(
     state,
     getConversationId: () => state.currentConversationId,
     processQueuedMessage: () => tab.controllers.inputController?.processQueuedMessage(),
+    // Stall watchdog false-kill guard (2026-11-10): chunk-free silence is only
+    // suspicious while nothing legitimately explains it. Both probes are
+    // resolved lazily — the controllers are constructed after this coordinator.
+    hasBlockingWork: turnId => (
+      (tab.controllers.streamController?.hasRunningToolWork(turnId) ?? false)
+      || (tab.controllers.inputController?.hasPendingInteractivePrompt() ?? false)
+    ),
+    recordDiagnostic: event => { tab.service?.recordAutoTurnDiagnostic?.(event); },
   });
 
   // Per-tab projection write lease (coord protocol): UI-level shared

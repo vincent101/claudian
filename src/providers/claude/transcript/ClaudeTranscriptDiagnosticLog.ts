@@ -51,9 +51,10 @@ export type TranscriptDiagnosticPhase =
   // spawn by the scope admission gate.
   | 'native_mcp_cutover_block'
   // Stop-hook waiting-semantics hardening (design 2026-11-10): the Stop event
-  // records what the SubagentManager believed, and a hook/projection instance
-  // split is called out explicitly instead of failing silently.
-  | 'stop_hook_state' | 'subagent_state_source_mismatch';
+  // records what the SubagentManager believed, a hook/projection instance
+  // split is called out explicitly, and the feature lease's silence watchdog
+  // reports its force settle (or the skip reason).
+  | 'stop_hook_state' | 'subagent_state_source_mismatch' | 'lease_stall_force_settle';
 
 export interface TranscriptDiagnosticEvent {
   phase: TranscriptDiagnosticPhase;

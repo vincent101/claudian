@@ -183,6 +183,21 @@ export class InputController {
     return this.deps.getTurnCoordinator?.() ?? null;
   }
 
+  /**
+   * Lease-stall liveness probe (2026-11-10): an interactive card awaiting the
+   * user parks the CLI's canUseTool, so no chunks can arrive until it settles.
+   * That silence is legitimate (a user-turn ask may wait indefinitely) and must
+   * never be force-settled by the turn watchdog.
+   */
+  hasPendingInteractivePrompt(): boolean {
+    return !!(
+      this.pendingAskInline
+      || this.pendingApprovalInline
+      || this.pendingExitPlanModeInline
+      || this.pendingPlanApproval
+    );
+  }
+
   private getAuxiliaryModel(): string | null {
     return this.deps.getAuxiliaryModel?.()
       ?? this.getAgentService()?.getAuxiliaryModel?.()
@@ -564,6 +579,10 @@ export class InputController {
           wasInterrupted = true;
           break;
         }
+
+        // Stall watchdog progress evidence (2026-11-10): any chunk of this
+        // turn proves the CLI is alive, boundary chunks included.
+        turnCoordinator?.touch(turnId);
 
         if (await this.handleProviderMessageBoundaryChunk(chunk)) {
           continue;

@@ -163,8 +163,9 @@ export interface AutoTurnDiagnosticEvent {
     // the dead-cancel force settle outcome.
     | 'cancel_request' | 'force_settle'
     // Stop-hook hardening (2026-11-10): the hook provider read a different
-    // SubagentManager instance than the one the StreamController writes.
-    | 'subagent_state_source_mismatch';
+    // SubagentManager instance than the one the StreamController writes, and
+    // the feature lease's silence watchdog force-settled (or skipped) a turn.
+    | 'subagent_state_source_mismatch' | 'lease_stall_force_settle';
   turnId?: string;
   generation?: number;
   leaseKind?: 'user' | 'auto';

@@ -1615,6 +1615,27 @@ describe('InputController - Message Queue', () => {
       expect((askController as any).pendingExitPlanModeInline).toBeNull();
     });
 
+    it('stall watchdog probe: a pending ask/approval card counts as legitimate blocking work', () => {
+      const askController = new InputController(createAskDeps());
+
+      expect(askController.hasPendingInteractivePrompt()).toBe(false);
+
+      (askController as any).pendingAskInline = { destroy: jest.fn() };
+      expect(askController.hasPendingInteractivePrompt()).toBe(true);
+      (askController as any).pendingAskInline = null;
+
+      (askController as any).pendingApprovalInline = { destroy: jest.fn() };
+      expect(askController.hasPendingInteractivePrompt()).toBe(true);
+      (askController as any).pendingApprovalInline = null;
+
+      (askController as any).pendingExitPlanModeInline = { destroy: jest.fn() };
+      expect(askController.hasPendingInteractivePrompt()).toBe(true);
+      (askController as any).pendingExitPlanModeInline = null;
+
+      (askController as any).pendingPlanApproval = { destroy: jest.fn() };
+      expect(askController.hasPendingInteractivePrompt()).toBe(true);
+    });
+
     /** Coordinator-wired deps with a live auto/user turn on the feature lease. */
     function createTurnWiredDeps(kind: 'user' | 'auto') {
       const askDeps = createAskDeps();
@@ -1655,7 +1676,7 @@ describe('InputController - Message Queue', () => {
     it('plan A: the auto-turn ask settles deny after the 5-minute window with a visible timeout notice', async () => {
       jest.useFakeTimers();
       try {
-        const { askController, parentEl } = createTurnWiredDeps('auto');
+        const { turnCoordinator, askController, parentEl } = createTurnWiredDeps('auto');
 
         const askPromise = askController.handleAskUserQuestion(askInput());
 
@@ -1671,6 +1692,9 @@ describe('InputController - Message Queue', () => {
         const notice = parentEl.querySelector('.claudian-ask-timeout-notice');
         expect(notice).not.toBeNull();
         expect(notice.textContent).toBe(t('chat.ask.autoTurnTimeout'));
+        // The lease watchdog's poll interval is the only timer a live turn may
+        // hold (2026-11-10) — settle the lease before asserting zero timers.
+        turnCoordinator.finish('auto-1');
         expect(jest.getTimerCount()).toBe(0);
       } finally {
         jest.useRealTimers();
@@ -1818,14 +1842,17 @@ describe('InputController - Message Queue', () => {
     it('plan A: a user turn keeps the unbounded ask (still pending after 5 minutes)', async () => {
       jest.useFakeTimers();
       try {
-        const { askController } = createTurnWiredDeps('user');
+        const { turnCoordinator, askController } = createTurnWiredDeps('user');
 
         const askPromise = askController.handleAskUserQuestion(askInput());
         expect((askController as any).pendingAskInline).not.toBeNull();
 
         jest.advanceTimersByTime(5 * 60 * 1000);
-        expect(jest.getTimerCount()).toBe(0);
         expect(await isSettled(askPromise)).toBe(false);
+        // Only the lease watchdog's poll interval remains (2026-11-10): the ask
+        // path itself armed no timer. Settle the lease and the count reaches 0.
+        turnCoordinator.finish('user-1');
+        expect(jest.getTimerCount()).toBe(0);
 
         askController.dismissPendingApproval();
         await expect(askPromise).resolves.toBeNull();
@@ -1885,7 +1912,7 @@ describe('InputController - Message Queue', () => {
       askDeps.onAskAttentionTimeout = attentionTimeout;
 
       const askController = new InputController(askDeps);
-      return { askDeps, askController, relay, armed, attentionTimeout };
+      return { askDeps, askController, relay, armed, attentionTimeout, turnCoordinator };
     }
 
     function relayAskFile(): string {
@@ -1964,7 +1991,7 @@ describe('InputController - Message Queue', () => {
     it('desktop answers first: relay settles, late reply is inert', async () => {
       jest.useFakeTimers();
       try {
-        const { askController, attentionTimeout } = createRelayWiredDeps();
+        const { turnCoordinator, askController, attentionTimeout } = createRelayWiredDeps();
         const askPromise = askController.handleAskUserQuestion(relayAskInput());
         const inline = (askController as any).pendingAskInline;
 
@@ -1979,6 +2006,8 @@ describe('InputController - Message Queue', () => {
         expect(pending).toBeUndefined(); // answered before the window lapsed
 
         expect(fs.existsSync(relayAskFile())).toBe(false);
+        // Lease watchdog poll is the only remaining timer (2026-11-10).
+        turnCoordinator.finish('user-1');
         expect(jest.getTimerCount()).toBe(0);
       } finally {
         jest.useRealTimers();
