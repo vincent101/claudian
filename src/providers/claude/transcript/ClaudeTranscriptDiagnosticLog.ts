@@ -49,7 +49,12 @@ export type TranscriptDiagnosticPhase =
   | 'prime_rejected'
   // Native MCP cutover (design 2026-11-09): a launch was blocked before
   // spawn by the scope admission gate.
-  | 'native_mcp_cutover_block';
+  | 'native_mcp_cutover_block'
+  // Stop-hook waiting-semantics hardening (design 2026-11-10): the Stop event
+  // records what the SubagentManager believed, a hook/projection instance
+  // split is called out explicitly, and the feature lease's silence watchdog
+  // reports its force settle (or the skip reason).
+  | 'stop_hook_state' | 'subagent_state_source_mismatch' | 'lease_stall_force_settle';
 
 export interface TranscriptDiagnosticEvent {
   phase: TranscriptDiagnosticPhase;
@@ -123,6 +128,8 @@ export interface TranscriptDiagnosticEvent {
   /** CLI version carried by the terminal-evidence transcript row (compact boundary rows carry it natively). */
   cliVersion?: string;
   agentIdHash?: string;
+  /** Stop-hook snapshot: salted hashes of the running agents (bounded list). */
+  agentIdHashes?: string[];
   agentCandidateCount?: number;
   /** Query epoch of the scope the recovery action acted on (frozen at send time). */
   queryEpoch?: number;
@@ -172,6 +179,8 @@ export interface TranscriptDiagnosticEvent {
 
 const SEGMENT_BYTES = 128 * 1024;
 const ENTRY_BYTES = 1024;
+/** Stop-hook snapshot list bound; agentCandidateCount carries the total. */
+const SUBAGENT_ID_HASH_LIMIT = 8;
 
 export class ClaudeTranscriptDiagnosticLog {
   private readonly currentPath: string;
@@ -228,6 +237,15 @@ export class ClaudeTranscriptDiagnosticLog {
         .filter(hash => typeof hash === 'string' && /^[a-f0-9]{12}$/.test(hash))
         .slice(0, RESULT_TURN_ECHO_LOG_HASH_LIMIT);
       if (validHashes.length > 0) clean.echoUuidHashes = validHashes;
+    }
+    // Stop-hook snapshot hashes follow the same rule: already salted, bounded
+    // by the list limit, total carried by agentCandidateCount.
+    const agentHashes = event.agentIdHashes;
+    if (Array.isArray(agentHashes)) {
+      const validHashes = agentHashes
+        .filter(hash => typeof hash === 'string' && /^[a-f0-9]{12}$/.test(hash))
+        .slice(0, SUBAGENT_ID_HASH_LIMIT);
+      if (validHashes.length > 0) clean.agentIdHashes = validHashes;
     }
     let line = `${JSON.stringify(clean)}\n`;
     if (Buffer.byteLength(line) > ENTRY_BYTES) {

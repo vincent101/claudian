@@ -253,6 +253,9 @@ export class AutoTurnProjectionController {
   async chunk(event: AutoTurnChunkEvent): Promise<void> {
     const active = this.active;
     if (!active || !this.isCurrent(active, event.turnId, event.generation)) return;
+    // Stall watchdog progress evidence (2026-11-10): a chunk — even a buffered
+    // pre-mount or duplicate replay one — proves the auto turn's CLI is alive.
+    this.deps.turnCoordinator.touch(event.turnId);
     if (event.replay && this.isDuplicateReplayChunk(active, event)) return;
     if (!active.mounted) {
       // Pre-mount (live lease still queued behind a stored transaction):
@@ -549,6 +552,49 @@ export class AutoTurnProjectionController {
     this.deps.streamController.invalidateRenderFlush();
     if (this.active) this.releaseLiveLease(this.active);
     this.active = null;
+  }
+
+  /**
+   * Lease-stall watchdog side effect (2026-11-10): the auto turn never
+   * settled, so its live projection lease must be released here — the parked
+   * runtime turn cannot run this controller's finalize path, and a held live
+   * lease parks every later acquireLive. Mirrors `cancelled` minus the lease
+   * bookkeeping the coordinator now owns.
+   */
+  abandonStalledTurn(turnId: string): void {
+    const active = this.active;
+    if (!active || active.turnId !== turnId) return;
+    // Critical actions first, exactly as abortActive: the lease and the active
+    // projection must drop even if DOM cleanup throws — a held live lease
+    // parks every later acquireLive. Neither statement can throw.
+    const liveLease = active.liveLease;
+    active.liveLease = null;
+    this.active = null;
+    try {
+      liveLease?.release();
+    } catch {
+      // Lease cancellation must survive cleanup failures.
+    }
+    try {
+      this.deps.streamController.invalidateRenderFlush();
+    } catch {
+      // UI-only cleanup.
+    }
+    try {
+      this.deps.streamController.hideThinkingIndicator();
+    } catch {
+      // UI-only cleanup.
+    }
+    if (!active.assistantMessage.content && (active.assistantMessage.toolCalls?.length ?? 0) === 0) {
+      try {
+        this.deps.state.messages = this.deps.state.messages.filter(
+          message => message.id !== active.assistantMessage.id,
+        );
+        this.deps.renderer.removeMessage(active.assistantMessage.id);
+      } catch {
+        // DOM removal is cosmetic; the message stays until the next render.
+      }
+    }
   }
 
   private releaseLiveLease(active: AutoProjection): void {

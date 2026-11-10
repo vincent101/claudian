@@ -837,4 +837,73 @@ describe('AutoTurnProjectionController', () => {
     // saved" Notice stays independent of the completion event.
     expect(onTurnCompleted).toHaveBeenCalledTimes(1);
   });
+
+  it('abandonStalledTurn releases the live projection lease and drops the empty placeholder', async () => {
+    const coordinator = new ProjectionWriteCoordinator();
+    const { controller, state, removeMessage } = setup({ coordinator });
+
+    expect(controller.started({
+      turnId: 'auto-stall',
+      generation: 0,
+      source: { kind: 'coordinator' },
+    })).toBe(true);
+    // Let the async live-lease mount grant and render.
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(state.messages).toHaveLength(1);
+
+    // The wedged turn still holds the live lease: a later acquisition waits.
+    let secondGranted = false;
+    const second = coordinator.acquireLive(() => false).then((lease) => {
+      secondGranted = !!lease;
+      return lease;
+    });
+    await Promise.resolve();
+    expect(secondGranted).toBe(false);
+
+    controller.abandonStalledTurn('auto-stall');
+
+    // Without the release this await never settles and every later send parks.
+    const secondLease = await second;
+    expect(secondGranted).toBe(true);
+    expect(state.messages).toHaveLength(0);
+    expect(removeMessage).toHaveBeenCalledWith('msg-1');
+    secondLease?.release();
+  });
+
+  it('abandonStalledTurn drops the live lease even when DOM removal throws', async () => {
+    const coordinator = new ProjectionWriteCoordinator();
+    const { controller, state, removeMessage } = setup({ coordinator });
+    controller.started({ turnId: 'auto-stall-dom', generation: 0, source: { kind: 'coordinator' } });
+    await Promise.resolve();
+    await Promise.resolve();
+    removeMessage.mockImplementation(() => { throw new Error('dom failed'); });
+
+    expect(() => controller.abandonStalledTurn('auto-stall-dom')).not.toThrow();
+
+    // The lease must be free for the next turn despite the cleanup failure.
+    let granted = false;
+    const lease = await coordinator.acquireLive(() => false).then((grantedLease) => {
+      granted = !!grantedLease;
+      return grantedLease;
+    });
+    expect(granted).toBe(true);
+    expect(state.messages).toHaveLength(0);
+    lease?.release();
+  });
+
+  it('abandonStalledTurn ignores a foreign turn id', async () => {
+    const coordinator = new ProjectionWriteCoordinator();
+    const { controller, state } = setup({ coordinator });
+    controller.started({ turnId: 'auto-live', generation: 0, source: { kind: 'coordinator' } });
+    await Promise.resolve();
+    await Promise.resolve();
+
+    controller.abandonStalledTurn('auto-other');
+
+    expect(state.messages).toHaveLength(1);
+
+    // Leave no lease behind for the shared coordinator.
+    controller.invalidate();
+  });
 });

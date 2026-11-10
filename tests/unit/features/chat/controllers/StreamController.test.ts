@@ -3807,3 +3807,56 @@ describe('StreamController - tool result projection clamp', () => {
     });
   });
 });
+
+describe('StreamController - lease stall liveness probe', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    deps = createMockDeps();
+    controller = new StreamController(deps);
+    deps.state.currentContentEl = createMockEl();
+  });
+
+  it('reports no blocking tool work before any chunk', () => {
+    expect(controller.hasRunningToolWork('test-turn')).toBe(false);
+  });
+
+  it('reports a running tool call as legitimate chunk-free work', async () => {
+    const msg = createTestMessage();
+
+    await controller.handleStreamChunk(
+      { type: 'tool_use', id: 'tool-1', name: 'Bash', input: { command: 'sleep 600' } },
+      ctx(msg)
+    );
+
+    expect(controller.hasRunningToolWork('test-turn')).toBe(true);
+  });
+
+  it('clears once the tool result lands', async () => {
+    const msg = createTestMessage();
+
+    await controller.handleStreamChunk(
+      { type: 'tool_use', id: 'tool-1', name: 'Bash', input: { command: 'sleep 600' } },
+      ctx(msg)
+    );
+    await controller.handleStreamChunk(
+      { type: 'tool_result', id: 'tool-1', content: 'done' },
+      ctx(msg)
+    );
+
+    expect(controller.hasRunningToolWork('test-turn')).toBe(false);
+  });
+
+  it('ignores a previous turn\'s context (interrupted tool must not mask a wedged turn)', async () => {
+    const msg = createTestMessage();
+
+    await controller.handleStreamChunk(
+      { type: 'tool_use', id: 'tool-1', name: 'Bash', input: { command: 'sleep 600' } },
+      ctx(msg)
+    );
+
+    // The context survives the finished user turn; a newer auto lease must
+    // not inherit its evidence.
+    expect(controller.hasRunningToolWork('test-turn')).toBe(true);
+    expect(controller.hasRunningToolWork('auto-turn-2')).toBe(false);
+  });
+});

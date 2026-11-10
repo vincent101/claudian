@@ -6,7 +6,7 @@ import { join } from 'path';
 
 import { TOOL_RESULT_PROJECTION_CHARS } from '@/core/tools/toolResultProjection';
 import type { SubagentInfo, ToolCallInfo } from '@/core/types';
-import { SubagentManager } from '@/features/chat/services/SubagentManager';
+import { DEFAULT_SUBAGENT_STALE_MS, SubagentManager } from '@/features/chat/services/SubagentManager';
 import { createStopSubagentHook } from '@/providers/claude/hooks/SubagentHooks';
 
 jest.mock('@/features/chat/rendering/SubagentRenderer', () => ({
@@ -1651,6 +1651,59 @@ Only this is the final result.
         expect(manager.getByTaskId('task-stale')).toBeUndefined();
       });
 
+      it('keeps the stale TTL at the fixed 20-minute design constant (was 2h)', () => {
+        expect(DEFAULT_SUBAGENT_STALE_MS).toBe(20 * 60 * 1000);
+      });
+
+      it('orphans a running agent past the default 20-minute TTL', () => {
+        const { manager } = createManager();
+        const parentEl = createMockEl();
+        manager.handleTaskToolUse('task-ttl', { description: 'Background', run_in_background: true }, parentEl);
+        manager.handleTaskToolResult('task-ttl', JSON.stringify({ agent_id: 'agent-ttl' }));
+        const record = manager.getByTaskId('task-ttl')!;
+        record.startedAt = Date.now() - 21 * 60 * 1000;
+
+        expect(manager.hasRunningSubagents()).toBe(false);
+        expect(record.asyncStatus).toBe('orphaned');
+        expect(manager.getRunningAsyncAgents()).toEqual([]);
+      });
+
+      it('keeps a running agent inside the default TTL', () => {
+        const { manager } = createManager();
+        const parentEl = createMockEl();
+        manager.handleTaskToolUse('task-live', { description: 'Background', run_in_background: true }, parentEl);
+        manager.handleTaskToolResult('task-live', JSON.stringify({ agent_id: 'agent-live' }));
+        manager.getByTaskId('task-live')!.startedAt = Date.now() - 19 * 60 * 1000;
+
+        expect(manager.hasRunningSubagents()).toBe(true);
+        expect(manager.getRunningAsyncAgents()).toHaveLength(1);
+      });
+
+      it('Stop snapshot reads hasRunning before the running list, so stale cleanup is reflected', async () => {
+        const { manager } = createManager();
+        const parentEl = createMockEl();
+        manager.handleTaskToolUse('task-order', { description: 'Background', run_in_background: true }, parentEl);
+        manager.handleTaskToolResult('task-order', JSON.stringify({ agent_id: 'agent-order' }));
+        manager.getByTaskId('task-order')!.startedAt = Date.now() - 21 * 60 * 1000;
+
+        // Before the Stop, the ghost record still looks running.
+        expect(manager.getRunningAsyncAgents()).toHaveLength(1);
+
+        const onEvaluate = jest.fn();
+        const hook = createStopSubagentHook(manager.createStopHookStateProvider(), { onEvaluate });
+        await hook.hooks[0]({
+          hook_event_name: 'Stop',
+          session_id: 'test-session',
+          transcript_path: join(tmpdir(), 'transcript'),
+          cwd: tmpdir(),
+          stop_hook_active: true,
+        }, undefined, { signal: new AbortController().signal });
+
+        // Production chain: hasRunning owns the cleanup, the snapshot follows
+        // it — an eagerly evaluated list would still carry agent-order.
+        expect(onEvaluate).toHaveBeenCalledWith({ hasRunning: false, runningAgentIds: [] });
+      });
+
       it('returns false when all subagents have completed', () => {
         const { manager } = createManager();
         const parentEl = createMockEl();
@@ -1957,6 +2010,33 @@ Only this is the final result.
 
       expect(() => manager.handleTaskNotification('agent-unknown', 'completed', 'x')).not.toThrow();
       expect(manager.handleTaskNotification('agent-unknown', 'completed', 'x')).toBeUndefined();
+    });
+
+    it('settles a running agent when the CLI notification carries the launch task id (2026-11-10 reconciliation)', () => {
+      const { manager } = createManager();
+      const parentEl = createMockEl();
+      setupRunning(manager, parentEl, 'task-launch', 'agent-real');
+
+      expect(manager.hasRunningSubagents()).toBe(true);
+
+      const settled = manager.handleTaskNotification('task-launch', 'completed', 'done');
+
+      expect(settled?.agentId).toBe('agent-real');
+      expect(settled?.asyncStatus).toBe('completed');
+      expect(manager.hasRunningSubagents()).toBe(false);
+      // Both index spaces are consumed by the same settlement.
+      expect(manager.getRunningAsyncAgents()).toEqual([]);
+      expect(manager.getByTaskId('task-launch')).toBeUndefined();
+    });
+
+    it('does not settle a task id whose mapped agent already settled', () => {
+      const { manager } = createManager();
+      const parentEl = createMockEl();
+      setupRunning(manager, parentEl, 'task-done', 'agent-done');
+
+      manager.handleTaskNotification('agent-done', 'completed');
+      expect(manager.handleTaskNotification('task-done', 'completed')).toBeUndefined();
+      expect(manager.getRunningAsyncAgents()).toEqual([]);
     });
 
     it('ignores non-terminal notification statuses', () => {

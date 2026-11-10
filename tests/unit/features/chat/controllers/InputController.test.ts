@@ -6,10 +6,15 @@ import * as path from 'path';
 
 import type { ToolCallInfo } from '@/core/types';
 import { InputController, type InputControllerDeps } from '@/features/chat/controllers/InputController';
-import { TurnCoordinator } from '@/features/chat/controllers/TurnCoordinator';
+import {
+  TURN_LEASE_STALL_MS,
+  TURN_LEASE_STALL_POLL_MS,
+  TurnCoordinator,
+} from '@/features/chat/controllers/TurnCoordinator';
 import { ProjectionWriteCoordinator as ProjectionWriteCoordinatorForTest } from '@/features/chat/rendering/ProjectionWriteCoordinator';
 import { AskRelayService } from '@/features/chat/services/AskRelayService';
 import { ChatState } from '@/features/chat/state/ChatState';
+import { createTurnStallWatchdogDeps } from '@/features/chat/tabs/Tab';
 import { t } from '@/i18n/i18n';
 import { encodeClaudeTurn } from '@/providers/claude/prompt/ClaudeTurnEncoder';
 import { ResumeSessionDropdown } from '@/shared/components/ResumeSessionDropdown';
@@ -955,6 +960,24 @@ describe('InputController - Message Queue', () => {
         jest.useRealTimers();
       }
     });
+
+    it('settles subagent bookkeeping at the cancel request (2026-11-10 interrupt accounting)', () => {
+      const subagentManager = {
+        resetSpawnedCount: jest.fn(),
+        resetStreamingState: jest.fn(),
+        interruptAllActive: jest.fn(),
+      };
+      const localDeps = createMockDeps({ getSubagentManager: () => subagentManager as any });
+      const localController = new InputController(localDeps);
+      localDeps.state.isStreaming = true;
+
+      localController.cancelStreaming();
+
+      // Reachable without any stream chunk: the parked for-await loop is
+      // exactly the state the old settleInterruptedTurn entry could not reach.
+      expect(subagentManager.interruptAllActive).toHaveBeenCalledTimes(1);
+      expect(subagentManager.interruptAllActive).toHaveBeenCalledWith(t('chat.cancel.toolInterrupted'));
+    });
   });
 
   describe('Sending messages', () => {
@@ -1597,6 +1620,109 @@ describe('InputController - Message Queue', () => {
       expect((askController as any).pendingExitPlanModeInline).toBeNull();
     });
 
+    it('stall watchdog wiring: a pending ask keeps the lease alive past the stall threshold', async () => {
+      jest.useFakeTimers();
+      try {
+        const askDeps = createAskDeps();
+        const askController = new InputController(askDeps);
+        const turnCoordinator = new TurnCoordinator({
+          state: askDeps.state,
+          getConversationId: () => askDeps.state.currentConversationId,
+          processQueuedMessage: () => {},
+          // Production wiring factory (Tab.createTurnStallWatchdogDeps).
+          ...createTurnStallWatchdogDeps({
+            streamController: { hasRunningToolWork: () => false },
+            inputController: askController,
+            autoTurnProjectionController: null,
+          } as any),
+        });
+        askDeps.getTurnCoordinator = () => turnCoordinator;
+        expect(turnCoordinator.beginUserTurn('user-stall', 5)).toBe(true);
+
+        const askPromise = askController.handleAskUserQuestion(askInput());
+        jest.advanceTimersByTime(TURN_LEASE_STALL_MS + 2 * TURN_LEASE_STALL_POLL_MS);
+
+        // The pending card is the CLI's own wait: the watchdog must not settle.
+        expect(askController.hasPendingInteractivePrompt()).toBe(true);
+        expect(turnCoordinator.isBusy()).toBe(true);
+
+        askController.dismissPendingApproval();
+        await expect(askPromise).resolves.toBeNull();
+        turnCoordinator.finish('user-stall');
+      } finally {
+        jest.useRealTimers();
+      }
+    });
+
+    it('abandonStalledTurn drops the lease and cancels the runtime even when UI cleanup throws', () => {
+      const localDeps = createMockDeps();
+      const localController = new InputController(localDeps);
+      const release = jest.fn();
+      // Fault injection: a live lease is held by the wedged turn.
+      (localController as any).activeProjectionLease = { release };
+      (localController as any).activeProjectionLeaseTurnId = 'turn-stall';
+      localDeps.streamController.invalidateRenderFlush = jest.fn(() => {
+        throw new Error('flush failed');
+      });
+      (localDeps.streamController as any).hideThinkingIndicator = jest.fn(() => {
+        throw new Error('thinking failed');
+      });
+
+      expect(() => localController.abandonStalledTurn('turn-stall')).not.toThrow();
+
+      expect(release).toHaveBeenCalledTimes(1);
+      expect((localController as any).activeProjectionLease).toBeNull();
+      expect(localDeps.state.cancelRequested).toBe(true);
+      expect((localDeps as any).mockAgentService.cancel).toHaveBeenCalled();
+    });
+
+    it('stall watchdog wiring: an input cleanup failure never skips the auto lease release', () => {
+      const askController = new InputController(createAskDeps());
+      jest.spyOn(askController, 'abandonStalledTurn').mockImplementation(() => {
+        throw new Error('input cleanup failed');
+      });
+      const abandonAuto = jest.fn();
+      const wiring = createTurnStallWatchdogDeps({
+        streamController: { hasRunningToolWork: () => false },
+        inputController: askController,
+        autoTurnProjectionController: { abandonStalledTurn: abandonAuto },
+      } as any);
+
+      expect(() => wiring.onStallForceSettle!({
+        turnId: 'turn-1',
+        kind: 'user',
+        generation: 1,
+        conversationId: 'conv-1',
+        lifecycleGeneration: 0,
+      })).not.toThrow();
+
+      expect(abandonAuto).toHaveBeenCalledWith('turn-1');
+    });
+
+    it('stall watchdog wiring: force settle delegates to both controller abandon hooks', () => {
+      const askDeps = createAskDeps();
+      const askController = new InputController(askDeps);
+      const abandonInput = jest.spyOn(askController, 'abandonStalledTurn').mockImplementation(() => {});
+      const abandonAuto = jest.fn();
+      const wiring = createTurnStallWatchdogDeps({
+        streamController: { hasRunningToolWork: () => false },
+        inputController: askController,
+        autoTurnProjectionController: { abandonStalledTurn: abandonAuto },
+      } as any);
+
+      expect(wiring.hasBlockingWork!('turn-1')).toBe(false);
+      wiring.onStallForceSettle!({
+        turnId: 'turn-1',
+        kind: 'user',
+        generation: 1,
+        conversationId: 'conv-1',
+        lifecycleGeneration: 0,
+      });
+
+      expect(abandonInput).toHaveBeenCalledWith('turn-1');
+      expect(abandonAuto).toHaveBeenCalledWith('turn-1');
+    });
+
     /** Coordinator-wired deps with a live auto/user turn on the feature lease. */
     function createTurnWiredDeps(kind: 'user' | 'auto') {
       const askDeps = createAskDeps();
@@ -1637,7 +1763,7 @@ describe('InputController - Message Queue', () => {
     it('plan A: the auto-turn ask settles deny after the 5-minute window with a visible timeout notice', async () => {
       jest.useFakeTimers();
       try {
-        const { askController, parentEl } = createTurnWiredDeps('auto');
+        const { turnCoordinator, askController, parentEl } = createTurnWiredDeps('auto');
 
         const askPromise = askController.handleAskUserQuestion(askInput());
 
@@ -1653,6 +1779,9 @@ describe('InputController - Message Queue', () => {
         const notice = parentEl.querySelector('.claudian-ask-timeout-notice');
         expect(notice).not.toBeNull();
         expect(notice.textContent).toBe(t('chat.ask.autoTurnTimeout'));
+        // The lease watchdog's poll interval is the only timer a live turn may
+        // hold (2026-11-10) — settle the lease before asserting zero timers.
+        turnCoordinator.finish('auto-1');
         expect(jest.getTimerCount()).toBe(0);
       } finally {
         jest.useRealTimers();
@@ -1800,14 +1929,17 @@ describe('InputController - Message Queue', () => {
     it('plan A: a user turn keeps the unbounded ask (still pending after 5 minutes)', async () => {
       jest.useFakeTimers();
       try {
-        const { askController } = createTurnWiredDeps('user');
+        const { turnCoordinator, askController } = createTurnWiredDeps('user');
 
         const askPromise = askController.handleAskUserQuestion(askInput());
         expect((askController as any).pendingAskInline).not.toBeNull();
 
         jest.advanceTimersByTime(5 * 60 * 1000);
-        expect(jest.getTimerCount()).toBe(0);
         expect(await isSettled(askPromise)).toBe(false);
+        // Only the lease watchdog's poll interval remains (2026-11-10): the ask
+        // path itself armed no timer. Settle the lease and the count reaches 0.
+        turnCoordinator.finish('user-1');
+        expect(jest.getTimerCount()).toBe(0);
 
         askController.dismissPendingApproval();
         await expect(askPromise).resolves.toBeNull();
@@ -1867,7 +1999,7 @@ describe('InputController - Message Queue', () => {
       askDeps.onAskAttentionTimeout = attentionTimeout;
 
       const askController = new InputController(askDeps);
-      return { askDeps, askController, relay, armed, attentionTimeout };
+      return { askDeps, askController, relay, armed, attentionTimeout, turnCoordinator };
     }
 
     function relayAskFile(): string {
@@ -1946,7 +2078,7 @@ describe('InputController - Message Queue', () => {
     it('desktop answers first: relay settles, late reply is inert', async () => {
       jest.useFakeTimers();
       try {
-        const { askController, attentionTimeout } = createRelayWiredDeps();
+        const { turnCoordinator, askController, attentionTimeout } = createRelayWiredDeps();
         const askPromise = askController.handleAskUserQuestion(relayAskInput());
         const inline = (askController as any).pendingAskInline;
 
@@ -1961,6 +2093,8 @@ describe('InputController - Message Queue', () => {
         expect(pending).toBeUndefined(); // answered before the window lapsed
 
         expect(fs.existsSync(relayAskFile())).toBe(false);
+        // Lease watchdog poll is the only remaining timer (2026-11-10).
+        turnCoordinator.finish('user-1');
         expect(jest.getTimerCount()).toBe(0);
       } finally {
         jest.useRealTimers();
@@ -4286,6 +4420,97 @@ describe('InputController - Message Queue', () => {
       await controller.sendMessage();
 
       expect(deps.renderer.renderMessages).not.toHaveBeenCalled();
+    });
+  });
+
+  // ============================================
+  // Lease stall watchdog (2026-11-10 design, 建议 4)
+  // ============================================
+
+  describe('Lease stall watchdog', () => {
+    async function flushMicrotasks(times = 20): Promise<void> {
+      for (let i = 0; i < times; i += 1) await Promise.resolve();
+    }
+
+    it('force-settles a wedged turn, frees the live lease and dispatches the queued message', async () => {
+      jest.useFakeTimers();
+      try {
+        const projectionCoordinator = new ProjectionWriteCoordinatorForTest();
+        deps = createSendableDeps({ getProjectionCoordinator: () => projectionCoordinator });
+        deps.renderer.renderMessages = jest.fn().mockReturnValue(createMockEl());
+        deps.renderer.waitForRenderedMessages = jest.fn().mockResolvedValue(undefined);
+        ((deps as any).mockAgentService.cancel as jest.Mock).mockClear();
+        inputEl = deps.getInputEl() as ReturnType<typeof createMockInputEl>;
+        controller = new InputController(deps);
+
+        const mockAgentService = (deps as any).mockAgentService;
+        let queryCalls = 0;
+        mockAgentService.query = jest.fn().mockImplementation(() => {
+          queryCalls += 1;
+          if (queryCalls === 1) {
+            // Wedged CLI: the consumer parks before the first chunk.
+            return (async function* () {
+              await new Promise<void>(() => {});
+              yield { type: 'text' as const, content: 'never reached' };
+            })();
+          }
+          return createMockStream([{ type: 'text', content: 'second reply' }]);
+        });
+
+        const turnCoordinator = new TurnCoordinator({
+          state: deps.state,
+          getConversationId: () => deps.state.currentConversationId,
+          processQueuedMessage: () => controller.processQueuedMessage(),
+          // Production wiring (Tab.createTurnStallWatchdogDeps).
+          ...createTurnStallWatchdogDeps({
+            // No tool call in flight: the only live evidence is the silence.
+            streamController: { ...deps.streamController, hasRunningToolWork: () => false },
+            inputController: controller,
+            autoTurnProjectionController: null,
+          } as any),
+        });
+        (deps as any).getTurnCoordinator = () => turnCoordinator;
+
+        inputEl.value = 'wedged turn';
+        void controller.sendMessage();
+        await flushMicrotasks();
+
+        expect(mockAgentService.query).toHaveBeenCalledTimes(1);
+        expect(turnCoordinator.isBusy()).toBe(true);
+        expect(deps.state.messages).toHaveLength(2);
+
+        // Sent while the lease is held: UI queue only, nothing dispatched.
+        inputEl.value = 'queued behind the wedge';
+        await controller.sendMessage();
+        expect(deps.state.queuedMessage?.content).toBe('queued behind the wedge');
+        expect(mockAgentService.query).toHaveBeenCalledTimes(1);
+
+        // Silence past the threshold: abort the runtime turn (the message
+        // channel keeps its active-turn slot until settle) and free the live
+        // projection lease the parked generator can never release.
+        jest.advanceTimersByTime(TURN_LEASE_STALL_MS + TURN_LEASE_STALL_POLL_MS);
+
+        expect(mockAgentService.cancel).toHaveBeenCalled();
+
+        // release() pumped the queue inside the same advance; its 0 ms
+        // dispatch must mount and reach the runtime, not park on acquireLive
+        // behind the dead lease.
+        await flushMicrotasks();
+
+        expect(mockAgentService.query).toHaveBeenCalledTimes(2);
+        expect(deps.state.messages.map(message => message.role))
+          .toEqual(['user', 'assistant', 'user', 'assistant']);
+        expect(deps.state.messages[2].content).toBe('queued behind the wedge');
+        expect(turnCoordinator.isBusy()).toBe(false);
+        expect(deps.state.isStreaming).toBe(false);
+
+        // No residual live lease: a stored transaction runs immediately.
+        let storedRan = false;
+        await projectionCoordinator.runStored(() => false, async () => { storedRan = true; });
+        expect(storedRan).toBe(true);
+      } finally {
+        jest.useRealTimers();
+      }
     });
   });
 

@@ -33,7 +33,7 @@ import { InputController } from '../controllers/InputController';
 import { NavigationController } from '../controllers/NavigationController';
 import { SelectionController } from '../controllers/SelectionController';
 import { StreamController } from '../controllers/StreamController';
-import { TurnCoordinator } from '../controllers/TurnCoordinator';
+import { TurnCoordinator, type TurnCoordinatorDeps } from '../controllers/TurnCoordinator';
 import { capturePageUiState, restorePageUiState } from '../history/HistoryPageUiState';
 import { HistoryWindowRenderer } from '../rendering/HistoryWindowRenderer';
 import { MessageRenderer } from '../rendering/MessageRenderer';
@@ -1372,6 +1372,38 @@ async function handleForkAll(
   });
 }
 
+/**
+ * Lease-stall watchdog wiring (2026-11-10): chunk-free silence is only
+ * suspicious while nothing legitimately explains it, and a force settle must
+ * abort the wedged turn's side effects before pumping the queue. Both probes
+ * resolve through the controllers lazily — they are constructed after the
+ * coordinator. Exported so the wiring itself is testable end to end.
+ */
+export function createTurnStallWatchdogDeps(
+  controllers: TabData['controllers'],
+): Pick<TurnCoordinatorDeps, 'hasBlockingWork' | 'onStallForceSettle'> {
+  return {
+    hasBlockingWork: turnId => (
+      (controllers.streamController?.hasRunningToolWork(turnId) ?? false)
+      || (controllers.inputController?.hasPendingInteractivePrompt() ?? false)
+    ),
+    onStallForceSettle: (turn) => {
+      // Independent isolation: a failing user-turn cleanup must never skip the
+      // auto-turn lease release (and vice versa).
+      try {
+        controllers.inputController?.abandonStalledTurn(turn.turnId);
+      } catch {
+        // The coordinator's own settle still runs.
+      }
+      try {
+        controllers.autoTurnProjectionController?.abandonStalledTurn(turn.turnId);
+      } catch {
+        // The coordinator's own settle still runs.
+      }
+    },
+  };
+}
+
 export function initializeTabControllers(
   tab: TabData,
   plugin: ClaudianPlugin,
@@ -1710,6 +1742,8 @@ export function initializeTabControllers(
     state,
     getConversationId: () => state.currentConversationId,
     processQueuedMessage: () => tab.controllers.inputController?.processQueuedMessage(),
+    ...createTurnStallWatchdogDeps(tab.controllers),
+    recordDiagnostic: event => { tab.service?.recordAutoTurnDiagnostic?.(event); },
   });
 
   // Per-tab projection write lease (coord protocol): UI-level shared
@@ -2272,13 +2306,23 @@ export function setupServiceCallbacks(
         return decision;
       }
     );
+    // Single source of truth (2026-11-10 hardening): the hook provider must
+    // read the exact SubagentManager instance StreamController writes to.
+    // Capture it here (same object passed as the StreamController dep) and
+    // read through the capture — a future tab-level replacement would surface
+    // as a diagnostic instead of a silent hook false negative.
+    const hookSubagentManager = tab.services.subagentManager;
+    // Both state reads are getters inside the manager's provider (hasRunning
+    // owns the stale cleanup; the snapshot must follow it) — see
+    // SubagentManager.createStopHookStateProvider.
+    const hookStateProvider = hookSubagentManager.createStopHookStateProvider();
     service.setSubagentHookProvider(
-      () => ({
-        // Stop reads this getter and retains its existing stale cleanup. The
-        // probe reads runningAgents only, without invoking that cleanup.
-        get hasRunning() { return tab.services.subagentManager.hasRunningSubagents(); },
-        runningAgents: tab.services.subagentManager.getRunningAsyncAgents(),
-      })
+      () => {
+        if (tab.services.subagentManager !== hookSubagentManager) {
+          service.recordAutoTurnDiagnostic?.({ phase: 'subagent_state_source_mismatch', detail: 'hook_provider' });
+        }
+        return hookStateProvider();
+      }
     );
     // Fix 2 (通知直接销账) + 0823 工具明细修复: terminal task-notifications go
     // through the StreamController entry so the settled subagent is hydrated

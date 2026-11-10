@@ -161,7 +161,11 @@ export interface AutoTurnDiagnosticEvent {
     | 'render_start' | 'render_end' | 'save_start' | 'save_end' | 'save_timeout' | 'callback_error'
     // P0 cancellation trace (2026-11-01): feature-layer cancel snapshot and
     // the dead-cancel force settle outcome.
-    | 'cancel_request' | 'force_settle';
+    | 'cancel_request' | 'force_settle'
+    // Stop-hook hardening (2026-11-10): the hook provider read a different
+    // SubagentManager instance than the one the StreamController writes, and
+    // the feature lease's silence watchdog force-settled (or skipped) a turn.
+    | 'subagent_state_source_mismatch' | 'lease_stall_force_settle';
   turnId?: string;
   generation?: number;
   leaseKind?: 'user' | 'auto';

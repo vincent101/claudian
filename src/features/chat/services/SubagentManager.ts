@@ -4,6 +4,7 @@ import { isAbsolute, sep } from 'path';
 
 import { ProviderRegistry } from '../../../core/providers/ProviderRegistry';
 import type { ProviderTaskResultInterpreter } from '../../../core/providers/types';
+import type { SubagentRuntimeState } from '../../../core/runtime/types';
 import { TOOL_TASK } from '../../../core/tools/toolNames';
 import { extractToolResultContent } from '../../../core/tools/toolResultContent';
 import { clampToolResultForProjection } from '../../../core/tools/toolResultProjection';
@@ -30,6 +31,16 @@ import {
 import type { PendingToolCall } from '../state/types';
 
 export type SubagentStateChangeCallback = (subagent: SubagentInfo) => void;
+
+/**
+ * Liveness TTL for "running" async bookkeeping (2026-11-10 hardening: lowered
+ * from 2h). A background agent whose process died silently can never deliver a
+ * terminal notification, so a shorter TTL bounds how long a ghost record keeps
+ * the Stop hook / recovery probe believing work is in flight. A fixed constant
+ * on purpose: no settings surface exists for it, and 20 min sits inside the
+ * design band (15–30 min) while exceeding real long-running agents.
+ */
+export const DEFAULT_SUBAGENT_STALE_MS = 20 * 60 * 1000;
 
 export type HandleTaskResult =
   | { action: 'buffered' }
@@ -91,6 +102,23 @@ export class SubagentManager {
 
   public setProjectionClampEnabled(enabled?: () => boolean): void {
     this.projectionClampEnabled = enabled;
+  }
+
+  /**
+   * Stop-hook snapshot provider (2026-11-10): handed to the Claude hook
+   * provider so the Stop event always reads THIS manager. Both properties must
+   * be getters — the hook reads `hasRunning` first because that read owns the
+   * stale cleanup, and an eagerly evaluated `runningAgents` would freeze the
+   * pre-cleanup list (idle-with-live-ids, the very false negative the snapshot
+   * exists to expose).
+   */
+  public createStopHookStateProvider(): () => SubagentRuntimeState {
+    const hasRunning = (): boolean => this.hasRunningSubagents();
+    const runningAgents = (): SubagentRuntimeState['runningAgents'] => this.getRunningAsyncAgents();
+    return () => ({
+      get hasRunning() { return hasRunning(); },
+      get runningAgents() { return runningAgents(); },
+    });
   }
 
   // ============================================
@@ -402,8 +430,11 @@ export class SubagentManager {
    * TaskOutput round-trip.
    *
    * Terminal statuses: completed / killed / failed (+ 'stopped', the structured
-   * SDK spelling of killed). Only active entries (key = agentId = task-id) are
-   * settled; pending entries (launch in flight) are recorded in the
+   * SDK spelling of killed). Active entries are keyed by agentId, but a CLI
+   * task-status notification may carry the launch task id — the recorded
+   * task-id → agent-id index is the reconciliation fallback (2026-11-10), so a
+   * real terminal always clears the running booking instead of leaving a ghost
+   * running entry. Pending entries (launch in flight) are recorded in the
    * seen-terminal short table and settled at promotion time.
    * Idempotent: unknown task-ids are tolerated silently.
    * Returns the settled SubagentInfo, or undefined when nothing was settled.
@@ -419,15 +450,26 @@ export class SubagentManager {
       return undefined; // non-terminal notification — ignore
     }
 
-    const subagent = this.activeAsyncSubagents.get(taskId);
+    let agentId = taskId;
+    let subagent = this.activeAsyncSubagents.get(taskId);
+    if (!subagent) {
+      const mappedAgentId = this.taskIdToAgentId.get(taskId);
+      if (mappedAgentId) {
+        const mapped = this.activeAsyncSubagents.get(mappedAgentId);
+        if (mapped) {
+          agentId = mappedAgentId;
+          subagent = mapped;
+        }
+      }
+    }
     if (!subagent) {
       // Notification arrived before promotion (or unknown task) — record for
       // the promotion-time check. Unknown ids age out via the LRU bound.
-      this.rememberTerminalNotification(taskId, normalized, result);
+      this.rememberTerminalNotification(agentId, normalized, result);
       return undefined;
     }
 
-    this.settleActiveSubagent(subagent, taskId, normalized, result);
+    this.settleActiveSubagent(subagent, agentId, normalized, result);
     return subagent;
   }
 
@@ -629,11 +671,10 @@ export class SubagentManager {
 
   public hasRunningSubagents(): boolean {
     // 每次读取时清理过期追踪状态：进程退出丢失状态的 agent 会永远留在 Map 里，
-    // 超过 STALE_MS 无生命的 "running" 条目经统一终态链（markOrphaned）标记后移除，
-    // 不再参与存活判定；真实活跃 agent（startedAt 距今 < 2h）保持原状态检查语义。
-    const STALE_MS = 2 * 60 * 60 * 1000;
+    // 超过 DEFAULT_SUBAGENT_STALE_MS 无生命的 "running" 条目经统一终态链（markOrphaned）标记后移除，
+    // 不再参与存活判定；真实活跃 agent（startedAt 距今 < TTL）保持原状态检查语义。
     const now = Date.now();
-    const isLive = (s?: SubagentInfo): boolean => now - (s?.startedAt ?? 0) < STALE_MS;
+    const isLive = (s?: SubagentInfo): boolean => now - (s?.startedAt ?? 0) < DEFAULT_SUBAGENT_STALE_MS;
     for (const [id, s] of this.pendingAsyncSubagents) {
       if (!isLive(s)) this.pendingAsyncSubagents.delete(id);
     }

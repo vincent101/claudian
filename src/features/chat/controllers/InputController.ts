@@ -162,6 +162,10 @@ export class InputController {
   private activeLivePageMessages: ChatMessage[] = [];
   /** Turn projection context of the in-flight turn (v3 §5.1); cleared on turn end. */
   private activeTurnContext: TurnProjectionContext | null = null;
+  /** P2 live projection lease of the in-flight user turn; the stall watchdog
+   *  releases it when the parked generator can no longer run its finally. */
+  private activeProjectionLease: ProjectionWriteLease | null = null;
+  private activeProjectionLeaseTurnId: string | null = null;
   private pendingProviderUserMessages: Array<{
     displayContent: string;
     persistedContent?: string;
@@ -181,6 +185,69 @@ export class InputController {
 
   private getTurnCoordinator(): TurnCoordinator | null {
     return this.deps.getTurnCoordinator?.() ?? null;
+  }
+
+  /**
+   * Lease-stall liveness probe (2026-11-10): an interactive card awaiting the
+   * user parks the CLI's canUseTool, so no chunks can arrive until it settles.
+   * That silence is legitimate (a user-turn ask may wait indefinitely) and must
+   * never be force-settled by the turn watchdog.
+   */
+  hasPendingInteractivePrompt(): boolean {
+    return !!(
+      this.pendingAskInline
+      || this.pendingApprovalInline
+      || this.pendingExitPlanModeInline
+      || this.pendingPlanApproval
+    );
+  }
+
+  /**
+   * Lease-stall watchdog side effects (2026-11-10): the turn never settles on
+   * its own, so the two things its finally/cancel path would otherwise do must
+   * happen here — abort the runtime turn (the Claude message channel keeps
+   * `activeTurnId` until settle, and only then delivers a queued message to
+   * the CLI) and release the live projection lease (a held lease parks every
+   * later acquireLive, so the pumped message never mounts).
+   */
+  abandonStalledTurn(turnId: string): void {
+    const ownsLease = this.activeProjectionLeaseTurnId === turnId;
+    let lease: ProjectionWriteLease | null = null;
+    if (ownsLease) {
+      // Drop the bookkeeping first: a throwing release must not leave the
+      // field pointing at a lease that will never be released again.
+      lease = this.activeProjectionLease;
+      this.activeProjectionLease = null;
+      this.activeProjectionLeaseTurnId = null;
+      // The parked generator is about to be woken by the cancel: make it take
+      // the interrupted path instead of projecting a late result into a tab
+      // that may already belong to a newer turn.
+      this.deps.state.cancelRequested = true;
+    }
+    // Same rule as abortActive: lease cancellation must survive cleanup
+    // failures, so the critical actions are each isolated from the rest.
+    try {
+      lease?.release();
+    } catch {
+      // Releasing a dead lease is a no-op; the runtime cancel below matters.
+    }
+    try {
+      this.getAgentService()?.cancel();
+    } catch {
+      // The feature lease still drops in TurnCoordinator.
+    }
+    if (ownsLease) {
+      try {
+        this.deps.streamController.invalidateRenderFlush?.();
+      } catch {
+        // UI-only cleanup.
+      }
+      try {
+        this.deps.streamController.hideThinkingIndicator();
+      } catch {
+        // UI-only cleanup.
+      }
+    }
   }
 
   private getAuxiliaryModel(): string | null {
@@ -378,6 +445,13 @@ export class InputController {
         projectionLease.release();
         projectionLease = null;
       }
+      if (projectionLease) {
+        // Exposed for the lease-stall watchdog: a turn that never settles
+        // cannot run the finally below, so the lease must be releasable from
+        // outside or every later send waits forever on acquireLive.
+        this.activeProjectionLease = projectionLease;
+        this.activeProjectionLeaseTurnId = turnId;
+      }
       if (!projectionLease) {
         // Queue instead of dropping — the cancelled wait lost the race, the
         // message itself is still wanted. No user/assistant DOM was created,
@@ -564,6 +638,10 @@ export class InputController {
           wasInterrupted = true;
           break;
         }
+
+        // Stall watchdog progress evidence (2026-11-10): any chunk of this
+        // turn proves the CLI is alive, boundary chunks included.
+        turnCoordinator?.touch(turnId);
 
         if (await this.handleProviderMessageBoundaryChunk(chunk)) {
           continue;
@@ -778,6 +856,10 @@ export class InputController {
       // stored transaction is queued; holding live while queueing stored
       // would self-deadlock the FIFO.
       projectionLease?.release();
+      if (this.activeProjectionLeaseTurnId === turnId) {
+        this.activeProjectionLease = null;
+        this.activeProjectionLeaseTurnId = null;
+      }
       const historyWindowRenderer = this.deps.getHistoryWindowRenderer?.();
       historyWindowRenderer?.freezeLivePage(this.activeLivePageMessages);
       this.activeLivePageMessages = [];
@@ -1464,6 +1546,13 @@ export class InputController {
     // Restore queued message to input instead of discarding
     this.restorePendingMessagesToInput();
     this.getAgentService()?.cancel();
+    // Interrupt accounting must not wait for the stream loop (2026-11-10): a
+    // CLI wedged before the next chunk parks the for-await consumer, so the
+    // settleInterruptedTurn entry (which owns interruptAllActive) never runs
+    // and every live subagent stays booked running. The cancel request is the
+    // terminal signal for this turn's subagents — settle them now. Idempotent
+    // with the later settleInterruptedTurn call (its maps are already clear).
+    this.deps.getSubagentManager().interruptAllActive(t('chat.cancel.toolInterrupted'));
     streamController.hideThinkingIndicator();
     this.armCancelWatchdog();
   }

@@ -1,4 +1,36 @@
+import type { AutoTurnDiagnosticEvent } from '../../../core/runtime/types';
 import type { ChatState } from '../state/ChatState';
+
+/**
+ * Lease-stall watchdog (2026-11-10 design, 建议 4). The cancel watchdog only
+ * covers user cancels; a turn that never settles while nobody cancels (CLI
+ * wedged, lost result) holds the exclusive lease forever and the user's queued
+ * message never flows. This window is silence-based on purpose: chunks are the
+ * CLI's progress evidence, while legitimately chunk-free work (a running tool
+ * call, a pending permission/ask prompt) is excluded by `hasBlockingWork`.
+ *
+ * 10 minutes: far above any observed inter-chunk gap once a tool call is
+ * accounted for (streaming turns deliver partial-message deltas continuously,
+ * and a running tool / pending prompt is excluded by `hasBlockingWork`), yet
+ * strictly below both runtime-side reconciliation bounds so the feature lease
+ * degrades first: the subagent running TTL is 20 min
+ * (`DEFAULT_SUBAGENT_STALE_MS`) and the async-subagent poll chain caps at
+ * ~30 min (900 × 2 s). Waiting for either would leave the user's queue stuck
+ * behind a ghost turn for twice as long.
+ */
+export const TURN_LEASE_STALL_MS = 10 * 60_000;
+/** Poll cadence: bounds how late a stall is noticed; cheap enough per tab. */
+export const TURN_LEASE_STALL_POLL_MS = 30_000;
+/**
+ * Absolute ceiling for evidence-backed silence (a tool call keeps reporting
+ * `running`). The `hasBlockingWork` probe is trusted only up to this bound:
+ * an interrupted tool whose result never lands is exactly the incident shape,
+ * and without a ceiling it would suppress the watchdog forever while leaving
+ * no trace. 30 min matches the async-subagent poll-chain cap (900 × 2 s) and
+ * stays above any single tool call observed in practice; past it the tool
+ * record itself is untrustworthy.
+ */
+export const TURN_LEASE_STALL_BLOCKED_MAX_MS = 30 * 60_000;
 
 /**
  * Feature-layer turn being arbitrated. `generation` is the feature
@@ -26,6 +58,23 @@ export interface TurnCoordinatorDeps {
   getConversationId: () => string | null;
   /** v4 §3.1 step 7: called only when the released turn is still current. */
   processQueuedMessage: () => void;
+  /**
+   * Stall-watchdog false-kill guard: true while work that legitimately emits
+   * no chunks explains the silence (a tool call in flight, a pending
+   * permission/ask prompt). Receives the lease's turnId so a probe can scope
+   * itself to the current turn. Absent = silence is always suspicious.
+   */
+  hasBlockingWork?: (turnId: string) => boolean;
+  recordDiagnostic?: (event: AutoTurnDiagnosticEvent) => void;
+  /**
+   * Side effects the wedged turn can no longer run itself, invoked
+   * synchronously before the lease is dropped: cancel the runtime turn so its
+   * message channel stops holding `activeTurnId`, and release the live
+   * projection lease the parked generator would otherwise own forever. A
+   * pumped queue message only reaches the CLI if the runtime turn is aborted.
+   * Failures are isolated — the settle still happens.
+   */
+  onStallForceSettle?: (turn: ActiveFeatureTurn) => void;
 }
 
 /**
@@ -41,6 +90,15 @@ export class TurnCoordinator {
   private active: ActiveFeatureTurn | null = null;
   private settled: SettledTurnRecord | null = null;
   private lifecycleGeneration = 0;
+  private stallTimer: ReturnType<typeof setInterval> | null = null;
+  /** Last observed progress (lease begin or touch). */
+  private lastProgressAt = 0;
+  /** Last real chunk of this lease; blocking-work polls never advance it. */
+  private lastChunkAt = 0;
+  /** One-shot guard for a throwing liveness probe (per lease). */
+  private stallProbeErrorRecorded = false;
+  /** One-shot guard for the suppressed-by-blocking-work diagnostic (per lease). */
+  private stallSuppressedRecorded = false;
 
   constructor(deps: TurnCoordinatorDeps) {
     this.deps = deps;
@@ -70,6 +128,7 @@ export class TurnCoordinator {
       conversationId: this.deps.getConversationId(),
       lifecycleGeneration: this.lifecycleGeneration,
     };
+    this.armStallWatchdog();
     return true;
   }
 
@@ -89,6 +148,7 @@ export class TurnCoordinator {
       lifecycleGeneration: this.lifecycleGeneration,
     };
     this.deps.state.isStreaming = true;
+    this.armStallWatchdog();
     return true;
   }
 
@@ -104,6 +164,117 @@ export class TurnCoordinator {
   }
 
   /**
+   * Progress evidence for the stall watchdog: every chunk of the active turn
+   * (user or auto) calls this. A foreign/released turnId is ignored so a late
+   * callback from an old turn can never keep a new lease alive.
+   */
+  touch(turnId: string): void {
+    if (!this.active || this.active.turnId !== turnId) return;
+    this.lastProgressAt = Date.now();
+    this.lastChunkAt = Date.now();
+  }
+
+  private armStallWatchdog(): void {
+    this.disarmStallWatchdog();
+    this.lastProgressAt = Date.now();
+    this.lastChunkAt = Date.now();
+    this.stallProbeErrorRecorded = false;
+    this.stallSuppressedRecorded = false;
+    const timer = setInterval(() => this.checkStall(), TURN_LEASE_STALL_POLL_MS) as unknown as {
+      unref?: () => void;
+    };
+    // A watchdog must never keep the host process alive on its own.
+    timer.unref?.();
+    this.stallTimer = timer as unknown as ReturnType<typeof setInterval>;
+  }
+
+  private disarmStallWatchdog(): void {
+    if (this.stallTimer === null) return;
+    clearInterval(this.stallTimer);
+    this.stallTimer = null;
+  }
+
+  private checkStall(): void {
+    const turn = this.active;
+    if (!turn) {
+      this.disarmStallWatchdog();
+      return;
+    }
+    const idleMs = Date.now() - this.lastProgressAt;
+    if (idleMs < TURN_LEASE_STALL_MS) return;
+    // Evidence-backed silence is still bounded: a running-tool record whose
+    // result was lost must not suppress the watchdog for the rest of the tab.
+    const blockedMs = Date.now() - this.lastChunkAt;
+    let blocking: boolean;
+    try {
+      blocking = this.deps.hasBlockingWork?.(turn.turnId) ?? false;
+    } catch {
+      // Fail safe: an unreadable liveness probe must never kill a live turn.
+      blocking = true;
+      // The probe-error entry is this lease's suppression evidence — do not
+      // stack a second "skipped_blocking_work" entry on the same poll.
+      this.stallSuppressedRecorded = true;
+      if (!this.stallProbeErrorRecorded) {
+        // One shot per lease: a permanently throwing probe would otherwise
+        // append a diagnostic entry on every poll.
+        this.stallProbeErrorRecorded = true;
+        this.deps.recordDiagnostic?.({
+          phase: 'lease_stall_force_settle',
+          turnId: turn.turnId,
+          generation: turn.generation,
+          leaseKind: turn.kind,
+          elapsedMs: idleMs,
+          detail: 'skipped_probe_error',
+        });
+      }
+    }
+    if (blocking && blockedMs < TURN_LEASE_STALL_BLOCKED_MAX_MS) {
+      if (!this.stallSuppressedRecorded) {
+        this.stallSuppressedRecorded = true;
+        this.deps.recordDiagnostic?.({
+          phase: 'lease_stall_force_settle',
+          turnId: turn.turnId,
+          generation: turn.generation,
+          leaseKind: turn.kind,
+          elapsedMs: blockedMs,
+          detail: 'skipped_blocking_work',
+        });
+      }
+      // Legitimate chunk-free work (tool in flight / pending ask). Restart the
+      // idle clock instead of accumulating silence across distinct waits.
+      this.lastProgressAt = Date.now();
+      return;
+    }
+    // A wedged turn cannot run its own cancel/finally: abort the runtime turn
+    // (frees the message channel's active-turn slot) and release the live
+    // projection lease first, or the pumped message only queues behind it.
+    try {
+      this.deps.onStallForceSettle?.(turn);
+    } catch {
+      // Cleanup failures must never keep the lease held.
+    }
+    const settled = this.finish(turn.turnId);
+    if (settled && turn.kind === 'user' && this.deps.state.isStreaming) {
+      this.deps.state.isStreaming = false;
+    }
+    this.deps.recordDiagnostic?.({
+      phase: 'lease_stall_force_settle',
+      turnId: turn.turnId,
+      generation: turn.generation,
+      leaseKind: turn.kind,
+      elapsedMs: blocking ? blockedMs : idleMs,
+      detail: settled
+        ? (blocking ? 'settled_blocked_too_long' : 'settled')
+        : 'skipped_not_held',
+    });
+    // finish() leaves the settled record; release consumes it so the queue is
+    // pumped exactly once and a late runtime release becomes a no-op. Called
+    // even when finish() lost the race: the cancel issued above may have
+    // settled the lease through another path that does not pump.
+    this.release(turn.turnId);
+  }
+
+  /**
    * v4 §3.1 step 3 (finishFeatureTurn): clears the lease and, for auto turns,
    * drops isStreaming. Never calls processQueuedMessage — release does that.
    */
@@ -113,6 +284,7 @@ export class TurnCoordinator {
     }
     const turn = this.active;
     this.active = null;
+    this.disarmStallWatchdog();
     this.settled = {
       turnId: turn.turnId,
       conversationId: turn.conversationId,
@@ -228,6 +400,7 @@ export class TurnCoordinator {
     const cancelled = this.active;
     if (cancelled) {
       this.active = null;
+      this.disarmStallWatchdog();
       this.settled = {
         turnId: cancelled.turnId,
         conversationId: cancelled.conversationId,

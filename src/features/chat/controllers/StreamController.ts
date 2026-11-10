@@ -191,6 +191,20 @@ export class StreamController {
   }
 
   /**
+   * Lease-stall watchdog probe (2026-11-10): a tool call still in flight is
+   * legitimate chunk-free work — its result is the next chunk. Reads the
+   * active turn's domain message, which both user and auto turns route here.
+   * Scoped to `turnId`: the context survives a finished user turn until the
+   * next chunk resets it, and a tool left `running` by an interrupted turn
+   * must not mask a wedged turn that never produced a chunk of its own.
+   */
+  hasRunningToolWork(turnId: string): boolean {
+    const context = this.activeContext;
+    if (!context || context.turnId !== turnId) return false;
+    return !!context.message.toolCalls?.some(toolCall => toolCall.status === 'running');
+  }
+
+  /**
    * Cancel/lifecycle invalidation: settle every pending render-flush await,
    * dropping the pending render instead of waiting on DOM state a cancelled
    * turn no longer owns. No timeout is used — a timed release could let old

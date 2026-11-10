@@ -392,6 +392,9 @@ jest.mock('@/features/chat/services/SubagentManager', () => ({
     orphanAllActive: jest.fn(),
     setCallback: jest.fn(),
     clear: jest.fn(),
+    createStopHookStateProvider: jest.fn().mockReturnValue(
+      () => ({ hasRunning: false, runningAgents: [] }),
+    ),
   })),
 }));
 
@@ -1736,11 +1739,16 @@ describe('Tab - Service Callbacks', () => {
       const handleAsyncSubagentNotification = jest.fn();
       const handleTaskNotification = jest.fn();
       tab.controllers.streamController = { handleAsyncSubagentNotification } as any;
-      tab.services.subagentManager = {
+      const hookManager = {
         hasRunningSubagents: jest.fn().mockReturnValue(false),
         getRunningAsyncAgents: jest.fn().mockReturnValue([{ agentId: 'live-agent', startedAt: 100 }]),
         handleTaskNotification,
-      } as any;
+        createStopHookStateProvider: () => () => ({
+          get hasRunning() { return hookManager.hasRunningSubagents(); },
+          get runningAgents() { return hookManager.getRunningAsyncAgents(); },
+        }),
+      };
+      tab.services.subagentManager = hookManager as any;
 
       const service = {
         setApprovalCallback: jest.fn(),
