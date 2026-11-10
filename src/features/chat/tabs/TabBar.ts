@@ -1,7 +1,7 @@
 import { Menu, Notice } from 'obsidian';
 
 import { t } from '../../../i18n/i18n';
-import { formatConversationSizeTooltip } from '../utils/conversationSize';
+import { formatActiveSessionIdentity } from '../utils/sessionIdentity';
 import type { TabBarItem, TabId } from './types';
 
 /** Callbacks for TabBar interactions. */
@@ -95,7 +95,13 @@ export class TabBar {
       || binding.item.conversationId !== item.conversationId
       || binding.item.providerId !== item.providerId || !this.containerEl.contains(binding.node)) return;
     binding.item.sizeSnapshot = item.sizeSnapshot;
-    binding.node.setAttribute('aria-label', `${item.title} · ${formatConversationSizeTooltip(item)}`);
+    binding.node.setAttribute('aria-label', this.tooltipLabel(item));
+  }
+
+  /** Identity tooltip; a bound conversation without a session still just shows its title. */
+  private tooltipLabel(item: TabBarItem): string {
+    if (!item.conversationId) return item.title;
+    return formatActiveSessionIdentity(item.sessionId ?? '', item.title) || item.title;
   }
 
   /** Renders a single tab badge. */
@@ -117,10 +123,8 @@ export class TabBar {
       text: String(item.index),
     });
 
-    // Tooltip with full title (aria-label only; adding title too causes double tooltip)
-    badgeEl.setAttribute('aria-label', item.conversationId
-      ? `${item.title} · ${formatConversationSizeTooltip(item)}`
-      : item.title);
+    // Tooltip with full identity (aria-label only; adding title too causes double tooltip)
+    badgeEl.setAttribute('aria-label', this.tooltipLabel(item));
     badgeEl.setAttribute('data-provider', item.providerId);
     badgeEl.draggable = true;
 

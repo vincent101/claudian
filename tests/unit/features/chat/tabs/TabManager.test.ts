@@ -1419,6 +1419,39 @@ describe('TabManager - Tab Bar Data', () => {
       expect(manager.getTabBarItems()[0].conversationId).toBe('conv-1');
     });
 
+    it('exposes the bound conversation session id on tab bar items', async () => {
+      manager = createManager({
+        plugin: createMockPlugin({
+          getConversationSync: jest.fn().mockReturnValue({
+            id: 'conv-1',
+            title: 'T',
+            sessionId: '02a240bd-1111-2222-3333-444444444444',
+          }),
+        }),
+        tabFactory: () => createMockTabData({
+          id: 'tab-1',
+          conversationId: 'conv-1',
+        }),
+      });
+
+      await manager.createTab();
+
+      expect(manager.getTabBarItems()[0].sessionId).toBe('02a240bd-1111-2222-3333-444444444444');
+    });
+
+    it('exposes null session id for a conversation without a session', async () => {
+      manager = createManager({
+        plugin: createMockPlugin({
+          getConversationSync: jest.fn().mockReturnValue({ id: 'conv-1', title: 'T', sessionId: null }),
+        }),
+        tabFactory: () => createMockTabData({ id: 'tab-1', conversationId: 'conv-1' }),
+      });
+
+      await manager.createTab();
+
+      expect(manager.getTabBarItems()[0].sessionId).toBeNull();
+    });
+
     it('exposes only the published conversation size on a bound tab', async () => {
       const sizeSnapshot = {
         conversationId: 'conv-1', revision: 1,
@@ -1460,6 +1493,7 @@ describe('TabManager - Tab Bar Data', () => {
       await manager.createTab();
 
       expect(manager.getTabBarItems()[0].conversationId).toBeNull();
+      expect(manager.getTabBarItems()[0].sessionId).toBeNull();
     });
 
     it('should expose null conversation title for an untitled conversation', async () => {

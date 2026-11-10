@@ -30,6 +30,7 @@ function createTabBarItem(overrides: Partial<TabBarItem> = {}): TabBarItem {
     canClose: true,
     conversationTitle: null,
     conversationId: null,
+    sessionId: null,
     ...overrides,
   };
 }
@@ -109,18 +110,31 @@ describe('TabBar', () => {
       expect(containerEl._children[0].getAttribute('title')).toBeNull();
     });
 
-    it('uses only the published current native file reading', () => {
+    it('labels a bound session with its title and short session id', () => {
+      const containerEl = createMockEl();
+      const tabBar = new TabBar(containerEl, createMockCallbacks());
+      tabBar.update([createTabBarItem({
+        title: 'My Conversation',
+        conversationId: 'one',
+        sessionId: '02a240bd-1111-2222-3333-444444444444',
+      })]);
+      expect(containerEl._children[0].getAttribute('aria-label')).toBe('My Conversation · 02a240bd');
+    });
+
+    it('never leaks the native file size into the tab tooltip', () => {
       const containerEl = createMockEl();
       const tabBar = new TabBar(containerEl, createMockCallbacks());
       tabBar.update([createTabBarItem({
         title: 'My Conversation', conversationId: 'one',
+        sessionId: '02a240bd-1111-2222-3333-444444444444',
         sizeSnapshot: {
           conversationId: 'one', revision: 1,
           files: { status: 'known', bytes: 2048, },
         },
       })]);
       const label = containerEl._children[0].getAttribute('aria-label');
-      expect(label).toContain('Current session file 2.0 KiB');
+      expect(label).toBe('My Conversation · 02a240bd');
+      expect(label).not.toContain('KiB');
       expect(containerEl._children[0].getAttribute('title')).toBeNull();
     });
 
@@ -128,8 +142,13 @@ describe('TabBar', () => {
       const containerEl = createMockEl();
       const onTabSizeRequest = jest.fn();
       const tabBar = new TabBar(containerEl, { ...createMockCallbacks(), onTabSizeRequest });
-      tabBar.update([createTabBarItem({ id: 'tab-one', title: 'My Conversation', conversationId: 'one' })]);
-      expect(containerEl._children[0].getAttribute('aria-label')).toContain('Current session file unknown');
+      tabBar.update([createTabBarItem({
+        id: 'tab-one',
+        title: 'My Conversation',
+        conversationId: 'one',
+        sessionId: '02a240bd-1111-2222-3333-444444444444',
+      })]);
+      expect(containerEl._children[0].getAttribute('aria-label')).toBe('My Conversation · 02a240bd');
       containerEl._children[0].dispatchEvent('mouseenter');
       expect(onTabSizeRequest).toHaveBeenCalledWith('tab-one', 'one');
     });
@@ -138,6 +157,54 @@ describe('TabBar', () => {
       const containerEl = createMockEl();
       const tabBar = new TabBar(containerEl, createMockCallbacks());
       tabBar.update([createTabBarItem({ title: 'My Conversation' })]);
+      expect(containerEl._children[0].getAttribute('aria-label')).toBe('My Conversation');
+    });
+
+    it('falls back to the plain title for a bound conversation without a session id', () => {
+      const containerEl = createMockEl();
+      const tabBar = new TabBar(containerEl, createMockCallbacks());
+      tabBar.update([createTabBarItem({ title: 'My Conversation', conversationId: 'one', sessionId: null })]);
+      expect(containerEl._children[0].getAttribute('aria-label')).toBe('My Conversation');
+    });
+
+    it('keeps the identity tooltip when a size publication refreshes the badge', () => {
+      const containerEl = createMockEl();
+      const tabBar = new TabBar(containerEl, createMockCallbacks());
+      const item = createTabBarItem({
+        id: 'tab-one',
+        title: 'My Conversation',
+        conversationId: 'one',
+        sessionId: '02a240bd-1111-2222-3333-444444444444',
+      });
+      tabBar.update([item]);
+      containerEl._children[0].dispatchEvent('mouseenter');
+
+      tabBar.updateSize({
+        ...item,
+        sizeSnapshot: {
+          conversationId: 'one', revision: 1,
+          files: { status: 'known', bytes: 2048, },
+        },
+      });
+
+      expect(containerEl._children[0].getAttribute('aria-label')).toBe('My Conversation · 02a240bd');
+    });
+
+    it('keeps the plain title after a size publication when no session id exists', () => {
+      const containerEl = createMockEl();
+      const tabBar = new TabBar(containerEl, createMockCallbacks());
+      const item = createTabBarItem({ id: 'tab-one', title: 'My Conversation', conversationId: 'one' });
+      tabBar.update([item]);
+      containerEl._children[0].dispatchEvent('mouseenter');
+
+      tabBar.updateSize({
+        ...item,
+        sizeSnapshot: {
+          conversationId: 'one', revision: 1,
+          files: { status: 'known', bytes: 2048, },
+        },
+      });
+
       expect(containerEl._children[0].getAttribute('aria-label')).toBe('My Conversation');
     });
 

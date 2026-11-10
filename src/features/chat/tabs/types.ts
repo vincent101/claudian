@@ -398,6 +398,8 @@ export interface TabBarItem {
   conversationTitle: string | null;
   /** Bound conversation id for rename; null for a new tab without a conversation. */
   conversationId: string | null;
+  /** Provider session id behind the identity tooltip; null until a session exists. */
+  sessionId: string | null;
   /** Only provider-validated, currently published statistics are rendered. */
   sizeSnapshot?: ConversationSizeSnapshot;
 }
