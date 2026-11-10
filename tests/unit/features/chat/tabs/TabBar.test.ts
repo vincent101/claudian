@@ -109,6 +109,38 @@ describe('TabBar', () => {
       expect(containerEl._children[0].getAttribute('title')).toBeNull();
     });
 
+    it('uses only the published current native file reading', () => {
+      const containerEl = createMockEl();
+      const tabBar = new TabBar(containerEl, createMockCallbacks());
+      tabBar.update([createTabBarItem({
+        title: 'My Conversation', conversationId: 'one',
+        sizeSnapshot: {
+          conversationId: 'one', revision: 1,
+          files: { status: 'known', bytes: 2048, },
+        },
+      })]);
+      const label = containerEl._children[0].getAttribute('aria-label');
+      expect(label).toContain('Current session file 2.0 KiB');
+      expect(containerEl._children[0].getAttribute('title')).toBeNull();
+    });
+
+    it('requests an unknown bound conversation when its badge is hovered', () => {
+      const containerEl = createMockEl();
+      const onTabSizeRequest = jest.fn();
+      const tabBar = new TabBar(containerEl, { ...createMockCallbacks(), onTabSizeRequest });
+      tabBar.update([createTabBarItem({ id: 'tab-one', title: 'My Conversation', conversationId: 'one' })]);
+      expect(containerEl._children[0].getAttribute('aria-label')).toContain('Current session file unknown');
+      containerEl._children[0].dispatchEvent('mouseenter');
+      expect(onTabSizeRequest).toHaveBeenCalledWith('tab-one', 'one');
+    });
+
+    it('keeps the plain title tooltip for an unbound draft', () => {
+      const containerEl = createMockEl();
+      const tabBar = new TabBar(containerEl, createMockCallbacks());
+      tabBar.update([createTabBarItem({ title: 'My Conversation' })]);
+      expect(containerEl._children[0].getAttribute('aria-label')).toBe('My Conversation');
+    });
+
     it('should set a provider attribute for per-tab streaming colors', () => {
       const containerEl = createMockEl();
       const callbacks = createMockCallbacks();

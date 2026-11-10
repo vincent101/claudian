@@ -87,6 +87,9 @@
       "boundaryHeld": "已取消的回合尚未确认停止。排队的消息保持暂存，待该回合确认结束后才会发出。"
     },
     "history": {
+      "sessionFileKnown": "当前会话日志 {size}",
+      "sessionFileUnknown": "当前会话日志体积未知",
+      "sessionFileTooltip": "仅当前会话原生日志文件的磁盘体积，不包含父会话、分支来源或元数据。",
       "loading": "正在加载会话…",
       "waitingForIndex": "等待索引（排队）…",
       "buildingIndex": "建立索引 {percent}%",

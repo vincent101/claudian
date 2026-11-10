@@ -87,6 +87,9 @@
       "boundaryHeld": "キャンセルされたターンが停止を確認していません。キューのメッセージはターン終了が確認されるまで保留され、確認後にのみ送信されます。"
     },
     "history": {
+      "sessionFileKnown": "現在のセッションファイル {size}",
+      "sessionFileUnknown": "現在のセッションファイルのサイズは不明",
+      "sessionFileTooltip": "現在のセッションのネイティブログファイルのサイズのみ。親セッション、分岐元、メタデータは含みません。",
       "loading": "Loading conversation…",
       "waitingForIndex": "インデックスを待機中…",
       "buildingIndex": "インデックスを作成中 {percent}%",

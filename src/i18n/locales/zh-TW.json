@@ -87,6 +87,9 @@
       "boundaryHeld": "已取消的回合尚未確認停止。排隊的訊息保持暫存，待該回合確認結束後才會發出。"
     },
     "history": {
+      "sessionFileKnown": "目前會話日誌 {size}",
+      "sessionFileUnknown": "目前會話日誌體積未知",
+      "sessionFileTooltip": "僅目前會話原生日誌檔案的磁碟體積，不包含父會話、分支來源或中繼資料。",
       "loading": "正在載入對話…",
       "waitingForIndex": "等待索引（排隊）…",
       "buildingIndex": "建立索引 {percent}%",

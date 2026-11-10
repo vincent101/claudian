@@ -87,6 +87,9 @@
       "boundaryHeld": "Der abgebrochene Durchlauf hat sein Stoppen nicht bestätigt. Die wartende Nachricht bleibt zurückgehalten und wird erst gesendet, wenn das Ende bestätigt ist."
     },
     "history": {
+      "sessionFileKnown": "Aktuelle Sitzungsdatei {size}",
+      "sessionFileUnknown": "Größe der aktuellen Sitzungsdatei unbekannt",
+      "sessionFileTooltip": "Nur die Größe der nativen Protokolldatei der aktuellen Sitzung; ohne übergeordnete Sitzungen, Fork-Quellen und Metadaten.",
       "loading": "Loading conversation…",
       "waitingForIndex": "Warten auf Index…",
       "buildingIndex": "Index wird erstellt {percent}%",

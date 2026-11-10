@@ -87,6 +87,9 @@
       "boundaryHeld": "취소된 턴이 중지를 확인하지 않았습니다. 대기 중인 메시지는 턴 종료가 확인될 때까지 보관되며, 확인된 후에만 전송됩니다."
     },
     "history": {
+      "sessionFileKnown": "현재 세션 파일 {size}",
+      "sessionFileUnknown": "현재 세션 파일 크기 알 수 없음",
+      "sessionFileTooltip": "현재 세션의 원본 로그 파일 크기만 표시합니다. 부모 세션, 분기 원본 및 메타데이터는 제외합니다.",
       "loading": "Loading conversation…",
       "waitingForIndex": "인덱스 대기 중…",
       "buildingIndex": "인덱스 생성 중 {percent}%",

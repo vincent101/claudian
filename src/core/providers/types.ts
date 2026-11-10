@@ -559,7 +559,38 @@ export interface HistoryWindowPage {
   hasMoreAfter: boolean;
 }
 
+export interface ConversationSizeSnapshot {
+  conversationId: string;
+  revision: number;
+  files:
+    | { status: 'known'; bytes: number }
+    | { status: 'unknown'; reason: 'unsupported' | 'unavailable' };
+}
+
+export interface ConversationSizeSource {
+  readonly sessionId?: string | null;
+  readonly filePath?: string | null;
+}
+
+/** Only the current native file identity; never transcript content or persisted readings. */
+export interface ConversationSizeReadInput {
+  readonly id: string;
+  readonly providerId: ProviderId;
+  readonly source: ConversationSizeSource;
+}
+
+export interface ConversationSizeReadResult {
+  readonly snapshot: ConversationSizeSnapshot;
+}
+
 export interface ProviderConversationHistoryService {
+  /** Capture only the provider-owned size source, not transcript content. */
+  captureConversationSizeSource?(conversation: Conversation): ConversationSizeSource;
+  readConversationSize?(
+    input: ConversationSizeReadInput,
+    vaultPath: string | null,
+    options: { revision: number; signal?: AbortSignal },
+  ): Promise<ConversationSizeReadResult>;
   hydrateConversationHistory?(
     conversation: Conversation,
     vaultPath: string | null,

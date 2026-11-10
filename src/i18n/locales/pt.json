@@ -87,6 +87,9 @@
       "boundaryHeld": "O turno cancelado não confirmou a parada. Sua mensagem na fila fica retida e só será enviada quando o fim do turno for confirmado."
     },
     "history": {
+      "sessionFileKnown": "Arquivo da sessão atual {size}",
+      "sessionFileUnknown": "Tamanho do arquivo da sessão atual desconhecido",
+      "sessionFileTooltip": "Apenas o tamanho do registro nativo da sessão atual; exclui sessões anteriores, fontes de ramificações e metadados.",
       "loading": "Loading conversation…",
       "waitingForIndex": "Aguardando o índice…",
       "buildingIndex": "Criando índice {percent}%",

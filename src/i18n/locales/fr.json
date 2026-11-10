@@ -87,6 +87,9 @@
       "boundaryHeld": "Le tour annulé n'a pas confirmé son arrêt. Votre message en file reste retenu et ne partira qu'une fois la fin du tour confirmée."
     },
     "history": {
+      "sessionFileKnown": "Fichier de session actuel {size}",
+      "sessionFileUnknown": "Taille du fichier de session actuel inconnue",
+      "sessionFileTooltip": "Uniquement la taille du journal natif de la session actuelle ; exclut les sessions parentes, les sources de branche et les métadonnées.",
       "loading": "Loading conversation…",
       "waitingForIndex": "En attente de l’index…",
       "buildingIndex": "Création de l’index {percent} %",
