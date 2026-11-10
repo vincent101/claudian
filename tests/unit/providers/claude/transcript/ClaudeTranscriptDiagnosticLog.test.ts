@@ -183,6 +183,39 @@ describe('ClaudeTranscriptDiagnosticLog', () => {
     expect(content).not.toContain('private-agent-id');
   });
 
+  it('persists result-echo diagnostics with hashed uuids and a bounded hash list', async () => {
+    const log = new ClaudeTranscriptDiagnosticLog(vault);
+    const hashes = Array.from({ length: 12 }, (_, index) => log.hashId(`uuid-${index}`));
+    log.record({
+      phase: 'turn_result_echo',
+      echoStatus: 'present',
+      echoUuidHash: log.hashId('uuid-singular'),
+      echoUuidHashes: hashes,
+      echoUuidCount: hashes.length,
+      queuedTurnCount: 2,
+      resultIndex: 3,
+      echoSupport: 'singular+queuedTurnCount+plural+resultIndex',
+      echoPluralTruncated: true,
+      echoSingularMissingFromPlural: true,
+    });
+    log.record({ phase: 'turn_identity_result_echo', echoOutcome: 'bound' });
+
+    const content = await readFile(join(vault, '.claudian/diagnostics/transcript-tail.current.jsonl'), 'utf8');
+    const [echo, verdict] = content.trim().split('\n').map(line => JSON.parse(line));
+    expect(echo).toMatchObject({
+      phase: 'turn_result_echo',
+      echoStatus: 'present',
+      echoUuidCount: 12,
+      queuedTurnCount: 2,
+      resultIndex: 3,
+      echoPluralTruncated: true,
+      echoSingularMissingFromPlural: true,
+    });
+    expect(echo.echoUuidHashes).toEqual(hashes.slice(0, 8));
+    expect(verdict).toMatchObject({ phase: 'turn_identity_result_echo', echoOutcome: 'bound' });
+    expect(content).not.toContain('uuid-');
+  });
+
   it('keeps each serialized event within one kilobyte', async () => {
     const log = new ClaudeTranscriptDiagnosticLog(vault);
     log.record({ phase: 'callback_error', errorName: 'X'.repeat(10_000) });

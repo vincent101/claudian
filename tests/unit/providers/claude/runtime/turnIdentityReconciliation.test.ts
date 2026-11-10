@@ -140,6 +140,81 @@ describe('Turn identity reconciliation wiring (batch 1 observe bypass)', () => {
     }));
   });
 
+  it('consults the result-echo binding when the CLI result carries turn uuids', async () => {
+    sdkMock.setMockMessages([
+      { type: 'system', subtype: 'init', session_id: 'echo-session' },
+      { type: 'assistant', message: { content: [{ type: 'text', text: 'reply' }] } },
+      {
+        type: 'result',
+        subtype: 'success',
+        user_message_uuid: 'uuid-echo-1',
+        user_message_uuids: ['uuid-echo-1'],
+        queued_turn_count: 0,
+        result_index: 0,
+      },
+    ], { appendResult: false });
+    await startPersistentQuery(service);
+    jest.spyOn(service as any, 'buildSDKUserMessage').mockReturnValue({
+      type: 'user',
+      message: { role: 'user', content: 'hello' },
+      parent_tool_use_id: null,
+      session_id: 'echo-session',
+      uuid: 'uuid-echo-1',
+    });
+    const reconcileSpy = jest.spyOn((service as any).turnReconciliation, 'recordResultEcho');
+
+    const turn = service.prepareTurn({ turnId: 'echo-turn-1', text: 'hello' });
+    const chunks = await collectChunks(service.query(turn));
+
+    expect(chunks.some(chunk => chunk.type === 'done')).toBe(true);
+    expect(reconcileSpy).toHaveBeenCalledTimes(1);
+    expect(reconcileSpy).toHaveBeenCalledWith({
+      leaseTurnId: 'echo-turn-1',
+      consumedUuids: ['uuid-echo-1'],
+      queuedTurnCount: 0,
+      resultIndex: 0,
+    });
+    expect((service as any).turnReconciliation.getResultEchoStats()).toEqual({
+      consulted: 1,
+      bound: 1,
+      mismatch: 0,
+      unbound: 0,
+    });
+  });
+
+  it('falls back to the existing binding heuristic when the result carries no echo (old CLI)', async () => {
+    sdkMock.setMockMessages([
+      { type: 'system', subtype: 'init', session_id: 'echo-session' },
+      { type: 'assistant', message: { content: [{ type: 'text', text: 'reply' }] } },
+      { type: 'result', subtype: 'success' },
+    ], { appendResult: false });
+    await startPersistentQuery(service);
+    const reconcileSpy = jest.spyOn((service as any).turnReconciliation, 'recordResultEcho');
+
+    const turn = service.prepareTurn({ turnId: 'echo-turn-2', text: 'hello' });
+    const chunks = await collectChunks(service.query(turn));
+
+    expect(chunks.some(chunk => chunk.type === 'done')).toBe(true);
+    expect(reconcileSpy).not.toHaveBeenCalled();
+    expect((service as any).turnReconciliation.getResultEchoStats().consulted).toBe(0);
+  });
+
+  it('never lets a failing echo consultation break settlement', async () => {
+    sdkMock.setMockMessages([
+      { type: 'system', subtype: 'init', session_id: 'echo-session' },
+      { type: 'assistant', message: { content: [{ type: 'text', text: 'reply' }] } },
+      { type: 'result', subtype: 'success', user_message_uuid: 'uuid-echo-3' },
+    ], { appendResult: false });
+    await startPersistentQuery(service);
+    jest.spyOn((service as any).turnReconciliation, 'recordResultEcho')
+      .mockImplementation(() => { throw new Error('boom'); });
+
+    const turn = service.prepareTurn({ turnId: 'echo-turn-3', text: 'hello' });
+    const chunks = await collectChunks(service.query(turn));
+
+    expect(chunks.some(chunk => chunk.type === 'done')).toBe(true);
+  });
+
   it('advances the session generation on session switch and reset', async () => {
     await startPersistentQuery(service);
     const reconciliation = (service as any).turnReconciliation;

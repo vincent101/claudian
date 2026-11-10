@@ -120,6 +120,15 @@ import {
   QueryOptionsBuilder,
   type QueryOptionsContext,
 } from './ClaudeQueryOptionsBuilder';
+import {
+  detectTurnEchoSupport,
+  formatTurnEchoSupport,
+  readClaudeCodeVersion,
+  readResultTurnEcho,
+  RESULT_TURN_ECHO_LOG_HASH_LIMIT,
+  resultEchoConsumedUuids,
+  type ResultTurnEchoRead,
+} from './ClaudeResultTurnEcho';
 import { executeClaudeRewind } from './ClaudeRewindService';
 import { SessionManager } from './ClaudeSessionManager';
 import { ClaudeTurnReconciliationCoordinator } from './ClaudeTurnReconciliationCoordinator';
@@ -394,6 +403,12 @@ export class ClaudianService implements ChatRuntime {
   private historyRecoverySource: (() => FullHistoryIterable) | null = null;
   private transcriptDiagnosticLog: ClaudeTranscriptDiagnosticLog | null = null;
   private transcriptCliVersion: string | undefined;
+  /**
+   * CLI build version from the latest `system/init` frame. Diagnostics and
+   * degradation expectations only (G1 result echo); never gates startup or
+   * sending — old CLIs simply produce no echo fields.
+   */
+  private cliCodeVersion: string | undefined;
   /** Query boundary isolation (2.4): the live persistent-query scope, null when retired/absent. */
   private currentQueryScope: QueryScope | null = null;
   // W4a typed command facet: eligibility/source metadata and invalidation
@@ -1433,6 +1448,14 @@ export class ClaudianService implements ChatRuntime {
       return;
     }
 
+    // G1: the CLI build version rides the init frame. Recorded for the
+    // result-echo diagnostics only — echo behavior keys on field presence,
+    // never on this value, so an unknown/old CLI cannot block anything.
+    const cliCodeVersion = readClaudeCodeVersion(message);
+    if (cliCodeVersion !== null) {
+      this.cliCodeVersion = cliCodeVersion;
+    }
+
     if (message.type === 'user' && (message as SDKUserMessage & { isReplay?: boolean }).isReplay === true) {
       return;
     }
@@ -1577,6 +1600,7 @@ export class ClaudianService implements ChatRuntime {
           result.subtype === 'success' && result.is_error !== true,
         );
       }
+      this.noteResultTurnEcho(message, activeTurn);
       await this.settleTurnAtResult(activeTurn);
     }
   }
@@ -1909,6 +1933,72 @@ export class ClaudianService implements ChatRuntime {
     } catch {
       // The bypass never gates settlement or cancellation.
     }
+  }
+
+  /**
+   * G1: consume the CLI-produced result turn echo. CLI >= 2.1.193 writes
+   * `user_message_uuid` (2.1.259 adds `user_message_uuids`; 2.1.303 adds
+   * `result_index`) into the result frame; the 0.2.112 SDK transport pipes
+   * both directions untouched, so the fields are read structurally. Absence
+   * is normal degradation (older CLI, or a turn with no client uuid): the
+   * existing lease/reconciliation heuristics stay authoritative.
+   */
+  private noteResultTurnEcho(message: SDKMessage, turn: RuntimeTurn): void {
+    const read = readResultTurnEcho(message);
+    this.recordResultEchoDiagnostic(turn, read);
+    // Auto turns never dispatched a client uuid, so there is no binding to
+    // consult — only the raw echo stays in diagnostics.
+    if (read.echo === null || turn.kind !== 'user') {
+      return;
+    }
+    try {
+      this.turnReconciliation.recordResultEcho({
+        leaseTurnId: turn.id,
+        consumedUuids: resultEchoConsumedUuids(read.echo),
+        ...(read.echo.queuedTurnCount !== null ? { queuedTurnCount: read.echo.queuedTurnCount } : {}),
+        ...(read.echo.resultIndex !== null ? { resultIndex: read.echo.resultIndex } : {}),
+      });
+    } catch {
+      // Reconciliation stays a read-only bypass: an echo consultation must
+      // never affect settlement, lease handling or waiters.
+    }
+  }
+
+  /** Raw echo diagnostic (hashed identities only) with the CLI capability expectation. */
+  private recordResultEchoDiagnostic(turn: RuntimeTurn, read: ResultTurnEchoRead): void {
+    const log = this.transcriptDiagnosticLog;
+    if (!log) return;
+    const echo = read.echo;
+    const consumedUuids = echo === null ? [] : resultEchoConsumedUuids(echo);
+    const support = detectTurnEchoSupport(this.cliCodeVersion);
+    log.record({
+      phase: 'turn_result_echo',
+      turnIdHash: log.hashId(turn.id),
+      generation: turn.generation,
+      leaseKind: turn.kind,
+      echoStatus: read.status,
+      ...(echo?.userMessageUuid !== null && echo?.userMessageUuid !== undefined
+        ? { echoUuidHash: log.hashId(echo.userMessageUuid) }
+        : {}),
+      ...(consumedUuids.length > 0
+        ? {
+            echoUuidCount: consumedUuids.length,
+            echoUuidHashes: consumedUuids
+              .slice(0, RESULT_TURN_ECHO_LOG_HASH_LIMIT)
+              .map(uuid => log.hashId(uuid)),
+          }
+        : {}),
+      ...(echo?.userMessageUuidsTruncated === true ? { echoPluralTruncated: true } : {}),
+      ...(echo?.userMessageUuidMissingFromPlural === true ? { echoSingularMissingFromPlural: true } : {}),
+      ...(echo?.queuedTurnCount !== null && echo?.queuedTurnCount !== undefined
+        ? { queuedTurnCount: echo.queuedTurnCount }
+        : {}),
+      ...(echo?.resultIndex !== null && echo?.resultIndex !== undefined
+        ? { resultIndex: echo.resultIndex }
+        : {}),
+      ...(support !== null ? { echoSupport: formatTurnEchoSupport(support) } : {}),
+      ...(this.cliCodeVersion !== undefined ? { cliVersion: this.cliCodeVersion } : {}),
+    });
   }
 
   /**
