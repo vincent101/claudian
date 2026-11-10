@@ -333,11 +333,6 @@ export class ClaudianView extends ItemView {
       onNewTab: () => isCurrent() ? this.createNewTab() : Promise.resolve(),
       onTabReorder: (tabId, targetIndex) => { if (isCurrent()) this.handleTabReorder(tabId, targetIndex); },
       onTabRename: (tabId) => { if (isCurrent()) this.handleTabRename(tabId); },
-      onTabSizeRequest: (tabId, conversationId) => {
-        if (isCurrent() && this.tabManager?.getTab(tabId)?.conversationId === conversationId) {
-          void this.plugin.conversationSizes?.refresh(conversationId, true);
-        }
-      },
     });
     fragment.appendChild(this.tabBarContainerEl);
 
@@ -521,11 +516,7 @@ export class ClaudianView extends ItemView {
   }
 
   onConversationSizePublished(conversationId: string): void {
-    const snapshot = this.plugin.conversationSizes.getSnapshot(conversationId);
-    if (!snapshot || !this.tabManager) return;
-    for (const item of this.tabManager.getTabBarItems()) {
-      if (item.conversationId === conversationId) this.tabBar?.updateSize(item);
-    }
+    if (!this.tabManager) return;
     if (this.historyDropdown) {
       this.tabManager.getActiveTab()?.controllers.conversationController
         ?.onConversationSizePublished(conversationId, this.historyDropdown);

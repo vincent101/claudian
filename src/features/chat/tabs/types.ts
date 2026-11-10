@@ -1,6 +1,6 @@
 import type { Component, WorkspaceLeaf } from 'obsidian';
 
-import type { AppTabManagerState, ConversationSizeSnapshot, HistoryLoadProgress, InstructionRefineService, ProviderId, TitleGenerationService } from '../../../core/providers/types';
+import type { AppTabManagerState, HistoryLoadProgress, InstructionRefineService, ProviderId, TitleGenerationService } from '../../../core/providers/types';
 import type { ChatRuntime } from '../../../core/runtime/ChatRuntime';
 import type { SlashCommandDropdown } from '../../../shared/components/SlashCommandDropdown';
 import type { AutoTurnProjectionController } from '../controllers/AutoTurnProjectionController';
@@ -400,6 +400,4 @@ export interface TabBarItem {
   conversationId: string | null;
   /** Provider session id behind the identity tooltip; null until a session exists. */
   sessionId: string | null;
-  /** Only provider-validated, currently published statistics are rendered. */
-  sizeSnapshot?: ConversationSizeSnapshot;
 }

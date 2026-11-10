@@ -256,7 +256,7 @@ it('P2-1 publishes the delayed stat to a rerendered visible history row without 
   } finally { pending.resolve(captured); await reading; }
 });
 
-it.each([false, true])('P2-2 publishes a same-session tab refresh to the visible list (rerender=%s)', async rerender => {
+it.each([false, true])('P2-2 publishes a forced same-session refresh to the visible list (rerender=%s)', async rerender => {
   const f = await fixture(`p2-cross-surface-${rerender}`);
   const actualStat = fs.stat;
   const oldStat = await actualStat(f.path);
@@ -270,8 +270,7 @@ it.each([false, true])('P2-2 publishes a same-session tab refresh to the visible
   await Promise.resolve();
   await appendFile(f.path, '456');
   const latestStat = await actualStat(f.path);
-  f.badge().dispatchEvent(new MouseEvent('mouseenter'));
-  const tabReading = f.plugin.conversationSizes.refresh(f.input.id);
+  const tabReading = f.plugin.conversationSizes.refresh(f.input.id, true);
   await Promise.resolve();
   if (rerender) f.fields.updateHistoryDropdown();
   const currentLine = f.line();
@@ -282,7 +281,6 @@ it.each([false, true])('P2-2 publishes a same-session tab refresh to the visible
     await tabReading;
     expect(f.line()).toBe(currentLine);
     expect(f.badge()).toBe(currentBadge);
-    expect(f.badge().getAttribute('aria-label')).toContain('6 B');
     expect(currentLine.textContent).toContain('6 B');
     menuPending.resolve(oldStat);
     expect(await menuReading).toBeUndefined();
@@ -370,7 +368,6 @@ it('P2-2 does not publish a replacement object into rows bound to the old same-I
     f.badge().dispatchEvent(new MouseEvent('mouseenter'));
     await f.plugin.conversationSizes.refresh(replacement.id);
     expect(oldLine.textContent).toContain('unknown');
-    expect(f.badge().getAttribute('aria-label')).toContain('6 B');
     pending.resolve(captured);
     expect(await oldReading).toBeUndefined();
     f.fields.updateHistoryDropdown();
@@ -436,30 +433,16 @@ it('opens history and refreshes known values through the real view/controller ch
   expect(build).not.toHaveBeenCalled();
 });
 
-it('connects mouseenter to onTabSizeRequest, refreshes known bytes, and preserves drag nodes on publication', async () => {
-  const f = await fixture('hover-refresh');
+it('does not start a native stat on tab hover or focus', async () => {
+  const f = await fixture('hover-no-request');
   const read = jest.spyOn(ProviderRegistry.getConversationHistoryService('codex'), 'readConversationSize');
-  const reorder = jest.spyOn(f.fields as unknown as { handleTabReorder(id: string, index: number): void }, 'handleTabReorder').mockImplementation(() => {});
-  const original = f.badge();
-  original.dispatchEvent(new MouseEvent('mouseenter'));
-  await f.plugin.conversationSizes.refresh(f.input.id);
-  f.paint();
-  expect(original.getAttribute('aria-label')).toContain('3 B');
-  expect(f.badge()).toBe(original);
-  expect(original.getAttribute('title')).toBeNull();
-  original.dispatchEvent(new MouseEvent('mouseleave'));
-  await appendFile(f.path, '456');
-  original.dispatchEvent(new MouseEvent('mouseenter'));
-  original.dispatchEvent(new Event('dragstart'));
-  await f.plugin.conversationSizes.refresh(f.input.id);
-  f.paint();
-  expect(f.badge()).toBe(original);
-  expect(original.classList.contains('claudian-tab-badge-dragging')).toBe(true);
-  expect(original.getAttribute('aria-label')).toContain('6 B');
-  expect(read).toHaveBeenCalledTimes(2);
-  const target = f.fields.tabBarContainerEl.lastElementChild!;
-  target.dispatchEvent(new MouseEvent('drop', { clientX: 1, cancelable: true }));
-  expect(reorder).toHaveBeenCalledWith('tab-one', 1);
+  const badge = f.badge();
+  badge.dispatchEvent(new MouseEvent('mouseenter'));
+  badge.dispatchEvent(new Event('focus'));
+  await new Promise(resolve => setImmediate(resolve));
+  expect(read).not.toHaveBeenCalled();
+  expect(f.plugin.conversationSizes.getSnapshot(f.input.id)).toBeUndefined();
+  expect(badge.getAttribute('aria-label')).toBe('Fixture');
   expect(f.write).not.toHaveBeenCalled();
 });
 
@@ -499,7 +482,6 @@ it('refreshes file bytes after a real normal save even when metadata writing fai
   await expect(controller.save()).rejects.toBe(failure);
   await f.plugin.conversationSizes.refresh(f.input.id);
   expect(f.plugin.conversationSizes.getSnapshot(f.input.id)?.files).toEqual({ status: 'known', bytes: 6 });
-  expect(f.badge().getAttribute('aria-label')).toContain('6 B');
   expect(write).toHaveBeenCalledTimes(1);
   expect(JSON.parse(write.mock.calls[0][1])).not.toHaveProperty('sizeSnapshot');
   expect(f.input).not.toHaveProperty('sizeSnapshot');
@@ -532,27 +514,6 @@ it.each(['closed', 'reopened', 'rerendered'] as const)('does not apply a previou
   const currentSize = expect.stringContaining('6 B');
   expect(action === 'reopened' ? f.line().textContent : null).toEqual(action === 'reopened' ? currentSize : null);
   expect(f.fields.historyDropdown.classList.contains('visible')).toBe(action !== 'closed');
-});
-
-it('keeps a fresh rehover result when the previous hover stat arrives last', async () => {
-  const f = await fixture('rehover-race');
-  const actualStat = fs.stat;
-  const captured = await actualStat(f.path);
-  let release!: () => void;
-  const pending = new Promise<Awaited<ReturnType<typeof fs.stat>>>(resolve => { release = () => resolve(captured); });
-  jest.spyOn(fs, 'stat').mockImplementationOnce(() => pending as ReturnType<typeof fs.stat>);
-  const badge = f.badge();
-  badge.dispatchEvent(new MouseEvent('mouseenter'));
-  const old = f.plugin.conversationSizes.refresh(f.input.id);
-  await Promise.resolve();
-  badge.dispatchEvent(new MouseEvent('mouseleave'));
-  await appendFile(f.path, '456');
-  badge.dispatchEvent(new MouseEvent('mouseenter'));
-  await f.plugin.conversationSizes.refresh(f.input.id);
-  expect(badge.getAttribute('aria-label')).toContain('6 B');
-  release();
-  expect(await old).toBeUndefined();
-  expect(badge.getAttribute('aria-label')).toContain('6 B');
 });
 
 it.each(['leave', 'rebind', 'close', 'reopen'] as const)('rejects a late hover result after tab %s', async action => {

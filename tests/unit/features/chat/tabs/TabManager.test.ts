@@ -1452,12 +1452,8 @@ describe('TabManager - Tab Bar Data', () => {
       expect(manager.getTabBarItems()[0].sessionId).toBeNull();
     });
 
-    it('exposes only the published conversation size on a bound tab', async () => {
-      const sizeSnapshot = {
-        conversationId: 'conv-1', revision: 1,
-        files: { status: 'known', bytes: 12, },
-      };
-      const getSnapshot = jest.fn().mockReturnValue(sizeSnapshot);
+    it('does not attach a conversation size snapshot to a tab bar item', async () => {
+      const getSnapshot = jest.fn();
       manager = createManager({
         plugin: createMockPlugin({
           getConversationSync: jest.fn().mockReturnValue({ id: 'conv-1', title: 'T', messageCount: 12 }),
@@ -1468,18 +1464,10 @@ describe('TabManager - Tab Bar Data', () => {
       });
       await manager.createTab();
       const item = manager.getTabBarItems()[0];
-      expect(getSnapshot).toHaveBeenCalledWith('conv-1');
-      expect(item.sizeSnapshot).toEqual(sizeSnapshot);
+      expect(item).not.toHaveProperty('sizeSnapshot');
       expect(item).not.toHaveProperty('usage');
       expect(item).not.toHaveProperty('messageCount');
-    });
-
-    it('omits a size snapshot for an unbound tab', async () => {
-      manager = createManager({
-        tabFactory: () => createMockTabData({ id: 'tab-1', conversationId: null }),
-      });
-      await manager.createTab();
-      expect(manager.getTabBarItems()[0].sizeSnapshot).toBeUndefined();
+      expect(getSnapshot).not.toHaveBeenCalled();
     });
 
     it('should expose null conversation id for an unbound tab', async () => {
