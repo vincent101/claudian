@@ -12,6 +12,15 @@ export class VaultFileAdapter {
 
   constructor(private app: App) {}
 
+  /**
+   * Host identity (the Obsidian App). Storage layers key same-host write
+   * ordering on this so every adapter instance over one app shares one
+   * PersistenceCoordinator.
+   */
+  get host(): object {
+    return this.app;
+  }
+
   async exists(path: string): Promise<boolean> {
     return this.app.vault.adapter.exists(path);
   }

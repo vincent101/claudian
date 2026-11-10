@@ -1,5 +1,6 @@
 import { ProviderRegistry } from '../providers/ProviderRegistry';
 import { DEFAULT_CHAT_PROVIDER_ID } from '../providers/types';
+import { PersistenceCoordinator, resolvePersistenceHost } from '../storage/PersistenceCoordinator';
 import type { VaultFileAdapter } from '../storage/VaultFileAdapter';
 import type {
   Conversation,
@@ -14,7 +15,21 @@ export {
 };
 
 export class SessionStorage {
-  constructor(private adapter: VaultFileAdapter) {}
+  /**
+   * Write ordering is host-scoped (S slice): every instance constructed over
+   * the same App shares one coordinator, so cross-instance writes to the same
+   * record serialize in admission order instead of racing on the file.
+   */
+  constructor(
+    private adapter: VaultFileAdapter,
+    private readonly coordinator: PersistenceCoordinator = PersistenceCoordinator.forHost(
+      resolvePersistenceHost(adapter),
+    ),
+  ) {}
+
+  private enqueueWrite(id: string, write: () => Promise<void>): Promise<void> {
+    return this.coordinator.enqueue(this.getMetadataPath(id), write);
+  }
 
   getMetadataPath(id: string): string {
     return `${SESSIONS_PATH}/${id}.meta.json`;
@@ -27,11 +42,17 @@ export class SessionStorage {
   async saveMetadata(metadata: SessionMetadata): Promise<void> {
     const filePath = this.getMetadataPath(metadata.id);
     const content = JSON.stringify(metadata, null, 2);
-    await this.adapter.write(filePath, content);
-    await this.deleteLegacyMetadataIfPresent(metadata.id);
+    await this.enqueueWrite(metadata.id, async () => {
+      await this.adapter.write(filePath, content);
+      await this.deleteLegacyMetadataIfPresent(metadata.id);
+    });
   }
 
   async loadMetadata(id: string): Promise<SessionMetadata | null> {
+    // Read barrier: never observe a stale file while a previously admitted
+    // write to this record is still in flight (any instance over the host).
+    await this.coordinator.drain(this.getMetadataPath(id));
+
     const filePath = await this.getLoadPath(id);
 
     try {
@@ -53,11 +74,16 @@ export class SessionStorage {
   }
 
   async deleteMetadata(id: string): Promise<void> {
-    await this.adapter.delete(this.getMetadataPath(id));
-    await this.deleteLegacyMetadataIfPresent(id);
+    await this.enqueueWrite(id, async () => {
+      await this.adapter.delete(this.getMetadataPath(id));
+      await this.deleteLegacyMetadataIfPresent(id);
+    });
   }
 
   async listMetadata(): Promise<SessionMetadata[]> {
+    // Read barrier across every pending metadata write on this host.
+    await this.coordinator.drainMatching(`${SESSIONS_PATH}/`);
+
     const metas: SessionMetadata[] = [];
 
     const files = await this.listUniqueMetadataFiles();

@@ -5,6 +5,7 @@ import { ClaudianSettingsStorage, type StoredClaudianSettings } from '../../../a
 import { SESSIONS_PATH, SessionStorage } from '../../../core/bootstrap/SessionStorage';
 import { CLAUDIAN_STORAGE_PATH } from '../../../core/bootstrap/StoragePaths';
 import type { AppTabManagerState } from '../../../core/providers/types';
+import { PersistenceCoordinator, TAB_LAYOUT_RESOURCE } from '../../../core/storage/PersistenceCoordinator';
 import { VaultFileAdapter } from '../../../core/storage/VaultFileAdapter';
 import type {
   SlashCommand,
@@ -39,16 +40,21 @@ export class StorageService {
   private adapter: VaultFileAdapter;
   private plugin: Plugin;
   private app: App;
+  private readonly persistence: PersistenceCoordinator;
 
   constructor(plugin: Plugin, adapter?: VaultFileAdapter) {
     this.plugin = plugin;
     this.app = plugin.app;
     this.adapter = adapter ?? new VaultFileAdapter(this.app);
+    // Same-host write ordering (S slice): shares one coordinator with
+    // SharedStorageService over the same app so metadata writes and layout
+    // RMWs serialize across both services.
+    this.persistence = PersistenceCoordinator.forHost(this.app);
     this.ccSettings = new CCSettingsStorage(this.adapter);
     this.claudianSettings = new ClaudianSettingsStorage(this.adapter);
     this.commands = new SlashCommandStorage(this.adapter);
     this.skills = new SkillStorage(this.adapter);
-    this.sessions = new SessionStorage(this.adapter);
+    this.sessions = new SessionStorage(this.adapter, this.persistence);
     this.mcp = new McpStorage(this.adapter);
     this.agents = new AgentVaultStorage(this.adapter);
   }
@@ -115,6 +121,8 @@ export class StorageService {
 
   async getTabManagerState(): Promise<TabManagerPersistedState | null> {
     try {
+      // Read barrier: mirror the shared-app layout lane before reading.
+      await this.persistence.drain(TAB_LAYOUT_RESOURCE);
       const data = await this.plugin.loadData();
       if (data?.tabManagerState) {
         return this.validateTabManagerState(data.tabManagerState);
@@ -169,9 +177,13 @@ export class StorageService {
 
   async setTabManagerState(state: TabManagerPersistedState): Promise<void> {
     try {
-      const data = (await this.plugin.loadData()) || {};
-      data.tabManagerState = state;
-      await this.plugin.saveData(data);
+      // One lane job per RMW — serialized with SharedStorageService's layout
+      // writes on the same host app (see TAB_LAYOUT_RESOURCE).
+      await this.persistence.enqueue(TAB_LAYOUT_RESOURCE, async () => {
+        const data = (await this.plugin.loadData()) || {};
+        data.tabManagerState = state;
+        await this.plugin.saveData(data);
+      });
     } catch {
       new Notice('Failed to save tab layout');
     }
