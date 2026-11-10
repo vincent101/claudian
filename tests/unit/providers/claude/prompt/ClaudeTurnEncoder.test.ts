@@ -1,23 +1,10 @@
 import type { ChatTurnRequest } from '@/core/runtime/types';
 import { encodeClaudeTurn } from '@/providers/claude/prompt/ClaudeTurnEncoder';
 
-function createMockMcpManager() {
-  return {
-    extractMentions: jest.fn().mockReturnValue(new Set<string>()),
-    transformMentions: jest.fn().mockImplementation((text: string) => text),
-  };
-}
-
 describe('encodeClaudeTurn', () => {
-  let mcpManager: ReturnType<typeof createMockMcpManager>;
-
-  beforeEach(() => {
-    mcpManager = createMockMcpManager();
-  });
-
   it('should return PreparedChatTurn with correct shape', () => {
     const request: ChatTurnRequest = { turnId: 'turn-encoder-1', text: 'hello' };
-    const result = encodeClaudeTurn(request, mcpManager);
+    const result = encodeClaudeTurn(request);
 
     expect(result).toEqual({
       turnId: 'turn-encoder-1',
@@ -25,22 +12,21 @@ describe('encodeClaudeTurn', () => {
       persistedContent: 'hello',
       prompt: 'hello',
       isCompact: false,
-      mcpMentions: new Set(),
     });
   });
 
   it('should detect /compact command', () => {
-    const result = encodeClaudeTurn({ turnId: 'turn-encoder', text: '/compact' }, mcpManager);
+    const result = encodeClaudeTurn({ turnId: 'turn-encoder', text: '/compact' });
     expect(result.isCompact).toBe(true);
   });
 
   it('should detect /compact with arguments', () => {
-    const result = encodeClaudeTurn({ turnId: 'turn-encoder', text: '/compact summarize' }, mcpManager);
+    const result = encodeClaudeTurn({ turnId: 'turn-encoder', text: '/compact summarize' });
     expect(result.isCompact).toBe(true);
   });
 
   it('should not treat "compact" without slash as compact', () => {
-    const result = encodeClaudeTurn({ turnId: 'turn-encoder', text: 'compact this' }, mcpManager);
+    const result = encodeClaudeTurn({ turnId: 'turn-encoder', text: 'compact this' });
     expect(result.isCompact).toBe(false);
   });
 
@@ -52,7 +38,7 @@ describe('encodeClaudeTurn', () => {
       editorSelection: { notePath: 'test.md', mode: 'selection', selectedText: 'selected' } as any,
       browserSelection: { source: 'surfing-view', selectedText: 'browser text' } as any,
     };
-    const result = encodeClaudeTurn(request, mcpManager);
+    const result = encodeClaudeTurn(request);
 
     expect(result.persistedContent).toBe('/compact');
     expect(result.prompt).toBe('/compact');
@@ -64,7 +50,7 @@ describe('encodeClaudeTurn', () => {
       text: 'hello',
       currentNotePath: 'notes/test.md',
     };
-    const result = encodeClaudeTurn(request, mcpManager);
+    const result = encodeClaudeTurn(request);
 
     expect(result.persistedContent).toContain('<current_note>');
     expect(result.persistedContent).toContain('notes/test.md');
@@ -80,7 +66,7 @@ describe('encodeClaudeTurn', () => {
         selectedText: 'selected code',
       } as any,
     };
-    const result = encodeClaudeTurn(request, mcpManager);
+    const result = encodeClaudeTurn(request);
 
     expect(result.persistedContent).toContain('<editor_selection');
     expect(result.persistedContent).toContain('selected code');
@@ -96,7 +82,7 @@ describe('encodeClaudeTurn', () => {
         title: 'Test Page',
       } as any,
     };
-    const result = encodeClaudeTurn(request, mcpManager);
+    const result = encodeClaudeTurn(request);
 
     expect(result.persistedContent).toContain('<browser_selection');
     expect(result.persistedContent).toContain('browser text');
@@ -111,7 +97,7 @@ describe('encodeClaudeTurn', () => {
         nodeIds: ['node-1', 'node-2'],
       } as any,
     };
-    const result = encodeClaudeTurn(request, mcpManager);
+    const result = encodeClaudeTurn(request);
 
     expect(result.persistedContent).toContain('<canvas_selection');
     expect(result.persistedContent).toContain('diagrams/overview.canvas');
@@ -119,22 +105,16 @@ describe('encodeClaudeTurn', () => {
     expect(result.persistedContent).toContain('node-2');
   });
 
-  it('should extract and transform MCP mentions', () => {
-    const mentions = new Set(['server-a']);
-    mcpManager.extractMentions.mockReturnValue(mentions);
-    mcpManager.transformMentions.mockImplementation((text: string) => text + ' [transformed]');
+  it('should keep @server text as plain text (no MCP mention machinery)', () => {
+    const result = encodeClaudeTurn({ turnId: 'turn-encoder', text: '@server-a hello' });
 
-    const result = encodeClaudeTurn({ turnId: 'turn-encoder', text: '@server-a hello' }, mcpManager);
-
-    expect(mcpManager.extractMentions).toHaveBeenCalledWith(result.persistedContent);
-    expect(result.mcpMentions).toBe(mentions);
-    expect(result.prompt).toContain('[transformed]');
-    // persistedContent should NOT have the transformation
-    expect(result.persistedContent).not.toContain('[transformed]');
+    // No suffix transformation: an @name is just text now.
+    expect(result.prompt).toBe('@server-a hello');
+    expect(result.persistedContent).toBe('@server-a hello');
   });
 
   it('should handle request with no optional fields', () => {
-    const result = encodeClaudeTurn({ turnId: 'turn-encoder', text: 'plain message' }, mcpManager);
+    const result = encodeClaudeTurn({ turnId: 'turn-encoder', text: 'plain message' });
 
     expect(result.persistedContent).toBe('plain message');
     expect(result.prompt).toBe('plain message');
@@ -144,7 +124,7 @@ describe('encodeClaudeTurn', () => {
 
   it('should preserve request reference in output', () => {
     const request: ChatTurnRequest = { turnId: 'turn-encoder-img', text: 'hello', images: [{ mediaType: 'image/png', data: 'abc' }] as any };
-    const result = encodeClaudeTurn(request, mcpManager);
+    const result = encodeClaudeTurn(request);
 
     expect(result.request).toBe(request);
   });

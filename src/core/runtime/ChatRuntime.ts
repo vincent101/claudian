@@ -40,7 +40,6 @@ export interface ChatRuntime {
     conversation: ChatRuntimeConversationState | null,
     externalContextPaths?: string[],
   ): void;
-  reloadMcpServers(): Promise<void>;
   ensureReady(options?: ChatRuntimeEnsureReadyOptions): Promise<boolean>;
   query(
     turn: PreparedChatTurn,

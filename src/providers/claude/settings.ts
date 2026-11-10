@@ -10,6 +10,7 @@ import { getProviderConfig, setProviderConfig } from '../../core/providers/provi
 import { getProviderEnvironmentVariables } from '../../core/providers/providerEnvironment';
 import type { HostnameCliPaths } from '../../core/types/settings';
 import { formatCustomModelLabel } from './modelLabels';
+import type { NativeMcpCutoverRecord } from './types/nativeMcpCutover';
 
 // Preset mechanics live in the provider-neutral core module; the Claude-named
 // re-exports keep existing imports stable.
@@ -41,6 +42,12 @@ export interface ClaudeProviderSettings {
   lastModel: string;
   environmentVariables: string;
   environmentHash: string;
+  /**
+   * Provider-owned, non-secret record of the user's one-shot confirmation
+   * for provider-native MCP management (design 2026-11-09). Must survive
+   * load/save normalization untouched.
+   */
+  nativeMcpCutover?: NativeMcpCutoverRecord;
 }
 
 export const DEFAULT_CLAUDE_PROVIDER_SETTINGS: Readonly<ClaudeProviderSettings> = Object.freeze({
@@ -144,6 +151,7 @@ export function getClaudeProviderSettings(
     environmentHash: (config.environmentHash as string | undefined)
       ?? (settings.lastEnvHash as string | undefined)
       ?? DEFAULT_CLAUDE_PROVIDER_SETTINGS.environmentHash,
+    nativeMcpCutover: config.nativeMcpCutover as NativeMcpCutoverRecord | undefined,
   };
 }
 

@@ -1,4 +1,7 @@
 import * as sdkModule from '@anthropic-ai/claude-agent-sdk';
+import * as fs from 'fs';
+import * as os from 'os';
+import * as path from 'path';
 
 import { type ColdStartQueryConfig, runColdStartQuery } from '@/providers/claude/runtime/claudeColdStartQuery';
 
@@ -12,7 +15,10 @@ const sdkMock = sdkModule as unknown as {
 // --- Mocks ---
 
 jest.mock('@/utils/path', () => ({
-  getVaultPath: jest.fn().mockReturnValue('/test/vault'),
+  // The cutover admission probes the real fs at the vault root; the value is
+  // swapped to a fresh temp dir in beforeEach so no machine-local vault can
+  // flip these tests to review-required.
+  getVaultPath: jest.fn(),
 }));
 
 jest.mock('@/utils/env', () => ({
@@ -56,10 +62,17 @@ function createConfig(overrides?: Partial<ColdStartQueryConfig>): ColdStartQuery
 
 // --- Tests ---
 
+let vaultRoot: string;
+
 beforeEach(() => {
   sdkMock.resetMockMessages();
-  (getVaultPath as jest.Mock).mockReturnValue('/test/vault');
+  vaultRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'claudian-coldstart-'));
+  (getVaultPath as jest.Mock).mockReturnValue(vaultRoot);
   (getMissingNodeError as jest.Mock).mockReturnValue(null);
+});
+
+afterEach(() => {
+  fs.rmSync(vaultRoot, { recursive: true, force: true });
 });
 
 describe('runColdStartQuery', () => {

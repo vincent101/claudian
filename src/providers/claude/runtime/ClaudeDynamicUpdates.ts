@@ -1,10 +1,8 @@
 import type {
-  McpServerConfig,
   PermissionMode as SDKPermissionMode,
   Query,
 } from '@anthropic-ai/claude-agent-sdk';
 
-import type { McpServerManager } from '../../../core/mcp/McpServerManager';
 import type {
   ChatRuntimeQueryOptions,
 } from '../../../core/runtime/types';
@@ -29,7 +27,6 @@ export interface ClaudeDynamicUpdateDeps {
   getScopedSettings: () => ClaudianSettings;
   getPermissionMode: () => string;
   resolveSDKPermissionMode: (mode: string) => SDKPermissionMode;
-  mcpManager: McpServerManager;
   buildPersistentQueryConfig: (
     vaultPath: string,
     cliPath: string,
@@ -151,28 +148,6 @@ export async function applyClaudeDynamicUpdates(
         config.permissionMode = permissionMode as PersistentQueryConfig['permissionMode'];
         config.sdkPermissionMode = sdkMode;
       });
-    }
-  }
-
-  const mcpMentions = queryOptions?.mcpMentions || new Set<string>();
-  const uiEnabledServers = queryOptions?.enabledMcpServers || new Set<string>();
-  const combinedMentions = new Set([...mcpMentions, ...uiEnabledServers]);
-  const mcpServers = deps.mcpManager.getActiveServers(combinedMentions);
-  const mcpServersKey = JSON.stringify(mcpServers);
-
-  if (deps.getCurrentConfig() && mcpServersKey !== deps.getCurrentConfig()!.mcpServersKey) {
-    const serverConfigs: Record<string, McpServerConfig> = {};
-    for (const [name, config] of Object.entries(mcpServers)) {
-      serverConfigs[name] = config as McpServerConfig;
-    }
-
-    try {
-      await persistentQuery.setMcpServers(serverConfigs);
-      deps.mutateCurrentConfig(config => {
-        config.mcpServersKey = mcpServersKey;
-      });
-    } catch {
-      deps.notifyFailure('Failed to update MCP servers');
     }
   }
 

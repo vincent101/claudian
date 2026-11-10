@@ -331,10 +331,6 @@
       "desc": "Masquez des commandes et compétences spécifiques du menu déroulant. Utile pour masquer les entrées Claude Code qui ne sont pas pertinentes pour Claudian. Saisissez les noms sans le slash initial, un par ligne.",
       "placeholder": "commit\nbuild\ntest"
     },
-    "mcpServers": {
-      "name": "Serveurs MCP",
-      "desc": "Gérez les configurations de serveurs MCP au niveau du vault stockées dans .claude/mcp.json. Les serveurs avec mode de sauvegarde de contexte nécessitent une @mention pour s'activer."
-    },
     "plugins": {
       "name": "Plugins Claude Code",
       "desc": "Gérez les plugins Claude Code découverts dans ~/.claude/plugins. Les plugins activés sont stockés par vault dans .claude/settings.json."
@@ -620,6 +616,7 @@
         "created": "Subagent \"{name}\" created"
       },
       "mcp": {
+        "name": "Serveurs MCP",
         "beforeCommand": "Codex manages MCP servers via its own CLI. Configure with",
         "afterCommand": "and they will be available in Claudian.",
         "learnMore": "Learn more"

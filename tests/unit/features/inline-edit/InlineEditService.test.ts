@@ -11,6 +11,15 @@ import * as fs from 'fs';
 // Mock fs module
 jest.mock('fs');
 
+// The MCP cutover admission probes fs/promises.lstat only (existence, never
+// content): stub it to a deterministic ENOENT so the fixture vault is a clean
+// install and no real thread-pool IO races the suite's timing contracts.
+jest.mock('fs/promises', () => ({
+  lstat: jest.fn().mockRejectedValue(
+    Object.assign(new Error('no such file'), { code: 'ENOENT' }),
+  ),
+}));
+
 // Now import after all mocks are set up
 import { buildInlineEditPrompt, parseInlineEditResponse } from '@/core/prompt/inlineEdit';
 import { getPathFromToolInput } from '@/core/tools/toolInput';
@@ -21,6 +30,8 @@ import {
 } from '@/providers/claude/auxiliary/ClaudeInlineEditService';
 import { buildCursorContext } from '@/utils/editor';
 
+// The fs/promises lstat stub above keeps the cutover admission on the
+// clean-install branch; the fixture vault path never reaches real IO.
 // Create a mock plugin
 function createMockPlugin(settings = {}) {
   return {
@@ -740,6 +751,18 @@ describe('InlineEditService', () => {
       (fs.existsSync as jest.Mock).mockReturnValue(true);
     });
 
+    // The aux cutover admission awaits a real fs/promises existence probe
+    // before reaching the SDK, so editText() no longer hits the SDK query in
+    // its first synchronous slice — wait for the spy-recorded turns instead
+    // of assuming a fixed event-loop turn count.
+    const waitForTurns = async (turns: unknown[], count: number): Promise<void> => {
+      const deadline = Date.now() + 1000;
+      while (turns.length < count && Date.now() < deadline) {
+        await new Promise(resolve => setTimeout(resolve, 1));
+      }
+      expect(turns).toHaveLength(count);
+    };
+
     // The SDK mock resolves turns immediately; a controlled spy lets each test
     // decide when a turn's init/assistant/result messages actually arrive, so
     // completions can be released after a reset/cancel and observed.
@@ -787,6 +810,7 @@ describe('InlineEditService', () => {
       try {
         const editA = service.editText(REQUEST);
         const editB = service.editText(REQUEST);
+        await waitForTurns(turns, 2);
 
         turns[0].release({ sessionId: 'session-A', text: '<replacement>A</replacement>' });
         await editA;
@@ -808,6 +832,7 @@ describe('InlineEditService', () => {
       try {
         const editA = service.editText(REQUEST);
         const editB = service.editText(REQUEST);
+        await waitForTurns(turns, 2);
 
         service.cancel();
         expect(turns[0].options.abortController?.signal.aborted).toBe(true);
@@ -829,6 +854,7 @@ describe('InlineEditService', () => {
         const editA = service.editText(REQUEST);
         service.resetConversation();
         const editB = service.editText(REQUEST);
+        await waitForTurns(turns, 2);
 
         turns[1].release({ sessionId: 'session-B', text: '<replacement>B</replacement>' });
         await editB;
@@ -838,7 +864,7 @@ describe('InlineEditService', () => {
         expect(resultA.success).toBe(true);
 
         const continuation = service.continueConversation('more');
-        expect(turns).toHaveLength(3);
+        await waitForTurns(turns, 3);
         expect(turns[2].options.resume).toBe('session-B');
 
         turns[2].release({ sessionId: 'session-B', text: '<replacement>C</replacement>' });

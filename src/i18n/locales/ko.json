@@ -331,10 +331,6 @@
       "desc": "드롭다운에서 특정 명령어와 스킬을 숨깁니다. Claudian과 관련 없는 Claude Code 항목을 숨기는 데 유용합니다. 앞의 슬래시 없이 이름을 한 줄에 하나씩 입력하세요.",
       "placeholder": "commit\nbuild\ntest"
     },
-    "mcpServers": {
-      "name": "MCP 서버",
-      "desc": ".claude/mcp.json에 저장된 Vault 수준의 MCP 서버 구성을 관리합니다. 컨텍스트 저장 모드 서버는 @mention으로 활성화해야 합니다."
-    },
     "plugins": {
       "name": "Claude Code 플러그인",
       "desc": "~/.claude/plugins에서 발견된 Claude Code 플러그인을 관리합니다. 활성화된 플러그인은 .claude/settings.json에 Vault별로 저장됩니다."
@@ -620,6 +616,7 @@
         "created": "Subagent \"{name}\" created"
       },
       "mcp": {
+        "name": "MCP 서버",
         "beforeCommand": "Codex manages MCP servers via its own CLI. Configure with",
         "afterCommand": "and they will be available in Claudian.",
         "learnMore": "Learn more"

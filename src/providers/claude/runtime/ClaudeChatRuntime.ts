@@ -8,7 +8,7 @@
  * - Persistent query for active chat conversation (eliminates cold-start latency)
  * - Cold-start queries for inline edit, title generation
  * - MessageChannel for message queueing and turn management
- * - Dynamic updates (model, thinking tokens, permission mode, MCP servers)
+ * - Dynamic updates (model, thinking tokens, permission mode)
  */
 
 import type {
@@ -24,7 +24,6 @@ import type {
 import { query as agentQuery } from '@anthropic-ai/claude-agent-sdk';
 import { Notice } from 'obsidian';
 
-import type { McpServerManager } from '../../../core/mcp/McpServerManager';
 import type {
   CommandDiscoveryToken,
   CommandRuntimeEligibility,
@@ -81,6 +80,8 @@ import {
   getLastUserMessage,
   isSessionExpiredError,
 } from '../../../utils/session';
+import type { ClaudeNativeMcpCutoverService} from '../app/ClaudeNativeMcpCutover';
+import { createClaudeNativeMcpCutoverService, resolveClaudeLaunchScopeInput } from '../app/ClaudeNativeMcpCutover';
 import { CLAUDE_PROVIDER_CAPABILITIES } from '../capabilities';
 import { loadSubagentFinalResult, loadSubagentToolCalls } from '../history/ClaudeHistoryStore';
 import { extractXmlTag } from '../history/sdkMessageParsing';
@@ -98,12 +99,17 @@ import {
 import { encodeClaudeTurn } from '../prompt/ClaudeTurnEncoder';
 import { isSessionInitEvent, isStreamChunk } from '../sdk/typeGuards';
 import type { SessionInitEvent, TransformEvent } from '../sdk/types';
+import { getClaudeProviderSettings, resolveClaudeSettingSources } from '../settings';
 import {
   transformSDKMessage,
 } from '../stream/transformClaudeMessage';
 import { ClaudeTranscriptDiagnosticLog, type TranscriptDiagnosticEvent } from '../transcript/ClaudeTranscriptDiagnosticLog';
 import { ClaudeTranscriptTurnObserver } from '../transcript/ClaudeTranscriptTurnObserver';
 import { getContextWindowSize } from '../types/models';
+import {
+  CutoverLaunchBlockedError,
+  resolveNativeMcpScopeKey,
+} from '../types/nativeMcpCutover';
 import { type ClaudeProviderState, getClaudeState } from '../types/providerState';
 import { createClaudeApprovalCallback } from './ClaudeApprovalHandler';
 import { applyClaudeDynamicUpdates } from './ClaudeDynamicUpdates';
@@ -142,7 +148,6 @@ export type {
 } from '../../../core/runtime/types';
 
 export interface ClaudeRuntimeServices {
-  mcpManager: McpServerManager;
   pluginManager: AppPluginManager;
   agentManager: Pick<AppAgentManager, 'setBuiltinAgentNames'>;
 }
@@ -325,7 +330,8 @@ export class ClaudianService implements ChatRuntime {
 
   // Modular components
   private sessionManager = new SessionManager();
-  private mcpManager: McpServerManager;
+  /** Cutover admission gate service (design 2026-11-09); lazily bound. */
+  private nativeMcpCutoverService: ClaudeNativeMcpCutoverService | null = null;
 
   private persistentQuery: Query | null = null;
   private messageChannel: MessageChannel | null = null;
@@ -458,20 +464,12 @@ export class ClaudianService implements ChatRuntime {
     };
   }
 
-  constructor(plugin: ClaudianPlugin, services: ClaudeRuntimeServices | McpServerManager) {
+  constructor(plugin: ClaudianPlugin, services: ClaudeRuntimeServices) {
     this.plugin = plugin;
     const legacyPlugin = this.getLegacyPluginDeps();
 
-    if ('mcpManager' in services) {
-      this.mcpManager = services.mcpManager;
-      this.pluginManager = services.pluginManager ?? legacyPlugin.pluginManager ?? null;
-      this.agentManager = services.agentManager ?? legacyPlugin.agentManager ?? null;
-      return;
-    }
-
-    this.mcpManager = services;
-    this.pluginManager = legacyPlugin.pluginManager ?? null;
-    this.agentManager = legacyPlugin.agentManager ?? null;
+    this.pluginManager = services.pluginManager ?? legacyPlugin.pluginManager ?? null;
+    this.agentManager = services.agentManager ?? legacyPlugin.agentManager ?? null;
   }
 
   getCapabilities() {
@@ -479,7 +477,7 @@ export class ClaudianService implements ChatRuntime {
   }
 
   prepareTurn(request: ChatTurnRequest): PreparedChatTurn {
-    return encodeClaudeTurn(request, this.mcpManager);
+    return encodeClaudeTurn(request);
   }
 
   consumeTurnMetadata(): ChatTurnMetadata {
@@ -635,10 +633,6 @@ export class ClaudianService implements ChatRuntime {
     return loadSubagentFinalResult(vaultPath, sessionId, agentId);
   }
 
-  async reloadMcpServers(): Promise<void> {
-    await this.mcpManager.loadServers();
-  }
-
   /**
    * Ensures the persistent query is running with current configuration.
    * Unified API that replaces preWarm() and restartPersistentQuery().
@@ -786,6 +780,27 @@ export class ClaudianService implements ChatRuntime {
     const config = this.buildPersistentQueryConfig(vaultPath, cliPath, externalContextPaths);
     this.currentConfig = config;
 
+    // Slot identity is captured with the synchronous build (2.4): any close
+    // landing while the flight is parked (gate/options awaits) orphans it.
+    const channel = this.messageChannel;
+    const abortController = this.queryAbortController;
+
+    // Cutover admission (design §5.1): strictly before any CLI spawn, with
+    // resume/fork/auto-continuation included. Placed after the synchronous
+    // slot build so the 2.4 single-flight observable structure is unchanged;
+    // a blocked launch tears the half-built slot down (same shape the
+    // mid-flight close uses) instead of leaving it behind.
+    if (!(await this.resolveNativeMcpCutoverAdmission(vaultPath, cliPath)).allowed) {
+      this.currentConfig = null;
+      channel.close();
+      if (this.messageChannel === channel) this.messageChannel = null;
+      if (this.queryAbortController === abortController) {
+        abortController.abort();
+        this.queryAbortController = null;
+      }
+      throw new CutoverLaunchBlockedError();
+    }
+
     // Query-scope exit sink: the spawn callback lands here once THIS CLI
     // truly exits; the binding to the scope happens right after creation.
     const exitSink: { handler: ((code: number | null) => void) | null } = { handler: null };
@@ -793,8 +808,6 @@ export class ClaudianService implements ChatRuntime {
     // await is intentional: yields to microtask queue so fire-and-forget callers
     // (e.g. setSessionId → ensureReady) don't synchronously set persistentQuery
     const resumeAtMessageId = this.pendingResumeAt;
-    const channel = this.messageChannel;
-    const abortController = this.queryAbortController;
     const options = await this.buildPersistentQueryOptions(
       vaultPath,
       cliPath,
@@ -818,6 +831,10 @@ export class ClaudianService implements ChatRuntime {
       prompt: this.messageChannel,
       options,
     });
+
+    // Admission passed and the CLI is spawning: record the transient
+    // native-running observation for this scope.
+    this.noteNativeMcpCutoverRunning(vaultPath, cliPath);
 
     const scope = this.ensureQueryScope();
     if (scope) {
@@ -1104,6 +1121,48 @@ export class ClaudianService implements ChatRuntime {
   }
 
   /**
+   * Cutover admission (design 2026-11-09-provider-native-mcp-alignment §4.2):
+   * one shared gate in front of every Claude spawn — persistent start,
+   * cold-start fallback, resume, fork, and auto-continuation all land here.
+   */
+  private async resolveNativeMcpCutoverAdmission(vaultPath: string, cliPath: string) {
+    const cutover = this.getNativeMcpCutoverService();
+    const claudeSettings = getClaudeProviderSettings(this.getScopedSettings() as unknown as Record<string, unknown>);
+    const scope = resolveClaudeLaunchScopeInput(
+      this.plugin,
+      vaultPath,
+      cliPath,
+      resolveClaudeSettingSources(claudeSettings.loadUserSettings),
+    );
+    const admission = await cutover.resolveLaunchAdmission(scope);
+    if (!admission.allowed) {
+      this.recordTranscriptDiagnostic({
+        phase: 'native_mcp_cutover_block',
+        detail: `reason=${admission.reason ?? 'unspecified'}`,
+      });
+    }
+    return admission;
+  }
+
+  private noteNativeMcpCutoverRunning(vaultPath: string, cliPath: string): void {
+    const claudeSettings = getClaudeProviderSettings(this.getScopedSettings() as unknown as Record<string, unknown>);
+    const scope = resolveClaudeLaunchScopeInput(
+      this.plugin,
+      vaultPath,
+      cliPath,
+      resolveClaudeSettingSources(claudeSettings.loadUserSettings),
+    );
+    this.getNativeMcpCutoverService().markNativeRunning(resolveNativeMcpScopeKey(scope));
+  }
+
+  private getNativeMcpCutoverService(): ClaudeNativeMcpCutoverService {
+    if (!this.nativeMcpCutoverService) {
+      this.nativeMcpCutoverService = createClaudeNativeMcpCutoverService(this.plugin);
+    }
+    return this.nativeMcpCutoverService;
+  }
+
+  /**
    * Builds configuration object for tracking changes.
    */
   private buildPersistentQueryConfig(
@@ -1137,7 +1196,6 @@ export class ClaudianService implements ChatRuntime {
       settings: this.getScopedSettings(),
       customEnv,
       enhancedPath,
-      mcpManager: this.mcpManager,
       pluginManager: this.requirePluginManager(),
     };
   }
@@ -2210,24 +2268,17 @@ export class ClaudianService implements ChatRuntime {
       text: prompt,
       images,
       externalContextPaths: queryOptions?.externalContextPaths,
-      enabledMcpServers: queryOptions?.enabledMcpServers,
     };
   }
 
   private buildQueryOptionsFromTurnRequest(
     request: ChatTurnRequest,
-    encodedTurn: PreparedChatTurn,
+    _encodedTurn: PreparedChatTurn,
     legacyQueryOptions?: QueryOptions,
   ): QueryOptions | undefined {
-    const mcpMentions = legacyQueryOptions?.mcpMentions
-      ? new Set([...legacyQueryOptions.mcpMentions, ...encodedTurn.mcpMentions])
-      : encodedTurn.mcpMentions;
-
     const effectiveQueryOptions: QueryOptions = {
       allowedTools: legacyQueryOptions?.allowedTools,
       model: legacyQueryOptions?.model,
-      mcpMentions,
-      enabledMcpServers: request.enabledMcpServers ?? legacyQueryOptions?.enabledMcpServers,
       forceColdStart: legacyQueryOptions?.forceColdStart,
       externalContextPaths: request.externalContextPaths ?? legacyQueryOptions?.externalContextPaths,
     };
@@ -2235,10 +2286,8 @@ export class ClaudianService implements ChatRuntime {
     if (
       effectiveQueryOptions.allowedTools === undefined &&
       effectiveQueryOptions.model === undefined &&
-      effectiveQueryOptions.enabledMcpServers === undefined &&
       effectiveQueryOptions.forceColdStart === undefined &&
-      effectiveQueryOptions.externalContextPaths === undefined &&
-      (effectiveQueryOptions.mcpMentions?.size ?? 0) === 0
+      effectiveQueryOptions.externalContextPaths === undefined
     ) {
       return undefined;
     }
@@ -3273,7 +3322,6 @@ export class ClaudianService implements ChatRuntime {
         // Scoped snapshot, never the top-level projection another provider owns.
         getPermissionMode: () => this.getScopedSettings().permissionMode,
         resolveSDKPermissionMode: (mode) => this.resolveSDKPermissionMode(mode),
-        mcpManager: this.mcpManager,
         buildPersistentQueryConfig: (vaultPath, cliPath, externalContextPaths) =>
           this.buildPersistentQueryConfig(vaultPath, cliPath, externalContextPaths),
         needsRestart: (newConfig) => this.needsRestart(newConfig),
@@ -3355,8 +3403,6 @@ export class ClaudianService implements ChatRuntime {
       modelOverride: queryOptions?.model,
       canUseTool: this.createApprovalCallback(),
       hooks,
-      mcpMentions: queryOptions?.mcpMentions,
-      enabledMcpServers: queryOptions?.enabledMcpServers,
       allowedTools,
       hasEditorContext,
       externalContextPaths,
@@ -3365,7 +3411,13 @@ export class ClaudianService implements ChatRuntime {
     const options = QueryOptionsBuilder.buildColdStartQueryOptions(ctx);
 
     try {
+      // Cutover admission: the cold-start fallback spawns a real CLI, so it
+      // passes the same gate as the persistent query.
+      if (!(await this.resolveNativeMcpCutoverAdmission(cwd, cliPath)).allowed) {
+        throw new CutoverLaunchBlockedError();
+      }
       const response = agentQuery({ prompt: queryPrompt, options });
+      this.noteNativeMcpCutoverRunning(cwd, cliPath);
       if (turn.recoveryGeneration !== undefined && this.sessionManager.needsHistoryRebuild()) {
         turn.recoveryGeneration = this.sessionManager.markRecoveryDispatched() ?? undefined;
       }

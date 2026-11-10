@@ -52,7 +52,7 @@ import type {
 } from '../state/types';
 import type { FileContextManager } from '../ui/FileContext';
 import type { ImageContextManager } from '../ui/ImageContext';
-import type { ExternalContextSelector, McpServerSelector } from '../ui/InputToolbar';
+import type { ExternalContextSelector } from '../ui/InputToolbar';
 import type { StatusPanel } from '../ui/StatusPanel';
 import { formatConversationSize, formatConversationSizeTooltip } from '../utils/conversationSize';
 import { formatActiveSessionIdentity, loadActiveSessionNames } from '../utils/sessionIdentity';
@@ -77,7 +77,6 @@ export interface ConversationControllerDeps {
   getInputEl: () => HTMLTextAreaElement;
   getFileContextManager: () => FileContextManager | null;
   getImageContextManager: () => ImageContextManager | null;
-  getMcpServerSelector: () => McpServerSelector | null;
   getExternalContextSelector: () => ExternalContextSelector | null;
   clearQueuedMessage: () => void;
   /** S2 lifecycle cancellation: invalidate the feature turn lease (generation++). */
@@ -305,8 +304,6 @@ export class ConversationController {
     const fileCtx = this.deps.getFileContextManager();
     const currentNote = fileCtx?.getCurrentNotePath() || undefined;
     const externalContextPaths = this.deps.getExternalContextSelector()?.getExternalContexts() ?? [];
-    const mcpServerSelector = this.deps.getMcpServerSelector();
-    const enabledMcpServers = mcpServerSelector ? Array.from(mcpServerSelector.getEnabledServers()) : [];
     const firstUser = state.messages.find(message => message.role === 'user');
     const metadata: MetadataPatch = {
       hasHistory: { op: 'set', value: state.messages.length > 0 || conversation.hasHistory === true },
@@ -326,9 +323,9 @@ export class ConversationController {
         ? { op: 'set', value: externalContextPaths }
         : { op: 'delete' },
       usage: state.usage ? { op: 'set', value: state.usage } : { op: 'delete' },
-      enabledMcpServers: enabledMcpServers.length > 0
-        ? { op: 'set', value: enabledMcpServers }
-        : { op: 'delete' },
+      // Deprecated inert field: never generated anew; the stored legacy value
+      // is round-tripped untouched (data protection — no silent loss).
+      enabledMcpServers: { op: 'keep' },
       ...(updateLastResponse ? { lastResponseAt: { op: 'set', value: Date.now() } } : {}),
       ...(options
         ? {
@@ -647,7 +644,6 @@ export class ConversationController {
       fileCtx?.autoAttachActiveFile();
 
       this.deps.getImageContextManager()?.clearImages();
-      this.deps.getMcpServerSelector()?.clearEnabled();
       // Pass current settings to ensure we have the most up-to-date persistent paths
       this.deps.getExternalContextSelector()?.clearExternalContexts(
         plugin.settings.persistentExternalContextPaths || []
@@ -757,8 +753,6 @@ export class ConversationController {
       this.deps.getExternalContextSelector()?.clearExternalContexts(
         plugin.settings.persistentExternalContextPaths || []
       );
-
-      this.deps.getMcpServerSelector()?.clearEnabled();
 
       const welcomeEl = renderer.renderMessages(
         [],
@@ -1847,8 +1841,6 @@ export class ConversationController {
     const currentNote = fileCtx?.getCurrentNotePath() || undefined;
     const externalContextSelector = this.deps.getExternalContextSelector();
     const externalContextPaths = externalContextSelector?.getExternalContexts() ?? [];
-    const mcpServerSelector = this.deps.getMcpServerSelector();
-    const enabledMcpServers = mcpServerSelector ? Array.from(mcpServerSelector.getEnabledServers()) : [];
 
     const conversation = plugin.getConversationSync(state.currentConversationId!);
 
@@ -1870,7 +1862,6 @@ export class ConversationController {
       currentNote: currentNote,
       externalContextPaths: externalContextPaths.length > 0 ? externalContextPaths : undefined,
       usage: state.usage ?? undefined,
-      enabledMcpServers: enabledMcpServers.length > 0 ? enabledMcpServers : undefined,
     };
 
     if (updateLastResponse) {
@@ -1945,12 +1936,8 @@ export class ConversationController {
 
     this.restoreExternalContextPaths(conversation.externalContextPaths, !hasMessages);
 
-    const mcpServerSelector = this.deps.getMcpServerSelector();
-    if (conversation.enabledMcpServers && conversation.enabledMcpServers.length > 0) {
-      mcpServerSelector?.setEnabledServers(conversation.enabledMcpServers);
-    } else {
-      mcpServerSelector?.clearEnabled();
-    }
+    // enabledMcpServers is a deprecated inert legacy field: restored
+    // conversations never rehydrate it into the removed UI selector.
 
     await this.runStoredTransaction(async () => {
       const windowRenderer = this.deps.getHistoryWindowRenderer?.();

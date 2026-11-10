@@ -1,7 +1,6 @@
 import type ClaudianPlugin from '../../main';
 import type { CursorContext } from '../../utils/editor';
 import type { SharedAppStorage } from '../bootstrap/storage';
-import type { McpServerManager } from '../mcp/McpServerManager';
 import type { ChatRuntime } from '../runtime/ChatRuntime';
 import type { HomeFileAdapter } from '../storage/HomeFileAdapter';
 import type { VaultFileAdapter } from '../storage/VaultFileAdapter';
@@ -10,7 +9,6 @@ import type {
   ChatMessage,
   Conversation,
   InstructionRefineResult,
-  ManagedMcpServer,
   PluginInfo,
   SessionMetadata,
   SlashCommand,
@@ -123,7 +121,6 @@ export interface ProviderCapabilities {
   supportsProviderCommands: boolean;
   supportsImageAttachments: boolean;
   supportsInstructionMode: boolean;
-  supportsMcpTools: boolean;
   supportsTurnSteer?: boolean;
   reasoningControl: 'effort' | 'token-budget' | 'none';
   planPathPrefix?: string;
@@ -203,12 +200,6 @@ export interface AppSessionStorage {
 // provider implementations. They are NOT part of the shared bootstrap storage
 // contract (`SharedAppStorage`).
 // ---------------------------------------------------------------------------
-
-export interface AppMcpStorage {
-  load(): Promise<ManagedMcpServer[]>;
-  save(servers: ManagedMcpServer[]): Promise<void>;
-  tryParseClipboardConfig?(text: string): unknown | null;
-}
 
 export interface AppCommandStorage {
   save(command: SlashCommand): Promise<void>;
@@ -466,7 +457,6 @@ export interface ProviderWorkspaceServices {
   cliResolver?: ProviderCliResolver | null;
   runtimeCommandLoader?: ProviderRuntimeCommandLoader | null;
   tabWarmupPolicy?: ProviderTabWarmupPolicy | null;
-  mcpServerManager?: McpServerManager | null;
   settingsTabRenderer?: ProviderSettingsTabRenderer | null;
   refreshAgentMentions?(): Promise<void>;
 }

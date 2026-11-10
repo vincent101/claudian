@@ -120,7 +120,11 @@ export interface Conversation {
   usage?: UsageInfo;
   /** Status of AI title generation. */
   titleGenerationStatus?: 'pending' | 'success' | 'failed';
-  /** UI-enabled MCP servers for this session (context-saving servers activated via selector). */
+  /**
+   * Deprecated inert legacy field: the in-app MCP selector was removed; the
+   * stored value is round-tripped untouched for old data and never read by
+   * runtime, UI, or new requests.
+   */
   enabledMcpServers?: string[];
   /** Assistant checkpoint identifier for resumeAtMessageId after rewind. */
   resumeAtMessageId?: string;
@@ -165,6 +169,7 @@ export interface SessionMetadata {
   firstUserExcerpt?: string;
   currentNote?: string;
   externalContextPaths?: string[];
+  /** Deprecated inert legacy field (see Conversation.enabledMcpServers). */
   enabledMcpServers?: string[];
   usage?: UsageInfo;
   /** Assistant checkpoint identifier for resumeAtMessageId after rewind. */

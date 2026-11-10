@@ -331,10 +331,6 @@
       "desc": "从下拉菜单中隐藏特定的命令与技能。适用于隐藏与 Claudian 无关的 Claude Code 条目。每行输入一个名称，无需前导斜杠。",
       "placeholder": "commit\nbuild\ntest"
     },
-    "mcpServers": {
-      "name": "MCP 服务器",
-      "desc": "管理存储在 .claude/mcp.json 中的 Vault 级 MCP 服务器配置。启用上下文保存模式的服务器需要 @ 提及才能激活。"
-    },
     "plugins": {
       "name": "Claude Code 插件",
       "desc": "管理从 ~/.claude/plugins 发现的 Claude Code 插件。启用的插件按 Vault 存储在 .claude/settings.json 中。"
@@ -620,6 +616,7 @@
         "created": "已创建子代理“{name}”"
       },
       "mcp": {
+        "name": "MCP 服务器",
         "beforeCommand": "Codex 通过自身 CLI 管理 MCP 服务器。请使用以下命令配置：",
         "afterCommand": "配置后即可在 Claudian 中使用。",
         "learnMore": "了解更多"

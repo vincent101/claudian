@@ -3,9 +3,7 @@ import { setIcon } from 'obsidian';
 
 import { buildExternalContextDisplayEntries } from '../../utils/externalContext';
 import { type ExternalContextFile, externalContextScanner } from '../../utils/externalContextScanner';
-import { extractMcpMentions } from '../../utils/mcp';
 import { SelectableDropdown } from '../components/SelectableDropdown';
-import { MCP_ICON_SVG } from '../icons';
 import {
   type AgentMentionProvider,
   type FolderMentionItem,
@@ -20,19 +18,11 @@ export interface MentionDropdownOptions {
 
 export interface MentionDropdownCallbacks {
   onAttachFile: (path: string) => void;
-  onMcpMentionChange?: (servers: Set<string>) => void;
   onAgentMentionSelect?: (agentId: string) => void;
-  getMentionedMcpServers: () => Set<string>;
-  setMentionedMcpServers: (mentions: Set<string>) => boolean;
-  addMentionedMcpServer: (name: string) => void;
   getExternalContexts: () => string[];
   getCachedVaultFolders: () => Array<Pick<FolderMentionItem, 'name' | 'path'>>;
   getCachedVaultFiles: () => TFile[];
   normalizePathForVault: (path: string | undefined | null) => string | null;
-}
-
-export interface McpMentionProvider {
-  getContextSavingServers: () => Array<{ name: string }>;
 }
 
 export class MentionDropdownController {
@@ -46,7 +36,6 @@ export class MentionDropdownController {
   private filteredContextFiles: ExternalContextFile[] = [];
   private activeContextFilter: { folderName: string; contextRoot: string } | null = null;
   private activeAgentFilter = false;
-  private mcpManager: McpMentionProvider | null = null;
   private agentService: AgentMentionProvider | null = null;
   private fixed: boolean;
   private debounceTimer: ReturnType<typeof setTimeout> | null = null;
@@ -74,10 +63,6 @@ export class MentionDropdownController {
       fixed: this.fixed,
       fixedClassName: 'claudian-mention-dropdown-fixed',
     });
-  }
-
-  setMcpManager(manager: McpMentionProvider | null): void {
-    this.mcpManager = manager;
   }
 
   setAgentService(service: AgentMentionProvider | null): void {
@@ -130,22 +115,6 @@ export class MentionDropdownController {
     this.dropdown.destroy();
   }
 
-  updateMcpMentionsFromText(text: string): void {
-    if (this.terminal) return;
-    if (!this.mcpManager) return;
-
-    const validNames = new Set(
-      this.mcpManager.getContextSavingServers().map(s => s.name)
-    );
-
-    const newMentions = extractMcpMentions(text, validNames);
-    const changed = this.callbacks.setMentionedMcpServers(newMentions);
-
-    if (changed) {
-      this.callbacks.onMcpMentionChange?.(newMentions);
-    }
-  }
-
   handleInputChange(): void {
     if (this.terminal) return;
     if (this.debounceTimer !== null) {
@@ -156,8 +125,6 @@ export class MentionDropdownController {
       this.debounceTimer = null;
       if (this.terminal) return;
       const text = this.inputEl.value;
-      this.updateMcpMentionsFromText(text);
-
       const cursorPos = this.inputEl.selectionStart || 0;
       const textBeforeCursor = text.substring(0, cursorPos);
       const lastAtIndex = textBeforeCursor.lastIndexOf('@');
@@ -317,19 +284,6 @@ export class MentionDropdownController {
     this.activeContextFilter = null;
     this.activeAgentFilter = false;
 
-    if (this.mcpManager) {
-      const mcpServers = this.mcpManager.getContextSavingServers();
-
-      for (const server of mcpServers) {
-        if (server.name.toLowerCase().includes(searchLower)) {
-          this.filteredMentionItems.push({
-            type: 'mcp-server',
-            name: server.name,
-          });
-        }
-      }
-    }
-
     if (this.agentService) {
       const hasAgents = this.agentService.searchAgents('').length > 0;
       if (hasAgents && 'agents'.includes(searchLower)) {
@@ -445,7 +399,6 @@ export class MentionDropdownController {
       emptyText: 'No matches',
       getItemClass: (item) => {
         switch (item.type) {
-          case 'mcp-server': return 'mcp-server';
           case 'folder': return 'vault-folder';
           case 'agent': return 'agent';
           case 'agent-folder': return 'agent-folder';
@@ -457,9 +410,6 @@ export class MentionDropdownController {
       renderItem: (item, itemEl) => {
         const iconEl = itemEl.createSpan({ cls: 'claudian-mention-icon' });
         switch (item.type) {
-          case 'mcp-server':
-            iconEl.innerHTML = MCP_ICON_SVG;
-            break;
           case 'agent':
           case 'agent-folder':
             setIcon(iconEl, 'bot');
@@ -478,9 +428,6 @@ export class MentionDropdownController {
         const textEl = itemEl.createSpan({ cls: 'claudian-mention-text' });
 
         switch (item.type) {
-          case 'mcp-server':
-            textEl.createSpan({ cls: 'claudian-mention-name' }).setText(`@${item.name}`);
-            break;
           case 'agent-folder':
             textEl.createSpan({
               cls: 'claudian-mention-name claudian-mention-name-agent-folder',
@@ -583,13 +530,6 @@ export class MentionDropdownController {
     const afterCursor = text.substring(cursorPos);
 
     switch (selectedItem.type) {
-      case 'mcp-server': {
-        const replacement = `@${selectedItem.name} `;
-        this.insertReplacement(beforeAt, replacement, afterCursor);
-        this.callbacks.addMentionedMcpServer(selectedItem.name);
-        this.callbacks.onMcpMentionChange?.(this.callbacks.getMentionedMcpServers());
-        break;
-      }
       case 'agent-folder':
         // Don't modify input text - just show agents submenu
         this.activeAgentFilter = true;

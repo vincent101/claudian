@@ -419,7 +419,7 @@ export const codexSettingsTabRenderer: ProviderSettingsTabRenderer = {
 
     // --- MCP Servers ---
 
-    new Setting(container).setName(t('settings.mcpServers.name')).setHeading();
+    new Setting(container).setName(t('settings.codex.mcp.name')).setHeading();
     const mcpNotice = container.createDiv({ cls: 'claudian-mcp-settings-desc' });
     const mcpDesc = mcpNotice.createEl('p', { cls: 'setting-item-description' });
     mcpDesc.appendText(t('settings.codex.mcp.beforeCommand'));

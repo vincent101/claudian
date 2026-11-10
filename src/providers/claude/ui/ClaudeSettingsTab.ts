@@ -1,24 +1,102 @@
 import * as fs from 'fs';
-import { Setting } from 'obsidian';
+import { Notice, Setting } from 'obsidian';
 
 import { ProviderSettingsCoordinator } from '../../../core/providers/ProviderSettingsCoordinator';
 import type { ProviderSettingsTabRenderer } from '../../../core/providers/types';
 import { renderEnvironmentSettingsSection } from '../../../features/settings/ui/EnvironmentSettingsSection';
-import { McpSettingsManager } from '../../../features/settings/ui/McpSettingsManager';
 import { t } from '../../../i18n/i18n';
+import type ClaudianPlugin from '../../../main';
 import { getHostnameKey } from '../../../utils/env';
-import { expandHomePath } from '../../../utils/path';
+import { expandHomePath, getVaultPath } from '../../../utils/path';
+import {
+  createClaudeNativeMcpCutoverService,
+  resolveClaudeLaunchScopeInput,
+} from '../app/ClaudeNativeMcpCutover';
 import { getClaudeWorkspaceServices } from '../app/ClaudeWorkspaceServices';
 import { resolveClaudeModelSelection } from '../modelOptions';
 import {
   getClaudeProviderSettings,
+  resolveClaudeSettingSources,
   updateClaudeProviderSettings,
 } from '../settings';
 import { AgentSettings } from './AgentSettings';
 import { claudeChatUIConfig } from './ClaudeChatUIConfig';
+import { ClaudeNativeMcpCutoverModal } from './ClaudeNativeMcpCutoverModal';
 import { claudeModelPresetBinding, ModelPresetSettings } from './ModelPresetSettings';
 import { PluginSettingsManager } from './PluginSettingsManager';
 import { SlashCommandSettings } from './SlashCommandSettings';
+
+/**
+ * One-shot cutover notice (design §5.1): shown only while the current scope
+ * sits in review-required. The confirm action persists the non-secret ack
+ * through the settings channel; it never starts a CLI, never touches any MCP
+ * configuration file, and never lists servers.
+ */
+async function renderNativeMcpCutoverNotice(container: HTMLElement, plugin: ClaudianPlugin): Promise<void> {
+  const vaultPath = getVaultPath(plugin.app);
+  const cliPath = plugin.getResolvedProviderCliPath('claude');
+  if (!vaultPath || !cliPath) {
+    return;
+  }
+
+  const settingsBag = plugin.settings as unknown as Record<string, unknown>;
+  const claudeSettings = getClaudeProviderSettings(settingsBag);
+  const cutover = createClaudeNativeMcpCutoverService(plugin);
+  const scope = resolveClaudeLaunchScopeInput(
+    plugin,
+    vaultPath,
+    cliPath,
+    resolveClaudeSettingSources(claudeSettings.loadUserSettings),
+  );
+  const admission = await cutover.resolveLaunchAdmission(scope);
+
+  if (admission.status !== 'review-required') {
+    // Fresh installs and confirmed scopes get the neutral pointer only.
+    const infoDesc = container.createDiv({ cls: 'claudian-mcp-settings-desc' });
+    infoDesc.createEl('p', {
+      text: 'Claudian does not manage MCP servers. Configure them natively with the Claude CLI (project .mcp.json, user, or managed settings); keep the same working directory, home, and CLI target.',
+      cls: 'setting-item-description',
+    });
+    return;
+  }
+
+  const notice = container.createDiv({ cls: 'claudian-mcp-cutover-notice' });
+  notice.createEl('p', {
+    text: 'This workspace still has legacy MCP management traces. Claude requests stay blocked until you review your native MCP configuration and confirm.',
+    cls: 'setting-item-description',
+  });
+
+  const actionSetting = new Setting(notice);
+  actionSetting.addButton(button => button
+    .setButtonText('Review native MCP configuration')
+    .setCta()
+    .onClick(() => {
+      new ClaudeNativeMcpCutoverModal(plugin.app, {
+        onConfirm: async () => {
+          const confirmed = await cutover.confirmCutover(scope);
+          if (confirmed.ok) {
+            notice.empty();
+            showNativeMcpCutoverNotice(container, plugin);
+            new Notice('Native MCP management confirmed for this workspace.');
+          } else {
+            new Notice('Could not save the confirmation. Claude stays blocked.');
+          }
+        },
+        onLater: () => {},
+      }).open();
+    }));
+}
+
+/**
+ * Fire-and-forget wrapper: the launch gate — not this notice — is the
+ * fail-closed enforcement point, so a failed render surfaces fixed copy
+ * instead of becoming an unhandled rejection inside the settings tab.
+ */
+function showNativeMcpCutoverNotice(container: HTMLElement, plugin: ClaudianPlugin): void {
+  renderNativeMcpCutoverNotice(container, plugin).catch(() => {
+    new Notice('Claudian could not load the native MCP management status for this workspace. Claude launches stay gated.');
+  });
+}
 
 export const claudeSettingsTabRenderer: ProviderSettingsTabRenderer = {
   render(container, context) {
@@ -221,26 +299,12 @@ export const claudeSettingsTabRenderer: ProviderSettingsTabRenderer = {
 
     // --- MCP Servers ---
 
-    new Setting(container).setName(t('settings.mcpServers.name')).setHeading();
-
-    const mcpDesc = container.createDiv({ cls: 'claudian-mcp-settings-desc' });
-    mcpDesc.createEl('p', {
-      text: t('settings.mcpServers.desc'),
-      cls: 'setting-item-description',
-    });
-
-    const mcpContainer = container.createDiv({ cls: 'claudian-mcp-container' });
-    new McpSettingsManager(mcpContainer, {
-      app: context.plugin.app,
-      mcpStorage: claudeWorkspace.mcpStorage,
-      broadcastMcpReload: async () => {
-        for (const view of context.plugin.getAllViews()) {
-          await view.getTabManager()?.broadcastToAllTabs(
-            (service) => service.reloadMcpServers(),
-          );
-        }
-      },
-    });
+    // In-app MCP management was removed: the provider CLI owns server
+    // configuration natively (.mcp.json / user settings). Legacy installs
+    // get a one-shot cutover notice here (design §5.1) — non-management by
+    // construction: it only explains and records the user's confirmation.
+    const mcpCutoverContainer = container.createDiv({ cls: 'claudian-mcp-cutover-container' });
+    showNativeMcpCutoverNotice(mcpCutoverContainer, context.plugin);
 
     // --- Plugins ---
 

@@ -66,19 +66,10 @@ function createTextUserMessage(content: string) {
   };
 }
 
-// Create a mock MCP server manager
-function createMockMcpManager() {
-  return {
-    loadServers: jest.fn().mockResolvedValue(undefined),
-    getServers: jest.fn().mockReturnValue([]),
-    getEnabledCount: jest.fn().mockReturnValue(0),
-    getActiveServers: jest.fn().mockReturnValue({}),
-    getDisallowedMcpTools: jest.fn().mockReturnValue([]),
-    getAllDisallowedMcpTools: jest.fn().mockReturnValue([]),
-    hasServers: jest.fn().mockReturnValue(false),
-    extractMentions: jest.fn().mockReturnValue(new Set<string>()),
-    transformMentions: jest.fn().mockImplementation((text: string) => text),
-  } as any;
+// Runtime services deps: empty on purpose — the runtime falls back to the
+// mock plugin's own pluginManager/agentManager, and MCP management is gone.
+function createRuntimeServices(): any {
+  return {};
 }
 
 // Create a mock plugin
@@ -142,7 +133,7 @@ describe('ClaudianService', () => {
     jest.clearAllMocks();
     resetMockMessages();
     mockPlugin = createMockPlugin();
-    service = new ClaudianService(mockPlugin, createMockMcpManager());
+    service = new ClaudianService(mockPlugin, createRuntimeServices());
   });
 
   afterEach(() => {
@@ -214,7 +205,7 @@ describe('ClaudianService', () => {
           mockPlugin.getActiveEnvironmentVariables()
         )
       );
-      service = new ClaudianService(mockPlugin, createMockMcpManager());
+      service = new ClaudianService(mockPlugin, createRuntimeServices());
 
       (fs.existsSync as jest.Mock).mockImplementation((p: string) => p === customPath);
       (fs.statSync as jest.Mock).mockReturnValue({ isFile: () => true });
@@ -245,7 +236,7 @@ describe('ClaudianService', () => {
           mockPlugin.getActiveEnvironmentVariables()
         )
       );
-      service = new ClaudianService(mockPlugin, createMockMcpManager());
+      service = new ClaudianService(mockPlugin, createRuntimeServices());
 
       const homeDir = os.homedir();
       const autoDetectedPath = path.join(homeDir, '.claude', 'local', 'claude');
@@ -281,7 +272,7 @@ describe('ClaudianService', () => {
           mockPlugin.getActiveEnvironmentVariables()
         )
       );
-      service = new ClaudianService(mockPlugin, createMockMcpManager());
+      service = new ClaudianService(mockPlugin, createRuntimeServices());
 
       const homeDir = os.homedir();
       const autoDetectedPath = path.join(homeDir, '.claude', 'local', 'claude');
@@ -317,7 +308,7 @@ describe('ClaudianService', () => {
           mockPlugin.getActiveEnvironmentVariables()
         )
       );
-      service = new ClaudianService(mockPlugin, createMockMcpManager());
+      service = new ClaudianService(mockPlugin, createRuntimeServices());
 
       const homeDir = os.homedir();
       const autoDetectedPath = path.join(homeDir, '.claude', 'local', 'claude');
@@ -363,7 +354,7 @@ describe('ClaudianService', () => {
           mockPlugin.getActiveEnvironmentVariables()
         )
       );
-      service = new ClaudianService(mockPlugin, createMockMcpManager());
+      service = new ClaudianService(mockPlugin, createRuntimeServices());
 
       (fs.existsSync as jest.Mock).mockImplementation((p: string) => p === firstPath);
       (fs.statSync as jest.Mock).mockReturnValue({ isFile: () => true });
@@ -848,7 +839,7 @@ describe('ClaudianService', () => {
           },
         },
       };
-      service = new ClaudianService(mockPlugin, createMockMcpManager());
+      service = new ClaudianService(mockPlugin, createRuntimeServices());
 
       const chunks: any[] = [];
       for await (const chunk of service.query('hello')) {
@@ -1570,7 +1561,7 @@ describe('ClaudianService', () => {
     it('updates permission mode via setPermissionMode when going from YOLO to normal', async () => {
       // Start in YOLO mode
       mockPlugin.settings.permissionMode = 'yolo';
-      service = new ClaudianService(mockPlugin, createMockMcpManager());
+      service = new ClaudianService(mockPlugin, createRuntimeServices());
 
       const chunks1: any[] = [];
       for await (const c of service.query('first')) chunks1.push(c);
@@ -1589,7 +1580,7 @@ describe('ClaudianService', () => {
     it('updates permission mode via setPermissionMode when going from normal to YOLO', async () => {
       // Start in normal mode
       mockPlugin.settings.permissionMode = 'normal';
-      service = new ClaudianService(mockPlugin, createMockMcpManager());
+      service = new ClaudianService(mockPlugin, createRuntimeServices());
 
       const chunks1: any[] = [];
       for await (const c of service.query('first')) chunks1.push(c);
@@ -1621,25 +1612,6 @@ describe('ClaudianService', () => {
       const response = getLastResponse();
       expect(response?.applyFlagSettings).toHaveBeenCalledWith({ effortLevel: 'max' });
       expect(getQueryCallCount()).toBe(queryCountBefore);
-    });
-
-    it('updates MCP servers on the active persistent query', async () => {
-      const chunks1: any[] = [];
-      for await (const c of service.query('first', undefined, undefined, {
-        mcpMentions: new Set(['server1']),
-      })) chunks1.push(c);
-
-      const response1 = getLastResponse();
-      expect(response1?.setMcpServers).toHaveBeenCalled();
-
-      // Query with different MCP mentions
-      const chunks2: any[] = [];
-      for await (const c of service.query('second', undefined, undefined, {
-        mcpMentions: new Set(['server2']),
-      })) chunks2.push(c);
-
-      const response2 = getLastResponse();
-      expect(response2?.setMcpServers).toHaveBeenCalled();
     });
 
     it('reapplies query overrides after restart triggered by config change', async () => {

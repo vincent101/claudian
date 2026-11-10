@@ -110,7 +110,6 @@ const mockGetCapabilities = jest.fn().mockReturnValue({
   supportsProviderCommands: true,
   supportsImageAttachments: true,
   supportsInstructionMode: true,
-  supportsMcpTools: true,
   reasoningControl: 'effort',
 });
 const mockGetChatUIConfig = jest.fn();
@@ -197,10 +196,6 @@ function createMockPlugin(overrides: Record<string, any> = {}): any {
   };
 }
 
-function createMockMcpManager(): any {
-  return {};
-}
-
 function createMockView(): any {
   return {
     leaf: { id: 'leaf-1' },
@@ -257,11 +252,6 @@ function createRealConversationControllerHarness(
       getCurrentNotePath: jest.fn().mockReturnValue(null),
     }) as any,
     getImageContextManager: () => ({ clearImages: jest.fn() }) as any,
-    getMcpServerSelector: () => ({
-      clearEnabled: jest.fn(),
-      getEnabledServers: jest.fn().mockResolvedValue(new Set()),
-      setEnabledServers: jest.fn(),
-    }) as any,
     getExternalContextSelector: () => ({
       getExternalContexts: jest.fn().mockReturnValue([]),
       setExternalContexts: jest.fn(),
@@ -347,7 +337,6 @@ function createManager(options: {
 
   return new TabManager(
     options.plugin ?? createMockPlugin(),
-    createMockMcpManager(),
     createMockEl(),
     createMockView(),
     options.callbacks
@@ -3366,7 +3355,7 @@ describe('TabManager - Callback Wiring', () => {
         return createMockTabData({ id: 'test-tab' });
       });
 
-      const manager = new TabManager(createMockPlugin(), createMockMcpManager(), createMockEl(), createMockView(), callbacks);
+      const manager = new TabManager(createMockPlugin(), createMockEl(), createMockView(), callbacks);
       await manager.createTab();
 
       // Trigger the onStreamingChanged callback
@@ -3385,7 +3374,7 @@ describe('TabManager - Callback Wiring', () => {
         return createMockTabData({ id: 'test-tab' });
       });
 
-      const manager = new TabManager(createMockPlugin(), createMockMcpManager(), createMockEl(), createMockView(), callbacks);
+      const manager = new TabManager(createMockPlugin(), createMockEl(), createMockView(), callbacks);
       await manager.createTab();
 
       capturedCallbacks.onTitleChanged('New Title');
@@ -3403,7 +3392,7 @@ describe('TabManager - Callback Wiring', () => {
         return createMockTabData({ id: 'test-tab' });
       });
 
-      const manager = new TabManager(createMockPlugin(), createMockMcpManager(), createMockEl(), createMockView(), callbacks);
+      const manager = new TabManager(createMockPlugin(), createMockEl(), createMockView(), callbacks);
       await manager.createTab();
 
       capturedCallbacks.onAttentionChanged(true);
@@ -3422,7 +3411,7 @@ describe('TabManager - Callback Wiring', () => {
         return tabData;
       });
 
-      const manager = new TabManager(createMockPlugin(), createMockMcpManager(), createMockEl(), createMockView(), callbacks);
+      const manager = new TabManager(createMockPlugin(), createMockEl(), createMockView(), callbacks);
       await manager.createTab();
 
       // Trigger the onConversationIdChanged callback (simulating conversation creation)
@@ -3510,7 +3499,6 @@ describe('TabManager - Service Initialization Errors', () => {
 
     const manager = new TabManager(
       createMockPlugin(),
-      createMockMcpManager(),
       createMockEl(),
       createMockView()
     );
@@ -3675,7 +3663,6 @@ describe('TabManager - forkInCurrentTab', () => {
 
     const manager = new TabManager(
       plugin,
-      createMockMcpManager(),
       createMockEl(),
       createMockView()
     );
@@ -3746,7 +3733,6 @@ describe('TabManager - forkInCurrentTab', () => {
 
     const manager = new TabManager(
       plugin,
-      createMockMcpManager(),
       createMockEl(),
       createMockView()
     );
@@ -3807,7 +3793,6 @@ describe('TabManager - switchToTab Session Sync', () => {
 
     const manager = new TabManager(
       plugin,
-      createMockMcpManager(),
       createMockEl(),
       createMockView()
     );
@@ -3861,7 +3846,6 @@ describe('TabManager - switchToTab Session Sync', () => {
 
     const manager = new TabManager(
       plugin,
-      createMockMcpManager(),
       createMockEl(),
       createMockView()
     );
@@ -3936,7 +3920,6 @@ describe('TabManager - switchToTab Session Sync', () => {
 
     const manager = new TabManager(
       plugin,
-      createMockMcpManager(),
       createMockEl(),
       createMockView()
     );
@@ -3996,7 +3979,6 @@ describe('TabManager - switchToTab Session Sync', () => {
 
     const manager = new TabManager(
       plugin,
-      createMockMcpManager(),
       createMockEl(),
       createMockView()
     );
@@ -4076,7 +4058,6 @@ describe('TabManager - switchToTab Session Sync', () => {
 
     const manager = new TabManager(
       plugin,
-      createMockMcpManager(),
       createMockEl(),
       createMockView()
     );
@@ -4118,7 +4099,6 @@ describe('TabManager - switchToTab Session Sync', () => {
 
     const manager = new TabManager(
       createMockPlugin(),
-      createMockMcpManager(),
       createMockEl(),
       createMockView()
     );
@@ -4209,7 +4189,6 @@ describe('TabManager - handleForkRequest (modal dispatch)', () => {
 
     const manager = new TabManager(
       plugin,
-      createMockMcpManager(),
       createMockEl(),
       createMockView()
     );
@@ -4270,7 +4249,6 @@ describe('TabManager - forkToNewTab at max tabs', () => {
 
     const manager = new TabManager(
       plugin,
-      createMockMcpManager(),
       createMockEl(),
       createMockView()
     );
@@ -4504,7 +4482,6 @@ describe('TabManager - Desktop Notifications', () => {
 
     const manager = new TabManager(
       createMockPlugin(),
-      createMockMcpManager(),
       createMockEl(),
       createMockView()
     );
@@ -4659,7 +4636,7 @@ describe('TabManager - Desktop Notifications', () => {
         messages: [],
       })),
     });
-    const manager = new TabManager(plugin, createMockMcpManager(), createMockEl(), createMockView());
+    const manager = new TabManager(plugin, createMockEl(), createMockView());
 
     jest.useFakeTimers();
     try {

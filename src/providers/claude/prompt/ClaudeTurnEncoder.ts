@@ -1,4 +1,3 @@
-import type { McpServerManager } from '../../../core/mcp/McpServerManager';
 import type { ChatTurnRequest, PreparedChatTurn } from '../../../core/runtime/types';
 import { appendBrowserContext } from '../../../utils/browser';
 import { appendCanvasContext } from '../../../utils/canvas';
@@ -9,10 +8,7 @@ function isCompactCommand(text: string): boolean {
   return /^\/compact(\s|$)/i.test(text);
 }
 
-export function encodeClaudeTurn(
-  request: ChatTurnRequest,
-  mcpManager: Pick<McpServerManager, 'extractMentions' | 'transformMentions'>,
-): PreparedChatTurn {
+export function encodeClaudeTurn(request: ChatTurnRequest): PreparedChatTurn {
   const isCompact = isCompactCommand(request.text);
 
   let persistedContent = request.text;
@@ -34,14 +30,11 @@ export function encodeClaudeTurn(
     }
   }
 
-  const mcpMentions = mcpManager.extractMentions(persistedContent);
-
   return {
     turnId: request.turnId,
     request,
     persistedContent,
-    prompt: mcpManager.transformMentions(persistedContent),
+    prompt: persistedContent,
     isCompact,
-    mcpMentions,
   };
 }

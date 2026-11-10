@@ -2,7 +2,7 @@ import '@/providers';
 
 import * as sdkModule from '@anthropic-ai/claude-agent-sdk';
 
-import type { McpServerManager } from '@/core/mcp/McpServerManager';
+import type { AppAgentManager, AppPluginManager } from '@/core/providers/types';
 import type { ChatMessage } from '@/core/types';
 import type ClaudianPlugin from '@/main';
 import { ClaudianService } from '@/providers/claude/runtime/ClaudeChatRuntime';
@@ -46,15 +46,11 @@ function makeMockPlugin(): ClaudianPlugin {
 }
 
 function makeService(): ClaudianService {
-  const mcpManager = {
-    loadServers: jest.fn().mockResolvedValue(undefined),
-    getAllDisallowedMcpTools: jest.fn().mockReturnValue([]),
-    getActiveServers: jest.fn().mockReturnValue({}),
-    getDisallowedMcpTools: jest.fn().mockReturnValue([]),
-    extractMentions: jest.fn().mockReturnValue(new Set<string>()),
-    transformMentions: jest.fn().mockImplementation((text: string) => text),
-  } as unknown as McpServerManager;
-  return new ClaudianService(makeMockPlugin(), mcpManager);
+  const plugin = makeMockPlugin();
+  return new ClaudianService(plugin, {
+    pluginManager: (plugin as unknown as { pluginManager: AppPluginManager }).pluginManager,
+    agentManager: (plugin as unknown as { agentManager: AppAgentManager }).agentManager,
+  });
 }
 
 async function startPersistentQuery(service: ClaudianService): Promise<void> {
@@ -182,18 +178,32 @@ describe('ClaudianService - history recovery dispatch lifecycle', () => {
 
   it('fails the recovery dispatch when a cold-start recovery turn is aborted mid-stream', async () => {
     await armPendingRecovery(service);
-    sdkMock.setMockMessages([assistantMessage('partial reply')], { appendResult: false });
+    // Two stream messages, no trailing result: the abort must land between
+    // them so the loop observes the aborted signal mid-stream — the dispatch
+    // is armed before the SDK await, so the abort point is a real stream
+    // boundary, not the generator's first synchronous slice.
+    sdkMock.setMockMessages(
+      [assistantMessage('partial reply'), assistantMessage('more reply')],
+      { appendResult: false },
+    );
 
     const turn = service.prepareTurn({ turnId: 'recovery-cold-abort', text: 'continue' });
     const gen = service.query(turn, recoveryHistory(), { forceColdStart: true });
 
-    // The first next() runs synchronously up to the SDK await: the dispatch
-    // is armed (awaiting_result) and the runtime abortController is wired.
+    // The cold-start path awaits the MCP cutover admission (a real fs
+    // existence probe on the thread pool) before reaching the SDK, so the
+    // dispatch arms a few event-loop turns after the generator start: wait
+    // for the armed state instead of assuming the first synchronous slice.
     const pending = gen.next();
-    expect((service as any).sessionManager.getHistoryRecoveryState().status).toBe('awaiting_result');
+    const status = () => (service as any).sessionManager.getHistoryRecoveryState().status;
+    const deadline = Date.now() + 1000;
+    while (status() !== 'awaiting_result' && Date.now() < deadline) {
+      await new Promise(resolve => setTimeout(resolve, 1));
+    }
+    expect(status()).toBe('awaiting_result');
     (service as any).abortController.abort();
 
-    // The loop sees the aborted signal on the first SDK message and breaks
+    // The loop sees the aborted signal on the next SDK message and breaks
     // out normally — no catch, no result — so the dispatch must fail there.
     await pending;
     await collectChunks(gen);

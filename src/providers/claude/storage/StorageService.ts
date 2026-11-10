@@ -17,7 +17,6 @@ import {
 } from '../types/settings';
 import { AGENTS_PATH, AgentVaultStorage } from './AgentVaultStorage';
 import { CCSettingsStorage } from './CCSettingsStorage';
-import { McpStorage } from './McpStorage';
 import { SKILLS_PATH, SkillStorage } from './SkillStorage';
 import { COMMANDS_PATH, SlashCommandStorage } from './SlashCommandStorage';
 
@@ -34,7 +33,6 @@ export class StorageService {
   readonly commands: SlashCommandStorage;
   readonly skills: SkillStorage;
   readonly sessions: SessionStorage;
-  readonly mcp: McpStorage;
   readonly agents: AgentVaultStorage;
 
   private adapter: VaultFileAdapter;
@@ -55,7 +53,6 @@ export class StorageService {
     this.commands = new SlashCommandStorage(this.adapter);
     this.skills = new SkillStorage(this.adapter);
     this.sessions = new SessionStorage(this.adapter, this.persistence);
-    this.mcp = new McpStorage(this.adapter);
     this.agents = new AgentVaultStorage(this.adapter);
   }
 

@@ -56,15 +56,10 @@ function createMockPlugin(overrides: Record<string, unknown> = {}) {
   } as unknown as ClaudianPlugin;
 }
 
-function createMockMcpManager() {
-  return {
-    loadServers: jest.fn().mockResolvedValue(undefined),
-    getAllDisallowedMcpTools: jest.fn().mockReturnValue([]),
-    getActiveServers: jest.fn().mockReturnValue({}),
-    getDisallowedMcpTools: jest.fn().mockReturnValue([]),
-    extractMentions: jest.fn().mockReturnValue(new Set<string>()),
-    transformMentions: jest.fn().mockImplementation((text: string) => text),
-  } as any;
+function createRuntimeServices(): any {
+  // Empty on purpose: the runtime falls back to the mock plugin's own
+  // pluginManager, and these tests exercise neither services dep.
+  return {};
 }
 
 function createOptionsContext(permissionMode: string) {
@@ -77,7 +72,6 @@ function createOptionsContext(permissionMode: string) {
     } as typeof DEFAULT_CLAUDIAN_SETTINGS,
     customEnv: {},
     enhancedPath: '/usr/bin:/mock/bin',
-    mcpManager: createMockMcpManager(),
     pluginManager: { getPluginsKey: jest.fn().mockReturnValue('') } as any,
   };
 }
@@ -152,7 +146,7 @@ describe('permission mode wiring (host-to-SDK contract)', () => {
   describe('four-mode rotation stays a live setter (T08)', () => {
     it('rotates modes on one query with setter calls and no restart', async () => {
       const plugin = createMockPlugin({ permissionMode: 'yolo' });
-      const service = new ClaudianService(plugin, createMockMcpManager());
+      const service = new ClaudianService(plugin, createRuntimeServices());
       const persistentQuery = installPersistentQuerySeam(service);
       const startSpy = jest.spyOn(service as any, 'startPersistentQuery');
       const queriesBefore = sdkMock.getQueryCallCount();
@@ -176,7 +170,7 @@ describe('permission mode wiring (host-to-SDK contract)', () => {
 
     it('does not repeat the setter for a same-value selection', async () => {
       const plugin = createMockPlugin({ permissionMode: 'manual' });
-      const service = new ClaudianService(plugin, createMockMcpManager());
+      const service = new ClaudianService(plugin, createRuntimeServices());
       const persistentQuery = installPersistentQuerySeam(service);
 
       await (service as any).applyDynamicUpdates({});
@@ -188,7 +182,7 @@ describe('permission mode wiring (host-to-SDK contract)', () => {
   describe('permission setter failure aborts the send (T09)', () => {
     it('surfaces an error and keeps the config on the last known SDK mode', async () => {
       const plugin = createMockPlugin({ permissionMode: 'yolo' });
-      const service = new ClaudianService(plugin, createMockMcpManager());
+      const service = new ClaudianService(plugin, createRuntimeServices());
       const persistentQuery = installPersistentQuerySeam(service);
       plugin.settings.permissionMode = 'manual';
       persistentQuery.setPermissionMode.mockRejectedValue(new Error('Auto not supported'));
@@ -202,7 +196,7 @@ describe('permission mode wiring (host-to-SDK contract)', () => {
 
     it('the send path yields an error chunk instead of enqueueing', async () => {
       const plugin = createMockPlugin({ permissionMode: 'yolo' });
-      const service = new ClaudianService(plugin, createMockMcpManager());
+      const service = new ClaudianService(plugin, createRuntimeServices());
       const persistentQuery = installPersistentQuerySeam(service);
       // Message channel present so queryViaPersistent is the chosen path.
       (service as any).messageChannel = (service as any).messageChannel
@@ -232,7 +226,7 @@ describe('permission mode wiring (host-to-SDK contract)', () => {
       ['plan', 'plan'],
     ])('normalizes the observed SDK mode %s to %s and updates the config', (sdkMode, appMode) => {
       const plugin = createMockPlugin({ permissionMode: 'acceptEdits' });
-      const service = new ClaudianService(plugin, createMockMcpManager());
+      const service = new ClaudianService(plugin, createRuntimeServices());
       installPersistentQuerySeam(service);
       const observed: string[] = [];
       service.setPermissionModeSyncCallback(mode => observed.push(mode));
@@ -245,7 +239,7 @@ describe('permission mode wiring (host-to-SDK contract)', () => {
 
     it('ignores native modes outside the toolbar policy', () => {
       const plugin = createMockPlugin({ permissionMode: 'acceptEdits' });
-      const service = new ClaudianService(plugin, createMockMcpManager());
+      const service = new ClaudianService(plugin, createRuntimeServices());
       installPersistentQuerySeam(service);
       const observed: string[] = [];
       service.setPermissionModeSyncCallback(mode => observed.push(mode));
@@ -259,7 +253,7 @@ describe('permission mode wiring (host-to-SDK contract)', () => {
 
     it('feeds the init path through the same scope-guarded helper', () => {
       const plugin = createMockPlugin({ permissionMode: 'acceptEdits' });
-      const service = new ClaudianService(plugin, createMockMcpManager());
+      const service = new ClaudianService(plugin, createRuntimeServices());
       installPersistentQuerySeam(service);
       const observed: string[] = [];
       service.setPermissionModeSyncCallback(mode => observed.push(mode));

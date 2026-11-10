@@ -120,15 +120,9 @@ function buildService(cliPath: string): ClaudianServiceInstance {
     getActiveEnvironmentVariables: jest.fn().mockReturnValue(''),
     pluginManager: { getPluginsKey: jest.fn().mockReturnValue('') },
   };
-  const mcpManager = {
-    loadServers: jest.fn().mockResolvedValue(undefined),
-    getAllDisallowedMcpTools: jest.fn().mockReturnValue([]),
-    getActiveServers: jest.fn().mockReturnValue({}),
-    getDisallowedMcpTools: jest.fn().mockReturnValue([]),
-    extractMentions: jest.fn().mockReturnValue(new Set()),
-    transformMentions: jest.fn().mockImplementation((text: string) => text),
-  };
-  return new ClaudianService(plugin as never, mcpManager as never) as ClaudianServiceInstance;
+  // Empty services on purpose: the runtime falls back to the mock plugin's
+  // own pluginManager; this suite exercises CLI-death settlement only.
+  return new ClaudianService(plugin as never, {} as never) as ClaudianServiceInstance;
 }
 
 /**

@@ -9,7 +9,6 @@ describe('encodeCodexTurn', () => {
     expect(result.prompt).toBe('Hello world');
     expect(result.persistedContent).toBe('Hello world');
     expect(result.isCompact).toBe(false);
-    expect(result.mcpMentions.size).toBe(0);
     expect(result.request).toBe(request);
   });
 

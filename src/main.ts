@@ -989,6 +989,18 @@ export default class ClaudianPlugin extends Plugin {
     return this.conversations.find(c => c.id === id) || null;
   }
 
+  /**
+   * Legacy MCP cutover signal (design 2026-11-09-provider-native-mcp-alignment):
+   * whether any already-loaded conversation metadata still carries the
+   * deprecated inert enabledMcpServers selection. Existence signal only —
+   * callers must not receive the conversation list or field values.
+   */
+  hasLoadedLegacyMcpMetadata(): boolean {
+    return this.conversations.some(
+      conversation => (conversation.enabledMcpServers?.length ?? 0) > 0,
+    );
+  }
+
   getConversationHistoryCoordinator(): ConversationHistoryCoordinator {
     return this.conversationHistoryCoordinator;
   }

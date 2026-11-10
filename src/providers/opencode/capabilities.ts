@@ -10,7 +10,6 @@ export const OPENCODE_PROVIDER_CAPABILITIES: Readonly<ProviderCapabilities> = Ob
   supportsProviderCommands: true,
   supportsImageAttachments: true,
   supportsInstructionMode: true,
-  supportsMcpTools: false,
   supportsTurnSteer: false,
   reasoningControl: 'effort',
 });
