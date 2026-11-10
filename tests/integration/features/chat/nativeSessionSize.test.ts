@@ -516,31 +516,9 @@ it.each(['closed', 'reopened', 'rerendered'] as const)('does not apply a previou
   expect(f.fields.historyDropdown.classList.contains('visible')).toBe(action !== 'closed');
 });
 
-it.each(['leave', 'rebind', 'close', 'reopen'] as const)('rejects a late hover result after tab %s', async action => {
-  const f = await fixture(`tab-${action}`);
-  const actualStat = fs.stat;
-  const captured = await actualStat(f.path);
-  let release!: () => void;
-  const pending = new Promise<Awaited<ReturnType<typeof fs.stat>>>(resolve => { release = () => resolve(captured); });
-  jest.spyOn(fs, 'stat').mockImplementationOnce(() => pending as ReturnType<typeof fs.stat>);
-  const oldBadge = f.badge();
-  const oldLabel = oldBadge.getAttribute('aria-label');
-  oldBadge.dispatchEvent(new MouseEvent('mouseenter'));
-  const old = f.plugin.conversationSizes.refresh(f.input.id);
-  await Promise.resolve();
-  if (action === 'leave') oldBadge.dispatchEvent(new MouseEvent('mouseleave'));
-  if (action === 'rebind') f.tab.conversationId = f.other.id;
-  if (action === 'close' || action === 'reopen') f.managerFields.tabs.delete(f.tab.id);
-  if (action !== 'leave') { f.fields.updateTabBar(); f.paint(); }
-  if (action === 'reopen') {
-    f.managerFields.tabs.set(f.tab.id, { ...f.tab });
-    f.fields.updateTabBar();
-    f.paint();
-  }
-  release();
-  await old;
-  f.paint();
-  expect(oldBadge.getAttribute('aria-label')).toBe(oldLabel);
-  const reopenedLabel = action === 'reopen' ? f.fields.tabBarContainerEl.lastElementChild!.getAttribute('aria-label') : '';
-  expect(reopenedLabel).not.toContain('3 B');
-});
+// Removed: 'rejects a late hover result after tab %s'. TabBar no longer wires
+// any hover/focus size request (guarded in TabBar.test.ts), so the tab
+// leave/rebind/close/reopen actions could not reach the pending stat: the
+// remaining assertions (identity label unchanged, reopened label without a
+// size) held for every action and thus caught no regression. Stale/deferred
+// stat handling stays covered by the menu refresh tests above.

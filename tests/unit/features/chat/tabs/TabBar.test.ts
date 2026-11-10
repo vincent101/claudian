@@ -121,20 +121,23 @@ describe('TabBar', () => {
       expect(containerEl._children[0].getAttribute('aria-label')).toBe('My Conversation · 02a240bd');
     });
 
-    it('keeps the identity tooltip on hover and focus without carrying size state', () => {
+    it('keeps the identity tooltip on hover and focus without wiring a size pipeline', () => {
       const containerEl = createMockEl();
       const tabBar = new TabBar(containerEl, createMockCallbacks());
-      const item = createTabBarItem({
+      tabBar.update([createTabBarItem({
         title: 'My Conversation',
         conversationId: 'one',
         sessionId: '02a240bd-1111-2222-3333-444444444444',
-      });
-      tabBar.update([item]);
+      })]);
       const badge = containerEl._children[0];
       badge.dispatchEvent('mouseenter');
       badge.dispatchEvent('focus');
       expect(badge.getAttribute('aria-label')).toBe('My Conversation · 02a240bd');
-      expect(item).not.toHaveProperty('sizeSnapshot');
+      // A reinstated size pipeline can only observe these gestures through a
+      // badge listener, so listener absence is the guard that actually fails.
+      expect(badge.getEventListenerCount('mouseenter')).toBe(0);
+      expect(badge.getEventListenerCount('focus')).toBe(0);
+      expect(badge.getEventListenerCount('mouseleave')).toBe(0);
     });
 
     it('keeps the plain title tooltip for an unbound draft', () => {
