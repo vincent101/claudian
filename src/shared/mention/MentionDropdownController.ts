@@ -50,6 +50,11 @@ export class MentionDropdownController {
   private agentService: AgentMentionProvider | null = null;
   private fixed: boolean;
   private debounceTimer: ReturnType<typeof setTimeout> | null = null;
+  private preScanTimer: ReturnType<typeof setTimeout> | null = null;
+  // Destroy is terminal: once set, every entry point (input, timer, click,
+  // hover, keydown) must stop before registering callbacks or mutating the
+  // input, so a detached DOM node or saved closure cannot revive the menu.
+  private terminal = false;
 
   constructor(
     containerEl: HTMLElement,
@@ -83,10 +88,13 @@ export class MentionDropdownController {
   }
 
   preScanExternalContexts(): void {
+    if (this.terminal) return;
     const externalContexts = this.callbacks.getExternalContexts() || [];
     if (externalContexts.length === 0) return;
 
-    setTimeout(() => {
+    this.preScanTimer = setTimeout(() => {
+      this.preScanTimer = null;
+      if (this.terminal) return;
       try {
         externalContextScanner.scanPaths(externalContexts);
       } catch {
@@ -109,13 +117,21 @@ export class MentionDropdownController {
   }
 
   destroy(): void {
+    if (this.terminal) return;
+    this.terminal = true;
     if (this.debounceTimer !== null) {
       clearTimeout(this.debounceTimer);
+      this.debounceTimer = null;
+    }
+    if (this.preScanTimer !== null) {
+      clearTimeout(this.preScanTimer);
+      this.preScanTimer = null;
     }
     this.dropdown.destroy();
   }
 
   updateMcpMentionsFromText(text: string): void {
+    if (this.terminal) return;
     if (!this.mcpManager) return;
 
     const validNames = new Set(
@@ -131,11 +147,14 @@ export class MentionDropdownController {
   }
 
   handleInputChange(): void {
+    if (this.terminal) return;
     if (this.debounceTimer !== null) {
       clearTimeout(this.debounceTimer);
     }
 
     this.debounceTimer = setTimeout(() => {
+      this.debounceTimer = null;
+      if (this.terminal) return;
       const text = this.inputEl.value;
       this.updateMcpMentionsFromText(text);
 
@@ -167,6 +186,7 @@ export class MentionDropdownController {
   }
 
   handleKeydown(e: KeyboardEvent): boolean {
+    if (this.terminal) return false;
     if (!this.dropdown.isVisible()) return false;
 
     if (e.key === 'ArrowDown') {
@@ -202,6 +222,7 @@ export class MentionDropdownController {
   }
 
   private showMentionDropdown(searchText: string): void {
+    if (this.terminal) return;
     const searchLower = searchText.toLowerCase();
     this.filteredMentionItems = [];
     this.filteredContextFiles = [];
@@ -417,6 +438,7 @@ export class MentionDropdownController {
   }
 
   private renderMentionDropdown(): void {
+    if (this.terminal) return;
     this.dropdown.render({
       items: this.filteredMentionItems,
       selectedIndex: this.selectedMentionIndex,
@@ -531,6 +553,7 @@ export class MentionDropdownController {
   }
 
   private returnToFirstLevel(): void {
+    if (this.terminal) return;
     const text = this.inputEl.value;
     const beforeAt = text.substring(0, this.mentionStartIndex);
     const cursorPos = this.inputEl.selectionStart || 0;
@@ -546,6 +569,7 @@ export class MentionDropdownController {
   }
 
   private selectMentionItem(): void {
+    if (this.terminal) return;
     if (this.filteredMentionItems.length === 0) return;
 
     const selectedIndex = this.dropdown.getSelectedIndex();

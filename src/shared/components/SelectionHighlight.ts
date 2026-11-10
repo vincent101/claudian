@@ -37,26 +37,28 @@ function createSelectionHighlighter(): SelectionHighlighter {
     provide: (f) => EditorView.decorations.from(f),
   });
 
-  const installedEditors = new WeakSet<EditorView>();
-
-  function ensureHighlightField(editorView: EditorView): void {
-    if (!installedEditors.has(editorView)) {
-      editorView.dispatch({
-        effects: StateEffect.appendConfig.of(selectionHighlightField),
-      });
-      installedEditors.add(editorView);
-    }
+  // Installation follows the live state, never a historical mark: a setState
+  // drops every appended extension, so stale install knowledge would leave
+  // the next show dispatching into a state without the field. Harness views
+  // without the real CM state API report nothing installed.
+  function isHighlightFieldInstalled(editorView: EditorView): boolean {
+    return typeof editorView.state.field === 'function'
+      && editorView.state.field(selectionHighlightField, false) !== undefined;
   }
 
   function show(editorView: EditorView, from: number, to: number): void {
-    ensureHighlightField(editorView);
+    if (!isHighlightFieldInstalled(editorView)) {
+      editorView.dispatch({
+        effects: StateEffect.appendConfig.of(selectionHighlightField),
+      });
+    }
     editorView.dispatch({
       effects: showHighlight.of({ from, to }),
     });
   }
 
   function hide(editorView: EditorView): void {
-    if (installedEditors.has(editorView)) {
+    if (isHighlightFieldInstalled(editorView)) {
       editorView.dispatch({
         effects: hideHighlight.of(null),
       });
