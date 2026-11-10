@@ -308,7 +308,6 @@ export interface PersistentQueryConfig {
   sdkPermissionMode: SDKPermissionMode | null;
   systemPromptKey: string;
   disallowedToolsKey: string;
-  mcpServersKey: string;
   pluginsKey: string;
   externalContextPaths: string[];
   settingSources: string;

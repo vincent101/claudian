@@ -6,9 +6,9 @@ import { EventEmitter } from 'events';
 import * as os from 'os';
 import { clearTimeout as clearNativeTimeout, setTimeout as setNativeTimeout } from 'timers';
 
-import type { McpServerManager } from '@/core/mcp/McpServerManager';
 import type { CommandDropdownSession, CommandDropdownSnapshot } from '@/core/providers/commands/ProviderCommandDiscovery';
 import { ProviderWorkspaceRegistry } from '@/core/providers/ProviderWorkspaceRegistry';
+import type { AppAgentManager, AppPluginManager } from '@/core/providers/types';
 import type { VaultFileAdapter } from '@/core/storage/VaultFileAdapter';
 import type { SlashCommand, StreamChunk } from '@/core/types';
 import * as TabUI from '@/features/chat/tabs/Tab';
@@ -150,17 +150,6 @@ function makePlugin(): ClaudianPlugin {
   } as unknown as ClaudianPlugin;
 }
 
-function makeMcpManager(): McpServerManager {
-  return {
-    loadServers: jest.fn().mockResolvedValue(undefined),
-    getAllDisallowedMcpTools: jest.fn().mockReturnValue([]),
-    getActiveServers: jest.fn().mockReturnValue({}),
-    getDisallowedMcpTools: jest.fn().mockReturnValue([]),
-    extractMentions: jest.fn().mockReturnValue(new Set()),
-    transformMentions: jest.fn((value: string) => value),
-  } as unknown as McpServerManager;
-}
-
 const initMessage = {
   type: 'system',
   subtype: 'init',
@@ -176,7 +165,11 @@ describe('Query command discovery', () => {
     jest.clearAllMocks();
     sdkMock.resetMockMessages();
     records = [];
-    service = new ClaudianService(makePlugin(), makeMcpManager());
+    const plugin = makePlugin();
+    service = new ClaudianService(plugin, {
+      pluginManager: (plugin as unknown as { pluginManager: AppPluginManager }).pluginManager,
+      agentManager: (plugin as unknown as { agentManager: AppAgentManager }).agentManager,
+    });
     jest.spyOn(sdkModule, 'query').mockImplementation(((input: any) => {
       const child = makeMockChild();
       (childProcess.spawn as jest.Mock).mockReturnValueOnce(child);
@@ -266,7 +259,10 @@ describe('Query command discovery', () => {
       try {
         const plugin = makePlugin();
         service.cleanup();
-        service = new ClaudianService(plugin, makeMcpManager());
+        service = new ClaudianService(plugin, {
+          pluginManager: (plugin as unknown as { pluginManager: AppPluginManager }).pluginManager,
+          agentManager: (plugin as unknown as { agentManager: AppAgentManager }).agentManager,
+        });
         await withDeadline(start(), 'temporary fixture startup');
         expect((plugin.app.vault.adapter as unknown as { basePath: string }).basePath).toBe(os.tmpdir());
         expect(childProcess.spawn).toHaveBeenLastCalledWith(

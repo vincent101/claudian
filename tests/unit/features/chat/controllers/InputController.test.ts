@@ -63,11 +63,6 @@ async function* createMockStream(chunks: any[]) {
   }
 }
 
-const mockMcpForEncoder = {
-  extractMentions: jest.fn().mockReturnValue(new Set<string>()),
-  transformMentions: jest.fn().mockImplementation((text: string) => text),
-};
-
 function createMockAgentService() {
   return {
     providerId: 'claude',
@@ -83,7 +78,7 @@ function createMockAgentService() {
       reasoningControl: 'effort',
     }),
     prepareTurn: jest.fn().mockImplementation((request: any) =>
-      encodeClaudeTurn(request, mockMcpForEncoder),
+      encodeClaudeTurn(request),
     ),
     query: jest.fn(),
     steer: jest.fn().mockResolvedValue(true),
@@ -186,7 +181,6 @@ function createMockDeps(overrides: Partial<InputControllerDeps> = {}): InputCont
       transformContextMentions: jest.fn().mockImplementation((text: string) => text),
     }) as any,
     getImageContextManager: () => imageContextManager as any,
-    getMcpServerSelector: () => null,
     getExternalContextSelector: () => null,
     getInstructionModeManager: () => null,
     getInstructionRefineService: () => null,
@@ -473,7 +467,6 @@ describe('InputController - Message Queue', () => {
         persistedContent: 'queued follow-up',
         prompt: 'queued follow-up',
         isCompact: false,
-        mcpMentions: new Set(),
       });
       mockAgentService.steer = jest.fn().mockResolvedValue(true);
 
@@ -547,7 +540,6 @@ describe('InputController - Message Queue', () => {
         persistedContent: 'queued follow-up',
         prompt: 'queued follow-up',
         isCompact: false,
-        mcpMentions: new Set(),
       });
       mockAgentService.steer = jest.fn().mockRejectedValue(new Error('boom'));
 
@@ -605,7 +597,6 @@ describe('InputController - Message Queue', () => {
         persistedContent: 'queued follow-up',
         prompt: 'queued follow-up',
         isCompact: false,
-        mcpMentions: new Set(),
       });
       mockAgentService.steer = jest.fn().mockResolvedValue(false);
 
@@ -658,7 +649,6 @@ describe('InputController - Message Queue', () => {
         persistedContent: 'persisted steer prompt',
         prompt: request.text,
         isCompact: false,
-        mcpMentions: new Set(),
       }));
       mockAgentService.steer = jest.fn().mockResolvedValue(true);
 
@@ -792,7 +782,6 @@ describe('InputController - Message Queue', () => {
           : request.text,
         prompt: request.text,
         isCompact: false,
-        mcpMentions: new Set(),
       }));
       mockAgentService.steer = jest.fn().mockResolvedValue(true);
 
@@ -1050,7 +1039,6 @@ describe('InputController - Message Queue', () => {
         persistedContent: '@server-a hello',
         prompt: '@server-a MCP hello',
         isCompact: false,
-        mcpMentions: new Set(['server-a']),
       });
       (deps as any).mockAgentService.query = jest.fn().mockImplementation(() => createMockStream([{ type: 'done' }]));
 
@@ -1115,20 +1103,7 @@ describe('InputController - Message Queue', () => {
       expect(deps.state.messages[0].currentNote).toBeUndefined();
     });
 
-    it('should include MCP options in query when mentions are present', async () => {
-      const mcpMentions = new Set(['server-a']);
-      const enabledServers = new Set(['server-b']);
-
-      (deps as any).mockAgentService.prepareTurn = jest.fn().mockImplementation((request: any) => ({
-        request,
-        persistedContent: request.text,
-        prompt: request.text,
-        isCompact: false,
-        mcpMentions,
-      }));
-      deps.getMcpServerSelector = () => ({
-        getEnabledServers: () => enabledServers,
-      }) as any;
+    it('does not attach MCP server selections to turn requests (selector removed)', async () => {
       (deps as any).mockAgentService.query = jest.fn().mockImplementation(() => createMockStream([{ type: 'done' }]));
 
       inputEl.value = 'hello';
@@ -1136,9 +1111,7 @@ describe('InputController - Message Queue', () => {
       await controller.sendMessage();
 
       const prepareTurnCall = ((deps as any).mockAgentService.prepareTurn as jest.Mock).mock.calls[0];
-      expect(prepareTurnCall[0].enabledMcpServers).toBe(enabledServers);
-      const queryCall = ((deps as any).mockAgentService.query as jest.Mock).mock.calls[0];
-      expect(queryCall[0].mcpMentions).toBe(mcpMentions);
+      expect(prepareTurnCall[0].enabledMcpServers).toBeUndefined();
     });
 
     it('should append browser selection context when available', async () => {

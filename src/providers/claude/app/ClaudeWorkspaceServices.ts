@@ -1,12 +1,10 @@
 import type { Plugin } from 'obsidian';
 
-import { McpServerManager } from '../../../core/mcp/McpServerManager';
 import type { ProviderCommandCatalog } from '../../../core/providers/commands/ProviderCommandCatalog';
 import { ProviderWorkspaceRegistry } from '../../../core/providers/ProviderWorkspaceRegistry';
 import type {
   AppAgentManager,
   AppAgentStorage,
-  AppMcpStorage,
   AppPluginManager,
   ProviderCliResolver,
   ProviderWorkspaceRegistration,
@@ -25,8 +23,6 @@ import { claudeSettingsTabRenderer } from '../ui/ClaudeSettingsTab';
 export interface ClaudeWorkspaceServices extends ProviderWorkspaceServices {
   claudeStorage: StorageService;
   cliResolver: ProviderCliResolver;
-  mcpStorage: AppMcpStorage;
-  mcpManager: McpServerManager;
   pluginManager: AppPluginManager;
   agentStorage: AppAgentStorage;
   agentManager: AppAgentManager;
@@ -42,9 +38,6 @@ export async function createClaudeWorkspaceServices(
   await claudeStorage.ensureDirectories();
 
   const cliResolver = new ClaudeCliResolver();
-  const mcpStorage = claudeStorage.mcp;
-  const mcpManager = new McpServerManager(mcpStorage);
-  await mcpManager.loadServers();
 
   const vaultPath = getVaultPath(plugin.app) ?? '';
   const pluginManager = new PluginManager(vaultPath, claudeStorage.ccSettings);
@@ -73,9 +66,6 @@ export async function createClaudeWorkspaceServices(
   return {
     claudeStorage,
     cliResolver,
-    mcpStorage,
-    mcpServerManager: mcpManager,
-    mcpManager,
     pluginManager,
     agentStorage,
     agentManager,

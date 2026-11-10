@@ -2,7 +2,6 @@ import { createMockEl } from '@test/helpers/mockElement';
 
 import {
   type AgentMentionProvider,
-  type McpMentionProvider,
   type MentionDropdownCallbacks,
   MentionDropdownController,
 } from '@/shared/mention/MentionDropdownController';
@@ -12,11 +11,6 @@ jest.mock('@/utils/externalContextScanner', () => ({
   externalContextScanner: {
     scanPaths: jest.fn().mockReturnValue([]),
   },
-}));
-
-// Mock extractMcpMentions
-jest.mock('@/utils/mcp', () => ({
-  extractMcpMentions: jest.fn().mockReturnValue(new Set()),
 }));
 
 // Mock SelectableDropdown with controllable visibility
@@ -45,14 +39,9 @@ function createMockInput() {
 }
 
 function createMockCallbacks(overrides: Partial<MentionDropdownCallbacks> = {}): MentionDropdownCallbacks {
-  const mentionedServers = new Set<string>();
   return {
     onAttachFile: jest.fn(),
-    onMcpMentionChange: jest.fn(),
     onAgentMentionSelect: jest.fn(),
-    getMentionedMcpServers: jest.fn().mockReturnValue(mentionedServers),
-    setMentionedMcpServers: jest.fn().mockReturnValue(false),
-    addMentionedMcpServer: jest.fn((name: string) => mentionedServers.add(name)),
     getExternalContexts: jest.fn().mockReturnValue([]),
     getCachedVaultFolders: jest.fn().mockReturnValue([]),
     getCachedVaultFiles: jest.fn().mockReturnValue([]),
@@ -74,12 +63,6 @@ function getLatestDropdownInstance(): any {
   const { SelectableDropdown } = jest.requireMock('@/shared/components/SelectableDropdown');
   const dropdownCtor = SelectableDropdown as jest.Mock;
   return dropdownCtor.mock.results[dropdownCtor.mock.results.length - 1]?.value;
-}
-
-function createMockMcpService(servers: Array<{ name: string }> = []): McpMentionProvider {
-  return {
-    getContextSavingServers: jest.fn().mockReturnValue(servers),
-  };
 }
 
 function createMockAgentService(agents: Array<{
@@ -283,28 +266,12 @@ describe('MentionDropdownController', () => {
     });
   });
 
-  describe('setMcpManager', () => {
-    it('sets the MCP manager', () => {
-      const mcpManager = createMockMcpService([{ name: 'filesystem' }]);
-      controller.setMcpManager(mcpManager);
-
-      inputEl.value = '@';
-      inputEl.selectionStart = 1;
-      controller.handleInputChange();
-      jest.advanceTimersByTime(200);
-
-      expect(mcpManager.getContextSavingServers).toHaveBeenCalled();
-    });
-  });
-
   describe('mixed providers', () => {
-    it('queries both MCP servers and agents', () => {
-      const mcpManager = createMockMcpService([{ name: 'filesystem' }]);
+    it('queries agent providers', () => {
       const agentService = createMockAgentService([
         { id: 'Explore', name: 'Explore', source: 'builtin' },
       ]);
 
-      controller.setMcpManager(mcpManager);
       controller.setAgentService(agentService);
 
       inputEl.value = '@';
@@ -312,7 +279,6 @@ describe('MentionDropdownController', () => {
       controller.handleInputChange();
       jest.advanceTimersByTime(200);
 
-      expect(mcpManager.getContextSavingServers).toHaveBeenCalled();
       expect(agentService.searchAgents).toHaveBeenCalled();
     });
   });
@@ -405,20 +371,6 @@ describe('MentionDropdownController', () => {
   describe('preScanExternalContexts', () => {
     it('can be called without error', () => {
       expect(() => controller.preScanExternalContexts()).not.toThrow();
-    });
-  });
-
-  describe('updateMcpMentionsFromText', () => {
-    it('does nothing without MCP manager', () => {
-      expect(() => controller.updateMcpMentionsFromText('@test')).not.toThrow();
-    });
-
-    it('updates mentions when MCP manager is set', () => {
-      const mcpManager = createMockMcpService([{ name: 'test' }]);
-      controller.setMcpManager(mcpManager);
-      controller.updateMcpMentionsFromText('@test');
-
-      expect(mcpManager.getContextSavingServers).toHaveBeenCalled();
     });
   });
 
@@ -593,7 +545,7 @@ describe('MentionDropdownController', () => {
       localController.destroy();
     });
 
-    it('defaults selection to first vault item when special items exist', () => {
+    it('defaults selection to the first vault item', () => {
       const localCallbacks = createMockCallbacks({
         getCachedVaultFolders: jest.fn().mockReturnValue([
           { name: 'src', path: 'src' },
@@ -608,7 +560,6 @@ describe('MentionDropdownController', () => {
       });
       const localInput = createMockInput();
       const localController = new MentionDropdownController(createMockEl(), localInput, localCallbacks);
-      localController.setMcpManager(createMockMcpService([{ name: 'filesystem' }]));
 
       localInput.value = '@';
       localInput.selectionStart = 1;
@@ -616,7 +567,7 @@ describe('MentionDropdownController', () => {
       jest.advanceTimersByTime(200);
 
       const renderOptions = getLatestDropdownRenderOptions();
-      expect(renderOptions.selectedIndex).toBe(1);
+      expect(renderOptions.selectedIndex).toBe(0);
 
       localController.destroy();
     });
@@ -920,17 +871,6 @@ describe('MentionDropdownController', () => {
       expect(controller.handleKeydown(escapeEvent)).toBe(false);
       expect(escapeEvent.preventDefault).not.toHaveBeenCalled();
       expect((instance.render as jest.Mock).mock.calls.length).toBe(rendersBefore);
-    });
-
-    it('does not propagate MCP mention updates after destroy', () => {
-      const mcpManager = createMockMcpService([{ name: 'test' }]);
-      controller.setMcpManager(mcpManager);
-
-      controller.destroy();
-      controller.updateMcpMentionsFromText('@test');
-
-      expect(callbacks.setMentionedMcpServers).not.toHaveBeenCalled();
-      expect(mcpManager.getContextSavingServers).not.toHaveBeenCalled();
     });
 
     it('destroying one controller does not affect a fresh controller instance', () => {

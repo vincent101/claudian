@@ -20,15 +20,13 @@ export const claudeProviderRegistration: ProviderRegistration = {
   settingsReconciler: claudeSettingsReconciler,
   createRuntime: ({ plugin }) => {
     const workspace = getClaudeWorkspaceServices();
-    const resolvedMcpManager = workspace?.mcpManager;
-    if (!resolvedMcpManager) {
+    if (!workspace) {
       throw new Error('Claude workspace services are not initialized.');
     }
 
     return new ClaudeChatRuntime(plugin, {
-      mcpManager: resolvedMcpManager,
-      pluginManager: workspace?.pluginManager,
-      agentManager: workspace?.agentManager,
+      pluginManager: workspace.pluginManager,
+      agentManager: workspace.agentManager,
     });
   },
   createTitleGenerationService: (plugin) => new ClaudeTitleGenerationService(plugin),

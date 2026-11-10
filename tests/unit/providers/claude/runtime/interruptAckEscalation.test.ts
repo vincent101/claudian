@@ -3,7 +3,7 @@ import '@/providers';
 import * as sdkModule from '@anthropic-ai/claude-agent-sdk';
 import { Notice } from 'obsidian';
 
-import type { McpServerManager } from '@/core/mcp/McpServerManager';
+import type { AppAgentManager, AppPluginManager } from '@/core/providers/types';
 import type ClaudianPlugin from '@/main';
 import { ClaudianService } from '@/providers/claude/runtime/ClaudeChatRuntime';
 import { MessageChannel } from '@/providers/claude/runtime/ClaudeMessageChannel';
@@ -50,15 +50,11 @@ function makeMockPlugin(): ClaudianPlugin {
 }
 
 function makeService(): ClaudianService {
-  const mcpManager = {
-    loadServers: jest.fn().mockResolvedValue(undefined),
-    getAllDisallowedMcpTools: jest.fn().mockReturnValue([]),
-    getActiveServers: jest.fn().mockReturnValue({}),
-    getDisallowedMcpTools: jest.fn().mockReturnValue([]),
-    extractMentions: jest.fn().mockReturnValue(new Set<string>()),
-    transformMentions: jest.fn().mockImplementation((text: string) => text),
-  } as unknown as McpServerManager;
-  return new ClaudianService(makeMockPlugin(), mcpManager);
+  const plugin = makeMockPlugin();
+  return new ClaudianService(plugin, {
+    pluginManager: (plugin as unknown as { pluginManager: AppPluginManager }).pluginManager,
+    agentManager: (plugin as unknown as { agentManager: AppAgentManager }).agentManager,
+  });
 }
 
 async function startPersistentQuery(service: ClaudianService): Promise<MessageChannel> {

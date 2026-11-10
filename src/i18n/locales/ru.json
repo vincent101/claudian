@@ -331,10 +331,6 @@
       "desc": "Скрыть определённые команды и навыки из выпадающего списка. Полезно для скрытия записей Claude Code, которые не актуальны для Claudian. Вводите имена без начального слэша, по одному на строку.",
       "placeholder": "commit\nbuild\ntest"
     },
-    "mcpServers": {
-      "name": "MCP серверы",
-      "desc": "Управление конфигурациями MCP-серверов на уровне хранилища в .claude/mcp.json. Серверы с режимом сохранения контекста требуют @mention для активации."
-    },
     "plugins": {
       "name": "Плагины Claude Code",
       "desc": "Управление плагинами Claude Code из ~/.claude/plugins. Включенные плагины сохраняются для каждого хранилища в .claude/settings.json."
@@ -620,6 +616,7 @@
         "created": "Subagent \"{name}\" created"
       },
       "mcp": {
+        "name": "MCP-серверы",
         "beforeCommand": "Codex manages MCP servers via its own CLI. Configure with",
         "afterCommand": "and they will be available in Claudian.",
         "learnMore": "Learn more"

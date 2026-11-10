@@ -115,7 +115,7 @@ async function historyOwnerFixture(name: string) {
     const controller = new ConversationController({ plugin: f.plugin, state: tab.state,
       getHistoryDropdown: () => f.fields.historyDropdown,
       getFileContextManager: () => null, getExternalContextSelector: () => null,
-      getMcpServerSelector: () => null, getAgentService: () => null, isHydrationReady: () => true,
+      getAgentService: () => null, isHydrationReady: () => true,
     } as unknown as ConversationControllerDeps);
     tab.controllers.conversationController = controller;
     return { tab, controller };
@@ -321,7 +321,7 @@ it.each(['save', 'close'].flatMap(operation => [false, true].map(failed => [oper
     tab.hydrationState = 'READY';
     const controller = new ConversationController({ plugin: f.plugin, state: tab.state,
       getFileContextManager: () => null, getExternalContextSelector: () => null,
-      getMcpServerSelector: () => null, getAgentService: () => null, isHydrationReady: () => true,
+      getAgentService: () => null, isHydrationReady: () => true,
     } as unknown as ConversationControllerDeps);
     tab.controllers.conversationController = controller;
     f.managerFields.tabs.set(tab.id, tab);
@@ -400,7 +400,7 @@ it.each([false, true])('P2-3 preserves metadata outcome despite background refre
   f.plugin.storage = { sessions } as never;
   const controller = new ConversationController({ plugin: f.plugin, state: f.tab.state,
     getFileContextManager: () => null, getExternalContextSelector: () => null,
-    getMcpServerSelector: () => null, getAgentService: () => null, isHydrationReady: () => true,
+    getAgentService: () => null, isHydrationReady: () => true,
   } as unknown as ConversationControllerDeps);
   try {
     const outcome = await controller.save().then(() => null, error => error);
@@ -490,7 +490,7 @@ it('refreshes file bytes after a real normal save even when metadata writing fai
   f.plugin.storage = { sessions } as never;
   const controller = new ConversationController({ plugin: f.plugin, state: f.tab.state,
     getFileContextManager: () => null, getExternalContextSelector: () => null,
-    getMcpServerSelector: () => null, getAgentService: () => null, isHydrationReady: () => true,
+    getAgentService: () => null, isHydrationReady: () => true,
   } as unknown as ConversationControllerDeps);
   const hydrate = jest.spyOn(ProviderRegistry.getConversationHistoryService('codex'), 'hydrateConversationHistory');
   f.badge().dispatchEvent(new MouseEvent('mouseenter'));

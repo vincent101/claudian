@@ -3,19 +3,6 @@ import type { QueryOptionsContext } from '@/providers/claude/runtime/ClaudeQuery
 import { QueryOptionsBuilder } from '@/providers/claude/runtime/ClaudeQueryOptionsBuilder';
 import type { PersistentQueryConfig } from '@/providers/claude/runtime/types';
 
-// Create a mock MCP server manager
-function createMockMcpManager() {
-  return {
-    loadServers: jest.fn().mockResolvedValue(undefined),
-    getServers: jest.fn().mockReturnValue([]),
-    getEnabledCount: jest.fn().mockReturnValue(0),
-    getActiveServers: jest.fn().mockReturnValue({}),
-    getDisallowedMcpTools: jest.fn().mockReturnValue([]),
-    getAllDisallowedMcpTools: jest.fn().mockReturnValue([]),
-    hasServers: jest.fn().mockReturnValue(false),
-  } as any;
-}
-
 // Create a mock plugin manager
 function createMockPluginManager() {
   return {
@@ -71,7 +58,6 @@ function createMockPersistentQueryConfig(
     sdkPermissionMode: 'bypassPermissions',
     systemPromptKey: 'key1',
     disallowedToolsKey: '',
-    mcpServersKey: '',
     pluginsKey: '',
     externalContextPaths: [],
     settingSources: 'project,local',
@@ -90,7 +76,6 @@ function createMockContext(overrides: Partial<QueryOptionsContext> = {}): QueryO
     settings: createMockSettings(),
     customEnv: {},
     enhancedPath: '/usr/bin:/mock/bin',
-    mcpManager: createMockMcpManager(),
     pluginManager: createMockPluginManager(),
     ...overrides,
   };
@@ -670,23 +655,17 @@ describe('QueryOptionsBuilder', () => {
   });
 
   describe('buildColdStartQueryOptions', () => {
-    it('includes MCP servers when available', () => {
-      const mcpManager = createMockMcpManager();
-      mcpManager.getActiveServers.mockReturnValue({
-        'test-server': { command: 'test', args: [] },
-      });
-
+    it('never injects user MCP servers into cold-start options', () => {
       const ctx = {
-        ...createMockContext({ mcpManager }),
+        ...createMockContext(),
         abortController: new AbortController(),
         hooks: {},
-        mcpMentions: new Set(['test-server']),
         hasEditorContext: false,
       };
       const options = QueryOptionsBuilder.buildColdStartQueryOptions(ctx);
 
-      expect(options.mcpServers).toBeDefined();
-      expect(options.mcpServers?.['test-server']).toBeDefined();
+      // In-app MCP management is gone: no server list may ever be attached.
+      expect(options.mcpServers).toBeUndefined();
     });
 
     it('uses model override when provided', () => {

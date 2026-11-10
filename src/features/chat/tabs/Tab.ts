@@ -282,10 +282,6 @@ function getRegistryProviderCatalogInfo(providerId: ProviderId): ProviderCatalog
   };
 }
 
-function getProviderMcpManager(providerId: ProviderId) {
-  return ProviderWorkspaceRegistry.getMcpServerManager(providerId);
-}
-
 function syncSlashCommandDropdownForProvider(
   tab: TabData,
   plugin: ClaudianPlugin,
@@ -358,17 +354,9 @@ function refreshTabProviderUI(tab: TabData, plugin: ClaudianPlugin): void {
 function applyProviderUIGating(tab: TabData, plugin: ClaudianPlugin): void {
   const capabilities = getTabCapabilities(tab, plugin);
   const uiConfig = getTabChatUIConfig(tab, plugin);
-  const mcpManager = capabilities.supportsMcpTools
-    ? getProviderMcpManager(capabilities.providerId)
-    : null;
   const hasPermissionToggle = Boolean(uiConfig.getPermissionModeOptions?.(plugin.settings as unknown as Record<string, unknown>)?.length);
 
-  if (!capabilities.supportsMcpTools) {
-    tab.ui.mcpServerSelector?.clearEnabled();
-  }
-  tab.ui.mcpServerSelector?.setVisible(capabilities.supportsMcpTools);
   tab.ui.permissionToggle?.setVisible(hasPermissionToggle);
-  tab.ui.fileContextManager?.setMcpManager(mcpManager);
 
   tab.ui.fileContextManager?.setAgentService(
     ProviderWorkspaceRegistry.getAgentMentionProvider(capabilities.providerId),
@@ -619,7 +607,6 @@ export function createTab(options: TabCreateOptions): TabData {
       modeSelector: null,
       thinkingBudgetSelector: null,
       externalContextSelector: null,
-      mcpServerSelector: null,
       permissionToggle: null,
       serviceTierToggle: null,
       slashCommandDropdown: null,
@@ -876,7 +863,6 @@ function initializeContextManagers(tab: TabData, plugin: ClaudianPlugin): void {
     },
     dom.inputContainerEl
   );
-  tab.ui.fileContextManager.setMcpManager(getProviderMcpManager(getTabProviderId(tab, plugin)));
 
   // Image context manager - drag/drop uses inputContainerEl, preview in contextRowEl
   tab.ui.imageContextManager = new ImageContextManager(
@@ -1119,16 +1105,8 @@ function initializeInputToolbar(
   tab.ui.thinkingBudgetSelector = toolbarComponents.thinkingBudgetSelector;
   tab.ui.contextUsageMeter = toolbarComponents.contextUsageMeter;
   tab.ui.externalContextSelector = toolbarComponents.externalContextSelector;
-  tab.ui.mcpServerSelector = toolbarComponents.mcpServerSelector;
   tab.ui.permissionToggle = toolbarComponents.permissionToggle;
   tab.ui.serviceTierToggle = toolbarComponents.serviceTierToggle;
-
-  tab.ui.mcpServerSelector.setMcpManager(getProviderMcpManager(getTabProviderId(tab, plugin)));
-
-  // Sync @-mentions to UI selector
-  tab.ui.fileContextManager?.setOnMcpMentionChange((servers) => {
-    tab.ui.mcpServerSelector?.addMentionedServers(servers);
-  });
 
   // Wire external context changes: revoke manager-side command eligibility
   // synchronously (before the dropdown reset and the prescan) so an effective
@@ -1627,7 +1605,6 @@ export function initializeTabControllers(
       getInputEl: () => dom.inputEl,
       getFileContextManager: () => ui.fileContextManager,
       getImageContextManager: () => ui.imageContextManager,
-      getMcpServerSelector: () => ui.mcpServerSelector,
       getExternalContextSelector: () => ui.externalContextSelector,
       clearQueuedMessage: () => tab.controllers.inputController?.clearQueuedMessage(),
       getProjectionCoordinator: () => tab.controllers.projectionWriteCoordinator,
@@ -1869,7 +1846,6 @@ export function initializeTabControllers(
     getMessagesEl: () => dom.messagesEl,
     getFileContextManager: () => ui.fileContextManager,
     getImageContextManager: () => ui.imageContextManager,
-    getMcpServerSelector: () => ui.mcpServerSelector,
     getExternalContextSelector: () => ui.externalContextSelector,
     getInstructionModeManager: () => ui.instructionModeManager,
     getInstructionRefineService: () => services.instructionRefineService,

@@ -4,7 +4,7 @@ import * as sdkModule from '@anthropic-ai/claude-agent-sdk';
 import { tmpdir } from 'os';
 import { join } from 'path';
 
-import type { McpServerManager } from '@/core/mcp/McpServerManager';
+import type { AppAgentManager, AppPluginManager } from '@/core/providers/types';
 import type ClaudianPlugin from '@/main';
 import { ClaudianService } from '@/providers/claude/runtime/ClaudeChatRuntime';
 import { MessageChannel } from '@/providers/claude/runtime/ClaudeMessageChannel';
@@ -28,11 +28,8 @@ const sdkMock = sdkModule as unknown as {
   query: typeof sdkModule.query;
 };
 
-type MockMcpServerManager = jest.Mocked<McpServerManager>;
-
 describe('ClaudianService', () => {
   let mockPlugin: Partial<ClaudianPlugin>;
-  let mockMcpManager: MockMcpServerManager;
   let service: ClaudianService;
 
   function makeTestTurn(turnId = `test-turn-${Date.now()}-${Math.random().toString(36).slice(2)}`) {
@@ -82,16 +79,10 @@ describe('ClaudianService', () => {
       },
     } as unknown as ClaudianPlugin;
 
-    mockMcpManager = {
-      loadServers: jest.fn().mockResolvedValue(undefined),
-      getAllDisallowedMcpTools: jest.fn().mockReturnValue([]),
-      getActiveServers: jest.fn().mockReturnValue({}),
-      getDisallowedMcpTools: jest.fn().mockReturnValue([]),
-      extractMentions: jest.fn().mockReturnValue(new Set<string>()),
-      transformMentions: jest.fn().mockImplementation((text: string) => text),
-    } as unknown as MockMcpServerManager;
-
-    service = new ClaudianService(mockPlugin as ClaudianPlugin, mockMcpManager);
+    service = new ClaudianService(mockPlugin as ClaudianPlugin, {
+      pluginManager: (mockPlugin as unknown as { pluginManager: AppPluginManager }).pluginManager,
+      agentManager: (mockPlugin as unknown as { agentManager: Pick<AppAgentManager, 'setBuiltinAgentNames'> }).agentManager,
+    });
   });
 
   describe('prepareTurn', () => {
@@ -101,7 +92,6 @@ describe('ClaudianService', () => {
       expect(result.prompt).toBe('hello world');
       expect(result.persistedContent).toBe('hello world');
       expect(result.isCompact).toBe(false);
-      expect(result.mcpMentions).toEqual(new Set());
     });
 
     it('should append current note context', () => {
@@ -124,11 +114,6 @@ describe('ClaudianService', () => {
       expect(result.persistedContent).toBe('/compact');
     });
 
-    it('should extract MCP mentions', () => {
-      (mockMcpManager.extractMentions as jest.Mock).mockReturnValue(new Set(['server-a']));
-      const result = service.prepareTurn({ turnId: 'turn-prepare-4', text: '@server-a hello' });
-      expect(result.mcpMentions).toEqual(new Set(['server-a']));
-    });
   });
 
   describe('query with PreparedChatTurn', () => {
@@ -218,14 +203,6 @@ describe('ClaudianService', () => {
 
       expect(ensureReadySpy).not.toHaveBeenCalled();
       expect(service.getSessionId()).toBe('test-session');
-    });
-  });
-
-  describe('MCP Server Management', () => {
-    it('should reload MCP servers', async () => {
-      await service.reloadMcpServers();
-
-      expect(mockMcpManager.loadServers).toHaveBeenCalled();
     });
   });
 
@@ -1850,18 +1827,6 @@ describe('ClaudianService', () => {
       expect((service as any).currentConfig.enableAutoMode).toBe(true);
     });
 
-    it('should update MCP servers when changed', async () => {
-      mockMcpManager.getActiveServers.mockReturnValue({
-        'test-server': { command: 'test', args: [] },
-      });
-
-      await (service as any).applyDynamicUpdates({
-        mcpMentions: new Set(['test-server']),
-      });
-
-      expect(mockPersistentQuery.setMcpServers).toHaveBeenCalled();
-    });
-
     it('should not restart when allowRestart is false', async () => {
       // Change something that would trigger restart
       (mockPlugin.getResolvedProviderCliPath as jest.Mock).mockReturnValue('/new/path/to/claude');
@@ -1928,12 +1893,6 @@ describe('ClaudianService', () => {
       await expect((service as any).applyDynamicUpdates({})).resolves.toBeUndefined();
     });
 
-    it('should silently handle MCP servers update error', async () => {
-      mockMcpManager.getActiveServers.mockReturnValue({ 'server-1': { command: 'cmd' } });
-      mockPersistentQuery.setMcpServers.mockRejectedValueOnce(new Error('MCP error'));
-
-      await expect((service as any).applyDynamicUpdates({ mcpMentions: new Set(['server-1']) })).resolves.toBeUndefined();
-    });
   });
 
   describe('query() method', () => {

@@ -91,10 +91,6 @@ jest.mock('@/features/settings/ui/EnvironmentSettingsSection', () => ({
   renderEnvironmentSettingsSection: (...args: unknown[]) => mockRenderEnvironmentSettingsSection(...args),
 }));
 
-jest.mock('@/features/settings/ui/McpSettingsManager', () => ({
-  McpSettingsManager: jest.fn(),
-}));
-
 jest.mock('@/providers/claude/app/ClaudeWorkspaceServices', () => ({
   getClaudeWorkspaceServices: jest.fn(() => ({
     cliResolver: {
@@ -103,7 +99,6 @@ jest.mock('@/providers/claude/app/ClaudeWorkspaceServices', () => ({
     commandCatalog: {},
     agentManager: {},
     agentStorage: {},
-    mcpStorage: {},
     pluginManager: {},
   })),
 }));

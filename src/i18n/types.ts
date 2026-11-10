@@ -273,10 +273,6 @@ export type TranslationKey =
   | 'settings.hiddenSlashCommands.desc'
   | 'settings.hiddenSlashCommands.placeholder'
 
-  // Settings - MCP Servers
-  | 'settings.mcpServers.name'
-  | 'settings.mcpServers.desc'
-
   // Settings - Plugins
   | 'settings.plugins.name'
   | 'settings.plugins.desc'
@@ -423,6 +419,7 @@ export type TranslationKey =
   | 'settings.codex.subagents.deleteFailed'
   | 'settings.codex.subagents.updated'
   | 'settings.codex.subagents.created'
+  | 'settings.codex.mcp.name'
   | 'settings.codex.mcp.beforeCommand'
   | 'settings.codex.mcp.afterCommand'
   | 'settings.codex.mcp.learnMore'

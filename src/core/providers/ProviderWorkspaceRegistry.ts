@@ -30,7 +30,7 @@ interface CommandCatalogSlot {
  * Registry for provider-owned workspace/bootstrap services.
  *
  * Unlike `ProviderRegistry`, this boundary owns app-level provider services such
- * as command catalogs, mention providers, MCP/plugin/agent managers, and
+ * as command catalogs, mention providers, plugin/agent managers, and
  * provider-specific storage adaptors.
  */
 export class ProviderWorkspaceRegistry {
@@ -83,7 +83,7 @@ export class ProviderWorkspaceRegistry {
     }
     const nextCatalog = services?.commandCatalog ?? null;
     // Only the command slot drives revision/notifications. An unchanged
-    // catalog object — including MCP-only changes on the same services
+    // catalog object — including non-command changes on the same services
     // object — must not advance the command revision.
     if (previousCatalog === nextCatalog) return;
     const slot = this.ensureCommandCatalogSlot(providerId);
@@ -185,10 +185,6 @@ export class ProviderWorkspaceRegistry {
 
   static getTabWarmupPolicy(providerId: ProviderId): ProviderTabWarmupPolicy | null {
     return this.getServices(providerId)?.tabWarmupPolicy ?? null;
-  }
-
-  static getMcpServerManager(providerId: ProviderId) {
-    return this.getServices(providerId)?.mcpServerManager ?? null;
   }
 
   static getSettingsTabRenderer(providerId: ProviderId): ProviderSettingsTabRenderer | null {

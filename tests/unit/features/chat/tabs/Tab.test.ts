@@ -174,7 +174,6 @@ const createMockClaudianService = (overrides?: {
     supportsProviderCommands: true,
     supportsImageAttachments: true,
     supportsInstructionMode: true,
-    supportsMcpTools: true,
     reasoningControl: 'effort',
   }),
   syncConversationState: overrides?.syncConversationState ?? jest.fn(),
@@ -198,13 +197,6 @@ const createMockExternalContextSelector = () => ({
   setOnChange: jest.fn(),
   setPersistentPaths: jest.fn(),
   setOnPersistenceChange: jest.fn(),
-});
-
-const createMockMcpServerSelector = () => ({
-  setMcpManager: jest.fn(),
-  addMentionedServers: jest.fn(),
-  clearEnabled: jest.fn(),
-  setVisible: jest.fn(),
 });
 
 const createMockPermissionToggle = () => ({
@@ -231,7 +223,6 @@ let mockModeSelector: ReturnType<typeof createMockModeSelector>;
 let mockThinkingBudgetSelector: ReturnType<typeof createMockThinkingBudgetSelector>;
 let mockContextUsageMeter: ReturnType<typeof createMockContextUsageMeter>;
 let mockExternalContextSelector: ReturnType<typeof createMockExternalContextSelector>;
-let mockMcpServerSelector: ReturnType<typeof createMockMcpServerSelector>;
 let mockPermissionToggle: ReturnType<typeof createMockPermissionToggle>;
 let mockServiceTierToggle: ReturnType<typeof createMockServiceTierToggle>;
 let mockMessageRenderer: { scrollToBottomIfNeeded: jest.Mock; setAsyncSubagentClickCallback: jest.Mock };
@@ -311,7 +302,6 @@ jest.mock('@/features/chat/ui/InputToolbar', () => ({
     mockThinkingBudgetSelector = createMockThinkingBudgetSelector();
     mockContextUsageMeter = createMockContextUsageMeter();
     mockExternalContextSelector = createMockExternalContextSelector();
-    mockMcpServerSelector = createMockMcpServerSelector();
     mockPermissionToggle = createMockPermissionToggle();
     mockServiceTierToggle = createMockServiceTierToggle();
     return {
@@ -320,7 +310,6 @@ jest.mock('@/features/chat/ui/InputToolbar', () => ({
       thinkingBudgetSelector: mockThinkingBudgetSelector,
       contextUsageMeter: mockContextUsageMeter,
       externalContextSelector: mockExternalContextSelector,
-      mcpServerSelector: mockMcpServerSelector,
       permissionToggle: mockPermissionToggle,
       serviceTierToggle: mockServiceTierToggle,
     };
@@ -997,8 +986,7 @@ describe('Tab - Service Initialization', () => {
         supportsProviderCommands: false,
         supportsImageAttachments: true,
         supportsInstructionMode: false,
-        supportsMcpTools: false,
-        reasoningControl: 'none',
+          reasoningControl: 'none',
       });
 
       const options = createMockOptions({
@@ -1970,15 +1958,6 @@ describe('Tab - UI Initialization', () => {
       expect(tab.ui.fileContextManager).toBeDefined();
     });
 
-    it('should wire FileContextManager to MCP service', () => {
-      const options = createMockOptions();
-      const tab = createTab(options);
-
-      initializeTabUI(tab, options.plugin);
-
-      expect(mockFileContextManager.setMcpManager).toHaveBeenCalledWith((options.plugin as any).mcpManager);
-    });
-
     it('should create ImageContextManager', () => {
       const options = createMockOptions();
       const tab = createTab(options);
@@ -2054,7 +2033,6 @@ describe('Tab - UI Initialization', () => {
       expect(tab.ui.thinkingBudgetSelector).toBeDefined();
       expect(tab.ui.contextUsageMeter).toBeDefined();
       expect(tab.ui.externalContextSelector).toBeDefined();
-      expect(tab.ui.mcpServerSelector).toBeDefined();
       expect(tab.ui.permissionToggle).toBeDefined();
     });
 
@@ -2079,15 +2057,6 @@ describe('Tab - UI Initialization', () => {
       expect(tab.ui.bangBashModeManager).toBeDefined();
 
       getEnhancedPathSpy.mockRestore();
-    });
-
-    it('should wire MCP server selector to MCP service', () => {
-      const options = createMockOptions();
-      const tab = createTab(options);
-
-      initializeTabUI(tab, options.plugin);
-
-      expect(mockMcpServerSelector.setMcpManager).toHaveBeenCalledWith((options.plugin as any).mcpManager);
     });
 
     it('should wire external context selector onChange', () => {
@@ -2875,21 +2844,6 @@ describe('Tab - UI Callback Wiring', () => {
       expect(contexts).toEqual(['/path/1', '/path/2']);
     });
 
-    it('should wire MCP mention change to add servers to selector', () => {
-      const options = createMockOptions();
-      const tab = createTab(options);
-
-      initializeTabUI(tab, options.plugin);
-
-      // Get the setOnMcpMentionChange callback
-      const onMcpMentionChange = mockFileContextManager.setOnMcpMentionChange.mock.calls[0][0];
-
-      // Trigger with server list
-      onMcpMentionChange(['server1', 'server2']);
-
-      expect(mockMcpServerSelector.addMentionedServers).toHaveBeenCalledWith(['server1', 'server2']);
-    });
-
     it('should wire external context onChange to pre-scan contexts', () => {
       const options = createMockOptions();
       const tab = createTab(options);
@@ -2948,8 +2902,7 @@ describe('Tab - UI Callback Wiring', () => {
         supportsProviderCommands: false,
         supportsImageAttachments: true,
         supportsInstructionMode: false,
-        supportsMcpTools: false,
-        reasoningControl: 'none',
+          reasoningControl: 'none',
       });
 
       const options = createMockOptions({
@@ -3211,7 +3164,6 @@ describe('Tab - Controller Configuration', () => {
       expect(config.getMessagesEl()).toBe(tab.dom.messagesEl);
       expect(config.getFileContextManager()).toBe(tab.ui.fileContextManager);
       expect(config.getImageContextManager()).toBe(tab.ui.imageContextManager);
-      expect(config.getMcpServerSelector()).toBe(tab.ui.mcpServerSelector);
       expect(config.getExternalContextSelector()).toBe(tab.ui.externalContextSelector);
       expect(config.getInstructionModeManager()).toBe(tab.ui.instructionModeManager);
       expect(config.getInstructionRefineService()).toBe(tab.services.instructionRefineService);

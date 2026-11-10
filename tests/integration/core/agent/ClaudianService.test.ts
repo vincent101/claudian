@@ -1623,25 +1623,6 @@ describe('ClaudianService', () => {
       expect(getQueryCallCount()).toBe(queryCountBefore);
     });
 
-    it('updates MCP servers on the active persistent query', async () => {
-      const chunks1: any[] = [];
-      for await (const c of service.query('first', undefined, undefined, {
-        mcpMentions: new Set(['server1']),
-      })) chunks1.push(c);
-
-      const response1 = getLastResponse();
-      expect(response1?.setMcpServers).toHaveBeenCalled();
-
-      // Query with different MCP mentions
-      const chunks2: any[] = [];
-      for await (const c of service.query('second', undefined, undefined, {
-        mcpMentions: new Set(['server2']),
-      })) chunks2.push(c);
-
-      const response2 = getLastResponse();
-      expect(response2?.setMcpServers).toHaveBeenCalled();
-    });
-
     it('reapplies query overrides after restart triggered by config change', async () => {
       const chunks1: any[] = [];
       for await (const c of service.query('first')) chunks1.push(c);

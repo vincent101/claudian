@@ -110,7 +110,6 @@ const mockGetCapabilities = jest.fn().mockReturnValue({
   supportsProviderCommands: true,
   supportsImageAttachments: true,
   supportsInstructionMode: true,
-  supportsMcpTools: true,
   reasoningControl: 'effort',
 });
 const mockGetChatUIConfig = jest.fn();
@@ -257,11 +256,6 @@ function createRealConversationControllerHarness(
       getCurrentNotePath: jest.fn().mockReturnValue(null),
     }) as any,
     getImageContextManager: () => ({ clearImages: jest.fn() }) as any,
-    getMcpServerSelector: () => ({
-      clearEnabled: jest.fn(),
-      getEnabledServers: jest.fn().mockResolvedValue(new Set()),
-      setEnabledServers: jest.fn(),
-    }) as any,
     getExternalContextSelector: () => ({
       getExternalContexts: jest.fn().mockReturnValue([]),
       setExternalContexts: jest.fn(),

@@ -14,7 +14,6 @@ export function encodeCodexTurn(request: ChatTurnRequest): PreparedChatTurn {
       persistedContent: request.text,
       prompt: request.text,
       isCompact: true,
-      mcpMentions: new Set(),
     };
   }
 
@@ -54,6 +53,5 @@ export function encodeCodexTurn(request: ChatTurnRequest): PreparedChatTurn {
     persistedContent: request.text,
     prompt,
     isCompact: false,
-    mcpMentions: new Set(),
   };
 }

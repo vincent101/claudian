@@ -46,7 +46,7 @@ import type { QueuedMessage } from '../state/types';
 import type { CompletedTurnEvent } from '../tabs/types';
 import type { FileContextManager } from '../ui/FileContext';
 import type { ImageContextManager } from '../ui/ImageContext';
-import type { AddExternalContextResult, McpServerSelector } from '../ui/InputToolbar';
+import type { AddExternalContextResult } from '../ui/InputToolbar';
 import type { InstructionModeManager } from '../ui/InstructionModeManager';
 import type { StatusPanel } from '../ui/StatusPanel';
 import type { BrowserSelectionController } from './BrowserSelectionController';
@@ -97,7 +97,6 @@ export interface InputControllerDeps {
   getMessagesEl: () => HTMLElement;
   getFileContextManager: () => FileContextManager | null;
   getImageContextManager: () => ImageContextManager | null;
-  getMcpServerSelector: () => McpServerSelector | null;
   getExternalContextSelector: () => {
     getExternalContexts: () => string[];
     addExternalContext: (path: string) => AddExternalContextResult;
@@ -999,7 +998,6 @@ export class InputController {
     } = this.deps;
 
     const fileContextManager = this.deps.getFileContextManager();
-    const mcpServerSelector = this.deps.getMcpServerSelector();
     const externalContextSelector = this.deps.getExternalContextSelector();
 
     const currentNotePath = fileContextManager?.getCurrentNotePath() || null;
@@ -1020,7 +1018,6 @@ export class InputController {
     const transformedText = !isCompact && fileContextManager
       ? fileContextManager.transformContextMentions(options.content)
       : options.content;
-    const enabledMcpServers = mcpServerSelector?.getEnabledServers();
 
     return {
       displayContent: options.content,
@@ -1039,9 +1036,6 @@ export class InputController {
         canvasSelection: canvasContext,
         externalContextPaths: externalContextPaths && externalContextPaths.length > 0
           ? externalContextPaths
-          : undefined,
-        enabledMcpServers: enabledMcpServers && enabledMcpServers.size > 0
-          ? enabledMcpServers
           : undefined,
       },
     };

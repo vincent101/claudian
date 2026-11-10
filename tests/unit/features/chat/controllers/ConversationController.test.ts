@@ -116,11 +116,6 @@ function createMockDeps(overrides: Partial<ConversationControllerDeps> = {}): Co
     getImageContextManager: () => ({
       clearImages: jest.fn(),
     }) as any,
-    getMcpServerSelector: () => ({
-      clearEnabled: jest.fn(),
-      getEnabledServers: jest.fn().mockResolvedValue(new Set()),
-      setEnabledServers: jest.fn(),
-    }) as any,
     getExternalContextSelector: () => ({
       getExternalContexts: jest.fn().mockReturnValue([]),
       setExternalContexts: jest.fn(),
@@ -3752,212 +3747,36 @@ Recent messages:
   });
 });
 
-describe('ConversationController - MCP Server Persistence', () => {
+describe('ConversationController - legacy enabledMcpServers round-trip', () => {
   let controller: ConversationController;
   let deps: ConversationControllerDeps;
-  let mockMcpServerSelector: any;
 
   beforeEach(() => {
     jest.clearAllMocks();
-    mockMcpServerSelector = {
-      clearEnabled: jest.fn(),
-      getEnabledServers: jest.fn().mockReturnValue(new Set(['mcp-server-1', 'mcp-server-2'])),
-      setEnabledServers: jest.fn(),
-    };
-    deps = createMockDeps({
-      getMcpServerSelector: () => mockMcpServerSelector,
-    });
+    deps = createMockDeps();
     controller = new ConversationController(deps);
   });
 
-  describe('save', () => {
-    it('should save enabled MCP servers to conversation', async () => {
-      deps.state.currentConversationId = 'conv-1';
-
-      await controller.save();
-
-      expect(deps.plugin.updateConversation).toHaveBeenCalledWith(
-        'conv-1',
-        expect.objectContaining({
-          enabledMcpServers: ['mcp-server-1', 'mcp-server-2'],
-        })
-      );
+  it('never writes new enabledMcpServers values on save (deprecated inert field)', async () => {
+    deps.state.currentConversationId = 'conv-1';
+    (deps.plugin.getConversationSync as jest.Mock).mockReturnValue({
+      id: 'conv-1',
+      messages: [],
+      sessionId: 'sess-1',
+      enabledMcpServers: ['legacy-server'],
     });
 
-    it('should save undefined when no MCP servers enabled', async () => {
-      mockMcpServerSelector.getEnabledServers.mockReturnValue(new Set());
-      deps.state.currentConversationId = 'conv-1';
+    await controller.save();
 
-      await controller.save();
-
-      expect(deps.plugin.updateConversation).toHaveBeenCalledWith(
-        'conv-1',
-        expect.objectContaining({
-          enabledMcpServers: undefined,
-        })
-      );
-    });
-  });
-
-  describe('loadActive', () => {
-    it('should restore enabled MCP servers from conversation', async () => {
-      deps.state.currentConversationId = 'conv-1';
-      (deps.plugin.getConversationById as jest.Mock).mockResolvedValue({
-        id: 'conv-1',
-        messages: [],
-        sessionId: null,
-        enabledMcpServers: ['restored-server-1', 'restored-server-2'],
-      });
-
-      await controller.loadActive();
-
-      expect(mockMcpServerSelector.setEnabledServers).toHaveBeenCalledWith([
-        'restored-server-1',
-        'restored-server-2',
-      ]);
-    });
-
-    it('should clear MCP servers when conversation has none', async () => {
-      deps.state.currentConversationId = 'conv-1';
-      (deps.plugin.getConversationById as jest.Mock).mockResolvedValue({
-        id: 'conv-1',
-        messages: [],
-        sessionId: null,
-        enabledMcpServers: undefined,
-      });
-
-      await controller.loadActive();
-
-      expect(mockMcpServerSelector.clearEnabled).toHaveBeenCalled();
-    });
-  });
-
-  describe('switchTo', () => {
-    it('should restore enabled MCP servers when switching conversations', async () => {
-      deps.state.currentConversationId = 'old-conv';
-      (deps.plugin.switchConversation as jest.Mock).mockResolvedValue({
-        id: 'new-conv',
-        providerId: 'claude',
-        messages: [],
-        sessionId: null,
-        enabledMcpServers: ['switched-server'],
-      });
-
-      await controller.switchTo('new-conv');
-
-      expect(mockMcpServerSelector.setEnabledServers).toHaveBeenCalledWith(['switched-server']);
-    });
-
-    it('should clear MCP servers when switching to conversation with no servers', async () => {
-      deps.state.currentConversationId = 'old-conv';
-      (deps.plugin.switchConversation as jest.Mock).mockResolvedValue({
-        id: 'new-conv',
-        providerId: 'claude',
-        messages: [],
-        sessionId: null,
-        enabledMcpServers: undefined,
-      });
-
-      await controller.switchTo('new-conv');
-
-      expect(mockMcpServerSelector.clearEnabled).toHaveBeenCalled();
-    });
-
-    it('keeps non-index Codex hydration on the legacy renderer without creating page windows', async () => {
-      const historyWindowRenderer = { addPage: jest.fn(), reset: jest.fn() };
-      const switchedConversation = {
-        id: 'codex-conv', providerId: 'codex', title: 'Codex',
-        messages: [{ id: 'm', role: 'user', content: 'hello', timestamp: 1 }],
-        sessionId: 'session-codex', createdAt: 1, updatedAt: 1,
-      };
-      deps = createMockDeps({
-        getHistoryWindowRenderer: () => historyWindowRenderer as any,
-        getHistoryIndexCapableService: () => null,
-        plugin: { ...createMockDeps().plugin, switchConversation: jest.fn().mockResolvedValue(switchedConversation) } as any,
-      });
-      controller = new ConversationController(deps);
-      deps.state.currentConversationId = 'old-conv';
-
-      await controller.switchTo('codex-conv');
-
-      expect(historyWindowRenderer.addPage).not.toHaveBeenCalled();
-      expect(deps.renderer.renderMessages).toHaveBeenCalledWith(switchedConversation.messages, expect.any(Function));
-    });
-
-    it('renders the history pager after a paged first-screen restore', async () => {
-      deps.state.currentConversationId = 'old-conv';
-      const switched = { id: 'large', providerId: 'claude', title: 'Large', messages: [], sessionId: 'session', createdAt: 1, updatedAt: 1 } as any;
-      (deps.plugin.switchConversation as jest.Mock).mockResolvedValue(switched);
-      (deps.plugin.getConversationSync as jest.Mock).mockImplementation((id: string) => (id === 'large' ? switched : null));
-      const lease = {
-        conversationId: 'large', totalTurns: 120, ready: Promise.resolve(), release: jest.fn(),
-        planWindow: jest.fn().mockImplementation(({ anchorTurn, budget }: any) => ({ start: anchorTurn - budget.maxTurns, end: anchorTurn })),
-        loadWindow: jest.fn().mockResolvedValue({
-          messages: [{ id: 'latest', role: 'user', content: 'latest', timestamp: 1 }],
-          range: { start: 110, end: 120 }, sourceBytes: 10, projectedChars: 20,
-          oversizedTurnCount: 0, pageKey: 'w:110:120', hasMoreBefore: true, hasMoreAfter: false,
-        }),
-      };
-      deps.getHistoryIndexCapableService = () => ({ acquireHistoryIndex: () => lease } as any);
-      const historyWindowRenderer = { addPage: jest.fn(), reset: jest.fn(), sampleIntent: jest.fn() };
-      deps.getHistoryWindowRenderer = () => historyWindowRenderer as any;
-
-      await controller.switchTo('large');
-
-      expect(historyWindowRenderer.addPage).toHaveBeenCalled();
-      expect(deps.renderer.renderHistoryPager).toHaveBeenCalledWith(true, false, null, expect.any(Function));
-    });
-
-    it('clears stale pager state when switching to a conversation without paged history', async () => {
-      deps.state.currentConversationId = 'old-conv';
-      // Stale pagination flags from the outgoing conversation must not leak a
-      // dead "Load earlier" button into the incoming conversation.
-      deps.state.historyHasMore = true;
-      const switched = { id: 'codex-conv', providerId: 'codex', title: 'Codex', messages: [{ id: 'm', role: 'user', content: 'hello', timestamp: 1 }], sessionId: 'session-codex', createdAt: 1, updatedAt: 1 } as any;
-      (deps.plugin.switchConversation as jest.Mock).mockResolvedValue(switched);
-      (deps.plugin.getConversationSync as jest.Mock).mockImplementation((id: string) => (id === 'codex-conv' ? switched : null));
-      deps.getHistoryIndexCapableService = () => null;
-
-      await controller.switchTo('codex-conv');
-
-      expect(deps.state.historyHasMore).toBe(false);
-      expect(deps.renderer.renderHistoryPager).toHaveBeenCalledWith(false, false, null, expect.any(Function));
-    });
-
-    it('should ensure the tab service matches the switched conversation provider', async () => {
-      const ensureServiceForConversation = jest.fn().mockResolvedValue(undefined);
-      const switchedConversation = {
-        id: 'new-conv',
-        providerId: 'codex',
-        title: 'Codex Conversation',
-        messages: [],
-        sessionId: null,
-        createdAt: Date.now(),
-        updatedAt: Date.now(),
-      };
-
-      deps = createMockDeps({
-        ensureServiceForConversation,
-        plugin: {
-          ...createMockDeps().plugin,
-          switchConversation: jest.fn().mockResolvedValue(switchedConversation),
-        } as any,
-      });
-      controller = new ConversationController(deps);
-      deps.state.currentConversationId = 'old-conv';
-
-      await controller.switchTo('new-conv');
-
-      expect(ensureServiceForConversation).toHaveBeenCalledWith(switchedConversation);
-    });
-  });
-
-  describe('createNew', () => {
-    it('should clear enabled MCP servers for new conversation', async () => {
-      await controller.createNew();
-
-      expect(mockMcpServerSelector.clearEnabled).toHaveBeenCalled();
-    });
+    // No selector exists anymore: a save must not fabricate or erase the
+    // legacy value (data protection — inert round-trip only).
+    const calls = (deps.plugin.updateConversation as jest.Mock).mock.calls;
+    for (const call of calls) {
+      const updates = (call?.[1] ?? {}) as Record<string, unknown>;
+      expect('enabledMcpServers' in updates && updates.enabledMcpServers !== undefined
+        ? updates.enabledMcpServers
+        : ['legacy-server']).toEqual(['legacy-server']);
+    }
   });
 });
 

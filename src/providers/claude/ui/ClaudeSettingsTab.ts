@@ -4,7 +4,6 @@ import { Setting } from 'obsidian';
 import { ProviderSettingsCoordinator } from '../../../core/providers/ProviderSettingsCoordinator';
 import type { ProviderSettingsTabRenderer } from '../../../core/providers/types';
 import { renderEnvironmentSettingsSection } from '../../../features/settings/ui/EnvironmentSettingsSection';
-import { McpSettingsManager } from '../../../features/settings/ui/McpSettingsManager';
 import { t } from '../../../i18n/i18n';
 import { getHostnameKey } from '../../../utils/env';
 import { expandHomePath } from '../../../utils/path';
@@ -221,26 +220,9 @@ export const claudeSettingsTabRenderer: ProviderSettingsTabRenderer = {
 
     // --- MCP Servers ---
 
-    new Setting(container).setName(t('settings.mcpServers.name')).setHeading();
-
-    const mcpDesc = container.createDiv({ cls: 'claudian-mcp-settings-desc' });
-    mcpDesc.createEl('p', {
-      text: t('settings.mcpServers.desc'),
-      cls: 'setting-item-description',
-    });
-
-    const mcpContainer = container.createDiv({ cls: 'claudian-mcp-container' });
-    new McpSettingsManager(mcpContainer, {
-      app: context.plugin.app,
-      mcpStorage: claudeWorkspace.mcpStorage,
-      broadcastMcpReload: async () => {
-        for (const view of context.plugin.getAllViews()) {
-          await view.getTabManager()?.broadcastToAllTabs(
-            (service) => service.reloadMcpServers(),
-          );
-        }
-      },
-    });
+    // In-app MCP management was removed: the provider CLI owns server
+    // configuration natively (.mcp.json / user settings). A one-shot
+    // cutover notice for legacy installs lives in the runtime gate.
 
     // --- Plugins ---
 

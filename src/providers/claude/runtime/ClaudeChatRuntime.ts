@@ -8,7 +8,7 @@
  * - Persistent query for active chat conversation (eliminates cold-start latency)
  * - Cold-start queries for inline edit, title generation
  * - MessageChannel for message queueing and turn management
- * - Dynamic updates (model, thinking tokens, permission mode, MCP servers)
+ * - Dynamic updates (model, thinking tokens, permission mode)
  */
 
 import type {
@@ -24,7 +24,6 @@ import type {
 import { query as agentQuery } from '@anthropic-ai/claude-agent-sdk';
 import { Notice } from 'obsidian';
 
-import type { McpServerManager } from '../../../core/mcp/McpServerManager';
 import type {
   CommandDiscoveryToken,
   CommandRuntimeEligibility,
@@ -142,7 +141,6 @@ export type {
 } from '../../../core/runtime/types';
 
 export interface ClaudeRuntimeServices {
-  mcpManager: McpServerManager;
   pluginManager: AppPluginManager;
   agentManager: Pick<AppAgentManager, 'setBuiltinAgentNames'>;
 }
@@ -325,7 +323,6 @@ export class ClaudianService implements ChatRuntime {
 
   // Modular components
   private sessionManager = new SessionManager();
-  private mcpManager: McpServerManager;
 
   private persistentQuery: Query | null = null;
   private messageChannel: MessageChannel | null = null;
@@ -458,20 +455,12 @@ export class ClaudianService implements ChatRuntime {
     };
   }
 
-  constructor(plugin: ClaudianPlugin, services: ClaudeRuntimeServices | McpServerManager) {
+  constructor(plugin: ClaudianPlugin, services: ClaudeRuntimeServices) {
     this.plugin = plugin;
     const legacyPlugin = this.getLegacyPluginDeps();
 
-    if ('mcpManager' in services) {
-      this.mcpManager = services.mcpManager;
-      this.pluginManager = services.pluginManager ?? legacyPlugin.pluginManager ?? null;
-      this.agentManager = services.agentManager ?? legacyPlugin.agentManager ?? null;
-      return;
-    }
-
-    this.mcpManager = services;
-    this.pluginManager = legacyPlugin.pluginManager ?? null;
-    this.agentManager = legacyPlugin.agentManager ?? null;
+    this.pluginManager = services.pluginManager ?? legacyPlugin.pluginManager ?? null;
+    this.agentManager = services.agentManager ?? legacyPlugin.agentManager ?? null;
   }
 
   getCapabilities() {
@@ -479,7 +468,7 @@ export class ClaudianService implements ChatRuntime {
   }
 
   prepareTurn(request: ChatTurnRequest): PreparedChatTurn {
-    return encodeClaudeTurn(request, this.mcpManager);
+    return encodeClaudeTurn(request);
   }
 
   consumeTurnMetadata(): ChatTurnMetadata {
@@ -633,10 +622,6 @@ export class ClaudianService implements ChatRuntime {
     const vaultPath = getVaultPath(this.plugin.app);
     if (!sessionId || !vaultPath) return null;
     return loadSubagentFinalResult(vaultPath, sessionId, agentId);
-  }
-
-  async reloadMcpServers(): Promise<void> {
-    await this.mcpManager.loadServers();
   }
 
   /**
@@ -1137,7 +1122,6 @@ export class ClaudianService implements ChatRuntime {
       settings: this.getScopedSettings(),
       customEnv,
       enhancedPath,
-      mcpManager: this.mcpManager,
       pluginManager: this.requirePluginManager(),
     };
   }
@@ -2210,24 +2194,17 @@ export class ClaudianService implements ChatRuntime {
       text: prompt,
       images,
       externalContextPaths: queryOptions?.externalContextPaths,
-      enabledMcpServers: queryOptions?.enabledMcpServers,
     };
   }
 
   private buildQueryOptionsFromTurnRequest(
     request: ChatTurnRequest,
-    encodedTurn: PreparedChatTurn,
+    _encodedTurn: PreparedChatTurn,
     legacyQueryOptions?: QueryOptions,
   ): QueryOptions | undefined {
-    const mcpMentions = legacyQueryOptions?.mcpMentions
-      ? new Set([...legacyQueryOptions.mcpMentions, ...encodedTurn.mcpMentions])
-      : encodedTurn.mcpMentions;
-
     const effectiveQueryOptions: QueryOptions = {
       allowedTools: legacyQueryOptions?.allowedTools,
       model: legacyQueryOptions?.model,
-      mcpMentions,
-      enabledMcpServers: request.enabledMcpServers ?? legacyQueryOptions?.enabledMcpServers,
       forceColdStart: legacyQueryOptions?.forceColdStart,
       externalContextPaths: request.externalContextPaths ?? legacyQueryOptions?.externalContextPaths,
     };
@@ -2235,10 +2212,8 @@ export class ClaudianService implements ChatRuntime {
     if (
       effectiveQueryOptions.allowedTools === undefined &&
       effectiveQueryOptions.model === undefined &&
-      effectiveQueryOptions.enabledMcpServers === undefined &&
       effectiveQueryOptions.forceColdStart === undefined &&
-      effectiveQueryOptions.externalContextPaths === undefined &&
-      (effectiveQueryOptions.mcpMentions?.size ?? 0) === 0
+      effectiveQueryOptions.externalContextPaths === undefined
     ) {
       return undefined;
     }
@@ -3273,7 +3248,6 @@ export class ClaudianService implements ChatRuntime {
         // Scoped snapshot, never the top-level projection another provider owns.
         getPermissionMode: () => this.getScopedSettings().permissionMode,
         resolveSDKPermissionMode: (mode) => this.resolveSDKPermissionMode(mode),
-        mcpManager: this.mcpManager,
         buildPersistentQueryConfig: (vaultPath, cliPath, externalContextPaths) =>
           this.buildPersistentQueryConfig(vaultPath, cliPath, externalContextPaths),
         needsRestart: (newConfig) => this.needsRestart(newConfig),
@@ -3355,8 +3329,6 @@ export class ClaudianService implements ChatRuntime {
       modelOverride: queryOptions?.model,
       canUseTool: this.createApprovalCallback(),
       hooks,
-      mcpMentions: queryOptions?.mcpMentions,
-      enabledMcpServers: queryOptions?.enabledMcpServers,
       allowedTools,
       hasEditorContext,
       externalContextPaths,

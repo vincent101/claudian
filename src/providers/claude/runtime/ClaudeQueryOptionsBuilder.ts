@@ -4,7 +4,6 @@ import type {
   PermissionMode as SDKPermissionMode,
 } from '@anthropic-ai/claude-agent-sdk';
 
-import type { McpServerManager } from '../../../core/mcp/McpServerManager';
 import {
   buildSystemPrompt,
   computeSystemPromptKey,
@@ -37,7 +36,6 @@ export interface QueryOptionsContext {
   settings: ClaudianSettings;
   customEnv: Record<string, string>;
   enhancedPath: string;
-  mcpManager: McpServerManager;
   pluginManager: AppPluginManager;
 }
 
@@ -61,8 +59,6 @@ export interface ColdStartQueryContext extends QueryOptionsContext {
   modelOverride?: string;
   canUseTool?: CanUseTool;
   hooks: Options['hooks'];
-  mcpMentions?: Set<string>;
-  enabledMcpServers?: Set<string>;
   allowedTools?: string[];
   hasEditorContext: boolean;
   externalContextPaths?: string[];
@@ -114,7 +110,7 @@ export class QueryOptionsBuilder {
     );
     const sdkPermissionMode = resolveClaudeSdkPermissionModeForRuntime(permissionMode);
 
-    const disallowedToolsKey = ctx.mcpManager.getAllDisallowedMcpTools().join('|');
+    const disallowedToolsKey = [...UNSUPPORTED_SDK_TOOLS, ...DISABLED_BUILTIN_SUBAGENTS].join('|');
     const pluginsKey = ctx.pluginManager.getPluginsKey();
 
     const settingSources = resolveClaudeSettingSources(claudeSettings.loadUserSettings);
@@ -127,7 +123,6 @@ export class QueryOptionsBuilder {
       sdkPermissionMode,
       systemPromptKey: computeSystemPromptKey(systemPromptSettings),
       disallowedToolsKey,
-      mcpServersKey: '', // Dynamic via setMcpServers, not tracked for restart
       pluginsKey,
       externalContextPaths: externalContextPaths || [],
       settingSources: settingSources.join(','),
@@ -148,7 +143,6 @@ export class QueryOptionsBuilder {
     );
 
     options.disallowedTools = [
-      ...ctx.mcpManager.getAllDisallowedMcpTools(),
       ...UNSUPPORTED_SDK_TOOLS,
       ...DISABLED_BUILTIN_SUBAGENTS,
     ];
@@ -189,18 +183,7 @@ export class QueryOptionsBuilder {
       ctx.abortController,
     );
 
-    const mcpMentions = ctx.mcpMentions || new Set<string>();
-    const uiEnabledServers = ctx.enabledMcpServers || new Set<string>();
-    const combinedMentions = new Set([...mcpMentions, ...uiEnabledServers]);
-    const mcpServers = ctx.mcpManager.getActiveServers(combinedMentions);
-
-    if (Object.keys(mcpServers).length > 0) {
-      options.mcpServers = mcpServers;
-    }
-
-    const disallowedMcpTools = ctx.mcpManager.getDisallowedMcpTools(combinedMentions);
     options.disallowedTools = [
-      ...disallowedMcpTools,
       ...UNSUPPORTED_SDK_TOOLS,
       ...DISABLED_BUILTIN_SUBAGENTS,
     ];

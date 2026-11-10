@@ -212,10 +212,6 @@ export class CodexChatRuntime implements ChatRuntime {
     this.session.setThread(threadId, state.sessionFilePath);
   }
 
-  async reloadMcpServers(): Promise<void> {
-    // No-op: Codex handles MCP internally
-  }
-
   async ensureReady(options?: ChatRuntimeEnsureReadyOptions): Promise<boolean> {
     const promptSettings = this.getSystemPromptSettings();
     const promptKey = computeSystemPromptKey(promptSettings);

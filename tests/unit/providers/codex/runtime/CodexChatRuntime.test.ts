@@ -150,8 +150,7 @@ function createTurn(text = 'hello', overrides: Partial<PreparedChatTurn> = {}): 
     persistedContent: text,
     prompt: text,
     isCompact: false,
-    mcpMentions: new Set(),
-    ...overrides,
+        ...overrides,
   };
 }
 

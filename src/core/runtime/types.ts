@@ -57,7 +57,6 @@ export interface ChatTurnRequest {
   browserSelection?: BrowserSelectionContext | null;
   canvasSelection?: CanvasSelectionContext | null;
   externalContextPaths?: string[];
-  enabledMcpServers?: Set<string>;
 }
 
 export interface PreparedChatTurn {
@@ -67,14 +66,11 @@ export interface PreparedChatTurn {
   persistedContent: string;
   prompt: string;
   isCompact: boolean;
-  mcpMentions: Set<string>;
 }
 
 export interface ChatRuntimeQueryOptions {
   allowedTools?: string[];
   model?: string;
-  mcpMentions?: Set<string>;
-  enabledMcpServers?: Set<string>;
   forceColdStart?: boolean;
   externalContextPaths?: string[];
 }

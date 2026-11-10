@@ -178,7 +178,6 @@ export class OpencodeChatRuntime implements ChatRuntime {
     return {
       turnId: request.turnId,
       isCompact: false,
-      mcpMentions: request.enabledMcpServers ?? new Set(),
       persistedContent: '',
       prompt: buildOpencodePromptText(request),
       request,
@@ -219,8 +218,6 @@ export class OpencodeChatRuntime implements ChatRuntime {
       this.currentDatabasePath = null;
     }
   }
-
-  async reloadMcpServers(): Promise<void> {}
 
   async ensureReady(options?: ChatRuntimeEnsureReadyOptions): Promise<boolean> {
     const settings = getOpencodeProviderSettings(this.plugin.settings as unknown as Record<string, unknown>);
