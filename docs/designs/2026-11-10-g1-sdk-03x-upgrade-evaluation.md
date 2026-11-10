@@ -1,6 +1,6 @@
 ---
 type: design-decision
-status: draft
+status: confirmed
 date: 2026-11-10
 target: /Users/vincentwang/Documents/NoteVault/tools/claudian
 tags:
@@ -18,6 +18,8 @@ tags:
 G1（turn/result 归属不可辨识）上轮以"SDK 0.2.112 类型层全包 grep 无消费回显"停修，并裁决立项本评估：升级 `@anthropic-ai/claude-agent-sdk` 0.2.112 → 0.3.x 能否解开归属。本轮为纯调研，不改生产代码。
 
 **核心结论先行**：0.3.x 的关联字段真实存在，但**字段由 CLI 进程产出而非 SDK 包装层**，且 0.2.112 对 wire 字段双向透传——**解 G1 不需要升级 SDK**；升级的主要动机不成立。
+
+**裁决结果（2026-11-10）**：用户采纳"不升级 SDK、以透传字段重开 G1"结论；运行时 wire 复核为实施第一步，真实 CLI 单轮实测另行授权。
 
 ## 方案设计（证据与结论）
 
