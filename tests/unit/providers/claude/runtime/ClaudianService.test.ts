@@ -1,12 +1,15 @@
 import '@/providers';
 
 import * as sdkModule from '@anthropic-ai/claude-agent-sdk';
+import { tmpdir } from 'os';
+import { join } from 'path';
 
 import type { McpServerManager } from '@/core/mcp/McpServerManager';
 import type ClaudianPlugin from '@/main';
 import { ClaudianService } from '@/providers/claude/runtime/ClaudeChatRuntime';
 import { MessageChannel } from '@/providers/claude/runtime/ClaudeMessageChannel';
 import { createResponseHandler, createRuntimeTurn } from '@/providers/claude/runtime/types';
+import * as permissionUpdates from '@/providers/claude/security/ClaudePermissionUpdates';
 import { adaptTranscriptFacts } from '@/providers/claude/transcript/ClaudeTranscriptFactAdapter';
 import { ClaudeTranscriptTurnObserver } from '@/providers/claude/transcript/ClaudeTranscriptTurnObserver';
 import * as envUtils from '@/utils/env';
@@ -388,7 +391,9 @@ describe('ClaudianService', () => {
 
       service.cleanup();
 
-      expect(closePersistentQuerySpy).toHaveBeenCalledWith('plugin cleanup');
+      // Plugin teardown is an explicit recovery entry: it may lift a send
+      // prohibition left by a failed recovery.
+      expect(closePersistentQuerySpy).toHaveBeenCalledWith('plugin cleanup', { clearStartProhibition: true });
       expect(cancelSpy).toHaveBeenCalled();
     });
   });
@@ -551,20 +556,37 @@ describe('ClaudianService', () => {
         );
       });
 
-      it('should return updatedPermissions with session destination for allow decisions', async () => {
+      it.each([
+        ['without suggestions', {}],
+        ['with empty suggestions', { suggestions: [] }],
+        ['with suggestions', {
+          suggestions: [
+            {
+              type: 'addRules',
+              behavior: 'allow',
+              rules: [{ toolName: 'Bash', ruleContent: 'git *' }],
+              destination: 'session',
+            },
+            { type: 'addDirectories', directories: ['/external'], destination: 'session' },
+          ],
+        }],
+      ])('should allow once without permission updates %s', async (_label, extraOptions) => {
         const callback = jest.fn().mockResolvedValue('allow');
+        const buildUpdates = jest.spyOn(permissionUpdates, 'buildPermissionUpdates');
         service.setApprovalCallback(callback);
 
-        const canUseTool = (service as any).createApprovalCallback();
-        const result = await canUseTool('Bash', { command: 'git status' }, canUseToolOptions);
+        try {
+          const canUseTool = (service as any).createApprovalCallback();
+          const input = { command: 'git status' };
+          const result = await canUseTool('Bash', input, { ...canUseToolOptions, ...extraOptions });
 
-        expect(result.behavior).toBe('allow');
-        expect(result.updatedPermissions).toBeDefined();
-        expect(result.updatedPermissions[0]).toMatchObject({
-          type: 'addRules',
-          behavior: 'allow',
-          destination: 'session',
-        });
+          expect(result).toEqual({ behavior: 'allow', updatedInput: input });
+          expect(result.updatedInput).toBe(input);
+          expect(result).not.toHaveProperty('updatedPermissions');
+          expect(buildUpdates).not.toHaveBeenCalled();
+        } finally {
+          buildUpdates.mockRestore();
+        }
       });
 
       it('should return updatedPermissions for allow-always decisions', async () => {
@@ -581,6 +603,41 @@ describe('ClaudianService', () => {
           behavior: 'allow',
           destination: 'projectSettings',
         });
+      });
+
+      it('should preserve suggestions for allow-always decisions', async () => {
+        service.setApprovalCallback(jest.fn().mockResolvedValue('allow-always'));
+        const buildUpdates = jest.spyOn(permissionUpdates, 'buildPermissionUpdates');
+        const suggestions = [
+          {
+            type: 'addRules',
+            behavior: 'allow',
+            rules: [{ toolName: 'Bash', ruleContent: 'git *' }],
+            destination: 'session',
+          },
+          { type: 'addDirectories', directories: ['/external'], destination: 'session' },
+          { type: 'setMode', mode: 'default', destination: 'session' },
+        ];
+        const input = { command: 'git status' };
+
+        try {
+          const canUseTool = (service as any).createApprovalCallback();
+          const result = await canUseTool('Bash', input, { ...canUseToolOptions, suggestions });
+
+          expect(buildUpdates).toHaveBeenCalledWith('Bash', input, 'allow-always', suggestions);
+          expect(result).toEqual({
+            behavior: 'allow',
+            updatedInput: input,
+            updatedPermissions: [
+              { ...suggestions[0], destination: 'projectSettings' },
+              suggestions[1],
+              suggestions[2],
+            ],
+          });
+          expect(result.updatedInput).toBe(input);
+        } finally {
+          buildUpdates.mockRestore();
+        }
       });
     });
   });
@@ -693,7 +750,105 @@ describe('ClaudianService', () => {
     });
   });
 
+  describe('Stop hook registration (Stop minimal fix)', () => {
+    beforeEach(() => {
+      sdkMock.resetMockMessages();
+      sdkMock.setMockMessages([{ type: 'result', subtype: 'success' }]);
+      (mockPlugin as any).app.vault.adapter.basePath = tmpdir();
+      (mockPlugin.getResolvedProviderCliPath as jest.Mock).mockReturnValue(join(tmpdir(), 'fake-claude'));
+    });
+
+    afterEach(() => {
+      service.cleanup();
+      sdkMock.resetMockMessages();
+    });
+
+    const stopInput = () => ({
+      hook_event_name: 'Stop' as const,
+      session_id: 'test-session',
+      transcript_path: join(tmpdir(), 'transcript'),
+      cwd: tmpdir(),
+      stop_hook_active: true,
+    });
+    const stopOpts = { signal: new AbortController().signal };
+
+    async function assertRegisteredStopAllows(options: any) {
+      expect(options.hooks?.Stop).toHaveLength(1);
+      expect(options.hooks.Stop[0].matcher).toBeUndefined();
+      let running = true;
+      const getter = jest.fn(() => running);
+      const getState = jest.fn(() => ({ get hasRunning() { return getter(); } }));
+      service.setSubagentHookProvider(getState);
+      expect(getState).not.toHaveBeenCalled();
+      expect(getter).not.toHaveBeenCalled();
+
+      expect(await options.hooks.Stop[0].hooks[0](stopInput(), undefined, stopOpts)).toEqual({});
+      expect(getState).toHaveBeenCalledTimes(1);
+      expect(getter).toHaveBeenCalledTimes(1);
+      expect(getter.mock.results[0].value).toBe(true);
+      running = false;
+      expect(await options.hooks.Stop[0].hooks[0](stopInput(), undefined, stopOpts)).toEqual({});
+      expect(getState).toHaveBeenCalledTimes(2);
+      expect(getter).toHaveBeenCalledTimes(2);
+      expect(getter.mock.results[1].value).toBe(false);
+    }
+
+    it('persistent query options register a Stop hook that reads the provider and allows', async () => {
+      expect(await service.ensureReady()).toBe(true);
+
+      const options = sdkMock.getLastOptions();
+      // Persistent-entry proof: enableFileCheckpointing is only set on the
+      // persistent options builder.
+      expect(options.enableFileCheckpointing).toBe(true);
+      await assertRegisteredStopAllows(options);
+    });
+
+    it('cold-start options register a Stop hook that reads the provider and allows', async () => {
+      const chunks = await collectChunks(
+        service.query('stop-cold-check', undefined, undefined, { forceColdStart: true })
+      );
+      expect(chunks.some(c => c.type === 'done')).toBe(true);
+
+      const options = sdkMock.getLastOptions();
+      expect(options.enableFileCheckpointing).toBeUndefined();
+      await assertRegisteredStopAllows(options);
+    });
+
+    it('still routes task notifications after the registered Stop callback', async () => {
+      const handler = jest.fn();
+      let delivered!: () => void;
+      const delivery = new Promise<void>(resolve => { delivered = resolve; });
+      service.setSubagentNotificationHandler((...args) => { handler(...args); delivered(); });
+      expect(await service.ensureReady()).toBe(true);
+      await assertRegisteredStopAllows(sdkMock.getLastOptions());
+      const query = sdkMock.getLastResponse();
+      query.pushStdoutMessage({
+        type: 'system', subtype: 'task_notification', task_id: 'agent-ntf', status: 'completed', summary: 'done',
+      });
+      await delivery;
+      expect(handler).toHaveBeenCalledWith('agent-ntf', 'completed', 'done');
+      expect((service as any).messageChannel.getActiveTurnId()).toBeNull();
+    });
+  });
+
   describe('SDK Skills (Supported Commands)', () => {
+    beforeEach(() => {
+      sdkMock.resetMockMessages();
+    });
+
+    afterEach(() => {
+      service.cleanup();
+      sdkMock.resetMockMessages();
+    });
+
+    async function startCommandQuery() {
+      expect(await service.ensureReady()).toBe(true);
+      expect(sdkMock.getQueryCallCount()).toBeGreaterThan(0);
+      const query = sdkMock.getLastResponse();
+      expect(query).toBeTruthy();
+      return query;
+    }
+
     it('should report not ready when no persistent query exists', () => {
       expect(service.isReady()).toBe(false);
     });
@@ -724,10 +879,8 @@ describe('ClaudianService', () => {
         { name: 'pr', description: 'Create a pull request', argumentHint: '<title>' },
       ];
 
-      const mockQuery = {
-        supportedCommands: jest.fn().mockResolvedValue(mockSdkCommands),
-      };
-      (service as any).persistentQuery = mockQuery;
+      const mockQuery = await startCommandQuery();
+      mockQuery.supportedCommands.mockResolvedValue(mockSdkCommands);
 
       const commands = await service.getSupportedCommands();
 
@@ -752,13 +905,13 @@ describe('ClaudianService', () => {
     });
 
     it('should return empty array on SDK error', async () => {
-      const mockQuery = {
-        supportedCommands: jest.fn().mockRejectedValue(new Error('SDK error')),
-      };
-      (service as any).persistentQuery = mockQuery;
+      const mockQuery = await startCommandQuery();
+      mockQuery.supportedCommands.mockRejectedValue(new Error('SDK error'));
 
       const commands = await service.getSupportedCommands();
 
+      expect(mockQuery.supportedCommands).toHaveBeenCalledTimes(1);
+      await expect(mockQuery.supportedCommands.mock.results[0].value).rejects.toThrow('SDK error');
       expect(commands).toEqual([]);
     });
 
@@ -768,25 +921,24 @@ describe('ClaudianService', () => {
         resolveStaleCommands = resolve;
       });
 
-      const staleQuery = {
-        supportedCommands: jest.fn().mockReturnValue(staleCommandsPromise),
-      };
-      const activeQuery = {
-        supportedCommands: jest.fn().mockResolvedValue([
-          { name: 'review', description: 'Review code', argumentHint: '' },
-        ]),
-      };
+      const staleQuery = await startCommandQuery();
+      staleQuery.supportedCommands.mockReturnValue(staleCommandsPromise);
+      const staleFetch = service.getSupportedCommands();
+      expect(staleQuery.supportedCommands).toHaveBeenCalledTimes(1);
 
-      (service as any).persistentQuery = staleQuery;
-      const staleFetch = (service as any).fetchAndCacheCommands(staleQuery);
-
-      (service as any).persistentQuery = activeQuery;
-      const activeCommands = await (service as any).fetchAndCacheCommands(activeQuery);
+      service.closePersistentQuery('replace command query');
+      expect(await staleFetch).toEqual([]);
+      const activeQuery = await startCommandQuery();
+      expect(activeQuery).not.toBe(staleQuery);
+      activeQuery.supportedCommands.mockResolvedValue([
+        { name: 'review', description: 'Review code', argumentHint: '' },
+      ]);
+      const activeCommands = await service.getSupportedCommands();
 
       resolveStaleCommands!([
         { name: 'commit', description: 'Create a commit', argumentHint: '' },
       ]);
-      const staleCommands = await staleFetch;
+      await Promise.resolve();
 
       expect(activeCommands).toEqual([{
         id: 'sdk:review',
@@ -796,8 +948,8 @@ describe('ClaudianService', () => {
         content: '',
         source: 'sdk',
       }]);
-      expect(staleCommands).toEqual(activeCommands);
-      expect((service as any).cachedSdkCommands).toEqual(activeCommands);
+      expect(await service.getSupportedCommands()).toEqual(activeCommands);
+      expect(activeQuery.supportedCommands).toHaveBeenCalledTimes(1);
     });
   });
 
@@ -1633,28 +1785,31 @@ describe('ClaudianService', () => {
       expect(mockPersistentQuery.setPermissionMode).toHaveBeenCalledWith('bypassPermissions');
     });
 
-    it('should update permission mode when claudeSafeMode changes within normal mode', async () => {
-      (mockPlugin as any).settings.permissionMode = 'normal';
-      (mockPlugin as any).settings.claudeSafeMode = 'acceptEdits';
+    it.each([
+      ['manual', 'default'],
+      ['acceptEdits', 'acceptEdits'],
+      ['auto', 'auto'],
+    ])('maps the durable mode %s onto the SDK setter value %s', async (appMode, sdkMode) => {
+      // Seed the live query under yolo first, then switch to the durable mode:
+      // the switch must reach the setter with the mapped SDK value.
+      (mockPlugin as any).settings.permissionMode = 'yolo';
       (service as any).currentConfig = (service as any).buildPersistentQueryConfig(
         '/mock/vault/path',
         '/usr/local/bin/claude',
         [],
       );
-
+      (mockPlugin as any).settings.permissionMode = appMode;
       mockPersistentQuery.setPermissionMode.mockClear();
-      (mockPlugin as any).settings.claudeSafeMode = 'default';
 
       await (service as any).applyDynamicUpdates({});
 
-      expect(mockPersistentQuery.setPermissionMode).toHaveBeenCalledWith('default');
-      expect((service as any).currentConfig.permissionMode).toBe('normal');
-      expect((service as any).currentConfig.sdkPermissionMode).toBe('default');
+      expect(mockPersistentQuery.setPermissionMode).toHaveBeenCalledWith(sdkMode);
+      expect((service as any).currentConfig.permissionMode).toBe(appMode);
+      expect((service as any).currentConfig.sdkPermissionMode).toBe(sdkMode);
     });
 
-    it('should update permission mode when claudeSafeMode switches back to acceptEdits', async () => {
-      (mockPlugin as any).settings.permissionMode = 'normal';
-      (mockPlugin as any).settings.claudeSafeMode = 'default';
+    it('switches manual→acceptEdits as a live setter with no restart', async () => {
+      (mockPlugin as any).settings.permissionMode = 'manual';
       (service as any).currentConfig = (service as any).buildPersistentQueryConfig(
         '/mock/vault/path',
         '/usr/local/bin/claude',
@@ -1662,55 +1817,35 @@ describe('ClaudianService', () => {
       );
 
       mockPersistentQuery.setPermissionMode.mockClear();
-      (mockPlugin as any).settings.claudeSafeMode = 'acceptEdits';
+      (service as any).startPersistentQuery.mockClear();
+      (mockPlugin as any).settings.permissionMode = 'acceptEdits';
 
       await (service as any).applyDynamicUpdates({});
 
       expect(mockPersistentQuery.setPermissionMode).toHaveBeenCalledWith('acceptEdits');
-      expect((service as any).currentConfig.permissionMode).toBe('normal');
+      expect((service as any).startPersistentQuery).not.toHaveBeenCalled();
+      expect((service as any).currentConfig.permissionMode).toBe('acceptEdits');
       expect((service as any).currentConfig.sdkPermissionMode).toBe('acceptEdits');
     });
 
-    it('should restart before applying auto mode when auto opt-in was not enabled', async () => {
-      (mockPlugin as any).settings.permissionMode = 'normal';
-      (mockPlugin as any).settings.claudeSafeMode = 'acceptEdits';
-      (service as any).currentConfig = (service as any).buildPersistentQueryConfig(
-        '/mock/vault/path',
-        '/usr/local/bin/claude',
-        [],
-      );
-
-      mockPersistentQuery.setPermissionMode.mockClear();
-      (service as any).startPersistentQuery.mockClear();
-      (mockPlugin as any).settings.claudeSafeMode = 'auto';
-
-      await (service as any).applyDynamicUpdates({});
-
-      expect(mockPersistentQuery.setPermissionMode).not.toHaveBeenCalled();
-      expect((service as any).startPersistentQuery).toHaveBeenCalledTimes(1);
-      expect((service as any).currentConfig.permissionMode).toBe('normal');
-      expect((service as any).currentConfig.sdkPermissionMode).toBe('auto');
-      expect((service as any).currentConfig.enableAutoMode).toBe(true);
-    });
-
-    it('should update permission mode to auto dynamically when auto opt-in is already enabled', async () => {
+    it('switches to auto as a live setter because every launch carries the auto capability', async () => {
       (mockPlugin as any).settings.permissionMode = 'yolo';
-      (mockPlugin as any).settings.claudeSafeMode = 'auto';
       (service as any).currentConfig = (service as any).buildPersistentQueryConfig(
         '/mock/vault/path',
         '/usr/local/bin/claude',
         [],
       );
+      expect((service as any).currentConfig.enableAutoMode).toBe(true);
 
       mockPersistentQuery.setPermissionMode.mockClear();
       (service as any).startPersistentQuery.mockClear();
-      (mockPlugin as any).settings.permissionMode = 'normal';
+      (mockPlugin as any).settings.permissionMode = 'auto';
 
       await (service as any).applyDynamicUpdates({});
 
       expect(mockPersistentQuery.setPermissionMode).toHaveBeenCalledWith('auto');
       expect((service as any).startPersistentQuery).not.toHaveBeenCalled();
-      expect((service as any).currentConfig.permissionMode).toBe('normal');
+      expect((service as any).currentConfig.permissionMode).toBe('auto');
       expect((service as any).currentConfig.sdkPermissionMode).toBe('auto');
       expect((service as any).currentConfig.enableAutoMode).toBe(true);
     });
@@ -1768,11 +1903,21 @@ describe('ClaudianService', () => {
       await expect((service as any).applyDynamicUpdates({})).resolves.toBeUndefined();
     });
 
-    it('should silently handle permission mode update error', async () => {
+    it('aborts this send when the permission mode setter fails instead of continuing silently', async () => {
       (mockPlugin as any).settings.permissionMode = 'yolo';
+      (service as any).currentConfig = (service as any).buildPersistentQueryConfig(
+        '/mock/vault/path',
+        '/usr/local/bin/claude',
+        [],
+      );
+      (mockPlugin as any).settings.permissionMode = 'manual';
       mockPersistentQuery.setPermissionMode.mockRejectedValueOnce(new Error('Permission error'));
 
-      await expect((service as any).applyDynamicUpdates({})).resolves.toBeUndefined();
+      // The rejection must surface: a failed switch must never send the next
+      // message under the previous mode (design §5.1).
+      await expect((service as any).applyDynamicUpdates({})).rejects.toThrow('Permission error');
+      expect((service as any).currentConfig.permissionMode).toBe('yolo');
+      expect((service as any).currentConfig.sdkPermissionMode).toBe('bypassPermissions');
     });
 
     it('should silently handle effort level update error', async () => {
@@ -4602,7 +4747,7 @@ describe('ClaudianService', () => {
       (service as any).runtimeTurns.clear();
     });
 
-    it('cancel() wakes the feature but holds the lease until projection acknowledgement', async () => {
+    it('cancel() wakes the feature and hands the lease to the boundary tombstone until the real result', async () => {
       service.setOnAutoTurnStarted(() => {});
       const channel = (service as any).messageChannel as MessageChannel;
       const turn = createRuntimeTurn({ id: 'user-active-cancel', kind: 'user', phase: 'collecting' });
@@ -4624,7 +4769,11 @@ describe('ClaudianService', () => {
       expect(channel.getActiveTurnId()).toBe('user-active-cancel');
       await service.completeUserTurnProjection('user-active-cancel');
       expect((service as any).runtimeTurns.has('user-active-cancel')).toBe(false);
-      expect(channel.getActiveTurnId()).toBeNull();
+      // Plain-cancel boundary (2026-11-05 spec 2.4): the handoff plants a
+      // tombstone, not a release — the lease holds until the cancelled CLI
+      // turn's real result or the 15s window, never at handoff itself.
+      expect(channel.getActiveTurnId()).toBe('user-active-cancel');
+      expect((service as any).cancelBoundaryTombstone?.turnId).toBe('user-active-cancel');
     });
 
     it('a cancelled user turn still hands its metadata to the feature layer', () => {

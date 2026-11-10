@@ -75,6 +75,30 @@ const ALLOWLIST: AllowlistEntry[] = [
     literal: 'OpenCode',
     reason: 'provider product name shown as the synthetic model label; identical in every locale',
   },
+  {
+    file: 'src/providers/codex/ui/CodexChatUIConfig.ts',
+    sink: 'obj.label',
+    literal: 'Low',
+    reason: 'Codex effort level label intentionally fixed English in every locale to match Claude built-in reasoning levels',
+  },
+  {
+    file: 'src/providers/codex/ui/CodexChatUIConfig.ts',
+    sink: 'obj.label',
+    literal: 'Medium',
+    reason: 'Codex effort level label intentionally fixed English in every locale to match Claude built-in reasoning levels',
+  },
+  {
+    file: 'src/providers/codex/ui/CodexChatUIConfig.ts',
+    sink: 'obj.label',
+    literal: 'High',
+    reason: 'Codex effort level label intentionally fixed English in every locale to match Claude built-in reasoning levels',
+  },
+  {
+    file: 'src/providers/codex/ui/CodexChatUIConfig.ts',
+    sink: 'obj.label',
+    literal: 'XHigh',
+    reason: 'Codex effort level label intentionally fixed English in every locale to match Claude built-in reasoning levels',
+  },
 ];
 
 // Sinks whose first call argument is user-visible text.

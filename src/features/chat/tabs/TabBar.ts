@@ -1,6 +1,7 @@
 import { Menu, Notice } from 'obsidian';
 
 import { t } from '../../../i18n/i18n';
+import { formatConversationSizeTooltip } from '../utils/conversationSize';
 import type { TabBarItem, TabId } from './types';
 
 /** Callbacks for TabBar interactions. */
@@ -13,6 +14,9 @@ export interface TabBarCallbacks {
 
   /** Called when the new tab button is clicked. */
   onNewTab: () => void;
+
+  /** Called on each hover or focus of a bound conversation, including known readings. */
+  onTabSizeRequest?: (tabId: TabId, conversationId: string) => void;
 
   /**
    * Called when a reorder gesture (drop, menu move) commits a new position.
@@ -38,6 +42,9 @@ export class TabBar {
 
   /** Latest item snapshot; menus and drop math read positions from here. */
   private items: TabBarItem[] = [];
+  private sizeBindings = new Map<TabId, {
+    node: HTMLElement; item: TabBarItem; hovered: boolean; focused: boolean;
+  }>();
 
   /** Tab id of the badge currently being dragged, null when idle. */
   private dragSourceId: TabId | null = null;
@@ -65,6 +72,7 @@ export class TabBar {
    */
   update(items: TabBarItem[]): void {
     this.items = items;
+    this.sizeBindings.clear();
     // Streaming/attention refreshes replace all badges mid-drag; the captured
     // drag state points at detached nodes, so drop it instead of letting a
     // stale drop or suppressed click leak into the new DOM.
@@ -78,6 +86,16 @@ export class TabBar {
     for (const item of items) {
       this.renderBadge(item);
     }
+  }
+
+  /** Size publication must not replace badges or reset a drag gesture. */
+  updateSize(item: TabBarItem): void {
+    const binding = this.sizeBindings.get(item.id);
+    if (!binding || (!binding.hovered && !binding.focused)
+      || binding.item.conversationId !== item.conversationId
+      || binding.item.providerId !== item.providerId || !this.containerEl.contains(binding.node)) return;
+    binding.item.sizeSnapshot = item.sizeSnapshot;
+    binding.node.setAttribute('aria-label', `${item.title} · ${formatConversationSizeTooltip(item)}`);
   }
 
   /** Renders a single tab badge. */
@@ -100,7 +118,9 @@ export class TabBar {
     });
 
     // Tooltip with full title (aria-label only; adding title too causes double tooltip)
-    badgeEl.setAttribute('aria-label', item.title);
+    badgeEl.setAttribute('aria-label', item.conversationId
+      ? `${item.title} · ${formatConversationSizeTooltip(item)}`
+      : item.title);
     badgeEl.setAttribute('data-provider', item.providerId);
     badgeEl.draggable = true;
 
@@ -108,6 +128,19 @@ export class TabBar {
   }
 
   private wireBadgeEvents(badgeEl: HTMLElement, item: TabBarItem): void {
+    const binding = { node: badgeEl, item, hovered: false, focused: false };
+    this.sizeBindings.set(item.id, binding);
+    const requestSize = (): void => {
+      if (item.conversationId && this.sizeBindings.get(item.id) === binding
+        && this.containerEl.contains(badgeEl)) {
+        this.callbacks.onTabSizeRequest?.(item.id, item.conversationId);
+      }
+    };
+    badgeEl.addEventListener('mouseenter', () => { binding.hovered = true; requestSize(); });
+    badgeEl.addEventListener('mouseleave', () => { binding.hovered = false; });
+    badgeEl.addEventListener('focus', () => { binding.focused = true; requestSize(); });
+    badgeEl.addEventListener('blur', () => { binding.focused = false; });
+
     // Click handler to switch tab; a click right after a drag is swallowed.
     badgeEl.addEventListener('click', () => {
       if (this.dragOccurred) {
@@ -280,6 +313,7 @@ export class TabBar {
 
   /** Destroys the tab bar. */
   destroy(): void {
+    this.sizeBindings.clear();
     this.clearDragState();
     this.containerEl.empty();
     this.containerEl.removeClass('claudian-tab-badges');

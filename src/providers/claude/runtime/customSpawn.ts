@@ -10,7 +10,8 @@ import { cliPathRequiresNode, findNodeExecutable } from '../../../utils/env';
 const STDOUT_CLOSE_GRACE_MS = 1000;
 
 export function createCustomSpawnFunction(
-  enhancedPath: string
+  enhancedPath: string,
+  onExit?: (code: number | null) => void
 ): (options: SpawnOptions) => SpawnedProcess {
   return (options: SpawnOptions): SpawnedProcess => {
     let { command } = options;
@@ -67,7 +68,11 @@ export function createCustomSpawnFunction(
     // teardown the already-settled handlers make the late error a no-op, and
     // the consumer-replacement check discards it during crash-recovery
     // replays.
-    child.on('exit', () => {
+    child.on('exit', code => {
+      // Query-scope-bound exit notification: the runtime's retirement rebuild
+      // waits for the REAL process exit — abort()/killed flags/loop teardown
+      // are not proof the CLI is gone.
+      try { onExit?.(code ?? null); } catch { /* notification must never break spawn */ }
       const stdout = child.stdout;
       if (!stdout || stdout.destroyed) return;
       const timer = setTimeout(() => {

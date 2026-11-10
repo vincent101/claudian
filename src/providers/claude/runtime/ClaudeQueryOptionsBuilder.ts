@@ -11,9 +11,12 @@ import {
   type SystemPromptSettings,
 } from '../../../core/prompt/mainAgent';
 import type { AppPluginManager } from '../../../core/providers/types';
-import type { ClaudianSettings, PermissionMode } from '../../../core/types/settings';
+import type { ClaudianSettings } from '../../../core/types/settings';
 import {
-  type ClaudeSafeMode,
+  resolveClaudeRuntimePermissionMode,
+  resolveClaudeSdkPermissionModeForRuntime,
+} from '../permissionModes';
+import {
   getClaudeProviderSettings,
   resolveClaudeSettingSources,
 } from '../settings';
@@ -48,6 +51,8 @@ export interface PersistentQueryContext extends QueryOptionsContext {
   canUseTool?: CanUseTool;
   hooks: Options['hooks'];
   externalContextPaths?: string[];
+  /** Query-scope-bound CLI exit notification (retirement rebuild waits for the real exit). */
+  onProcessExit?: (code: number | null) => void;
 }
 
 export interface ColdStartQueryContext extends QueryOptionsContext {
@@ -103,10 +108,11 @@ export class QueryOptionsBuilder {
       userName: ctx.settings.userName,
     };
 
-    const sdkPermissionMode = QueryOptionsBuilder.resolveClaudeSdkPermissionMode(
+    const permissionMode = resolveClaudeRuntimePermissionMode(
       ctx.settings.permissionMode,
-      claudeSettings.safeMode,
+      ctx.settings as unknown as Record<string, unknown>,
     );
+    const sdkPermissionMode = resolveClaudeSdkPermissionModeForRuntime(permissionMode);
 
     const disallowedToolsKey = ctx.mcpManager.getAllDisallowedMcpTools().join('|');
     const pluginsKey = ctx.pluginManager.getPluginsKey();
@@ -117,7 +123,7 @@ export class QueryOptionsBuilder {
       model: ctx.settings.model,
       thinkingTokens: resolveThinkingTokens(ctx.settings.model, ctx.settings.thinkingBudget),
       effortLevel: resolveAdaptiveEffortLevel(ctx.settings.model, ctx.settings.effortLevel),
-      permissionMode: ctx.settings.permissionMode,
+      permissionMode,
       sdkPermissionMode,
       systemPromptKey: computeSystemPromptKey(systemPromptSettings),
       disallowedToolsKey,
@@ -127,15 +133,18 @@ export class QueryOptionsBuilder {
       settingSources: settingSources.join(','),
       claudeCliPath: ctx.cliPath,
       enableChrome: claudeSettings.enableChrome,
-      enableAutoMode: claudeSettings.safeMode === 'auto',
+      // Auto mode stays available on every launch so permission switches
+      // remain live setters (design §5.1).
+      enableAutoMode: true,
     };
   }
 
   static buildPersistentQueryOptions(ctx: PersistentQueryContext): Options {
-    const { options, claudeSettings } = QueryOptionsBuilder.buildBaseOptions(
+    const { options } = QueryOptionsBuilder.buildBaseOptions(
       ctx,
       ctx.settings.model,
       ctx.abortController,
+      ctx.onProcessExit,
     );
 
     options.disallowedTools = [
@@ -147,7 +156,7 @@ export class QueryOptionsBuilder {
     QueryOptionsBuilder.applyPermissionMode(
       options,
       ctx.settings.permissionMode,
-      claudeSettings.safeMode,
+      ctx.settings as unknown as Record<string, unknown>,
       ctx.canUseTool,
     );
     QueryOptionsBuilder.applyThinking(options, ctx.settings, ctx.settings.model);
@@ -174,7 +183,7 @@ export class QueryOptionsBuilder {
 
   static buildColdStartQueryOptions(ctx: ColdStartQueryContext): Options {
     const selectedModel = ctx.modelOverride ?? ctx.settings.model;
-    const { options, claudeSettings } = QueryOptionsBuilder.buildBaseOptions(
+    const { options } = QueryOptionsBuilder.buildBaseOptions(
       ctx,
       selectedModel,
       ctx.abortController,
@@ -199,7 +208,7 @@ export class QueryOptionsBuilder {
     QueryOptionsBuilder.applyPermissionMode(
       options,
       ctx.settings.permissionMode,
-      claudeSettings.safeMode,
+      ctx.settings as unknown as Record<string, unknown>,
       ctx.canUseTool,
     );
     options.hooks = ctx.hooks;
@@ -221,20 +230,22 @@ export class QueryOptionsBuilder {
   }
 
   static resolveClaudeSdkPermissionMode(
-    permissionMode: PermissionMode,
-    claudeSafeMode: ClaudeSafeMode = 'acceptEdits',
+    permissionMode: unknown,
+    settings?: Record<string, unknown>,
   ): SDKPermissionMode {
-    if (permissionMode === 'yolo') return 'bypassPermissions';
-    if (permissionMode === 'plan') return 'plan';
-    return claudeSafeMode;
+    const runtimeMode = resolveClaudeRuntimePermissionMode(permissionMode, settings);
+    return resolveClaudeSdkPermissionModeForRuntime(runtimeMode);
   }
 
   private static applyPermissionMode(
     options: Options,
-    permissionMode: PermissionMode,
-    claudeSafeMode: ClaudeSafeMode,
+    permissionMode: unknown,
+    settings: Record<string, unknown>,
     canUseTool?: CanUseTool
   ): void {
+    // Allows a future explicit switch to YOLO without a restart; it does NOT
+    // mean the current mode bypasses approvals. canUseTool stays registered
+    // in every mode (design §5.1).
     options.allowDangerouslySkipPermissions = true;
 
     if (canUseTool) {
@@ -243,17 +254,17 @@ export class QueryOptionsBuilder {
 
     options.permissionMode = QueryOptionsBuilder.resolveClaudeSdkPermissionMode(
       permissionMode,
-      claudeSafeMode,
+      settings,
     );
   }
 
   private static applyExtraArgs(
     options: Options,
-    settings: { enableChrome: boolean; safeMode: ClaudeSafeMode },
+    settings: { enableChrome: boolean },
   ): void {
-    if (settings.safeMode === 'auto') {
-      options.extraArgs = { ...options.extraArgs, 'enable-auto-mode': null };
-    }
+    // Auto mode stays available on every launch so permission switches remain
+    // live setters instead of restarts (design §5.1).
+    options.extraArgs = { ...options.extraArgs, 'enable-auto-mode': null };
 
     if (settings.enableChrome) {
       options.extraArgs = { ...options.extraArgs, chrome: null };
@@ -264,6 +275,7 @@ export class QueryOptionsBuilder {
     ctx: QueryOptionsContext,
     model: string,
     abortController?: AbortController,
+    onProcessExit?: (code: number | null) => void,
   ): { options: Options; claudeSettings: ReturnType<typeof getClaudeProviderSettings> } {
     const claudeSettings = getClaudeProviderSettings(ctx.settings as unknown as Record<string, unknown>);
     const systemPromptSettings: SystemPromptSettings = {
@@ -288,7 +300,7 @@ export class QueryOptionsBuilder {
     };
 
     QueryOptionsBuilder.applyExtraArgs(options, claudeSettings);
-    options.spawnClaudeCodeProcess = createCustomSpawnFunction(ctx.enhancedPath);
+    options.spawnClaudeCodeProcess = createCustomSpawnFunction(ctx.enhancedPath, onProcessExit);
 
     return { options, claudeSettings };
   }

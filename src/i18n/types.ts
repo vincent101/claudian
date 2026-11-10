@@ -58,6 +58,7 @@ export type TranslationKey =
   // Chat - Cancel settle-down
   | 'chat.cancel.toolInterrupted'
   | 'chat.cancel.interruptUnacknowledged'
+  | 'chat.cancel.boundaryHeld'
 
   // Chat - Auto-turn ask timeout fallback (plan A)
   | 'chat.ask.autoTurnTimeout'
@@ -72,6 +73,9 @@ export type TranslationKey =
   | 'chat.history.errorDescription'
   | 'chat.history.retry'
   | 'chat.history.switchFailed'
+  | 'chat.history.sessionFileKnown'
+  | 'chat.history.sessionFileUnknown'
+  | 'chat.history.sessionFileTooltip'
   | 'chat.history.export.file'
   | 'chat.history.export.clipboard'
   | 'chat.history.export.fileSuccess'
@@ -126,6 +130,7 @@ export type TranslationKey =
   | 'chat.tabs.moveRight'
   | 'chat.tabs.close'
   | 'chat.tabs.boundProviderSwitch'
+  | 'chat.tabs.draftModelReset'
 
   // Chat - Fork
   | 'chat.fork.ariaLabel'
@@ -171,6 +176,22 @@ export type TranslationKey =
   | 'chat.commands.unknown'
   | 'chat.resume.noConversations'
   | 'chat.resume.openFailed'
+
+  // Chat - Claude permission mode menu
+  | 'chat.claude.permission.auto'
+  | 'chat.claude.permission.autoDesc'
+  | 'chat.claude.permission.manual'
+  | 'chat.claude.permission.manualDesc'
+  | 'chat.claude.permission.acceptEdits'
+  | 'chat.claude.permission.acceptEditsDesc'
+  | 'chat.claude.permission.yolo'
+  | 'chat.claude.permission.yoloDesc'
+  | 'chat.claude.permission.plan'
+  | 'chat.claude.permission.updateFailed'
+
+  // Chat - Shared permission menu chrome
+  | 'chat.permission.ariaLabel'
+  | 'chat.permission.unavailable'
 
   // Chat - Codex chat UI config copy
   | 'chat.codex.effort.low'
@@ -296,12 +317,11 @@ export type TranslationKey =
   | 'settings.subagents.modal.promptDesc'
   | 'settings.subagents.modal.promptPlaceholder'
 
-  // Settings - Safety
+  // Settings - Safety / Configuration
   | 'settings.safety'
   | 'settings.loadUserSettings.name'
   | 'settings.loadUserSettings.desc'
-  | 'settings.claudeSafeMode.name'
-  | 'settings.claudeSafeMode.desc'
+  | 'settings.claude.configuration'
   | 'settings.codexSafeMode.name'
   | 'settings.codexSafeMode.desc'
 

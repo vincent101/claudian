@@ -1,10 +1,27 @@
-import type { ProviderConversationHistoryService } from '../../../core/providers/types';
+import type { ConversationSizeReadInput, ConversationSizeReadResult, ProviderConversationHistoryService } from '../../../core/providers/types';
 import type { Conversation } from '../../../core/types';
 import { getOpencodeState, type OpencodeProviderState } from '../types';
 import { loadOpencodeSessionMessages } from './OpencodeHistoryStore';
 
 export class OpencodeConversationHistoryService implements ProviderConversationHistoryService {
   private hydratedKeys = new Map<string, string>();
+
+  captureConversationSizeSource(_conversation: Conversation) {
+    return Object.freeze({});
+  }
+
+  async readConversationSize(
+    input: ConversationSizeReadInput,
+    _vaultPath: string | null,
+    options: { revision: number; signal?: AbortSignal },
+  ): Promise<ConversationSizeReadResult> {
+    return {
+      snapshot: {
+        conversationId: input.id, revision: options.revision,
+        files: { status: 'unknown', reason: 'unsupported' },
+      },
+    };
+  }
 
   async hydrateConversationHistory(
     conversation: Conversation,

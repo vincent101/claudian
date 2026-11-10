@@ -17,7 +17,6 @@ import type ClaudianPlugin from '../../../main';
 import { getVaultPath } from '../../../utils/path';
 import { AgentManager } from '../agents/AgentManager';
 import { ClaudeCommandCatalog } from '../commands/ClaudeCommandCatalog';
-import { probeRuntimeCommands } from '../commands/probeRuntimeCommands';
 import { PluginManager } from '../plugins/PluginManager';
 import { ClaudeCliResolver } from '../runtime/ClaudeCliResolver';
 import { StorageService } from '../storage/StorageService';
@@ -55,10 +54,20 @@ export async function createClaudeWorkspaceServices(
   const agentManager = new AgentManager(vaultPath, pluginManager);
   await agentManager.loadAgents();
 
-  const commandCatalog = new ClaudeCommandCatalog(
+  // The legacy probe stays out of the production factory (owned-probe
+  // disabled); the third parameter is left undefined on purpose so the real
+  // registry binding lands in the fourth slot. The binding is consumed lazily
+  // by typed sessions only — it must never be read before this catalog is
+  // actually published via ProviderWorkspaceRegistry.setServices.
+  const commandCatalog: ClaudeCommandCatalog = new ClaudeCommandCatalog(
     claudeStorage.commands,
     claudeStorage.skills,
-    () => probeRuntimeCommands(plugin),
+    undefined,
+    {
+      getRevision: () => ProviderWorkspaceRegistry.getCommandCatalogRevision('claude'),
+      isCurrent: () => ProviderWorkspaceRegistry.getCommandCatalog('claude') === commandCatalog,
+      subscribe: listener => ProviderWorkspaceRegistry.subscribeCommandCatalog('claude', listener),
+    },
   );
 
   return {

@@ -1,74 +1,47 @@
 import '@/providers';
 
-import { getEnabledProviderForModel, getProviderForModel } from '@/core/providers/modelRouting';
-import { DEFAULT_CODEX_PRIMARY_MODEL } from '@/providers/codex/types/models';
+import { getDefaultProviderModelSelection, getProviderModelOptions, isValidProviderModelSelection, restoreDraftModelSelection } from '@/core/providers/modelRouting';
 
-describe('getProviderForModel', () => {
-  it('routes Claude default models to claude', () => {
-    expect(getProviderForModel('haiku')).toBe('claude');
-    expect(getProviderForModel('sonnet')).toBe('claude');
-    expect(getProviderForModel('opus')).toBe('claude');
+const settings = {
+  settingsProvider: 'claude', model: 'shared',
+  providerConfigs: {
+    claude: { modelPresets: [{ label: 'Claude Shared', model: 'shared' }, { label: 'Only Claude', model: 'unique' }] },
+    codex: { enabled: true, modelPresets: [{ label: 'Codex Shared', model: 'shared' }] },
+  },
+};
+
+describe('explicit provider/model routing', () => {
+  it('stamps option identity without encoding the native model ID', () => {
+    expect(getProviderModelOptions('claude', settings)[0]).toMatchObject({ providerId: 'claude', value: 'shared' });
+    expect(getProviderModelOptions('codex', settings)[0]).toMatchObject({ providerId: 'codex', value: 'shared' });
   });
 
-  it('routes Claude extended models to claude', () => {
-    expect(getProviderForModel('claude-sonnet-4-5-20250514')).toBe('claude');
-    expect(getProviderForModel('claude-opus-4-6-20250616')).toBe('claude');
+  it('validates each full pair without another provider claiming the model', () => {
+    expect(isValidProviderModelSelection({ providerId: 'claude', modelId: 'shared' }, settings)).toBe(true);
+    expect(isValidProviderModelSelection({ providerId: 'codex', modelId: 'shared' }, settings)).toBe(true);
+    expect(isValidProviderModelSelection({ providerId: 'codex', modelId: 'unique' }, settings)).toBe(false);
+    expect(isValidProviderModelSelection({ providerId: 'missing', modelId: 'shared' }, settings)).toBe(false);
   });
 
-  it('routes Codex default models to codex', () => {
-    expect(getProviderForModel(DEFAULT_CODEX_PRIMARY_MODEL)).toBe('codex');
+  it('retains a valid new-format draft', () => {
+    expect(restoreDraftModelSelection(settings, 'shared', 'codex'))
+      .toEqual({ selection: { providerId: 'codex', modelId: 'shared' }, reset: false });
   });
 
-  it('routes unknown models to claude (default)', () => {
-    expect(getProviderForModel('some-unknown-model')).toBe('claude');
+  it('fills a unique legacy draft and resets an ambiguous draft explicitly', () => {
+    expect(restoreDraftModelSelection(settings, 'unique'))
+      .toEqual({ selection: { providerId: 'claude', modelId: 'unique' }, reset: false });
+    expect(restoreDraftModelSelection(settings, 'shared'))
+      .toEqual({ selection: { providerId: 'claude', modelId: 'shared' }, reset: true });
   });
 
-  it('routes models starting with gpt- to codex', () => {
-    expect(getProviderForModel('gpt-4o')).toBe('codex');
-    expect(getProviderForModel('gpt-custom')).toBe('codex');
+  it('does not reinterpret an invalid provider pair as a legacy model', () => {
+    expect(restoreDraftModelSelection(settings, 'shared', 'deleted').reset).toBe(true);
+    expect(restoreDraftModelSelection(settings, 'gone', 'claude').reset).toBe(true);
   });
 
-  it('routes models starting with o prefix to codex', () => {
-    expect(getProviderForModel('o3')).toBe('codex');
-    expect(getProviderForModel('o4-mini')).toBe('codex');
-  });
-
-  it('routes custom OPENAI_MODEL to codex when settings are provided', () => {
-    const settings = { environmentVariables: 'OPENAI_MODEL=my-custom-model' };
-    expect(getProviderForModel('my-custom-model', settings)).toBe('codex');
-  });
-
-  it('routes settings-defined custom Codex models to codex when settings are provided', () => {
-    const settings = {
-      providerConfigs: {
-        codex: {
-          enabled: true,
-          modelPresets: [{ label: 'My Custom', model: 'my-custom-model' }],
-        },
-      },
-    };
-
-    expect(getProviderForModel('my-custom-model', settings)).toBe('codex');
-  });
-
-  it('routes custom OPENAI_MODEL to claude without settings (no context)', () => {
-    expect(getProviderForModel('my-custom-model')).toBe('claude');
-  });
-
-  it('can resolve blank-tab routing within enabled providers only', () => {
-    const settings = {
-      settingsProvider: 'claude',
-      providerConfigs: {
-        claude: {
-          environmentVariables: `ANTHROPIC_MODEL=${DEFAULT_CODEX_PRIMARY_MODEL}`,
-        },
-        codex: {
-          enabled: false,
-        },
-      },
-    };
-
-    expect(getProviderForModel(DEFAULT_CODEX_PRIMARY_MODEL, settings)).toBe('codex');
-    expect(getEnabledProviderForModel(DEFAULT_CODEX_PRIMARY_MODEL, settings)).toBe('claude');
+  it('inherits the preferred enabled provider only for a fresh tab', () => {
+    expect(restoreDraftModelSelection(settings, undefined, undefined, 'codex').selection.providerId).toBe('codex');
+    expect(getDefaultProviderModelSelection(settings).providerId).toBe('claude');
   });
 });

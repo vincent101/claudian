@@ -2,6 +2,7 @@ import type { EventRef, WorkspaceLeaf } from 'obsidian';
 import { ItemView, Notice, Scope, setIcon } from 'obsidian';
 
 import { getHiddenProviderCommandSet } from '../../core/providers/commands/hiddenCommands';
+import { resolveProviderPermissionMode } from '../../core/providers/permissionModes';
 import { ProviderRegistry } from '../../core/providers/ProviderRegistry';
 import { ProviderSettingsCoordinator } from '../../core/providers/ProviderSettingsCoordinator';
 import { DEFAULT_CHAT_PROVIDER_ID, type ProviderId } from '../../core/providers/types';
@@ -10,7 +11,7 @@ import { t } from '../../i18n/i18n';
 import type ClaudianPlugin from '../../main';
 import { createProviderIconSvg } from '../../shared/icons';
 import { InputModal } from '../../shared/modals/InputModal';
-import type { HistoryConversationOpenState } from './controllers/ConversationController';
+import type { ConversationController, HistoryConversationOpenState } from './controllers/ConversationController';
 import {
   closeHistorySearchForTab,
   getTabProviderId,
@@ -28,6 +29,8 @@ export class ClaudianView extends ItemView {
 
   // Tab management
   private tabManager: TabManager | null = null;
+  private assemblyGeneration: object | null = null;
+  private closeFlights?: WeakMap<TabManager, Promise<void>>;
   private tabBar: TabBar | null = null;
   private tabBarContainerEl: HTMLElement | null = null;
   private tabContentEl: HTMLElement | null = null;
@@ -44,6 +47,7 @@ export class ClaudianView extends ItemView {
 
   // Header elements
   private historyDropdown: HTMLElement | null = null;
+  private historyDropdownOwner: ConversationController | null = null;
 
   // Event refs for cleanup
   private eventRefs: EventRef[] = [];
@@ -153,6 +157,9 @@ export class ClaudianView extends ItemView {
       return;
     }
 
+    const generation = {};
+    this.assemblyGeneration = generation;
+
     // Use contentEl (standard Obsidian API) as primary target.
     // Hover Editor and other plugins may modify the DOM structure,
     // so we need fallbacks to handle non-standard scenarios.
@@ -174,18 +181,22 @@ export class ClaudianView extends ItemView {
     this.navRowContent = this.buildNavRowContent();
     this.tabContentEl = this.viewContainerEl.createDiv({ cls: 'claudian-tab-content-container' });
 
-    this.tabManager = new TabManager(
+    let tabManager: TabManager | null = null;
+    const isCurrent = () => this.isCurrentManager(tabManager, generation);
+    tabManager = new TabManager(
       this.plugin,
       this.tabContentEl,
       this,
       {
         onTabCreated: () => {
+          if (!isCurrent()) return;
           this.updateTabBar();
           this.updateNavRowLocation();
           this.persistTabState();
           this.syncProviderBrandColor();
         },
         onTabSwitched: () => {
+          if (!isCurrent()) return;
           this.updateTabBar();
           this.updateHistoryDropdown();
           this.updateNavRowLocation();
@@ -193,23 +204,27 @@ export class ClaudianView extends ItemView {
           this.syncProviderBrandColor();
         },
         onTabClosed: () => {
+          if (!isCurrent()) return;
           this.updateTabBar();
           this.persistTabState();
         },
-        onTabStreamingChanged: () => this.updateTabBar(),
-        onTabReviewChanged: () => this.updateTabBar(),
-        onTabTitleChanged: () => this.updateTabBar(),
-        onTabAttentionChanged: () => this.updateTabBar(),
+        onTabStreamingChanged: () => { if (isCurrent()) this.updateTabBar(); },
+        onTabReviewChanged: () => { if (isCurrent()) this.updateTabBar(); },
+        onTabTitleChanged: () => { if (isCurrent()) this.updateTabBar(); },
+        onTabAttentionChanged: () => { if (isCurrent()) this.updateTabBar(); },
         onTabConversationChanged: () => {
+          if (!isCurrent()) return;
           this.updateTabBar();
           this.persistTabState();
           this.syncProviderBrandColor();
         },
         onTabProviderChanged: () => {
+          if (!isCurrent()) return;
           this.updateTabBar();
           this.syncProviderBrandColor();
         },
         onTabOrderChanged: () => {
+          if (!isCurrent()) return;
           // Badge numbers and close-fallback neighbours derive from Map order,
           // so a reorder must repaint the bar and persist the new openTabs
           // sequence in the same pass.
@@ -219,31 +234,62 @@ export class ClaudianView extends ItemView {
       }
     );
 
+    this.tabManager = tabManager;
     this.wireEventHandlers();
-    await this.restoreOrCreateTabs();
+    await this.restoreOrCreateTabs(tabManager, generation);
+    if (this.assemblyGeneration !== generation || this.tabManager !== tabManager) return;
     this.syncProviderBrandColor();
     this.updateLayoutForPosition();
-    this.tabManager?.primeProviderRuntime();
+    tabManager.primeProviderRuntime();
   }
 
-  async onClose() {
+  onClose(): Promise<void> {
+    const tabManager = this.tabManager;
+    const tabBar = this.tabBar;
+    if (!tabManager) return this.closeGeneration(null, tabBar);
+
+    const existing = this.closeFlights?.get(tabManager);
+    if (existing) return existing;
+    let resolve!: () => void;
+    let reject!: (reason: unknown) => void;
+    const flight = new Promise<void>((onResolve, onReject) => {
+      resolve = onResolve;
+      reject = onReject;
+    });
+    (this.closeFlights ??= new WeakMap()).set(tabManager, flight);
+    void this.closeGeneration(tabManager, tabBar).then(resolve, reject);
+    return flight;
+  }
+
+  private async closeGeneration(tabManager: TabManager | null, tabBar: TabBar | null): Promise<void> {
+    // Seal admission before persistence yields, and keep cleanup tied to this generation.
+    this.assemblyGeneration = null;
+    const errors: unknown[] = [];
+    const attempt = (operation: () => void): void => {
+      try { operation(); } catch (error) { errors.push(error); }
+    };
+    attempt(() => tabManager?.beginClose());
+    attempt(() => tabManager?.stopMarkdownDiagnostics());
+    for (const tab of tabManager?.getAllTabs() ?? []) {
+      try { tab.markdownRenderDiagnostics?.dispose(); } catch { /* diagnostics are isolated */ }
+    }
+    attempt(() => this.hideHistoryDropdown());
     if (this.pendingTabBarUpdate !== null) {
-      cancelAnimationFrame(this.pendingTabBarUpdate);
+      attempt(() => cancelAnimationFrame(this.pendingTabBarUpdate!));
       this.pendingTabBarUpdate = null;
     }
 
-    for (const ref of this.eventRefs) {
-      this.plugin.app.vault.offref(ref);
-    }
+    const refs = this.eventRefs;
     this.eventRefs = [];
+    for (const ref of refs) attempt(() => this.plugin.app.vault.offref(ref));
 
-    await this.persistTabStateImmediate();
-
-    await this.tabManager?.destroy();
-    this.tabManager = null;
-
-    this.tabBar?.destroy();
-    this.tabBar = null;
+    try { await this.persistTabStateImmediate(tabManager); } catch (error) { errors.push(error); }
+    try { await tabManager?.destroy(); } catch (error) { errors.push(error); }
+    if (this.tabManager === tabManager) this.tabManager = null;
+    attempt(() => tabBar?.destroy());
+    if (this.tabBar === tabBar) this.tabBar = null;
+    if (errors.length === 1) throw errors[0];
+    if (errors.length > 1) throw new AggregateError(errors, 'View close failed');
   }
 
   // ============================================
@@ -273,6 +319,8 @@ export class ClaudianView extends ItemView {
    * This is called once and the content is moved between locations.
    */
   private buildNavRowContent(): HTMLElement {
+    const generation = this.assemblyGeneration;
+    const isCurrent = () => this.isCurrentManager(this.tabManager, generation);
     // Create a fragment to hold nav row content
     const fragment = document.createDocumentFragment();
 
@@ -280,11 +328,16 @@ export class ClaudianView extends ItemView {
     this.tabBarContainerEl = document.createElement('div');
     this.tabBarContainerEl.className = 'claudian-tab-bar-container';
     this.tabBar = new TabBar(this.tabBarContainerEl, {
-      onTabClick: (tabId) => this.handleTabClick(tabId),
-      onTabClose: (tabId) => this.handleTabClose(tabId),
-      onNewTab: () => this.createNewTab(),
-      onTabReorder: (tabId, targetIndex) => this.handleTabReorder(tabId, targetIndex),
-      onTabRename: (tabId) => this.handleTabRename(tabId),
+      onTabClick: (tabId) => { if (isCurrent()) this.handleTabClick(tabId); },
+      onTabClose: (tabId) => isCurrent() ? this.handleTabClose(tabId) : Promise.resolve(),
+      onNewTab: () => isCurrent() ? this.createNewTab() : Promise.resolve(),
+      onTabReorder: (tabId, targetIndex) => { if (isCurrent()) this.handleTabReorder(tabId, targetIndex); },
+      onTabRename: (tabId) => { if (isCurrent()) this.handleTabRename(tabId); },
+      onTabSizeRequest: (tabId, conversationId) => {
+        if (isCurrent() && this.tabManager?.getTab(tabId)?.conversationId === conversationId) {
+          void this.plugin.conversationSizes?.refresh(conversationId, true);
+        }
+      },
     });
     fragment.appendChild(this.tabBarContainerEl);
 
@@ -297,7 +350,7 @@ export class ClaudianView extends ItemView {
     setIcon(newTabBtn, 'square-plus');
     newTabBtn.setAttribute('aria-label', 'New tab');
     newTabBtn.addEventListener('click', async () => {
-      await this.createNewTab();
+      if (isCurrent()) await this.createNewTab();
     });
 
     // New conversation button (square-pen icon - new conversation in current tab)
@@ -305,8 +358,10 @@ export class ClaudianView extends ItemView {
     setIcon(newBtn, 'square-pen');
     newBtn.setAttribute('aria-label', 'New conversation');
     newBtn.addEventListener('click', async () => {
-      await this.tabManager?.createNewConversation();
-      this.updateHistoryDropdown();
+      const tabManager = this.tabManager;
+      if (!this.isCurrentManager(tabManager, generation)) return;
+      await tabManager.createNewConversation();
+      if (this.isCurrentManager(tabManager, generation)) this.updateHistoryDropdown();
     });
 
     // History dropdown
@@ -319,7 +374,7 @@ export class ClaudianView extends ItemView {
 
     historyBtn.addEventListener('click', (e) => {
       e.stopPropagation();
-      this.toggleHistoryDropdown();
+      if (isCurrent()) this.toggleHistoryDropdown();
     });
 
     fragment.appendChild(this.headerActionsContent);
@@ -389,16 +444,27 @@ export class ClaudianView extends ItemView {
   // Tab Management
   // ============================================
 
+  private isCurrentManager(tabManager: TabManager | null, generation: object | null): tabManager is TabManager {
+    return tabManager !== null
+      && this.tabManager === tabManager
+      && this.assemblyGeneration === generation
+      && tabManager.isOpen();
+  }
+
   private handleTabClick(tabId: TabId): void {
-    this.tabManager?.switchToTab(tabId);
+    const tabManager = this.tabManager;
+    if (this.isCurrentManager(tabManager, this.assemblyGeneration)) void tabManager.switchToTab(tabId);
   }
 
   private async handleTabClose(tabId: TabId): Promise<void> {
-    const tab = this.tabManager?.getTab(tabId);
+    const tabManager = this.tabManager;
+    const generation = this.assemblyGeneration;
+    if (!this.isCurrentManager(tabManager, generation)) return;
+    const tab = tabManager.getTab(tabId);
     // If streaming, treat close like user interrupt (force close cancels the stream)
     const force = tab?.state.isStreaming ?? false;
-    await this.tabManager?.closeTab(tabId, force);
-    this.updateTabBarVisibility();
+    await tabManager.closeTab(tabId, force);
+    if (this.isCurrentManager(tabManager, generation)) this.updateTabBarVisibility();
   }
 
   /**
@@ -407,21 +473,30 @@ export class ClaudianView extends ItemView {
    * caller — not just the tab bar — stays consistent.
    */
   private handleTabReorder(tabId: TabId, targetIndex: number): void {
-    this.tabManager?.moveTab(tabId, targetIndex);
+    const tabManager = this.tabManager;
+    if (this.isCurrentManager(tabManager, this.assemblyGeneration)) tabManager.moveTab(tabId, targetIndex);
   }
 
   private handleTabRename(tabId: TabId): void {
-    const conversationId = this.tabManager?.getTab(tabId)?.conversationId;
+    const tabManager = this.tabManager;
+    const generation = this.assemblyGeneration;
+    if (!this.isCurrentManager(tabManager, generation)) return;
+    const tab = tabManager.getTab(tabId);
+    const conversationId = tab?.conversationId;
     if (!conversationId) return;
+    const isCurrent = () => this.isCurrentManager(tabManager, generation)
+      && tabManager.getTab(tabId) === tab
+      && tab.conversationId === conversationId;
 
     const currentTitle = this.plugin.getConversationSync(conversationId)?.title;
     new InputModal(this.app, {
       value: currentTitle ?? '',
       onSubmit: async (raw) => {
         const title = raw.trim();
-        if (!title || title === currentTitle) return;
+        if (!title || title === currentTitle || !isCurrent()) return;
         try {
           await this.plugin.renameConversationManually(conversationId, title);
+          if (!isCurrent()) return;
           this.updateTabBar();
           this.updateHistoryDropdown();
         } catch {
@@ -432,7 +507,11 @@ export class ClaudianView extends ItemView {
   }
 
   async createNewTab(): Promise<void> {
-    const tab = await this.tabManager?.createTab();
+    const tabManager = this.tabManager;
+    const generation = this.assemblyGeneration;
+    if (!this.isCurrentManager(tabManager, generation)) return;
+    const tab = await tabManager.createTab();
+    if (!this.isCurrentManager(tabManager, generation)) return;
     if (!tab) {
       const maxTabs = this.plugin.settings.maxTabs ?? 3;
       new Notice(`Maximum ${maxTabs} tabs allowed`);
@@ -441,22 +520,39 @@ export class ClaudianView extends ItemView {
     this.updateTabBarVisibility();
   }
 
+  onConversationSizePublished(conversationId: string): void {
+    const snapshot = this.plugin.conversationSizes.getSnapshot(conversationId);
+    if (!snapshot || !this.tabManager) return;
+    for (const item of this.tabManager.getTabBarItems()) {
+      if (item.conversationId === conversationId) this.tabBar?.updateSize(item);
+    }
+    if (this.historyDropdown) {
+      this.tabManager.getActiveTab()?.controllers.conversationController
+        ?.onConversationSizePublished(conversationId, this.historyDropdown);
+    }
+  }
+
   private updateTabBar(): void {
-    if (!this.tabManager || !this.tabBar) return;
+    const tabManager = this.tabManager;
+    const tabBar = this.tabBar;
+    const generation = this.assemblyGeneration;
+    if (!tabBar || !this.isCurrentManager(tabManager, generation)) return;
 
     // Debounce tab bar updates using requestAnimationFrame
     if (this.pendingTabBarUpdate !== null) {
       cancelAnimationFrame(this.pendingTabBarUpdate);
     }
 
-    this.pendingTabBarUpdate = requestAnimationFrame(() => {
+    const frame: number = requestAnimationFrame(() => {
+      if (this.pendingTabBarUpdate !== frame) return;
       this.pendingTabBarUpdate = null;
-      if (!this.tabManager || !this.tabBar) return;
+      if (!this.isCurrentManager(tabManager, generation) || this.tabBar !== tabBar) return;
 
-      const items = this.tabManager.getTabBarItems();
-      this.tabBar.update(items);
+      const items = tabManager.getTabBarItems();
+      tabBar.update(items);
       this.updateTabBarVisibility();
     });
+    this.pendingTabBarUpdate = frame;
   }
 
   private updateTabBarVisibility(): void {
@@ -509,49 +605,81 @@ export class ClaudianView extends ItemView {
   // History Dropdown
   // ============================================
 
+  onConversationDeleted(conversationId: string): void {
+    this.historyDropdownOwner?.discardHistorySizeRow(conversationId);
+    for (const tab of this.tabManager?.getAllTabs() ?? []) {
+      tab.controllers.conversationController?.discardHistorySizeRow?.(conversationId);
+    }
+  }
+
+  private hideHistoryDropdown(): void {
+    this.historyDropdown?.removeClass('visible');
+    const owner = this.historyDropdownOwner ?? this.tabManager?.getActiveTab()?.controllers.conversationController;
+    owner?.releaseHistorySizeRows?.(this.historyDropdown ?? undefined);
+    this.historyDropdownOwner = null;
+  }
+
   private toggleHistoryDropdown(): void {
     if (!this.historyDropdown) return;
 
     const isVisible = this.historyDropdown.hasClass('visible');
     if (isVisible) {
-      this.historyDropdown.removeClass('visible');
+      this.hideHistoryDropdown();
     } else {
-      this.updateHistoryDropdown();
+      this.updateHistoryDropdown(true);
       this.historyDropdown.addClass('visible');
     }
   }
 
-  private updateHistoryDropdown(): void {
-    if (!this.historyDropdown) return;
-    this.historyDropdown.empty();
-
-    const activeTab = this.tabManager?.getActiveTab();
-    const conversationController = activeTab?.controllers.conversationController;
+  private updateHistoryDropdown(refreshSizes = false): void {
+    const tabManager = this.tabManager;
+    const generation = this.assemblyGeneration;
+    const dropdown = this.historyDropdown;
+    if (!dropdown || !this.isCurrentManager(tabManager, generation)) return;
+    const activeTab = tabManager.getActiveTab();
+    const conversationController = activeTab?.controllers.conversationController ?? null;
+    const ownsRows = refreshSizes || dropdown.hasClass('visible');
+    if (this.historyDropdownOwner && (!ownsRows || this.historyDropdownOwner !== conversationController)) {
+      this.historyDropdownOwner.releaseHistorySizeRows(dropdown);
+    }
+    this.historyDropdownOwner = ownsRows ? conversationController : null;
+    dropdown.empty();
 
     if (conversationController) {
-      conversationController.renderHistoryDropdown(this.historyDropdown, {
-        onSelectConversation: (id) => this.openHistoryConversation(id),
-        onOpenConversationInNewTab: (id, activate) =>
-          this.openHistoryConversationInNewTab(id, activate),
-        getConversationOpenState: (id) => this.getHistoryConversationOpenState(id),
+      const isCurrent = () => this.isCurrentManager(tabManager, generation)
+        && this.historyDropdown === dropdown
+        && tabManager.getActiveTab() === activeTab
+        && activeTab?.controllers.conversationController === conversationController;
+      conversationController.renderHistoryDropdown(dropdown, {
+        refreshSizes,
+        onSelectConversation: (id) => isCurrent() ? this.openHistoryConversation(id) : Promise.resolve(),
+        onOpenConversationInNewTab: (id, activate) => isCurrent()
+          ? this.openHistoryConversationInNewTab(id, activate) : Promise.resolve(),
+        getConversationOpenState: (id) => isCurrent() ? this.getHistoryConversationOpenState(id) : 'closed',
       });
     }
   }
 
   private async openHistoryConversation(conversationId: string): Promise<void> {
-    await this.tabManager?.openConversation(conversationId);
-    this.historyDropdown?.removeClass('visible');
+    const tabManager = this.tabManager;
+    const generation = this.assemblyGeneration;
+    if (!this.isCurrentManager(tabManager, generation)) return;
+    await tabManager.openConversation(conversationId);
+    if (this.isCurrentManager(tabManager, generation)) this.hideHistoryDropdown();
   }
 
   private async openHistoryConversationInNewTab(
     conversationId: string,
     activate = true,
   ): Promise<void> {
-    await this.tabManager?.openConversation(conversationId, {
+    const tabManager = this.tabManager;
+    const generation = this.assemblyGeneration;
+    if (!this.isCurrentManager(tabManager, generation)) return;
+    await tabManager.openConversation(conversationId, {
       preferNewTab: true,
       activate,
     });
-    this.historyDropdown?.removeClass('visible');
+    if (this.isCurrentManager(tabManager, generation)) this.hideHistoryDropdown();
   }
 
   private getHistoryConversationOpenState(conversationId: string): HistoryConversationOpenState {
@@ -582,13 +710,17 @@ export class ClaudianView extends ItemView {
   // ============================================
 
   private wireEventHandlers(): void {
+    const tabManager = this.tabManager;
+    const generation = this.assemblyGeneration;
+    const isCurrent = () => this.isCurrentManager(tabManager, generation);
     // Document-level click to close dropdowns
     this.registerDomEvent(document, 'click', () => {
-      this.historyDropdown?.removeClass('visible');
+      if (isCurrent()) this.hideHistoryDropdown();
     });
 
     // View-level Shift+Tab to toggle plan mode (works from any focused element)
     this.registerDomEvent(this.containerEl, 'keydown', (e: KeyboardEvent) => {
+      if (!isCurrent()) return;
       if (e.key === 'Tab' && e.shiftKey && !e.isComposing) {
         e.preventDefault();
         const activeTab = this.tabManager?.getActiveTab();
@@ -600,7 +732,13 @@ export class ClaudianView extends ItemView {
           providerId,
         ).permissionMode as string;
         if (current === 'plan') {
-          const restoreMode = activeTab.state.prePlanPermissionMode ?? 'normal';
+          // Shift+Tab fallback (§5.3): a lost restore value falls back to the
+          // provider's fail-closed mode (Manual for Claude), never YOLO/Auto.
+          const policy = ProviderRegistry.getChatUIConfig(providerId).permissionModes;
+          const prePlan = activeTab.state.prePlanPermissionMode;
+          const restoreMode = policy && prePlan
+            ? resolveProviderPermissionMode(policy, prePlan, {}) ?? policy.fallbackValue
+            : policy?.fallbackValue ?? 'normal';
           activeTab.state.prePlanPermissionMode = null;
           updatePlanModeUI(activeTab, this.plugin, restoreMode);
         } else {
@@ -620,14 +758,22 @@ export class ClaudianView extends ItemView {
     // The view scope outranks app scope exactly while this view is the active
     // leaf, and modals push their own scope so the shortcut stays gated.
     this.scope.register(['Mod'], 'F', () => {
-      const activeTab = this.tabManager?.getActiveTab();
+      if (!isCurrent()) return;
+      const activeTab = tabManager?.getActiveTab();
       if (activeTab && openHistorySearchForTab(activeTab)) return false;
     });
     this.scope.register([], 'Escape', () => {
-      const activeTab = this.tabManager?.getActiveTab();
+      if (!isCurrent()) return;
+      const activeTab = tabManager?.getActiveTab();
       // An open history-search panel outranks streaming-cancel in Escape
       // arbitration; both consume the event.
       if (activeTab && closeHistorySearchForTab(activeTab)) return false;
+      // An open permission menu closes first; the second Escape resumes the
+      // old cancel behavior (§5.3 arbitration).
+      if (activeTab?.ui.permissionToggle?.isMenuOpen()) {
+        activeTab.ui.permissionToggle.closeMenu();
+        return false;
+      }
       if (activeTab?.state.isStreaming) {
         activeTab.controllers.inputController?.cancelStreaming();
       }
@@ -636,7 +782,8 @@ export class ClaudianView extends ItemView {
 
     // Vault events - forward to active tab's file context manager
     const markCacheDirty = (includesFolders: boolean): void => {
-      const mgr = this.tabManager?.getActiveTab()?.ui.fileContextManager;
+      if (!isCurrent()) return;
+      const mgr = tabManager?.getActiveTab()?.ui.fileContextManager;
       if (!mgr) return;
       mgr.markFileCacheDirty();
       if (includesFolders) mgr.markFolderCacheDirty();
@@ -651,15 +798,16 @@ export class ClaudianView extends ItemView {
     // File open event
     this.registerEvent(
       this.plugin.app.workspace.on('file-open', (file) => {
-        if (file) {
-          this.tabManager?.getActiveTab()?.ui.fileContextManager?.handleFileOpen(file);
+        if (file && isCurrent()) {
+          tabManager?.getActiveTab()?.ui.fileContextManager?.handleFileOpen(file);
         }
       })
     );
 
     // Click outside to close mention dropdown
     this.registerDomEvent(document, 'click', (e) => {
-      const activeTab = this.tabManager?.getActiveTab();
+      if (!isCurrent()) return;
+      const activeTab = tabManager?.getActiveTab();
       if (activeTab) {
         const fcm = activeTab.ui.fileContextManager;
         if (fcm && !fcm.containsElement(e.target as Node) && e.target !== activeTab.dom.inputEl) {
@@ -673,50 +821,65 @@ export class ClaudianView extends ItemView {
   // Persistence
   // ============================================
 
-  private async restoreOrCreateTabs(): Promise<void> {
-    if (!this.tabManager) return;
-
-    // Try to restore from persisted state
+  private async restoreOrCreateTabs(tabManager: TabManager, generation: object): Promise<void> {
+    // A delayed restore must keep the manager from its original view generation.
     const persistedState = await this.plugin.storage.getTabManagerState();
+    if (this.assemblyGeneration !== generation || this.tabManager !== tabManager) return;
     if (persistedState && persistedState.openTabs.length > 0) {
-      await this.tabManager.restoreState(persistedState);
+      await tabManager.restoreState(persistedState);
       return;
     }
 
     // Fallback: create a new empty tab
-    await this.tabManager.createTab();
+    await tabManager.createTab();
   }
 
   private persistTabState(): void {
+    const tabManager = this.tabManager;
+    const generation = this.assemblyGeneration;
+    if (!this.isCurrentManager(tabManager, generation)) return;
     // Debounce persistence to avoid rapid writes (300ms delay)
     if (this.pendingPersist !== null) {
       clearTimeout(this.pendingPersist);
     }
-    this.pendingPersist = setTimeout(() => {
+    const timer: ReturnType<typeof setTimeout> = setTimeout(() => {
+      if (this.pendingPersist !== timer) return;
       this.pendingPersist = null;
-      if (!this.tabManager) return;
-      const state = this.tabManager.getPersistedState();
+      if (!this.isCurrentManager(tabManager, generation)) return;
+      const state = tabManager.getPersistedState();
       this.plugin.persistTabManagerState(state).catch(() => {
         // Silently ignore persistence errors
       });
     }, 300);
+    this.pendingPersist = timer;
   }
 
   /** Force immediate persistence (for onClose/onunload). */
-  private async persistTabStateImmediate(): Promise<void> {
+  private async persistTabStateImmediate(tabManager: TabManager | null): Promise<void> {
     // Cancel any pending debounced persist
     if (this.pendingPersist !== null) {
       clearTimeout(this.pendingPersist);
       this.pendingPersist = null;
     }
-    if (!this.tabManager) return;
-    const state = this.tabManager.getPersistedState();
+    if (!tabManager) return;
+    const state = tabManager.getPersistedState();
     await this.plugin.persistTabManagerState(state);
   }
 
   // ============================================
   // Public API
   // ============================================
+
+  /** Explicit, rate-limited census of one tab's message subtree. */
+  sampleMarkdownRenderDom(tabId: TabId): void {
+    const tab = this.tabManager?.getTab(tabId);
+    if (!tab?.markdownRenderDiagnostics) return;
+    try {
+      tab.markdownRenderDiagnostics.collector.sampleDom(tab.dom.messagesEl);
+    } catch {
+      try { tab.markdownRenderDiagnostics.collector.disable(); } catch { /* diagnostics are isolated */ }
+    }
+  }
 
   /** Gets the currently active tab. */
   getActiveTab(): TabData | null {

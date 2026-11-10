@@ -1,9 +1,12 @@
 import { Menu, Notice, setIcon } from 'obsidian';
 
+import type { ConversationHistoryCoordinator } from '../../../app/ConversationHistoryCoordinator';
+import type { ConversationMetadataSavePort } from '../../../app/ConversationMetadataSavePort';
 import { consumeHistoryText } from '../../../core/providers/consumeHistoryText';
 import { ProviderRegistry } from '../../../core/providers/ProviderRegistry';
 import { ProviderSettingsCoordinator } from '../../../core/providers/ProviderSettingsCoordinator';
 import {
+  type FieldPatch,
   type FullHistoryIterable,
   type HistoryIndexLease,
   type HistoryLoadProgress,
@@ -11,12 +14,20 @@ import {
   HistorySourceUnavailableError,
   type HistoryWindowPage,
   type HistoryWindowRequest,
+  type JsonObject,
+  type JsonValue,
   type LoadedTurnRange,
+  type MetadataPatch,
+  type OwnerToken,
   type ProviderConversationHistoryService,
   type ProviderId,
+  type SaveReceipt,
+  type SaveRequestResult,
+  type SessionBindingPatch,
   type TitleGenerationService,
 } from '../../../core/providers/types';
 import type { ChatRuntime } from '../../../core/runtime/ChatRuntime';
+import type { CapturedSessionPersistence } from '../../../core/runtime/types';
 import { type ChatMessage, compareChatDisplayOrder, type Conversation } from '../../../core/types';
 import { t } from '../../../i18n/i18n';
 import type ClaudianPlugin from '../../../main';
@@ -32,10 +43,19 @@ import { cleanupThinkingBlock } from '../rendering/ThinkingBlockRenderer';
 import { findRewindContext } from '../rewind';
 import type { SubagentManager } from '../services/SubagentManager';
 import type { ChatState } from '../state/ChatState';
+import type {
+  CloseSaveOutcome,
+  CommitReceipt,
+  PersistableBindingState,
+  ReservationWitness,
+  RuntimePersistencePort,
+} from '../state/types';
 import type { FileContextManager } from '../ui/FileContext';
 import type { ImageContextManager } from '../ui/ImageContext';
 import type { ExternalContextSelector, McpServerSelector } from '../ui/InputToolbar';
 import type { StatusPanel } from '../ui/StatusPanel';
+import { formatConversationSize, formatConversationSizeTooltip } from '../utils/conversationSize';
+import { formatActiveSessionIdentity, loadActiveSessionNames } from '../utils/sessionIdentity';
 import { refreshUsageContextWindow } from '../utils/usageInfo';
 import { enumerateVisibleMatches, type HistorySearchSnapshotRefreshResult } from './HistorySearchController';
 
@@ -94,6 +114,18 @@ export interface ConversationControllerDeps {
   commitConversation?: (conversationId: string) => void;
   cancelConversationReservation?: (conversationId: string) => void;
   releaseConversation?: (conversationId: string) => void;
+  /** Local view/tab admission only; it does not revoke accepted saves. */
+  isManagerActive?: () => boolean;
+  /**
+   * R2 binding/save-admission wiring (stage 1). Absent in legacy unit fixtures —
+   * the controller then keeps the pre-R2 save path.
+   */
+  getConversationHistoryCoordinator?: () => ConversationHistoryCoordinator | null;
+  getConversationMetadataSavePort?: () => ConversationMetadataSavePort | null;
+  /** Stable owner identity pair (view plays the manager role: one TabManager per view). */
+  getBindingOwnerIdentity?: () => { manager: object; tab: object };
+  /** Sync claim witness over the tab's pending/committed ConversationOpenRegistry claim. */
+  getBindingReservation?: (conversationId: string) => ReservationWitness | null;
 }
 
 type SaveOptions = {
@@ -106,6 +138,7 @@ type HistoryRenderOptions = {
   onSelectConversation: (id: string) => Promise<void>;
   onOpenConversationInNewTab?: (id: string, activate?: boolean) => Promise<void>;
   getConversationOpenState?: (id: string) => HistoryConversationOpenState;
+  refreshSizes?: boolean;
   onRerender: () => void;
 };
 
@@ -126,12 +159,55 @@ export class ConversationController {
   private deps: ConversationControllerDeps;
   private callbacks: ConversationCallbacks;
   private projectionCache = new Map<string, HTMLElement>();
+  private readonly acceptedSaves = new Set<Promise<void>>();
+  /**
+   * Open-generation bookkeeping for history-menu size results: a refresh that
+   * resolves for a menu epoch that has since closed must never write into the
+   * currently rendered dropdown.
+   */
+  private historyMenuEpoch = 0;
+  private historySizeRows = new Map<string, {
+    epoch: number;
+    container: HTMLElement;
+    sizeEl: HTMLElement;
+    conversation: Conversation | null;
+    menuConversationId: string | null;
+  }>();
+  /**
+   * The current row's identity-suffix target for this menu epoch. The session
+   * registry is CC-external state scanned asynchronously, so the suffix first
+   * renders from the last resolved scan (if any) and is backfilled under the
+   * same epoch/visibility guards as the size rows when the scan resolves.
+   */
+  private historyIdentityRow: {
+    epoch: number;
+    container: HTMLElement;
+    titleEl: HTMLElement;
+    title: string;
+    conversation: Conversation | null;
+    menuConversationId: string | null;
+  } | null = null;
+  /** Last resolved registry scan; per-use scans keep it fresh, never cached as a promise. */
+  private activeSessionNames: ReadonlyMap<string, string> = new Map();
   /**
    * Candidates the provider index verified in detail text but the current
    * (summary/loaded) projection cannot mount — recorded for diagnostics only;
    * they never enter the navigable search results or the total.
    */
   private searchDiagnostics: HistorySearchResult[] = [];
+  /**
+   * R2 binding/save-admission state (P6-0 core wiring, stage 1). The receipt
+   * is the committed tab binding; saves target its record so the save target
+   * and the session payload can never come from two different bindings.
+   */
+  private bindingReceipt: CommitReceipt | null = null;
+  private ownerToken: OwnerToken | null = null;
+  /** Owner-epoch identity object; rotated only when a binding's record is deleted. */
+  private ownerEpoch: object = {};
+  private currentRuntimePort: ChatRuntimePersistencePort | null = null;
+  private closeSaveCompletion: Promise<readonly CloseSaveOutcome[]> | null = null;
+  /** Set once the current binding is sealed outgoing and its write is settled. */
+  private outgoingSealed = false;
 
   constructor(deps: ConversationControllerDeps, callbacks: ConversationCallbacks = {}) {
     this.deps = deps;
@@ -140,6 +216,336 @@ export class ConversationController {
 
   private getAgentService(): ChatRuntime | null {
     return this.deps.getAgentService?.() ?? null;
+  }
+
+  private isManagerActive(): boolean {
+    return this.deps.isManagerActive?.() ?? true;
+  }
+
+  /** Captures only saves already accepted by this controller, not pending reads. */
+  snapshotAcceptedSaves(): Promise<void>[] {
+    return Array.from(this.acceptedSaves);
+  }
+
+  private trackAcceptedSave(operation: () => Promise<void>): Promise<void> {
+    let resolve!: () => void;
+    let reject!: (reason: unknown) => void;
+    const save = new Promise<void>((onResolve, onReject) => {
+      resolve = onResolve;
+      reject = onReject;
+    });
+    this.acceptedSaves.add(save);
+    void save.then(
+      () => this.acceptedSaves.delete(save),
+      () => this.acceptedSaves.delete(save),
+    );
+    try {
+      void operation().then(resolve, reject);
+    } catch (error) {
+      reject(error);
+    }
+    return save;
+  }
+
+  // ============================================
+  // R2 binding / save admission (P6-0 core wiring)
+  // ============================================
+
+  private getSaveCoordinator(): ConversationHistoryCoordinator | null {
+    return this.deps.getConversationHistoryCoordinator?.() ?? null;
+  }
+
+  private ensureOwnerToken(): OwnerToken | null {
+    const coordinator = this.getSaveCoordinator();
+    const identity = this.deps.getBindingOwnerIdentity?.();
+    if (!coordinator || !identity) return null;
+    const registered = coordinator.registerOwner(identity.manager, this.ownerEpoch);
+    if (registered.status === 'ok') {
+      this.ownerToken = registered.value;
+      return registered.value;
+    }
+    if (registered.reason === 'owner-retiring') this.rotateOwnerEpoch();
+    return null;
+  }
+
+  /** A dead binding epoch may never be reused; a fresh owner identity restarts clean. */
+  private rotateOwnerEpoch(): void {
+    this.ownerEpoch = {};
+    this.ownerToken = null;
+    this.bindingReceipt = null;
+    this.currentRuntimePort = null;
+    this.outgoingSealed = false;
+  }
+
+  /** Seed state captured from the persisted record at binding-commit time. */
+  private buildSeedState(conversation: Conversation): PersistableBindingState {
+    const providerFields: Record<string, FieldPatch<JsonValue>> = {};
+    for (const [key, value] of Object.entries(conversation.providerState ?? {})) {
+      providerFields[key] = { op: 'set', value: value as JsonValue };
+    }
+    return {
+      metadata: {},
+      sessionSeed: {
+        sessionId: conversation.sessionId == null
+          ? { op: 'delete' }
+          : { op: 'set', value: conversation.sessionId },
+        providerFields,
+      },
+    };
+  }
+
+  /** Live persistable-field refresh; the sessionSeed always passes through unchanged. */
+  private buildPersistableState(
+    conversation: Conversation,
+    sessionSeed: SessionBindingPatch,
+    updateLastResponse: boolean,
+    options: SaveOptions | undefined,
+  ): PersistableBindingState {
+    const { state } = this.deps;
+    const fileCtx = this.deps.getFileContextManager();
+    const currentNote = fileCtx?.getCurrentNotePath() || undefined;
+    const externalContextPaths = this.deps.getExternalContextSelector()?.getExternalContexts() ?? [];
+    const mcpServerSelector = this.deps.getMcpServerSelector();
+    const enabledMcpServers = mcpServerSelector ? Array.from(mcpServerSelector.getEnabledServers()) : [];
+    const firstUser = state.messages.find(message => message.role === 'user');
+    const metadata: MetadataPatch = {
+      hasHistory: { op: 'set', value: state.messages.length > 0 || conversation.hasHistory === true },
+      messageCount: { op: 'set', value: Math.max(conversation.messageCount ?? 0, state.messages.length) },
+      firstUserExcerpt: conversation.firstUserExcerpt != null
+        ? { op: 'keep' }
+        : firstUser
+          ? { op: 'set', value: (firstUser.displayContent ?? firstUser.content).slice(0, 300) }
+          : { op: 'keep' },
+      preview: conversation.preview != null
+        ? { op: 'keep' }
+        : firstUser
+          ? { op: 'set', value: (firstUser.displayContent ?? firstUser.content).slice(0, 50) }
+          : { op: 'keep' },
+      currentNote: currentNote === undefined ? { op: 'delete' } : { op: 'set', value: currentNote },
+      externalContextPaths: externalContextPaths.length > 0
+        ? { op: 'set', value: externalContextPaths }
+        : { op: 'delete' },
+      usage: state.usage ? { op: 'set', value: state.usage } : { op: 'delete' },
+      enabledMcpServers: enabledMcpServers.length > 0
+        ? { op: 'set', value: enabledMcpServers }
+        : { op: 'delete' },
+      ...(updateLastResponse ? { lastResponseAt: { op: 'set', value: Date.now() } } : {}),
+      ...(options
+        ? {
+          resumeAtMessageId: options.resumeAtMessageId === undefined
+            ? { op: 'delete' }
+            : { op: 'set', value: options.resumeAtMessageId },
+        }
+        : {}),
+    };
+    return { metadata, sessionSeed };
+  }
+
+  private registerMaterializationSource(recordId: string): void {
+    this.deps.getConversationMetadataSavePort?.()?.registerMaterializationSource(recordId, () => {
+      // Display/record divergence (mid-switch) must never leak the other
+      // conversation's materialized view into this record's metadata.
+      if (this.deps.state.currentConversationId !== recordId) return null;
+      const base = this.deps.plugin.getConversationSync(recordId);
+      if (!base) return null;
+      return base.sessionId ? [] : this.deps.state.messages;
+    });
+  }
+
+  /**
+   * Commits the R2 tab binding for a conversation: record + owner + attempt +
+   * immutable seed state, all before any runtime adoption or UI notification
+   * for the incoming conversation (P6 §6.2 prepare→commit→adoption→notify).
+   * Requires the outgoing binding (if any) to be sealed and written first.
+   */
+  private async commitConversationBinding(
+    conversation: Conversation,
+    options?: { unclaimedIsOwn?: boolean },
+  ): Promise<CommitReceipt | null> {
+    const coordinator = this.getSaveCoordinator();
+    if (!coordinator) return null;
+    const registered = coordinator.registerRecord(conversation);
+    if (registered.status !== 'ok') return null;
+    const record = registered.value;
+    const owner = this.ensureOwnerToken();
+    if (!owner) return null;
+    const versions = coordinator.readRecordVersions(record);
+    if (versions.status !== 'ok') return null;
+    // An outgoing binding whose record was deleted can never be sealed
+    // written; declare the epoch dead and start a fresh owner for the commit.
+    if (this.bindingReceipt && this.deps.plugin.getConversationSync(this.bindingReceipt.record.id) == null) {
+      coordinator.retireRecord(this.bindingReceipt.record);
+      this.rotateOwnerEpoch();
+    }
+    if (this.bindingReceipt && !this.outgoingSealed) {
+      try {
+        await this.sealOutgoingBinding();
+      } catch (error) {
+        if (!this.isManagerActive()) return null;
+        throw error;
+      }
+    }
+    const freshOwner = this.ownerToken ?? this.ensureOwnerToken();
+    if (!freshOwner) return null;
+    // A lost or missing claim means this tab no longer holds display
+    // admission for the record — the binding must not commit. Only a record
+    // this tab just created (lazy create) is self-evidently its own.
+    const reservation = options?.unclaimedIsOwn
+      ? { claim: this.ownerEpoch, owns: () => true }
+      : (this.deps.getBindingReservation?.(conversation.id) ?? null);
+    if (!reservation) return null;
+    const attempt = coordinator.beginBindingAttempt({
+      owner: freshOwner,
+      record,
+      expectedRecordVersions: versions.value,
+      reservation,
+    });
+    if (attempt.status !== 'ok') return null;
+    const committed = coordinator.commitPreparedBinding({ attempt: attempt.value, state: this.buildSeedState(conversation) });
+    if (committed.status !== 'ok') return null;
+    this.bindingReceipt = committed.value;
+    this.outgoingSealed = false;
+    this.registerMaterializationSource(conversation.id);
+    return committed.value;
+  }
+
+  /**
+   * Seals the current binding as outgoing and waits for its receipt. Idempotent:
+   * an already sealed binding returns its original ticket without re-writing.
+   * A failed write rejects with the original error (the switch must fail
+   * loudly rather than rebind past an unwritten outgoing state).
+   */
+  private async sealOutgoingBinding(): Promise<void> {
+    const coordinator = this.getSaveCoordinator();
+    const receipt = this.bindingReceipt;
+    if (!coordinator || !receipt) return;
+    const request = this.sealOutgoingAdmission();
+    if (!request) return;
+    // The admitting window is synchronous for this port; settle it explicitly
+    // anyway — the receipt chain must be followed, not assumed.
+    const admission = request.status === 'admitting' ? await request.settlement : request;
+    if (admission.status !== 'accepted') return;
+    const savedId = admission.ticket.record.id;
+    this.deps.plugin.conversationSizes?.invalidate(savedId);
+    try {
+      const result = await admission.durability;
+      if (result.status === 'written') {
+        this.outgoingSealed = true;
+        if (this.deps.state.currentConversationId === savedId) {
+          this.deps.state.hasPendingConversationSave = false;
+        }
+      }
+    } catch (error) {
+      void Promise.resolve()
+        .then(() => this.deps.plugin.conversationSizes?.refresh(savedId, true))
+        .catch(() => undefined);
+      throw error;
+    }
+    void Promise.resolve()
+      .then(() => this.deps.plugin.conversationSizes?.refresh(savedId, true))
+      .catch(() => undefined);
+  }
+
+  private sealOutgoingAdmission(): SaveRequestResult | null {
+    const coordinator = this.getSaveCoordinator();
+    const receipt = this.bindingReceipt;
+    if (!coordinator || !receipt) return null;
+    const current = coordinator.readBinding(receipt);
+    if (current.status !== 'ok') return null;
+    const conversation = this.deps.plugin.getConversationSync(receipt.record.id);
+    // The outgoing payload is frozen before the first await: metadata from the
+    // live display only while it still shows the outgoing record, and the
+    // session input from the binding itself (adopted capture or seed).
+    if (conversation && this.deps.state.currentConversationId === receipt.record.id) {
+      const fresh = this.buildPersistableState(conversation, current.value.state.sessionSeed, false, undefined);
+      coordinator.updatePersistableBinding({
+        binding: receipt,
+        expectedDirtyRevision: current.value.dirtyRevision,
+        state: fresh,
+      });
+    }
+    return coordinator.sealOutgoing(receipt);
+  }
+
+  /**
+   * Wraps an actual runtime sync under the current binding's adoption
+   * (P6 §4.2/§6.2): every production sync entry point routes through here so a
+   * save can only capture from the runtime its binding adopted.
+   *
+   * A sync whose target conversation is not the binding's record (e.g. an
+   * environment reconcile that still sees the outgoing conversationId inside
+   * the commit→rebind window) still runs — environment changes must reach the
+   * runtime — but the adoption is failed afterwards: the binding's saves fall
+   * back to its seed instead of capturing a runtime state that now belongs to
+   * a different record.
+   */
+  adoptRuntimeSync(runtime: ChatRuntime | null, sync: () => void, target?: { conversationId: string | null }): void {
+    const coordinator = this.getSaveCoordinator();
+    const receipt = this.bindingReceipt;
+    if (!runtime || !coordinator || !receipt) {
+      sync();
+      return;
+    }
+    const port = new ChatRuntimePersistencePort(runtime, () =>
+      this.deps.plugin.getConversationSync(receipt.record.id));
+    const adoption = coordinator.beginRuntimeAdoption({ binding: receipt, runtime: port });
+    if (adoption.status !== 'ok') {
+      sync();
+      return;
+    }
+    try {
+      sync();
+    } catch (error) {
+      coordinator.failRuntimeAdoption(adoption.value, error);
+      throw error;
+    }
+    if (target !== undefined && target.conversationId !== receipt.record.id) {
+      // The seed fallback is the safety property, so the silent degradation
+      // itself must be traceable — an unattributed bypass is indistinguishable
+      // from the bug this guard exists to prevent.
+      recordHistoryDiagnosticEvent({ kind: 'save_adoption_target_mismatch' });
+      coordinator.failRuntimeAdoption(adoption.value, new Error(
+        `runtime sync targeted conversation ${String(target.conversationId)} outside binding record ${receipt.record.id}`,
+      ));
+      return;
+    }
+    const completed = coordinator.completeRuntimeAdoption(adoption.value);
+    if (completed.status === 'ok') this.currentRuntimePort = port;
+  }
+
+  /**
+   * Close-time sealing (manager beginClose): synchronously prepares the
+   * binding's last persistable state and obtains the core CloseSavePlan. The
+   * plan's final admission captures from the committed binding — an outgoing
+   * shell can never read a runtime a later rebind owns. Idempotent per close.
+   */
+  sealForCloseSave(): readonly Promise<readonly CloseSaveOutcome[]>[] {
+    const coordinator = this.getSaveCoordinator();
+    const owner = this.ownerToken;
+    if (!coordinator || !owner || this.closeSaveCompletion) {
+      return this.closeSaveCompletion ? [this.closeSaveCompletion] : [];
+    }
+    const receipt = this.bindingReceipt;
+    // An incoming binding whose restore never committed (a switch canceled by
+    // close) must leave no persistence trace: its record belongs to the next
+    // owner now, and the entered switch is revoked (R1a close semantics).
+    if (receipt && this.deps.state.currentConversationId !== receipt.record.id) return [];
+    if (receipt) {
+      const current = coordinator.readBinding(receipt);
+      const conversation = this.deps.plugin.getConversationSync(receipt.record.id);
+      if (current.status === 'ok' && conversation && this.deps.state.currentConversationId === receipt.record.id) {
+        const fresh = this.buildPersistableState(conversation, current.value.state.sessionSeed, false, undefined);
+        coordinator.updatePersistableBinding({
+          binding: receipt,
+          expectedDirtyRevision: current.value.dirtyRevision,
+          state: fresh,
+        });
+      }
+    }
+    const plan = coordinator.sealForClose(owner);
+    if (plan.status !== 'ok') return [];
+    this.closeSaveCompletion = plan.value.completion;
+    return [plan.value.completion];
   }
 
   // ============================================
@@ -155,6 +561,7 @@ export class ConversationController {
   async createNew(options: { force?: boolean } = {}): Promise<void> {
     const { plugin, state, subagentManager } = this.deps;
     const force = !!options.force;
+    if (!this.isManagerActive()) return;
     if (state.isStreaming && !force) return;
     if (state.isCreatingConversation) return;
     if (state.isSwitchingConversation) return;
@@ -177,10 +584,13 @@ export class ConversationController {
       // auto-turn finish cannot write into the freshly blanked conversation.
       this.deps.invalidateTurnLifecycle?.();
 
-      // Save current conversation if it has messages
+      // Save current conversation if it has messages. R2: the outgoing save is
+      // a binding seal — its payload is frozen before the tab blanks, so the
+      // blank/reset runtime state can never overwrite the record.
       if (state.currentConversationId && state.messages.length > 0) {
-        await this.save();
+        await this.save(false, undefined, { outgoing: true });
       }
+      if (!this.isManagerActive()) return;
 
       subagentManager.orphanAllActive();
       subagentManager.clear();
@@ -228,6 +638,7 @@ export class ConversationController {
         // Remount StatusPanel to restore state for new conversation
         this.deps.getStatusPanel()?.remount();
       });
+      if (!this.isManagerActive()) return;
 
       this.deps.getInputEl().value = '';
 
@@ -259,9 +670,12 @@ export class ConversationController {
    */
   async loadActive(shouldApply: () => boolean = () => true): Promise<void> {
     const { plugin, state, renderer } = this.deps;
+    const canApply = (): boolean => this.isManagerActive() && shouldApply();
+    if (!this.isManagerActive()) return;
 
     const conversationId = state.currentConversationId;
     const conversation = conversationId ? await plugin.getConversationById(conversationId) : null;
+    if (!this.isManagerActive()) return;
     let firstScreen: HistoryWindowPage | null = null;
     if (conversation) {
       const historyService = this.deps.getHistoryIndexCapableService(conversation);
@@ -274,25 +688,47 @@ export class ConversationController {
         state.historyLoading = true;
         const lease = this.acquireLease(conversation, historyService);
         let transferred = false;
+        let bodyFailed = false;
+        let bodyError: unknown;
         try {
           await lease.ready;
+          if (!this.isManagerActive()) return;
           firstScreen = await this.loadFirstScreenWindow(lease);
-          if (!shouldApply()) return;
+          if (!canApply()) return;
           state.historyLease?.release();
           state.historyLease = lease;
           transferred = true;
           state.loadedRanges = [firstScreen.range];
           state.historyHasMore = firstScreen.hasMoreBefore;
           state.historySnapshotOffset = firstScreen.snapshotOffset ?? null;
+          state.historyTailStart = firstScreen.tailStart ?? null;
           state.historyError = null;
           await this.backfillLegacyHistoryMetadata(conversation, firstScreen);
+          if (!canApply()) return;
+        } catch (error) {
+          bodyFailed = true;
+          bodyError = error;
+          throw error;
         } finally {
-          if (!transferred) lease.release();
-          state.historyLoading = false;
+          if (!transferred) {
+            try {
+              lease.release();
+            } catch (releaseError) {
+              if (bodyFailed) {
+                // Both failures, including non-Error values, remain ordered in the aggregate.
+                // eslint-disable-next-line no-unsafe-finally, preserve-caught-error
+                throw new AggregateError([bodyError, releaseError], 'History lease release failed');
+              }
+              // A release failure must override a pending return without changing its identity.
+              // eslint-disable-next-line no-unsafe-finally
+              throw releaseError;
+            }
+          }
+          if (this.isManagerActive()) state.historyLoading = false;
         }
       }
     }
-    if (!shouldApply()) return;
+    if (!canApply()) return;
 
     // No active conversation - start at entry point
     if (!conversation) {
@@ -335,8 +771,15 @@ export class ConversationController {
       return;
     }
 
+    // R2: commit the tab binding before the runtime adoption so the sync
+    // inside ensureServiceForConversation runs under this record's adoption —
+    // never the outgoing binding's (P6 §6.2 commit→adoption→notify).
+    await this.commitConversationBinding(conversation);
+    if (!canApply()) return;
     await this.deps.ensureServiceForConversation?.(conversation);
+    if (!canApply()) return;
     await this.restoreConversation(conversation, firstScreen, { autoAttachFile: true });
+    if (!canApply()) return;
     this.updateWelcomeVisibility();
 
     this.renderHistoryPager();
@@ -345,7 +788,7 @@ export class ConversationController {
 
   async loadOlderHistory(): Promise<void> {
     const { state } = this.deps;
-    if (!state.historyLease || state.historyLoading) return;
+    if (!this.isManagerActive() || !state.historyLease || state.historyLoading) return;
     await this.loadOlderWindow();
   }
 
@@ -423,12 +866,13 @@ export class ConversationController {
     options?: { timeoutMs?: number; bypassLive?: boolean },
   ): Promise<T | null> {
     const conversationId = this.deps.state.currentConversationId;
-    const isStale = (): boolean => this.deps.state.currentConversationId !== conversationId;
+    const isStale = (): boolean => !this.isManagerActive()
+      || this.deps.state.currentConversationId !== conversationId;
     const coordinator = this.deps.getProjectionCoordinator?.() ?? null;
     if (!coordinator) {
-      return task(isStale);
+      return isStale() ? null : task(isStale);
     }
-    return coordinator.runStored(isStale, () => task(isStale), options);
+    return coordinator.runStored(isStale, () => isStale() ? Promise.resolve(null) : task(isStale), options);
   }
 
   /**
@@ -440,7 +884,7 @@ export class ConversationController {
     conversation: Conversation,
     firstScreen: HistoryWindowPage,
   ): Promise<void> {
-    if (conversation.hasHistory === true || firstScreen.messages.length === 0) return;
+    if (!this.isManagerActive() || conversation.hasHistory === true || firstScreen.messages.length === 0) return;
     const firstUser = firstScreen.messages.find(message => message.role === 'user');
     const backfill: Partial<Conversation> = {
       hasHistory: true,
@@ -456,7 +900,7 @@ export class ConversationController {
     // Update the shell before persistence so warmup/passive sync in the
     // same restore observes history metadata immediately.
     Object.assign(conversation, backfill);
-    await this.deps.plugin.updateConversation(conversation.id, backfill);
+    await this.trackAcceptedSave(() => this.deps.plugin.updateConversation(conversation.id, backfill));
   }
 
   /** Budget-window first screen; every oversized turn arrives as a summary projection. */
@@ -522,16 +966,21 @@ export class ConversationController {
         state.loadedRanges = this.mergeRanges([...state.loadedRanges, page.range]);
         state.historyHasMore = !this.coversAll(state.loadedRanges, total);
         state.historySnapshotOffset = page.snapshotOffset ?? state.historySnapshotOffset;
+        state.historyTailStart = page.tailStart ?? state.historyTailStart;
       });
     } catch (error) {
-      state.historyError = error instanceof Error ? error.message : String(error);
+      if (this.isManagerActive()) state.historyError = error instanceof Error ? error.message : String(error);
+      else throw error;
     } finally {
-      state.historyLoading = false;
-      this.renderHistoryPager();
+      if (this.isManagerActive()) {
+        state.historyLoading = false;
+        this.renderHistoryPager();
+      }
     }
   }
 
   private renderHistoryPager(): void {
+    if (!this.isManagerActive()) return;
     this.deps.renderer.renderHistoryPager(
       this.deps.state.historyHasMore,
       this.deps.state.historyLoading,
@@ -833,6 +1282,7 @@ export class ConversationController {
       state.loadedRanges = this.mergeRanges([...state.loadedRanges, page.range]);
       state.historyHasMore = !this.coversAll(state.loadedRanges, lease.totalTurns);
       state.historySnapshotOffset = page.snapshotOffset ?? state.historySnapshotOffset;
+      state.historyTailStart = page.tailStart ?? state.historyTailStart;
     });
   }
 
@@ -871,7 +1321,9 @@ export class ConversationController {
     // passed — so their async index events can never drive the hydration
     // placeholder over messages that are already rendered.
     const progress = notifyProgress
-      ? (value: HistoryLoadProgress) => this.deps.onHistoryLoadProgress?.(value)
+      ? (value: HistoryLoadProgress) => {
+          if (this.isManagerActive()) this.deps.onHistoryLoadProgress?.(value);
+        }
       : undefined;
     const lease = forceNewSnapshot
       ? service.acquireHistoryIndex?.(conversation, getVaultPath(this.deps.plugin.app), progress, true)
@@ -884,6 +1336,7 @@ export class ConversationController {
   async switchTo(id: string): Promise<void> {
     const { plugin, state, subagentManager } = this.deps;
 
+    if (!this.isManagerActive()) return;
     if (id === state.currentConversationId) return;
     if (state.isStreaming) return;
     if (state.isSwitchingConversation) return;
@@ -899,7 +1352,10 @@ export class ConversationController {
       : undefined;
 
     if (this.deps.reserveConversation && !(await this.deps.reserveConversation(id))) return;
+    if (!this.isManagerActive()) return;
     state.isSwitchingConversation = true;
+    let lease: HistoryIndexLease | null = null;
+    let transferred = false;
 
     try {
       this.deps.dismissPendingInlinePrompts?.();
@@ -910,12 +1366,17 @@ export class ConversationController {
       // conversation being switched to.
       this.deps.invalidateTurnLifecycle?.();
 
-      await this.save();
+      // R2: the outgoing conversation's final save is an outgoing seal — its
+      // payload freezes before the first await, so the rebind below can never
+      // leak the incoming runtime's identity into the outgoing record.
+      await this.save(false, undefined, { outgoing: true });
+      if (!this.isManagerActive()) return;
 
       subagentManager.orphanAllActive();
       subagentManager.clear();
 
       const conversation = await plugin.switchConversation(id);
+      if (!this.isManagerActive()) return;
       if (!conversation) {
         this.deps.cancelConversationReservation?.(id);
         return;
@@ -923,20 +1384,23 @@ export class ConversationController {
 
       const historyService = this.deps.getHistoryIndexCapableService(conversation);
       let firstScreen: HistoryWindowPage | null = null;
-      let lease: HistoryIndexLease | null = null;
       if (historyService) {
         lease = this.acquireLease(conversation, historyService);
-        try {
-          await lease.ready;
-          firstScreen = await this.loadFirstScreenWindow(lease);
-          await this.backfillLegacyHistoryMetadata(conversation, firstScreen);
-        } catch (error) {
-          lease.release();
-          throw error;
-        }
+        await lease.ready;
+        if (!this.isManagerActive()) return;
+        firstScreen = await this.loadFirstScreenWindow(lease);
+        if (!this.isManagerActive()) return;
+        await this.backfillLegacyHistoryMetadata(conversation, firstScreen);
+        if (!this.isManagerActive()) return;
       }
 
+      // R2: commit the incoming binding after the outgoing seal above — the
+      // runtime rebind inside ensureServiceForConversation then adopts under
+      // the incoming record, and the outgoing shell can never read it.
+      await this.commitConversationBinding(conversation);
+      if (!this.isManagerActive()) return;
       await this.deps.ensureServiceForConversation?.(conversation);
+      if (!this.isManagerActive()) return;
 
       this.deps.getInputEl().value = '';
       this.deps.clearQueuedMessage();
@@ -945,16 +1409,20 @@ export class ConversationController {
       this.deps.getHistoryWindowRenderer?.()?.reset();
       if (lease && firstScreen) {
         state.historyLease = lease;
+        transferred = true;
         state.loadedRanges = [firstScreen.range];
         state.historyHasMore = firstScreen.hasMoreBefore;
         state.historySnapshotOffset = firstScreen.snapshotOffset ?? null;
+        state.historyTailStart = firstScreen.tailStart ?? null;
       } else {
         // Non-index conversations have no pager: stale pagination flags from
         // the outgoing conversation must not leak a dead button.
         state.historyHasMore = false;
         state.historySnapshotOffset = null;
+        state.historyTailStart = null;
       }
       await this.restoreConversation(conversation, firstScreen);
+      if (!this.isManagerActive()) return;
       // Release while the tab still carries the outgoing claim; commit replaces it.
       if (previousConversationId) this.deps.releaseConversation?.(previousConversationId);
       this.deps.commitConversation?.(id);
@@ -970,14 +1438,16 @@ export class ConversationController {
       // the data arrived — the restored render queue drains first (the real
       // race protection is the projection lease; this is the UX semantics).
       await this.deps.renderer.waitForRenderedMessages();
+      if (!this.isManagerActive()) return;
 
       this.deps.markHydrationReady?.();
 
       this.callbacks.onConversationSwitched?.();
     } catch (error) {
-      this.deps.cancelConversationReservation?.(id);
+      if (this.isManagerActive()) this.deps.cancelConversationReservation?.(id);
       throw error;
     } finally {
+      if (lease && !transferred) lease.release();
       state.isSwitchingConversation = false;
     }
   }
@@ -1021,6 +1491,7 @@ export class ConversationController {
     | { status: 'switched' }
   > {
     const { state } = this.deps;
+    if (!this.isManagerActive()) return { status: 'switched' };
     if (projected.projectionLevel !== 'summary') return { status: 'exact', message: projected };
     const conversationId = state.currentConversationId;
     const lease = state.historyLease;
@@ -1028,6 +1499,7 @@ export class ConversationController {
     // the user's message, so a lease-less summary can only abort.
     if (!lease) return { status: 'not_found' };
     const detail = await lease.loadMessageDetail(projected.id, { maxSourceBytes: 16 * 1024 * 1024 });
+    if (!this.isManagerActive()) return { status: 'switched' };
     if (detail.status !== 'not_found') return detail;
     if (state.currentConversationId !== conversationId) return { status: 'switched' };
     try {
@@ -1037,10 +1509,11 @@ export class ConversationController {
       // honestly ends not_found instead of surfacing the build error as a
       // rewind failure.
     }
-    if (state.currentConversationId !== conversationId) return { status: 'switched' };
+    if (!this.isManagerActive() || state.currentConversationId !== conversationId) return { status: 'switched' };
     const retryLease = state.historyLease;
     if (!retryLease) return { status: 'not_found' };
-    return retryLease.loadMessageDetail(projected.id, { maxSourceBytes: 16 * 1024 * 1024 });
+    const retry = await retryLease.loadMessageDetail(projected.id, { maxSourceBytes: 16 * 1024 * 1024 });
+    return this.isManagerActive() ? retry : { status: 'switched' };
   }
 
   async rewind(userMessageId: string): Promise<void> {
@@ -1241,7 +1714,15 @@ export class ConversationController {
    * For native sessions (new conversations with sessionId from SDK),
    * only metadata is saved - the SDK handles message persistence.
    */
-  async save(updateLastResponse = false, options?: SaveOptions): Promise<void> {
+  save(updateLastResponse = false, options?: SaveOptions, phase?: { outgoing?: boolean }): Promise<void> {
+    return this.trackAcceptedSave(() => this.performSave(updateLastResponse, options, phase));
+  }
+
+  private async performSave(
+    updateLastResponse: boolean,
+    options?: SaveOptions,
+    phase?: { outgoing?: boolean },
+  ): Promise<void> {
     const { plugin, state } = this.deps;
 
     // Entry point with no messages - nothing to save
@@ -1263,6 +1744,7 @@ export class ConversationController {
 
     const agentService = this.getAgentService();
     const sessionInvalidated = agentService?.consumeSessionInvalidation?.() ?? false;
+    if (sessionInvalidated) this.currentRuntimePort?.markSessionInvalidated();
 
     // Entry point with messages - create conversation lazily
     // New conversations always use SDK-native storage.
@@ -1273,7 +1755,93 @@ export class ConversationController {
         sessionId: initialSessionId,
       });
       state.currentConversationId = conversation.id;
+      const lazyReceipt = await this.commitConversationBinding(conversation, { unclaimedIsOwn: true });
+      // The runtime's session belongs to this record's first turn even though
+      // no conversation sync ran (the tab was blank at runtime install): the
+      // immediately-completed adoption marks it as the binding's persistence
+      // source so the first save captures provider-native session facts.
+      if (lazyReceipt && agentService) {
+        const coordinator = this.getSaveCoordinator();
+        const port = new ChatRuntimePersistencePort(agentService, () =>
+          plugin.getConversationSync(conversation.id));
+        const adoption = coordinator?.beginRuntimeAdoption({ binding: lazyReceipt, runtime: port });
+        if (coordinator && adoption?.status === 'ok') {
+          this.currentRuntimePort = port;
+          coordinator.completeRuntimeAdoption(adoption.value);
+        }
+      }
     }
+
+    const coordinator = this.getSaveCoordinator();
+    const receipt = this.bindingReceipt;
+    if (!coordinator || !receipt) {
+      await this.performLegacySave(updateLastResponse, options, sessionInvalidated);
+      return;
+    }
+
+    // Outgoing save (switch/reset): the binding's final write is a seal — its
+    // payload freezes before the first await so the rebind that follows can
+    // never leak the incoming runtime's identity into the outgoing record.
+    if (phase?.outgoing) {
+      await this.sealOutgoingBinding();
+      return;
+    }
+
+    // The save target is the committed binding's record, never the display
+    // state — display and binding only diverge mid-switch, where the incoming
+    // binding must not receive the outgoing conversation's live fields.
+    const conversation = plugin.getConversationSync(receipt.record.id);
+    if (!conversation) return;
+
+    const current = coordinator.readBinding(receipt);
+    if (current.status !== 'ok') return;
+    if (state.currentConversationId === receipt.record.id) {
+      const fresh = this.buildPersistableState(conversation, current.value.state.sessionSeed, updateLastResponse, options);
+      const updated = coordinator.updatePersistableBinding({
+        binding: receipt,
+        expectedDirtyRevision: current.value.dirtyRevision,
+        state: fresh,
+      });
+      if (updated.status !== 'ok') {
+        // Structural rejections (stale/sealed/retiring/retired) mean this
+        // binding no longer qualifies for a shell save — the binding that
+        // replaced it owns the record's persistence from here on.
+        return;
+      }
+    }
+
+    const admission = coordinator.admitSave({ binding: receipt });
+    if (admission.status !== 'accepted') return;
+    const savedId = admission.ticket.record.id;
+    plugin.conversationSizes?.invalidate(savedId);
+    let saveReceipt: SaveReceipt;
+    try {
+      saveReceipt = await admission.durability;
+    } catch (error) {
+      void Promise.resolve()
+        .then(() => plugin.conversationSizes?.refresh(savedId, true))
+        .catch(() => undefined);
+      throw error;
+    }
+    // File observations must not delay or replace the metadata save outcome.
+    void Promise.resolve()
+      .then(() => plugin.conversationSizes?.refresh(savedId, true))
+      .catch(() => undefined);
+    // Only a written receipt clears the pending flag; skipped/conflict keep
+    // the dirty state honest (P6 §4.4).
+    if (saveReceipt.status === 'written') {
+      state.hasPendingConversationSave = false;
+    }
+  }
+
+  /** Pre-R2 save path, kept for legacy unit fixtures without the coordinator dep. */
+  private async performLegacySave(
+    updateLastResponse: boolean,
+    options: SaveOptions | undefined,
+    sessionInvalidated: boolean,
+  ): Promise<void> {
+    const { plugin, state } = this.deps;
+    const agentService = this.getAgentService();
 
     const fileCtx = this.deps.getFileContextManager();
     const currentNote = fileCtx?.getCurrentNotePath() || undefined;
@@ -1313,7 +1881,16 @@ export class ConversationController {
       updates.resumeAtMessageId = options.resumeAtMessageId;
     }
 
-    await plugin.updateConversation(state.currentConversationId!, updates);
+    const savedId = state.currentConversationId!;
+    plugin.conversationSizes?.invalidate(savedId);
+    try {
+      await plugin.updateConversation(savedId, updates);
+    } finally {
+      // File observations must not delay or replace the metadata save outcome.
+      void Promise.resolve()
+        .then(() => plugin.conversationSizes?.refresh(savedId, true))
+        .catch(() => undefined);
+    }
     state.hasPendingConversationSave = false;
   }
 
@@ -1327,6 +1904,7 @@ export class ConversationController {
     options?: { autoAttachFile?: boolean }
   ): Promise<void> {
     const { plugin, state, renderer } = this.deps;
+    if (!this.isManagerActive()) return;
 
     state.currentConversationId = conversation.id;
     state.messages = page ? [...page.messages] : [...conversation.messages];
@@ -1347,7 +1925,14 @@ export class ConversationController {
       ? conversation.externalContextPaths || []
       : plugin.settings.persistentExternalContextPaths || [];
 
-    this.getAgentService()?.syncConversationState(conversation, externalContextPaths);
+    // R2: the restore sync runs under the committed binding's adoption so
+    // saves capture this runtime only through the adoption registry.
+    const agentService = this.getAgentService();
+    this.adoptRuntimeSync(
+      agentService,
+      () => { agentService?.syncConversationState(conversation, externalContextPaths); },
+      { conversationId: conversation.id },
+    );
 
     const fileCtx = this.deps.getFileContextManager();
     fileCtx?.resetForLoadedConversation(hasMessages);
@@ -1448,6 +2033,40 @@ export class ConversationController {
   // History Dropdown
   // ============================================
 
+  releaseHistorySizeRows(container?: HTMLElement): void {
+    if (!container) {
+      this.historyMenuEpoch += 1;
+      this.historySizeRows.clear();
+      return;
+    }
+    let released = false;
+    for (const [id, row] of this.historySizeRows) {
+      if (row.container !== container) continue;
+      this.historySizeRows.delete(id);
+      released = true;
+    }
+    if (released) this.historyMenuEpoch += 1;
+  }
+
+  discardHistorySizeRow(conversationId: string): void {
+    this.historySizeRows.delete(conversationId);
+  }
+
+  /** Publication targets the current rows, not the nodes that initiated a stat. */
+  onConversationSizePublished(conversationId: string, container?: HTMLElement): void {
+    const { plugin, state } = this.deps;
+    const row = this.historySizeRows.get(conversationId);
+    const snapshot = plugin.conversationSizes?.getSnapshot(conversationId);
+    if (!row || !snapshot || snapshot.conversationId !== conversationId
+      || (container && row.container !== container) || row.epoch !== this.historyMenuEpoch
+      || !row.container.hasClass('visible') || !row.container.contains(row.sizeEl)
+      || state.currentConversationId !== row.menuConversationId || !row.conversation
+      || plugin.getConversationSync(conversationId) !== row.conversation) return;
+    const info = { sizeSnapshot: snapshot };
+    row.sizeEl.textContent = formatConversationSize(info);
+    row.sizeEl.setAttribute('aria-label', formatConversationSizeTooltip(info));
+  }
+
   toggleHistoryDropdown(): void {
     const dropdown = this.deps.getHistoryDropdown();
     if (!dropdown) return;
@@ -1455,17 +2074,19 @@ export class ConversationController {
     const isVisible = dropdown.hasClass('visible');
     if (isVisible) {
       dropdown.removeClass('visible');
+      this.releaseHistorySizeRows(dropdown);
     } else {
-      this.updateHistoryDropdown();
+      this.updateHistoryDropdown(true);
       dropdown.addClass('visible');
     }
   }
 
-  updateHistoryDropdown(): void {
+  updateHistoryDropdown(refreshSizes = false): void {
     const dropdown = this.deps.getHistoryDropdown();
     if (!dropdown) return;
 
     this.renderHistoryItems(dropdown, {
+      refreshSizes,
       onSelectConversation: (id) => this.switchTo(id).catch((error: unknown) => {
         // Non-hydration failures have no shell route; surface them instead
         // of leaving an unhandled rejection with no user feedback.
@@ -1485,6 +2106,11 @@ export class ConversationController {
     options: HistoryRenderOptions
   ): void {
     const { plugin, state } = this.deps;
+    const menuEpoch = ++this.historyMenuEpoch;
+    const menuConversationId = state.currentConversationId;
+    const bindSizeRows = options.refreshSizes || container.hasClass('visible');
+    this.historySizeRows.clear();
+    this.historyIdentityRow = null;
 
     container.empty();
 
@@ -1516,10 +2142,34 @@ export class ConversationController {
       const content = item.createDiv({ cls: 'claudian-history-item-content' });
       const titleEl = content.createDiv({ cls: 'claudian-history-item-title', text: conv.title });
       titleEl.setAttribute('title', conv.title);
+      if (isCurrent) {
+        // Identity suffix is current-session-only: history rows, drafts
+        // (sessionId null), and registry misses render plain titles. The
+        // Conversation (not the list meta) carries the full session UUID.
+        this.historyIdentityRow = {
+          epoch: menuEpoch,
+          container,
+          titleEl,
+          title: conv.title,
+          conversation: plugin.getConversationSync(conv.id),
+          menuConversationId,
+        };
+        this.applySessionIdentitySuffix(this.historyIdentityRow);
+        this.refreshActiveSessionNames();
+      }
       content.createDiv({
         cls: 'claudian-history-item-date',
         text: isCurrent ? 'Current session' : this.formatDate(conv.lastResponseAt ?? conv.createdAt),
       });
+
+      const sizeEl = content.createDiv({ cls: 'claudian-history-item-date', text: formatConversationSize(conv) });
+      sizeEl.setAttribute('aria-label', formatConversationSizeTooltip(conv));
+      if (bindSizeRows) this.historySizeRows.set(conv.id, {
+        epoch: menuEpoch, container, sizeEl, menuConversationId,
+        conversation: plugin.getConversationSync(conv.id),
+      });
+      const request = options.refreshSizes ? plugin.conversationSizes?.refresh(conv.id, true) : undefined;
+      if (request) void request.then(() => this.onConversationSizePublished(conv.id, container)).catch(() => undefined);
 
       if (!isCurrent) {
         content.addEventListener('click', async (e) => {
@@ -1602,6 +2252,41 @@ export class ConversationController {
 
   private isHistoryNewTabModifierClick(event: MouseEvent): boolean {
     return !event.altKey && !event.shiftKey && (event.metaKey || event.ctrlKey);
+  }
+
+  /**
+   * One registry scan per current-row render (registry scale = active
+   * process count, so no promise caching). On resolve, backfill the suffix
+   * under the menu guards; scan failures degrade to the last known names.
+   */
+  private refreshActiveSessionNames(): void {
+    loadActiveSessionNames()
+      .then((names) => {
+        this.activeSessionNames = names;
+        const row = this.historyIdentityRow;
+        if (!row) return;
+        const { plugin, state } = this.deps;
+        if (row.epoch !== this.historyMenuEpoch
+          || state.currentConversationId !== row.menuConversationId
+          || !row.container.hasClass('visible') || !row.container.contains(row.titleEl)
+          || plugin.getConversationSync(row.menuConversationId ?? '') !== row.conversation) return;
+        this.applySessionIdentitySuffix(row);
+      })
+      .catch(() => undefined);
+  }
+
+  /** Idempotent suffix + tooltip write; no registry hit → no dangling separator. */
+  private applySessionIdentitySuffix(row: NonNullable<ConversationController['historyIdentityRow']>): void {
+    const sessionId = row.conversation?.sessionId ?? '';
+    const identity = formatActiveSessionIdentity(sessionId, this.activeSessionNames.get(sessionId) ?? '');
+    if (!identity) return;
+    const existing = row.titleEl.querySelector<HTMLElement>('.claudian-history-item-identity');
+    if (existing) {
+      existing.textContent = ` · ${identity}`;
+    } else {
+      row.titleEl.createSpan({ cls: 'claudian-history-item-identity', text: ` · ${identity}` });
+    }
+    row.titleEl.setAttribute('title', `${row.title} · ${identity}`);
   }
 
   private async runHistoryAction(
@@ -2004,7 +2689,89 @@ Recent messages:
   ): void {
     this.renderHistoryItems(container, {
       ...options,
-      onRerender: () => this.renderHistoryDropdown(container, options),
+      onRerender: () => this.renderHistoryDropdown(container, { ...options, refreshSizes: false }),
     });
+  }
+}
+
+/**
+ * Controller-side RuntimePersistencePort: wraps a ChatRuntime as the pure
+ * capture source for its adopted binding (P6 §4.2/§6.3). The capture runs the
+ * provider-owned session reduction synchronously at admission time against
+ * the record's latest base — never at write time, never against a runtime
+ * another binding owns. The one-shot session-invalidation flag is consumed by
+ * the controller before admission and cleared by the capture acknowledgement
+ * only for the revision it was captured with.
+ */
+class ChatRuntimePersistencePort implements RuntimePersistencePort {
+  readonly identity: object;
+  readonly providerId: ProviderId;
+  private invalidationRevision = 0;
+  private invalidated = false;
+
+  constructor(
+    private readonly runtime: ChatRuntime,
+    private readonly getBase: () => Conversation | null,
+  ) {
+    this.identity = runtime;
+    this.providerId = runtime.providerId;
+  }
+
+  markSessionInvalidated(): void {
+    this.invalidated = true;
+    this.invalidationRevision += 1;
+  }
+
+  captureSessionPersistence(): CapturedSessionPersistence {
+    const base = this.getBase();
+    const { updates } = this.runtime.buildSessionUpdates({
+      conversation: base,
+      sessionInvalidated: this.invalidated,
+    });
+    // JSON-clean provider reduction: undefined-valued fields (legal in a
+    // Partial<Conversation> assign payload) cannot ride the capture — encode
+    // sessionId null-for-absent and providerState null-for-cleared instead.
+    const reduced = updates ?? {};
+    const providerState = reduced.providerState === undefined
+      ? null
+      : ChatRuntimePersistencePort.cleanUndefined(reduced.providerState);
+    return {
+      protocolVersion: 1,
+      providerId: this.providerId,
+      facts: {
+        sessionId: reduced.sessionId === undefined ? null : reduced.sessionId,
+        providerState,
+      } as unknown as JsonObject,
+      invalidation: { revision: this.invalidationRevision, invalidated: this.invalidated },
+    };
+  }
+
+  /** Deep-copies plain JSON data with undefined-valued keys stripped. */
+  private static cleanUndefined(value: unknown, seen: Set<object> = new Set()): unknown {
+    if (value === undefined) return undefined;
+    if (value === null || typeof value === 'string' || typeof value === 'boolean') return value;
+    if (typeof value === 'number') return Number.isFinite(value) ? value : null;
+    if (typeof value !== 'object' || seen.has(value)) return null;
+    seen.add(value);
+    if (Array.isArray(value)) {
+      const copy = value
+        .map(item => ChatRuntimePersistencePort.cleanUndefined(item, seen))
+        .filter(item => item !== undefined);
+      seen.delete(value);
+      return copy;
+    }
+    const copy: Record<string, unknown> = {};
+    for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
+      const cleaned = ChatRuntimePersistencePort.cleanUndefined(item, seen);
+      if (cleaned !== undefined) copy[key] = cleaned;
+    }
+    seen.delete(value);
+    return copy;
+  }
+
+  acknowledgeSessionPersistenceCapture(capture: CapturedSessionPersistence): void {
+    if (capture.invalidation.invalidated && capture.invalidation.revision === this.invalidationRevision) {
+      this.invalidated = false;
+    }
   }
 }

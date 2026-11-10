@@ -658,7 +658,7 @@ describe('MessageChannel', () => {
       channel.completeTurn('user-1');
       await iterator.next();
 
-      expect(dequeuedPayloads[1]).toEqual({
+      expect(dequeuedPayloads[1]).toMatchObject({
         leaseTurnId: 'user-2',
         canonicalTurnId: 'uuid-second',
         hostTurnIds: ['user-2', 'user-3'],
@@ -671,7 +671,7 @@ describe('MessageChannel', () => {
       channel.enqueue('user-1', createTextUserMessage('hello', 'uuid-live'));
       await pending;
 
-      expect(dequeuedPayloads[0]).toEqual({
+      expect(dequeuedPayloads[0]).toMatchObject({
         leaseTurnId: 'user-1',
         canonicalTurnId: 'uuid-live',
         hostTurnIds: ['user-1'],
@@ -690,7 +690,7 @@ describe('MessageChannel', () => {
       channel.completeTurn('user-1');
       await iterator.next();
 
-      expect(dequeuedPayloads[1]).toEqual({
+      expect(dequeuedPayloads[1]).toMatchObject({
         leaseTurnId: 'user-2',
         canonicalTurnId: 'uuid-att-one',
         hostTurnIds: ['user-2', 'user-3'],
@@ -707,7 +707,7 @@ describe('MessageChannel', () => {
       channel.completeTurn('user-1');
       await iterator.next();
 
-      expect(dequeuedPayloads[1]).toEqual({
+      expect(dequeuedPayloads[1]).toMatchObject({
         leaseTurnId: 'user-2',
         canonicalTurnId: '',
         hostTurnIds: ['user-2'],
@@ -765,6 +765,105 @@ describe('MessageChannel', () => {
       expect(ids).toEqual(['user-1', 'user-2']);
       expect(channel.getActiveTurnId()).toBeNull();
       expect(channel.getQueueLength()).toBe(0);
+    });
+  });
+
+  describe('dispatch description (2026-11-05 fix 3: final payload decides the command kind)', () => {
+    it('stamps the real dispatch time and merges-safe /compact detection on every dequeue path', async () => {
+      const iterator = channel[Symbol.asyncIterator]();
+      const firstPromise = iterator.next();
+      channel.enqueue('turn-plain', createTextUserMessage('hello', 'uuid-plain'));
+      await firstPromise;
+      expect(dequeuedPayloads[0].dispatchedAt).toBeGreaterThan(0);
+      expect(dequeuedPayloads[0].isManualCompact).toBe(false);
+
+      // Queued manual /compact then a merged follow-up: the FINAL payload
+      // still leads with /compact, so the dispatch description says compact.
+      channel.enqueue('turn-compact', createTextUserMessage('/compact', 'uuid-compact'));
+      channel.enqueue('turn-follow', createTextUserMessage('and summarize twice'));
+      channel.completeTurn('turn-plain');
+      const second = await iterator.next();
+      expect(second.value.message.content).toBe('/compact\n\nand summarize twice');
+      expect(dequeuedPayloads[1].isManualCompact).toBe(true);
+      expect(dequeuedPayloads[1].dispatchedAt).toBeGreaterThanOrEqual(dequeuedPayloads[0].dispatchedAt);
+
+      // Plain merged text never looks like compact even when it mentions it.
+      channel.enqueue('turn-mention', createTextUserMessage('please run /compact for me'));
+      channel.completeTurn('turn-compact');
+      await iterator.next();
+      expect(dequeuedPayloads[2].isManualCompact).toBe(false);
+    });
+
+    it('immediate delivery to a waiting consumer reports the manual compact payload', async () => {
+      const iterator = channel[Symbol.asyncIterator]();
+      const pending = iterator.next();
+      channel.enqueue('turn-live-compact', createTextUserMessage('/compact keep notes', 'uuid-live-compact'));
+      await pending;
+      expect(dequeuedPayloads[0].isManualCompact).toBe(true);
+      expect(dequeuedPayloads[0].canonicalTurnId).toBe('uuid-live-compact');
+      expect(dequeuedPayloads[0].dispatchedAt).toBeGreaterThan(0);
+    });
+  });
+
+  describe('unsent queue extraction and restore (retirement rebuild)', () => {
+    it('extracts the queued items in order, leaves the lease untouched, and restores verbatim', async () => {
+      const iterator = channel[Symbol.asyncIterator]();
+      const firstPromise = iterator.next();
+      channel.enqueue('lease-holder', createTextUserMessage('dispatched', 'canonical-uuid-1'));
+      await firstPromise;
+      expect(channel.getActiveTurnId()).toBe('lease-holder');
+
+      // Merged text: one queue item carries all three turns, the FIRST
+      // writer's turn stays canonical, content concatenates in order.
+      channel.enqueue('turn-a', createTextUserMessage('alpha', 'canonical-uuid-2'));
+      channel.enqueue('turn-b', createTextUserMessage('beta'));
+      channel.enqueue('turn-c', createTextUserMessage('gamma'));
+      channel.enqueue('turn-img', createImageUserMessage('img-data', 'canonical-uuid-img'));
+
+      const unsent = channel.extractUnsentQueue();
+      expect(unsent).toHaveLength(2);
+      expect(unsent[0].type).toBe('text');
+      expect(unsent[0].turnId).toBe('turn-a');
+      expect((unsent[0] as { content: string }).content).toBe('alpha\n\nbeta\n\ngamma');
+      expect(unsent[0].hostTurnIds).toEqual(['turn-a', 'turn-b', 'turn-c']);
+      expect(unsent[1].type).toBe('attachment');
+      expect(unsent[1].turnId).toBe('turn-img');
+
+      // The active lease survives extraction (retirement closes the input
+      // afterwards; the already-dispatched turn is never re-sent).
+      expect(channel.getActiveTurnId()).toBe('lease-holder');
+      expect(channel.getQueueLength()).toBe(0);
+
+      const restored = new MessageChannel(
+        (message) => warnings.push(message),
+        (info) => dequeuedPayloads.push(info),
+      );
+      const second = restored[Symbol.asyncIterator]();
+      const secondPromise = second.next();
+      restored.restoreQueue(unsent);
+      const delivered = await secondPromise;
+      expect(delivered.done).toBe(false);
+      expect(delivered.value.message.content).toBe('alpha\n\nbeta\n\ngamma');
+      expect((delivered.value as { uuid?: string }).uuid).toBe('canonical-uuid-2');
+      expect(restored.getActiveTurnId()).toBe('turn-a');
+      expect(dequeuedPayloads[1]).toMatchObject({ leaseTurnId: 'turn-a', canonicalTurnId: 'canonical-uuid-2', hostTurnIds: ['turn-a', 'turn-b', 'turn-c'] });
+      restored.close();
+    });
+
+    it('restore wakes a waiting consumer immediately and is a no-op on a closed channel', async () => {
+      const restored = new MessageChannel();
+      const second = restored[Symbol.asyncIterator]();
+      const secondPromise = second.next();
+      restored.restoreQueue([{ type: 'text', turnId: 'parked', hostTurnIds: ['parked'], message: createTextUserMessage('parked'), content: 'parked' }]);
+      const delivered = await secondPromise;
+      expect(delivered.value.message.content).toBe('parked');
+      restored.close();
+
+      const closed = new MessageChannel();
+      closed.close();
+      closed.restoreQueue([{ type: 'text', turnId: 'x', hostTurnIds: ['x'], message: createTextUserMessage('x'), content: 'x' }]);
+      expect(closed.getQueueLength()).toBe(0);
+      expect(closed.isClosed()).toBe(true);
     });
   });
 });

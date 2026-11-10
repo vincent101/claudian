@@ -1,6 +1,6 @@
 import type { Component, WorkspaceLeaf } from 'obsidian';
 
-import type { HistoryLoadProgress, InstructionRefineService, ProviderId, TitleGenerationService } from '../../../core/providers/types';
+import type { AppTabManagerState, ConversationSizeSnapshot, HistoryLoadProgress, InstructionRefineService, ProviderId, TitleGenerationService } from '../../../core/providers/types';
 import type { ChatRuntime } from '../../../core/runtime/ChatRuntime';
 import type { SlashCommandDropdown } from '../../../shared/components/SlashCommandDropdown';
 import type { AutoTurnProjectionController } from '../controllers/AutoTurnProjectionController';
@@ -14,11 +14,13 @@ import type { SelectionController } from '../controllers/SelectionController';
 import type { StreamController } from '../controllers/StreamController';
 import type { TurnCoordinator } from '../controllers/TurnCoordinator';
 import type { HistoryWindowRenderer } from '../rendering/HistoryWindowRenderer';
+import type { MarkdownRenderDiagnostics } from '../rendering/MarkdownRenderDiagnostics';
 import type { MessageRenderer } from '../rendering/MessageRenderer';
 import type { ProjectionWriteCoordinator } from '../rendering/ProjectionWriteCoordinator';
 import type { AskRelayPendingInfo, AskRelayService } from '../services/AskRelayService';
 import type { SubagentManager } from '../services/SubagentManager';
 import type { ChatState } from '../state/ChatState';
+import type { ReservationWitness } from '../state/types';
 import type { BangBashModeManager } from '../ui/BangBashModeManager';
 import type { FileContextManager } from '../ui/FileContext';
 import type { ImageContextManager } from '../ui/ImageContext';
@@ -98,6 +100,12 @@ export interface TabManagerInterface {
 /** Tab identifier type. */
 export type TabId = string;
 
+export interface MarkdownRenderDiagnosticBinding {
+  collector: MarkdownRenderDiagnostics;
+  bindConversation: (conversationId: string | null) => void;
+  dispose: () => void;
+}
+
 /**
  * Provider-neutral successful turn completion. Emitted only after the
  * provider stream exhausted naturally AND the final visible projection
@@ -127,6 +135,8 @@ export interface TabHydrationDiagnostic {
  * state machine own every hydration transition.
  */
 export interface TabHydrationHooks {
+  /** Whether this original manager and tab may still publish local results. */
+  isManagerActive?: () => boolean;
   /** Report a direct (non-shell) load/switch completion (reset to READY). */
   markHydrationReady: () => void;
   /** Whether the tab has fully hydrated (READY) and may persist session state. */
@@ -135,6 +145,11 @@ export interface TabHydrationHooks {
   commitConversation: (conversationId: string) => void;
   cancelConversationReservation: (conversationId: string) => void;
   releaseConversation: (conversationId: string) => void;
+  /**
+   * R2 binding wiring: sync claim witness over this tab's pending or
+   * committed ConversationOpenRegistry claim for a conversation (P6 §3.2).
+   */
+  getBindingReservation?: (conversationId: string) => ReservationWitness | null;
 }
 
 /** Generates a unique tab ID. */
@@ -251,9 +266,10 @@ export interface TabData {
 
   /**
    * Draft model selected in a blank tab (before first send).
-   * Used to derive provider on first send. Null after binding.
+   * Paired with draftProviderId; null after binding.
    */
   draftModel: string | null;
+  draftProviderId: ProviderId | null;
 
   /** Active provider for this tab's current conversation/runtime. */
   providerId: ProviderId;
@@ -294,6 +310,9 @@ export interface TabData {
   /** Per-tab renderer. */
   renderer: MessageRenderer | null;
 
+  /** Per-tab diagnostic lifetime, separate from the shared plugin sink. */
+  markdownRenderDiagnostics?: MarkdownRenderDiagnosticBinding | null;
+
   /**
    * Last turn id already consumed by the completion-notification policy.
    * Turn ids are monotonic per tab, so a single slot deduplicates replays
@@ -316,19 +335,12 @@ export type TabProviderContext = Pick<TabData, 'conversationId' | 'service' | 'p
 /**
  * Persisted tab state for restoration on plugin reload.
  */
-export interface PersistedTabState {
-  tabId: TabId;
-  conversationId: string | null;
-  draftModel?: string | null;
-}
+export type PersistedTabState = AppTabManagerState['openTabs'][number];
 
 /**
  * Tab manager state persisted to data.json.
  */
-export interface PersistedTabManagerState {
-  openTabs: PersistedTabState[];
-  activeTabId: TabId | null;
-}
+export type PersistedTabManagerState = AppTabManagerState;
 
 /**
  * Callbacks for tab state changes.
@@ -388,4 +400,6 @@ export interface TabBarItem {
   conversationTitle: string | null;
   /** Bound conversation id for rename; null for a new tab without a conversation. */
   conversationId: string | null;
+  /** Only provider-validated, currently published statistics are rendered. */
+  sizeSnapshot?: ConversationSizeSnapshot;
 }

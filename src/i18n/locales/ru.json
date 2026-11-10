@@ -83,9 +83,13 @@
     },
     "cancel": {
       "toolInterrupted": "Прервано",
-      "interruptUnacknowledged": "CLI не ответила на отмену. Если интерфейс долго не восстанавливается, перезагрузите диалог."
+      "interruptUnacknowledged": "CLI не ответила на отмену. Если интерфейс долго не восстанавливается, перезагрузите диалог.",
+      "boundaryHeld": "Отменённый ход не подтвердил остановку. Сообщение из очереди удерживается и будет отправлено только после подтверждения завершения хода."
     },
     "history": {
+      "sessionFileKnown": "Файл текущей сессии {size}",
+      "sessionFileUnknown": "Размер файла текущей сессии неизвестен",
+      "sessionFileTooltip": "Только размер нативного журнала текущей сессии; без родительских сессий, источников веток и метаданных.",
       "loading": "Loading conversation…",
       "waitingForIndex": "Ожидание индекса…",
       "buildingIndex": "Создание индекса: {percent}%",
@@ -158,7 +162,8 @@
       "moveLeft": "Move left",
       "moveRight": "Move right",
       "close": "Close",
-      "boundProviderSwitch": "Cannot switch provider on a bound session. Start a new tab instead."
+      "boundProviderSwitch": "Cannot switch provider on a bound session. Start a new tab instead.",
+      "draftModelReset": "Выбор модели черновика нельзя однозначно восстановить или модель больше недоступна. Выбор сброшен; выберите модель заново."
     },
     "input": {
       "placeholder": "How can I help you today?",
@@ -186,6 +191,24 @@
     "resume": {
       "noConversations": "No conversations to resume",
       "openFailed": "Failed to open conversation: {error}"
+    },
+    "claude": {
+      "permission": {
+        "auto": "Авто",
+        "autoDesc": "Claude решает, какие запросы требуют подтверждения",
+        "manual": "Вручную",
+        "manualDesc": "Спрашивать перед каждым изменением",
+        "acceptEdits": "Принимать правки",
+        "acceptEditsDesc": "Автоматически принимать правки файлов",
+        "yolo": "YOLO",
+        "yoloDesc": "Пропускать все запросы разрешений",
+        "plan": "Plan",
+        "updateFailed": "Не удалось обновить режим разрешений. Сообщение не отправлено."
+      }
+    },
+    "permission": {
+      "ariaLabel": "Режим разрешений: {mode}",
+      "unavailable": "Недоступно"
     },
     "codex": {
       "effort": {
@@ -357,11 +380,7 @@
     "safety": "Безопасность",
     "loadUserSettings": {
       "name": "Загружать пользовательские настройки Claude",
-      "desc": "Загружает ~/.claude/settings.json. При включении пользовательские правила разрешений Claude Code могут обходить безопасный режим."
-    },
-    "claudeSafeMode": {
-      "name": "Safe mode",
-      "desc": "Permission mode used when the Safe toggle is active."
+      "desc": "Загружает ~/.claude/settings.json. Если включено, существующие правила разрешений пользователя могут пропускать подтверждения."
     },
     "codexSafeMode": {
       "name": "Safe mode",
@@ -470,6 +489,9 @@
       "desc": "Изменить язык интерфейса плагина"
     },
     "environmentReview": "Review environment ownership for: {keys}",
+    "claude": {
+      "configuration": "Конфигурация"
+    },
     "codex": {
       "enable": {
         "name": "Enable Codex provider",

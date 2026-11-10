@@ -83,9 +83,13 @@
     },
     "cancel": {
       "toolInterrupted": "已中断",
-      "interruptUnacknowledged": "CLI 未响应取消。若界面长时间未恢复，请重载会话。"
+      "interruptUnacknowledged": "CLI 未响应取消。若界面长时间未恢复，请重载会话。",
+      "boundaryHeld": "已取消的回合尚未确认停止。排队的消息保持暂存，待该回合确认结束后才会发出。"
     },
     "history": {
+      "sessionFileKnown": "当前会话日志 {size}",
+      "sessionFileUnknown": "当前会话日志体积未知",
+      "sessionFileTooltip": "仅当前会话原生日志文件的磁盘体积，不包含父会话、分支来源或元数据。",
       "loading": "正在加载会话…",
       "waitingForIndex": "等待索引（排队）…",
       "buildingIndex": "建立索引 {percent}%",
@@ -158,7 +162,8 @@
       "moveLeft": "向左移动",
       "moveRight": "向右移动",
       "close": "关闭标签页",
-      "boundProviderSwitch": "已绑定的会话无法切换提供商，请改开新标签页。"
+      "boundProviderSwitch": "已绑定的会话无法切换提供商，请改开新标签页。",
+      "draftModelReset": "草稿模型选择无法明确还原或已不可用；已重置，请重新选择模型。"
     },
     "input": {
       "placeholder": "今天我能帮你做什么？",
@@ -186,6 +191,24 @@
     "resume": {
       "noConversations": "没有可恢复的对话",
       "openFailed": "打开对话失败：{error}"
+    },
+    "claude": {
+      "permission": {
+        "auto": "自动",
+        "autoDesc": "由 Claude 决定哪些请求需要审批",
+        "manual": "手动",
+        "manualDesc": "每次更改前询问",
+        "acceptEdits": "接受编辑",
+        "acceptEditsDesc": "自动接受文件编辑",
+        "yolo": "YOLO",
+        "yoloDesc": "跳过所有权限提示",
+        "plan": "Plan",
+        "updateFailed": "更新权限模式失败。消息未发送。"
+      }
+    },
+    "permission": {
+      "ariaLabel": "权限模式：{mode}",
+      "unavailable": "不可用"
     },
     "codex": {
       "effort": {
@@ -357,11 +380,7 @@
     "safety": "安全",
     "loadUserSettings": {
       "name": "加载用户 Claude 设置",
-      "desc": "加载 ~/.claude/settings.json。启用后，用户的 Claude Code 权限规则可能绕过安全模式。"
-    },
-    "claudeSafeMode": {
-      "name": "安全模式",
-      "desc": "启用 Safe 开关时使用的权限模式。"
+      "desc": "加载 ~/.claude/settings.json。启用后，已有的用户权限规则可能跳过审批。"
     },
     "codexSafeMode": {
       "name": "安全模式",
@@ -470,6 +489,9 @@
       "desc": "更改插件界面的显示语言"
     },
     "environmentReview": "请检查以下环境变量的归属：{keys}",
+    "claude": {
+      "configuration": "配置"
+    },
     "codex": {
       "enable": {
         "name": "启用 Codex 提供商",

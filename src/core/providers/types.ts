@@ -22,6 +22,97 @@ import type { ProviderCommandCatalog } from './commands/ProviderCommandCatalog';
 
 export type { ProviderId } from '../types/provider';
 
+declare const persistenceTokenBrand: unique symbol;
+
+export type PersistenceToken<K extends string> = Readonly<{ [persistenceTokenBrand]: K }>;
+export type RecordToken = PersistenceToken<'record'>;
+export type OwnerToken = PersistenceToken<'owner'>;
+export type BindingToken = PersistenceToken<'binding'>;
+export type AttemptToken = PersistenceToken<'attempt'>;
+export type RuntimeAdoptionToken = PersistenceToken<'runtime-adoption'>;
+export type SaveToken = PersistenceToken<'save'>;
+export type CloseToken = PersistenceToken<'close'>;
+
+export interface RecordHandle {
+  readonly id: string;
+  readonly providerId: ProviderId;
+  readonly token: RecordToken;
+}
+export interface RecordVersions {
+  readonly binding: number;
+  readonly materialization: number;
+  readonly turn: number;
+}
+export type JsonValue = null | boolean | number | string | readonly JsonValue[] | { readonly [key: string]: JsonValue };
+export type JsonObject = { readonly [key: string]: JsonValue };
+export type FieldPatch<T> = { readonly op: 'keep' } | { readonly op: 'set'; readonly value: T } | { readonly op: 'delete' };
+export type PersistableMetadataKey = 'hasHistory' | 'messageCount' | 'preview' | 'firstUserExcerpt'
+  | 'currentNote' | 'externalContextPaths' | 'enabledMcpServers' | 'usage' | 'resumeAtMessageId' | 'lastResponseAt';
+export type MetadataPatch = Readonly<Partial<{ [K in PersistableMetadataKey]: FieldPatch<Exclude<SessionMetadata[K], undefined>> }>>;
+export interface SessionBindingPatch {
+  readonly sessionId: FieldPatch<string | null>;
+  readonly providerFields: Readonly<Record<string, FieldPatch<JsonValue>>>;
+}
+export interface CapturedSessionPersistence {
+  readonly protocolVersion: 1;
+  readonly providerId: ProviderId;
+  readonly facts: JsonObject;
+  readonly invalidation: { readonly revision: number; readonly invalidated: boolean };
+}
+export type SessionSaveInput = { readonly kind: 'none' } | { readonly kind: 'seed'; readonly patch: SessionBindingPatch }
+  | { readonly kind: 'runtime'; readonly capture: CapturedSessionPersistence };
+export interface SaveIntentBase {
+  readonly token: SaveToken;
+  readonly record: RecordHandle;
+  readonly expectedRecordVersions: RecordVersions;
+  readonly owner: OwnerToken;
+  readonly metadata: MetadataPatch;
+}
+export type SaveIntent = SaveIntentBase & (
+  | { readonly reason: 'backfill'; readonly binding: null; readonly dirtyRevision: null; readonly session: { readonly kind: 'none' } }
+  | { readonly reason: 'normal' | 'outgoing' | 'final'; readonly binding: BindingToken; readonly dirtyRevision: number;
+      readonly session: Exclude<SessionSaveInput, { readonly kind: 'none' }> }
+);
+export interface SaveTicket {
+  readonly token: SaveToken;
+  readonly record: RecordHandle;
+  readonly owner: OwnerToken;
+  readonly binding: BindingToken | null;
+  readonly dirtyRevision: number | null;
+  readonly reason: SaveIntent['reason'];
+  readonly sequence: number;
+}
+export type SaveFailureStage = 'admission' | 'record-validation' | 'reduce' | 'serialize' | 'write' | 'legacy-cleanup' | 'recovery-read' | 'unknown';
+export type SaveReceipt = { readonly ticket: SaveTicket } & (
+  | { readonly status: 'written'; readonly confirmedRevision: number }
+  | { readonly status: 'skipped'; readonly reason: 'missing' | 'deleted' }
+  | { readonly status: 'conflict'; readonly reason: 'record-replaced' | 'binding-version' | 'materialization-version' }
+  | { readonly status: 'failed'; readonly stage: SaveFailureStage; readonly error: unknown }
+);
+export type SaveRejectionReason = 'unknown-token' | 'owner-retiring' | 'record-retired' | 'stale-record'
+  | 'stale-attempt' | 'stale-binding' | 'binding-sealed' | 'unbound' | 'version-mismatch' | 'reservation-lost'
+  | 'provider-mismatch' | 'invalid-snapshot' | 'runtime-capture-failed' | 'storage-rejected' | 'storage-admission-failed';
+export type CaptureAcknowledgement = { readonly status: 'not-needed' } | { readonly status: 'acknowledged' }
+  | { readonly status: 'failed'; readonly error: unknown };
+export type SaveAdmission = { readonly status: 'rejected'; readonly reason: SaveRejectionReason; readonly error?: unknown }
+  | { readonly status: 'accepted'; readonly ticket: SaveTicket; readonly durability: Promise<SaveReceipt>;
+      readonly captureAcknowledgement: CaptureAcknowledgement };
+export interface SaveAdmissionPending {
+  readonly status: 'admitting';
+  readonly token: SaveToken;
+  readonly settlement: Promise<SaveAdmission>;
+}
+export type SaveRequestResult = SaveAdmission | SaveAdmissionPending;
+export type RegisteredSaveRequest = SaveAdmissionPending | Extract<SaveAdmission, { status: 'accepted' }>;
+export type MetadataWriteResult = { readonly status: 'written'; readonly confirmedRevision: number }
+  | { readonly status: 'skipped'; readonly reason: 'missing' | 'deleted' }
+  | { readonly status: 'conflict'; readonly reason: 'record-replaced' | 'binding-version' | 'materialization-version' }
+  | { readonly status: 'failed'; readonly stage: SaveFailureStage; readonly error: unknown };
+export type MetadataAdmission = { readonly status: 'rejected'; readonly reason: string }
+  | { readonly status: 'accepted'; readonly sequence: number; readonly completion: Promise<MetadataWriteResult> };
+export interface MetadataSavePort { admit(intent: SaveIntent): MetadataAdmission }
+
+
 export interface ProviderCapabilities {
   providerId: ProviderId;
   supportsPersistentRuntime: boolean;
@@ -87,7 +178,12 @@ export interface ProviderSettingsReconciler {
 
 /** Tab manager state persisted across restarts. */
 export interface AppTabManagerState {
-  openTabs: Array<{ tabId: string; conversationId: string | null; draftModel?: string | null }>;
+  openTabs: Array<{
+    tabId: string;
+    conversationId: string | null;
+    draftModel?: string | null;
+    draftProviderId?: ProviderId | null;
+  }>;
   activeTabId: string | null;
 }
 
@@ -178,6 +274,15 @@ export interface ProviderUIOption {
   providerIcon?: ProviderIconSvg;
 }
 
+export interface ProviderModelSelection {
+  providerId: ProviderId;
+  modelId: string;
+}
+
+export interface ProviderModelOption extends ProviderUIOption {
+  providerId: ProviderId;
+}
+
 export interface ProviderPathIconSvg {
   kind?: 'path';
   viewBox: string;
@@ -198,14 +303,30 @@ export interface ProviderReasoningOption extends ProviderUIOption {
   tokens?: number;
 }
 
-/** Compact permission-mode toggle descriptor for providers that expose the current toolbar control. */
-export interface ProviderPermissionModeToggleConfig {
-  inactiveValue: string;
-  inactiveLabel: string;
-  activeValue: string;
-  activeLabel: string;
-  planValue?: string;
-  planLabel?: string;
+/**
+ * Permission-mode values a provider accepts in the shared `permissionMode`
+ * setting. The policy owns validity, migration, and fail-closed behavior;
+ * the UI options own only presentation.
+ */
+export interface ProviderPermissionModePolicy {
+  readonly values: readonly string[];
+  /** Fail-closed value for unknown stored values. */
+  readonly fallbackValue: string;
+  /** Value used when the provider has no stored choice (e.g. fresh install). */
+  readonly defaultValue?: string;
+  /** Maps a retired stored value to a current one; unmapped values fail closed. */
+  migrateValue?(value: string, settings: Record<string, unknown>): string | undefined;
+  /**
+   * Runtime-only values (fork plan mode) accepted by in-memory projection but
+   * never persisted by storage serialization.
+   */
+  readonly transientValues?: readonly string[];
+}
+
+/** One toolbar permission-mode choice, in menu order. */
+export interface ProviderPermissionModeOption extends ProviderUIOption {
+  /** Skips approval prompts; the toolbar marks the selection as a warning. */
+  bypassesApprovals?: boolean;
 }
 
 /** Compact service-tier toggle descriptor for providers that expose a fast/standard toolbar control. */
@@ -259,8 +380,16 @@ export interface ProviderChatUIConfig {
   /** Extract custom model IDs from parsed environment variables. Used for per-model context limit UI. */
   getCustomModelIds(envVars: Record<string, string>): Set<string>;
 
-  /** Optional permission-mode toggle descriptor. Return null when the provider exposes no permission toggle UI. */
-  getPermissionModeToggle?(): ProviderPermissionModeToggleConfig | null;
+  /** Permission-mode values this provider accepts, with migration and fail-closed rules. */
+  readonly permissionModes?: ProviderPermissionModePolicy;
+
+  /** Permission-mode menu choices in menu order. Null when the provider exposes no permission UI. */
+  getPermissionModeOptions?(
+    settings: Record<string, unknown>,
+  ): readonly ProviderPermissionModeOption[] | null;
+
+  /** Display label for a runtime-only transient state (e.g. plan); null when unknown. */
+  getPermissionTransientModeLabel?(value: string): string | null;
 
   /** Optional provider-owned mapping back into the shared permission-mode contract. */
   resolvePermissionMode?(settings: Record<string, unknown>): string | null;
@@ -504,6 +633,20 @@ export interface HistoryWindowRequest {
   maxTurn?: number;
 }
 
+/**
+ * Neutral tail-start handoff shell (H/P8): the provider that produced a
+ * windowed page certifies the transcript source its committed boundary was
+ * observed on. The payload stays provider-owned and opaque — feature code
+ * stores and forwards it, never parses it. A consumer priming at the
+ * committed boundary must reject a source whose identity does not match
+ * these credentials instead of reading a replacement at the stale offset.
+ */
+export interface HistoryTailStart {
+  provider: ProviderId;
+  protocol: 1;
+  payload: unknown;
+}
+
 export interface HistoryWindowPage {
   messages: ChatMessage[];
   /** Estimated retained/render cost used by the page-data weighted LRU. */
@@ -511,6 +654,8 @@ export interface HistoryWindowPage {
   /** Actual half-open turn range that satisfied the budgets. */
   range: LoadedTurnRange;
   snapshotOffset?: number;
+  /** Identity credentials for the source snapshotOffset was observed on. */
+  tailStart?: HistoryTailStart;
   sourceBytes: number;
   projectedChars: number;
   /** Turns materialized through the oversized summary projection. */
@@ -521,7 +666,38 @@ export interface HistoryWindowPage {
   hasMoreAfter: boolean;
 }
 
+export interface ConversationSizeSnapshot {
+  conversationId: string;
+  revision: number;
+  files:
+    | { status: 'known'; bytes: number }
+    | { status: 'unknown'; reason: 'unsupported' | 'unavailable' };
+}
+
+export interface ConversationSizeSource {
+  readonly sessionId?: string | null;
+  readonly filePath?: string | null;
+}
+
+/** Only the current native file identity; never transcript content or persisted readings. */
+export interface ConversationSizeReadInput {
+  readonly id: string;
+  readonly providerId: ProviderId;
+  readonly source: ConversationSizeSource;
+}
+
+export interface ConversationSizeReadResult {
+  readonly snapshot: ConversationSizeSnapshot;
+}
+
 export interface ProviderConversationHistoryService {
+  /** Capture only the provider-owned size source, not transcript content. */
+  captureConversationSizeSource?(conversation: Conversation): ConversationSizeSource;
+  readConversationSize?(
+    input: ConversationSizeReadInput,
+    vaultPath: string | null,
+    options: { revision: number; signal?: AbortSignal },
+  ): Promise<ConversationSizeReadResult>;
   hydrateConversationHistory?(
     conversation: Conversation,
     vaultPath: string | null,

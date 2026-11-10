@@ -83,9 +83,13 @@
     },
     "cancel": {
       "toolInterrupted": "중단됨",
-      "interruptUnacknowledged": "CLI가 취소에 응답하지 않았습니다. 화면이 오랫동안 복구되지 않으면 대화를 다시 로드하세요."
+      "interruptUnacknowledged": "CLI가 취소에 응답하지 않았습니다. 화면이 오랫동안 복구되지 않으면 대화를 다시 로드하세요.",
+      "boundaryHeld": "취소된 턴이 중지를 확인하지 않았습니다. 대기 중인 메시지는 턴 종료가 확인될 때까지 보관되며, 확인된 후에만 전송됩니다."
     },
     "history": {
+      "sessionFileKnown": "현재 세션 파일 {size}",
+      "sessionFileUnknown": "현재 세션 파일 크기 알 수 없음",
+      "sessionFileTooltip": "현재 세션의 원본 로그 파일 크기만 표시합니다. 부모 세션, 분기 원본 및 메타데이터는 제외합니다.",
       "loading": "Loading conversation…",
       "waitingForIndex": "인덱스 대기 중…",
       "buildingIndex": "인덱스 생성 중 {percent}%",
@@ -158,7 +162,8 @@
       "moveLeft": "왼쪽으로 이동",
       "moveRight": "오른쪽으로 이동",
       "close": "탭 닫기",
-      "boundProviderSwitch": "바인딩된 세션에서는 프로바이더를 전환할 수 없습니다. 새 탭을 열어 주세요."
+      "boundProviderSwitch": "바인딩된 세션에서는 프로바이더를 전환할 수 없습니다. 새 탭을 열어 주세요.",
+      "draftModelReset": "초안의 모델 선택을 명확하게 복원할 수 없거나 더 이상 사용할 수 없습니다. 초기화했으니 모델을 다시 선택해 주세요."
     },
     "input": {
       "placeholder": "오늘은 무엇을 도와드릴까요?",
@@ -186,6 +191,24 @@
     "resume": {
       "noConversations": "재개할 대화가 없습니다",
       "openFailed": "대화를 열지 못했습니다: {error}"
+    },
+    "claude": {
+      "permission": {
+        "auto": "자동",
+        "autoDesc": "Claude가 승인이 필요한 요청을 결정합니다",
+        "manual": "수동",
+        "manualDesc": "모든 변경 전에 확인합니다",
+        "acceptEdits": "편집 허용",
+        "acceptEditsDesc": "파일 편집을 자동으로 허용합니다",
+        "yolo": "YOLO",
+        "yoloDesc": "모든 권한 프롬프트를 건너뜁니다",
+        "plan": "Plan",
+        "updateFailed": "권한 모드를 업데이트하지 못했습니다. 메시지가 전송되지 않았습니다."
+      }
+    },
+    "permission": {
+      "ariaLabel": "권한 모드: {mode}",
+      "unavailable": "사용할 수 없음"
     },
     "codex": {
       "effort": {
@@ -357,11 +380,7 @@
     "safety": "보안",
     "loadUserSettings": {
       "name": "사용자 Claude 설정 로드",
-      "desc": "~/.claude/settings.json을 로드합니다. 활성화하면 사용자의 Claude Code 허용 규칙이 보안 모드를 우회할 수 있습니다."
-    },
-    "claudeSafeMode": {
-      "name": "Safe mode",
-      "desc": "Permission mode used when the Safe toggle is active."
+      "desc": "~/.claude/settings.json을 로드합니다. 활성화하면 기존 사용자 권한 규칙이 승인을 건너뛸 수 있습니다."
     },
     "codexSafeMode": {
       "name": "Safe mode",
@@ -470,6 +489,9 @@
       "desc": "플러그인 인터페이스의 표시 언어 변경"
     },
     "environmentReview": "Review environment ownership for: {keys}",
+    "claude": {
+      "configuration": "구성"
+    },
     "codex": {
       "enable": {
         "name": "Enable Codex provider",

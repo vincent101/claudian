@@ -1,6 +1,9 @@
+import {
+  BINARY_PERMISSION_MODE_POLICY,
+  getBinaryPermissionModeOptions,
+} from '../../../core/providers/permissionModes';
 import type {
   ProviderChatUIConfig,
-  ProviderPermissionModeToggleConfig,
   ProviderReasoningOption,
   ProviderServiceTierToggleConfig,
   ProviderUIOption,
@@ -18,26 +21,23 @@ import {
 
 // Render-time factories instead of module-level constants: labels must be
 // resolved through t() at call time so a locale switch is reflected without
-// reloading the plugin.
+// reloading the plugin. Effort labels are intentionally fixed English to
+// match Claude's built-in reasoning levels in every locale.
 
 function getEffortLevels(): ProviderReasoningOption[] {
   return [
-    { value: 'low', label: t('chat.codex.effort.low') },
-    { value: 'medium', label: t('chat.codex.effort.medium') },
-    { value: 'high', label: t('chat.codex.effort.high') },
-    { value: 'xhigh', label: t('chat.codex.effort.xhigh') },
+    { value: 'low', label: 'Low' },
+    { value: 'medium', label: 'Medium' },
+    { value: 'high', label: 'High' },
+    { value: 'xhigh', label: 'XHigh' },
   ];
 }
 
-function getCodexPermissionModeToggle(): ProviderPermissionModeToggleConfig {
-  return {
-    inactiveValue: 'normal',
-    inactiveLabel: t('chat.codex.permission.safe'),
-    activeValue: 'yolo',
-    activeLabel: t('chat.codex.permission.yolo'),
-    planValue: 'plan',
-    planLabel: t('chat.codex.permission.plan'),
-  };
+function getCodexPermissionModeOptions() {
+  return getBinaryPermissionModeOptions({
+    safe: t('chat.codex.permission.safe'),
+    yolo: t('chat.codex.permission.yolo'),
+  });
 }
 
 function getCodexServiceTierToggle(): ProviderServiceTierToggleConfig {
@@ -57,6 +57,8 @@ function looksLikeCodexModel(model: string): boolean {
 }
 
 export const codexChatUIConfig: ProviderChatUIConfig = {
+  permissionModes: BINARY_PERMISSION_MODE_POLICY,
+
   getModelOptions(settings: Record<string, unknown>): ProviderUIOption[] {
     return getCodexModelOptions(settings);
   },
@@ -115,8 +117,12 @@ export const codexChatUIConfig: ProviderChatUIConfig = {
     return ids;
   },
 
-  getPermissionModeToggle(): ProviderPermissionModeToggleConfig {
-    return getCodexPermissionModeToggle();
+  getPermissionModeOptions() {
+    return getCodexPermissionModeOptions();
+  },
+
+  getPermissionTransientModeLabel(value) {
+    return value === 'plan' ? t('chat.codex.permission.plan') : null;
   },
 
   getServiceTierToggle(settings): ProviderServiceTierToggleConfig | null {

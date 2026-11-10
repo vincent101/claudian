@@ -35,8 +35,10 @@ describe('types.ts', () => {
   });
 
   describe('DEFAULT_SETTINGS', () => {
-    it('should default to yolo permission mode', () => {
-      expect(DEFAULT_SETTINGS.permissionMode).toBe('yolo');
+    it('should default to auto permission mode', () => {
+      // New installs start Claude on Auto (#1482 port); existing stored YOLO
+      // selections are preserved by the storage migration, never reset.
+      expect(DEFAULT_SETTINGS.permissionMode).toBe('auto');
     });
 
     it('should have sharedEnvironmentVariables as empty string by default', () => {

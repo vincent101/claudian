@@ -10,7 +10,7 @@ import type {
   ChatTurnMetadata,
 } from '../../../core/runtime/types';
 import type { ImageAttachment, StreamChunk } from '../../../core/types';
-import type { PermissionMode } from '../../../core/types/settings';
+import type { ClaudeRuntimePermissionMode } from '../permissionModes';
 import type { TransformStreamState } from '../stream/toolInputStreamState';
 import type { TransformUsageState } from '../stream/transformClaudeMessage';
 import { createTransformStreamState, createTransformUsageState } from '../stream/transformClaudeMessage';
@@ -65,11 +65,19 @@ export type PendingMessage = PendingTextMessage | PendingAttachmentMessage;
  * Turn identity reported at dequeue (batch 1 §2.3). `canonicalTurnId` is the
  * transcript UUID of the dequeued SDK message — empty when the message carried
  * no UUID. `hostTurnIds` lists the lease owner first, merged aliases after.
+ * 2026-11-05 fix 3: the info also carries the REAL dispatch description —
+ * wall clock at dequeue delivery to the CLI transport, and whether the FINAL
+ * sent payload (post-merge) is a manual /compact command. Feature-begin
+ * timestamps must never stand in for these.
  */
 export interface DequeuedTurnInfo {
   leaseTurnId: string;
   canonicalTurnId: string;
   hostTurnIds: string[];
+  /** Real dispatch wall clock (dequeue delivery), the compact attribution anchor. */
+  dispatchedAt: number;
+  /** True when the FINAL sent payload (after merges) is a manual /compact command. */
+  isManualCompact: boolean;
 }
 
 /** Channel lease operation outcome. Occupancy conflicts are reported, never thrown. */
@@ -146,10 +154,30 @@ export interface RuntimeTurn {
   /**
    * P0-1 result-late watchdog: observer tick time at which the transcript
    * first showed this turn's terminal state (end_turn + stop-hook
-   * evidence). Null until then — a long turn without terminal evidence must
-   * never arm the watchdog (T4 red line).
+   * evidence, or a manual compact_boundary). Null until then — a long turn
+   * without terminal evidence must never arm the watchdog (T4 red line).
    */
   transcriptTerminalSeenAt: number | null;
+  /** Which terminal evidence stamped transcriptTerminalSeenAt (stop_hook pair is the pre-compact default). */
+  transcriptTerminalSource?: 'compact' | 'stop_hook';
+  /** CLI version carried by the terminal-evidence row (compact boundary evidence only). */
+  transcriptTerminalCliVersion?: string;
+  /** Wall time of channel dequeue; silence must not include time queued behind another turn. */
+  dispatchedAt: number;
+  /** One silent-turn probe per logical turn, never automatic escalation without evidence. */
+  stopTaskProbeSent: boolean;
+  /**
+   * Agent ids already stopped for this LOGICAL turn (2026-11-05 fix 1):
+   * shared by every recovery attempt and the silent probe — an id is sent at
+   * most once even after terminal retraction and re-arming.
+   */
+  stopTaskSentAgentIds: Set<string>;
+  /** Active independent recovery attempt id, null when none owns the chain. */
+  recoveryAttemptId: number | null;
+  /** Bumped on every terminal-evidence retraction; freezes out stale attempts. */
+  evidenceRevision: number;
+  /** How the turn finally ended ('result' | 'cancel') — closes the U-A attribution gap. */
+  terminalSettlementKind?: 'result' | 'cancel';
   /** P0-1 diagnostics: wall time of the last chunk delivered to this turn. */
   lastChunkAt: number | null;
   /**
@@ -159,8 +187,21 @@ export interface RuntimeTurn {
    * CLI responded, even while the feature projection is still closing.
    */
   lastRoutedMessageAt: number | null;
+  /**
+   * Plain-cancel boundary (2.4): a real result reached this cancelled turn's
+   * lease before the projection handoff landed. The CLI turn is provably
+   * over, so the tombstone window is skipped at handoff instead of holding
+   * the queued input for another 15s.
+   */
+  sawTerminalResult?: boolean;
   /** Recovery generation carried by the exact dispatch awaiting confirmation. */
   recoveryGeneration?: number;
+  /**
+   * Query epoch this turn was dispatched under (query boundary, 2.4). Lease
+   * release and delayed handoffs resolve against the scope that owns this
+   * epoch, so an old turn's completion can never act on a newer channel.
+   */
+  queryEpoch?: number;
 }
 
 export interface RuntimeTurnOptions {
@@ -189,6 +230,11 @@ export function createRuntimeTurn(options: RuntimeTurnOptions): RuntimeTurn {
     mergedInto: null,
     notificationResultPending: false,
     transcriptTerminalSeenAt: null,
+    dispatchedAt: Date.now(),
+    stopTaskProbeSent: false,
+    stopTaskSentAgentIds: new Set(),
+    recoveryAttemptId: null,
+    evidenceRevision: 0,
     lastChunkAt: null,
     lastRoutedMessageAt: null,
   };
@@ -196,6 +242,13 @@ export function createRuntimeTurn(options: RuntimeTurnOptions): RuntimeTurn {
 
 export interface ClosePersistentQueryOptions {
   preserveHandlers?: boolean;
+  /**
+   * Only the explicit recovery entries (session reset/switch, plugin
+   * cleanup) may lift the send prohibition. Internal closes (force
+   * restarts, stdin errors, session invalidation) must never revive
+   * starts over a possibly-live orphaned CLI.
+   */
+  clearStartProhibition?: boolean;
 }
 
 export interface ClaudeEnsureReadyOptions extends ChatRuntimeEnsureReadyOptions {
@@ -251,7 +304,7 @@ export interface PersistentQueryConfig {
   model: string | null;
   thinkingTokens: number | null;
   effortLevel: EffortLevel | null;
-  permissionMode: PermissionMode | null;
+  permissionMode: ClaudeRuntimePermissionMode | null;
   sdkPermissionMode: SDKPermissionMode | null;
   systemPromptKey: string;
   disallowedToolsKey: string;

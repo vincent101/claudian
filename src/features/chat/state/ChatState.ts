@@ -1,3 +1,4 @@
+import type { HistoryTailStart } from '../../../core/providers/types';
 import type { UsageInfo } from '../../../core/types';
 import { recordHistoryDiagnosticEvent } from '../history/HistoryDiagnostics';
 import { HistoryPageStore } from '../history/HistoryPageStore';
@@ -21,6 +22,7 @@ function createInitialState(): ChatStateData {
     historyLoading: false,
     historyError: null,
     historySnapshotOffset: null,
+    historyTailStart: null,
     historyPageStore: new HistoryPageStore({ onDiagnostic: recordHistoryDiagnosticEvent }),
     isStreaming: false,
     cancelRequested: false,
@@ -116,6 +118,8 @@ export class ChatState {
   set historyError(value: string | null) { this.state.historyError = value; }
   get historySnapshotOffset(): number | null { return this.state.historySnapshotOffset; }
   set historySnapshotOffset(value: number | null) { this.state.historySnapshotOffset = value; }
+  get historyTailStart(): HistoryTailStart | null { return this.state.historyTailStart; }
+  set historyTailStart(value: HistoryTailStart | null) { this.state.historyTailStart = value; }
   get historyPageStore(): HistoryPageStore { return this.state.historyPageStore; }
 
   resetHistoryPagination(): void {
@@ -126,6 +130,7 @@ export class ChatState {
     this.state.historyLoading = false;
     this.state.historyError = null;
     this.state.historySnapshotOffset = null;
+    this.state.historyTailStart = null;
     this.state.historyPageStore.clear();
   }
 

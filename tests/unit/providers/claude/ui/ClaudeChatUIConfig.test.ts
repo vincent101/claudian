@@ -91,6 +91,37 @@ describe('claudeChatUIConfig', () => {
     });
   });
 
+  describe('getPermissionModeOptions', () => {
+    it('exposes the four durable modes with bypass flagged only on yolo', () => {
+      const options = claudeChatUIConfig.getPermissionModeOptions?.({}) ?? [];
+
+      expect(options.map(option => option.value)).toEqual([
+        'auto', 'manual', 'acceptEdits', 'yolo',
+      ]);
+      expect(options.map(option => option.bypassesApprovals === true))
+        .toEqual([false, false, false, true]);
+      expect(options.every(option => option.description)).toBe(true);
+    });
+
+    it('never lists plan as a fifth option', () => {
+      const options = claudeChatUIConfig.getPermissionModeOptions?.({}) ?? [];
+
+      expect(options.some(option => option.value === 'plan')).toBe(false);
+      expect(claudeChatUIConfig.getPermissionTransientModeLabel?.('plan')).toBe('Plan');
+      expect(claudeChatUIConfig.getPermissionTransientModeLabel?.('yolo')).toBeNull();
+    });
+
+    it('binds the Claude four-mode policy with auto default and manual fallback', () => {
+      expect(claudeChatUIConfig.permissionModes).toEqual({
+        values: ['auto', 'manual', 'acceptEdits', 'yolo'],
+        defaultValue: 'auto',
+        fallbackValue: 'manual',
+        transientValues: ['plan'],
+        migrateValue: expect.any(Function),
+      });
+    });
+  });
+
   describe('applyModelDefaults', () => {
     it('clamps stale xhigh effort when switching to a custom sonnet model', () => {
       const settings: Record<string, unknown> = {

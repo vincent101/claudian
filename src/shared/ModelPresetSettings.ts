@@ -170,6 +170,7 @@ export class ModelPresetSettings {
     for (const candidate of this.rows) {
       this.listEl.appendChild(candidate.rowEl);
     }
+    void this.commit();
   }
 
   private removeRow(row: PresetRow): void {

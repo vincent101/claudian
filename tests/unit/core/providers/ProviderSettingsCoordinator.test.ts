@@ -189,6 +189,43 @@ describe('ProviderSettingsCoordinator', () => {
       expect(settings.permissionMode).toBe('normal');
     });
 
+    it('keeps same-ID projections isolated per provider', () => {
+      // Both providers expose the same model ID; the top-level projection
+      // belongs to the settings provider and must not leak to the other.
+      const settings: Record<string, unknown> = {
+        settingsProvider: 'claude',
+        providerConfigs: {
+          codex: {
+            enabled: true,
+            modelPresets: [
+              { label: 'Codex First', model: 'codex-first' },
+              { label: 'Shared', model: 'shared-model' },
+            ],
+          },
+        },
+        model: 'shared-model',
+        effortLevel: 'high',
+        permissionMode: 'yolo',
+        savedProviderModel: { claude: 'shared-model' },
+        savedProviderEffort: { claude: 'high' },
+      };
+
+      const claudeSnapshot = ProviderSettingsCoordinator.getProviderSettingsSnapshot(settings, 'claude');
+      expect(claudeSnapshot.model).toBe('shared-model');
+      expect(claudeSnapshot.effortLevel).toBe('high');
+
+      const codexSnapshot = ProviderSettingsCoordinator.getProviderSettingsSnapshot(settings, 'codex');
+      // Codex has no saved values: it falls back to its own first option,
+      // never inheriting the claude-owned top-level projection — not even
+      // when the shared ID is one of its own options.
+      expect(codexSnapshot.model).toBe('codex-first');
+      expect(codexSnapshot.model).not.toBe(settings.model);
+      expect(codexSnapshot.effortLevel).not.toBe('high');
+
+      // The top-level projection itself stays untouched for claude.
+      expect(settings.model).toBe('shared-model');
+    });
+
     it('migrates a saved legacy Codex model before projecting provider state', () => {
       const settings: Record<string, unknown> = {
         settingsProvider: 'claude',
@@ -376,6 +413,98 @@ describe('ProviderSettingsCoordinator', () => {
 
       expect(settings.model).toBe('gpt-5.4-mini');
       expect(settings.serviceTier).toBe('fast');
+    });
+
+    it('keeps saved Claude permission modes in the projection', () => {
+      for (const mode of ['auto', 'manual', 'acceptEdits', 'yolo']) {
+        const snapshot = ProviderSettingsCoordinator.getProviderSettingsSnapshot({
+          settingsProvider: 'codex',
+          permissionMode: 'normal',
+          providerConfigs: { codex: { enabled: true } },
+          savedProviderPermissionMode: { claude: mode },
+        }, 'claude');
+        expect(snapshot.permissionMode).toBe(mode);
+      }
+    });
+
+    it('defaults a provider without any stored choice to its policy default', () => {
+      const claudeSnapshot = ProviderSettingsCoordinator.getProviderSettingsSnapshot({
+        settingsProvider: 'codex',
+        permissionMode: 'normal',
+        providerConfigs: { codex: { enabled: true } },
+        savedProviderPermissionMode: {},
+      }, 'claude');
+      expect(claudeSnapshot.permissionMode).toBe('auto');
+
+      const codexSnapshot = ProviderSettingsCoordinator.getProviderSettingsSnapshot({
+        settingsProvider: 'claude',
+        permissionMode: 'yolo',
+        savedProviderPermissionMode: {},
+      }, 'codex');
+      expect(codexSnapshot.permissionMode).toBe('normal');
+    });
+
+    it('migrates a legacy Claude normal through the stored Safe selection', () => {
+      for (const [safeMode, expected] of [
+        ['auto', 'auto'],
+        ['default', 'manual'],
+        ['acceptEdits', 'acceptEdits'],
+      ] as const) {
+        const snapshot = ProviderSettingsCoordinator.getProviderSettingsSnapshot({
+          settingsProvider: 'claude',
+          permissionMode: 'normal',
+          providerConfigs: { claude: { safeMode } },
+          savedProviderPermissionMode: {},
+        }, 'claude');
+        expect(snapshot.permissionMode).toBe(expected);
+      }
+
+      // Both Safe sources missing → historical acceptEdits.
+      expect(ProviderSettingsCoordinator.getProviderSettingsSnapshot({
+        settingsProvider: 'claude',
+        permissionMode: 'normal',
+        savedProviderPermissionMode: {},
+      }, 'claude').permissionMode).toBe('acceptEdits');
+    });
+
+    it('fails an invalid saved value closed to the provider fallback', () => {
+      const snapshot = ProviderSettingsCoordinator.getProviderSettingsSnapshot({
+        settingsProvider: 'claude',
+        permissionMode: 'yolo',
+        savedProviderPermissionMode: { claude: 'bogus' },
+      }, 'claude');
+      expect(snapshot.permissionMode).toBe('manual');
+    });
+
+    it('keeps an in-memory transient plan in the projection and the saved map', () => {
+      const settings: Record<string, unknown> = {
+        settingsProvider: 'claude',
+        permissionMode: 'plan',
+        savedProviderPermissionMode: { claude: 'plan' },
+      };
+
+      const snapshot = ProviderSettingsCoordinator.getProviderSettingsSnapshot(settings, 'claude');
+      expect(snapshot.permissionMode).toBe('plan');
+      const savedMap = snapshot.savedProviderPermissionMode as Record<string, unknown>;
+      expect(savedMap.claude).toBe('plan');
+    });
+
+    it('migrates legacy permission candidates before the model defaults run', () => {
+      // applyModelDefaults rewrites the Claude provider config via its updater;
+      // the permission candidate must already be captured at that point.
+      const settings: Record<string, unknown> = {
+        settingsProvider: 'claude',
+        permissionMode: 'normal',
+        providerConfigs: {
+          claude: { safeMode: 'auto', modelPresets: [{ label: 'Haiku', model: 'haiku' }] },
+        },
+        model: 'haiku',
+        savedProviderPermissionMode: {},
+      };
+
+      const snapshot = ProviderSettingsCoordinator.getProviderSettingsSnapshot(settings, 'claude');
+
+      expect(snapshot.permissionMode).toBe('auto');
     });
 
     it('derives OpenCode permission mode from the managed selected mode when no provider snapshot exists yet', () => {

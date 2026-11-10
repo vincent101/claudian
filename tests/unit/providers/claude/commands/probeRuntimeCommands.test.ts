@@ -70,10 +70,11 @@ describe('probeRuntimeCommands', () => {
 
     const options = sdkMock.getLastOptions();
     expect(options?.settingSources).toEqual(['user', 'project', 'local']);
-    expect(options?.extraArgs).toEqual({ chrome: null });
+    // Legacy probe matches chat launches: auto-mode opt-in is always present.
+    expect(options?.extraArgs).toEqual({ 'enable-auto-mode': null, chrome: null });
   });
 
-  it('passes auto mode opt-in when Claude safe mode is auto', async () => {
+  it('always passes the auto mode opt-in regardless of the stored permission state', async () => {
     sdkMock.setMockMessages([
       { type: 'system', subtype: 'init', session_id: 'probe-session' },
     ], { appendResult: false });
@@ -82,7 +83,7 @@ describe('probeRuntimeCommands', () => {
     await probeRuntimeCommands(createMockPlugin({
       providerConfigs: {
         claude: {
-          safeMode: 'auto',
+          safeMode: 'acceptEdits',
         },
       },
     }));

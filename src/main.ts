@@ -7,6 +7,9 @@ import './providers';
 import type { Editor, WorkspaceLeaf } from 'obsidian';
 import { MarkdownView, Notice, Plugin } from 'obsidian';
 
+import { ConversationHistoryCoordinator } from './app/ConversationHistoryCoordinator';
+import { ConversationMetadataSavePort } from './app/ConversationMetadataSavePort';
+import { ConversationSizeService } from './app/ConversationSizeService';
 import { DEFAULT_CLAUDIAN_SETTINGS } from './app/settings/defaultSettings';
 import { SharedStorageService } from './app/storage/SharedStorageService';
 import type { SharedAppStorage } from './core/bootstrap/storage';
@@ -34,9 +37,12 @@ import {
 } from './core/types';
 import type { ChatViewPlacement, EnvironmentScope } from './core/types/settings';
 import { ClaudianView } from './features/chat/ClaudianView';
-import { type HistoryDiagnosticEvent, setHistoryDiagnosticsSink } from './features/chat/history/HistoryDiagnostics';
+import { type HistoryDiagnosticEvent, recordHistoryDiagnosticEvent, setHistoryDiagnosticsSink } from './features/chat/history/HistoryDiagnostics';
+import { MarkdownRenderDiagnostics } from './features/chat/rendering/MarkdownRenderDiagnostics';
 import { cleanupAskRelayFiles } from './features/chat/services/AskRelayService';
 import { ConversationOpenRegistry } from './features/chat/tabs/ConversationOpenRegistry';
+import { syncRuntimeUnderAdoption } from './features/chat/tabs/runtimeAdoptionSync';
+import type { MarkdownRenderDiagnosticBinding } from './features/chat/tabs/types';
 import { type InlineEditContext, InlineEditModal } from './features/inline-edit/ui/InlineEditModal';
 import { ClaudianSettingTab } from './features/settings/ClaudianSettings';
 import { setLocale } from './i18n/i18n';
@@ -52,6 +58,38 @@ function isClaudianView(value: unknown): value is ClaudianView {
     && typeof (value as { getTabManager?: unknown }).getTabManager === 'function';
 }
 
+function diagnosticInteger(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 ? value : undefined;
+}
+
+function diagnosticDuration(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : undefined;
+}
+
+function diagnosticHash(value: unknown): string | undefined {
+  return typeof value === 'string' && /^[a-f0-9]{12}$/.test(value) ? value : undefined;
+}
+
+function diagnosticHistogram(value: unknown, length: number): number[] | undefined {
+  if (!Array.isArray(value) || value.length !== length) return undefined;
+  const counts: number[] = [];
+  for (let index = 0; index < length; index++) {
+    if (!Object.prototype.hasOwnProperty.call(value, index)) return undefined;
+    const count = diagnosticInteger(value[index]);
+    if (count === undefined) return undefined;
+    counts.push(count);
+  }
+  return counts;
+}
+
+function diagnosticVisibility(value: unknown): 'yes' | 'no' | 'unknown' | undefined {
+  return value === 'yes' || value === 'no' || value === 'unknown' ? value : undefined;
+}
+
+function diagnosticIdState(value: unknown): 'known' | 'unknown' | undefined {
+  return value === 'known' || value === 'unknown' ? value : undefined;
+}
+
 /**
  * Maps feature history diagnostics onto the persisted transcript diagnostic
  * shape. Page keys embed local transcript paths, so they are salted-hashed
@@ -63,6 +101,65 @@ export function mapHistoryDiagnosticEvent(
   hashId: (id: string) => string,
 ): TranscriptDiagnosticEvent {
   switch (event.kind) {
+    case 'markdown_render_summary': {
+      const common: TranscriptDiagnosticEvent = {
+        phase: event.kind,
+        metricVersion: event.metricVersion === 1 ? 1 : undefined,
+        collectorIdHash: diagnosticHash(event.collectorIdHash),
+        flushId: diagnosticInteger(event.flushId),
+        flushReason: event.flushReason === 'timer' || event.flushReason === 'dispose' ? event.flushReason : undefined,
+        flushScope: event.flushScope === 'window' || event.flushScope === 'attribution' ? event.flushScope : undefined,
+        windowMs: diagnosticDuration(event.windowMs),
+        callsSum: diagnosticInteger(event.callsSum),
+        charsSum: diagnosticInteger(event.charsSum),
+        charsMax: diagnosticInteger(event.charsMax),
+        charsHistogram: diagnosticHistogram(event.charsHistogram, 7),
+        elapsedMsSum: diagnosticDuration(event.elapsedMsSum),
+        elapsedMsMax: diagnosticDuration(event.elapsedMsMax),
+        elapsedMsHistogram: diagnosticHistogram(event.elapsedMsHistogram, 8),
+        settledCalls: diagnosticInteger(event.settledCalls),
+        successCalls: diagnosticInteger(event.successCalls),
+        failureCalls: diagnosticInteger(event.failureCalls),
+        inFlightAtStart: diagnosticInteger(event.inFlightAtStart),
+        inFlightAtEnd: diagnosticInteger(event.inFlightAtEnd),
+        abandonedCalls: diagnosticInteger(event.abandonedCalls),
+        startVisibilityHistogram: diagnosticHistogram(event.startVisibilityHistogram, 27),
+      };
+      if (event.flushScope === 'window') {
+        return {
+          ...common,
+          callsMax: diagnosticInteger(event.callsMax),
+          callsHistogram: diagnosticHistogram(event.callsHistogram, 8),
+          callsSampleCount: diagnosticInteger(event.callsSampleCount),
+          attributionRows: diagnosticInteger(event.attributionRows),
+          domPageNodes: diagnosticInteger(event.domPageNodes),
+          domMessageNodes: diagnosticInteger(event.domMessageNodes),
+          domTextBlockNodes: diagnosticInteger(event.domTextBlockNodes),
+        };
+      }
+      if (event.flushScope === 'attribution' && event.attributionKind === 'known') {
+        const slot = diagnosticInteger(event.attributionSlot);
+        return {
+          ...common,
+          attributionKind: 'known',
+          attributionSlot: slot !== undefined && slot >= 1 && slot <= 31 ? slot : undefined,
+          tabIdState: diagnosticIdState(event.tabIdState),
+          conversationIdState: diagnosticIdState(event.conversationIdState),
+          tabIdHash: diagnosticHash(event.tabIdHash),
+          conversationIdHash: diagnosticHash(event.conversationIdHash),
+          tabGeneration: diagnosticInteger(event.tabGeneration),
+          conversationGeneration: diagnosticInteger(event.conversationGeneration),
+          tabActive: diagnosticVisibility(event.tabActive),
+          documentVisible: diagnosticVisibility(event.documentVisible),
+          domConnected: diagnosticVisibility(event.domConnected),
+          viewport: event.viewport === 'unknown' ? 'unknown' : undefined,
+        };
+      }
+      if (event.flushScope === 'attribution' && event.attributionKind === 'overflow') {
+        return { ...common, attributionKind: 'overflow', attributionSlot: event.attributionSlot === 0 ? 0 : undefined };
+      }
+      return common;
+    }
     case 'render_batch':
       return { phase: event.kind, batchLines: event.mounted, entries: event.total, elapsedMs: event.elapsedMs };
     case 'render_complete':
@@ -93,6 +190,13 @@ export function mapHistoryDiagnosticEvent(
       };
     case 'dom_overcommit':
       return { phase: event.kind, pageKeyHash: hashId(event.pageKey), turns: event.turns };
+    case 'save_adoption_target_mismatch':
+      return { phase: event.kind };
+    case 'save_materialization_rejected':
+      // 'malformed' carries both rejection reasons: the payload (or its
+      // source) could not be detached honestly, so the messages axis was
+      // dropped for that save.
+      return { phase: event.kind, reason: 'malformed' };
     default: {
       const unhandled: never = event;
       throw new Error(`Unhandled history diagnostic kind: ${unhandled}`);
@@ -105,7 +209,31 @@ export default class ClaudianPlugin extends Plugin {
   storage!: SharedAppStorage;
   private conversations: Conversation[] = [];
   readonly conversationOpenRegistry = new ConversationOpenRegistry();
+  /**
+   * R2 wiring (stage 1): one plugin-lifetime save-admission coordinator. All
+   * production save paths route through it so the save target and session
+   * payload come from the same committed binding — never from a live runtime
+   * that a later rebind already owns.
+   */
+  private readonly conversationMetadataSavePort = new ConversationMetadataSavePort({
+    plugin: this,
+    onDiagnostic: recordHistoryDiagnosticEvent,
+  });
+  readonly conversationHistoryCoordinator = new ConversationHistoryCoordinator({
+    metadata: this.conversationMetadataSavePort,
+  });
+  readonly conversationSizes = new ConversationSizeService({
+    getConversation: id => this.getConversationSync(id),
+    getHistoryService: providerId => ProviderRegistry.getConversationHistoryService(providerId),
+    getVaultPath: () => getVaultPath(this.app),
+    onPublished: id => {
+      for (const view of this.getAllViews()) view.onConversationSizePublished(id);
+    },
+  });
   private lastKnownTabManagerState: AppTabManagerState | null = null;
+  private markdownRenderLog: ClaudeTranscriptDiagnosticLog | null = null;
+  private readonly markdownRenderBindings = new Set<MarkdownRenderDiagnosticBinding>();
+  private markdownTabGeneration = 0;
 
   async onload() {
     await this.loadSettings();
@@ -116,8 +244,18 @@ export default class ClaudianPlugin extends Plugin {
     const vaultPath = getVaultPath(this.app);
     if (vaultPath) {
       const renderDiagnostics = new ClaudeTranscriptDiagnosticLog(vaultPath, () => {}, 'history-render');
+      try {
+        this.markdownRenderLog = new ClaudeTranscriptDiagnosticLog(vaultPath, () => {}, 'markdown-render');
+      } catch {
+        this.markdownRenderLog = null;
+      }
       setHistoryDiagnosticsSink(event => {
-        renderDiagnostics.record(mapHistoryDiagnosticEvent(event, id => renderDiagnostics.hashId(id)));
+        if (event.kind === 'markdown_render_summary') {
+          const log = this.markdownRenderLog;
+          if (log) log.record(mapHistoryDiagnosticEvent(event, id => log.hashId(id)));
+        } else {
+          renderDiagnostics.record(mapHistoryDiagnosticEvent(event, id => renderDiagnostics.hashId(id)));
+        }
       });
       // Startup orphan sweep: plugin start can never inherit a live pending
       // ask (the SDK connection dropped with the previous process aborted any
@@ -247,6 +385,11 @@ export default class ClaudianPlugin extends Plugin {
   }
 
   async onunload() {
+    for (const binding of this.markdownRenderBindings) binding.dispose();
+    this.markdownRenderBindings.clear();
+    this.markdownRenderLog = null;
+    setHistoryDiagnosticsSink(null);
+
     // Ensures state is saved even if Obsidian quits without calling onClose()
     for (const view of this.getAllViews()) {
       const tabManager = view.getTabManager();
@@ -254,6 +397,71 @@ export default class ClaudianPlugin extends Plugin {
         const state = tabManager.getPersistedState();
         await this.persistTabManagerState(state);
       }
+    }
+  }
+
+  registerMarkdownRenderDiagnostics(
+    tabId: string,
+    initialConversationId: string | null,
+    getTabActive: () => boolean | undefined,
+  ): MarkdownRenderDiagnosticBinding | null {
+    let log = this.markdownRenderLog;
+    if (!log) return null;
+    let collector: MarkdownRenderDiagnostics | null = null;
+    try {
+      const tabGeneration = ++this.markdownTabGeneration;
+      if (!Number.isSafeInteger(tabGeneration)) return null;
+      const collectorIdHash = log.hashId(`collector:${tabGeneration}`);
+      const tabIdHash = log.hashId(tabId);
+      let conversationId = initialConversationId;
+      let conversationGeneration = 1;
+      const conversationIdHash = conversationId === null ? undefined : log.hashId(conversationId);
+      let readActive: (() => boolean | undefined) | null = getTabActive;
+      collector = new MarkdownRenderDiagnostics(collectorIdHash, recordHistoryDiagnosticEvent);
+      const instance = collector;
+      instance.setContext({
+        tabIdHash, conversationIdHash, tabGeneration, conversationGeneration,
+        getTabActive: () => readActive?.(),
+      });
+      let closed = false;
+      const binding: MarkdownRenderDiagnosticBinding = {
+        collector: instance,
+        bindConversation: next => {
+          if (closed || next === conversationId) return;
+          try {
+            if (!log || !Number.isSafeInteger(conversationGeneration + 1)) throw new Error('diagnostic binding unavailable');
+            const nextHash = next === null ? undefined : log.hashId(next);
+            conversationId = next;
+            conversationGeneration++;
+            instance.setContext({
+              tabIdHash, conversationIdHash: nextHash, tabGeneration, conversationGeneration,
+              getTabActive: () => readActive?.(),
+            });
+          } catch {
+            try { instance.disable(); } catch { /* diagnostics are isolated */ }
+            binding.dispose();
+          }
+        },
+        dispose: () => {
+          if (closed) return;
+          closed = true;
+          try {
+            instance.dispose();
+          } catch {
+            // Diagnostics must not interrupt teardown.
+          } finally {
+            conversationId = null;
+            readActive = null;
+            log = null;
+            this.markdownRenderBindings.delete(binding);
+          }
+        },
+      };
+      this.markdownRenderBindings.add(binding);
+      return binding;
+    } catch {
+      try { collector?.disable(); } catch { /* diagnostics are isolated */ }
+      return null;
     }
   }
 
@@ -347,22 +555,9 @@ export default class ClaudianPlugin extends Plugin {
       ...claudian,
     } as ClaudianSettings;
 
-    // Plan mode is ephemeral — normalize back to normal on load so the app
-    // doesn't start stuck in plan mode after a restart (prePlanPermissionMode is lost)
-    if (this.settings.permissionMode === 'plan') {
-      this.settings.permissionMode = 'normal';
-    }
-    if (
-      this.settings.savedProviderPermissionMode
-      && typeof this.settings.savedProviderPermissionMode === 'object'
-      && !Array.isArray(this.settings.savedProviderPermissionMode)
-    ) {
-      for (const [providerId, mode] of Object.entries(this.settings.savedProviderPermissionMode)) {
-        if (mode === 'plan') {
-          this.settings.savedProviderPermissionMode[providerId] = 'normal';
-        }
-      }
-    }
+    // Plan is a runtime overlay and never survives a reload: storage already
+    // normalizes durable values per provider fallback, so no blanket plan
+    // rewrite may run here — it would erase a legitimate Claude Manual.
     const opencodeConfig = this.settings.providerConfigs?.opencode;
     if (
       opencodeConfig
@@ -526,7 +721,16 @@ export default class ClaudianPlugin extends Plugin {
             ? conversation?.externalContextPaths ?? []
             : this.settings.persistentExternalContextPaths ?? []);
 
-        tab.service.syncConversationState(conversation, externalContextPaths);
+        // R2: environment re-syncs also route through the binding's adoption
+        // registry — a reconcile that still sees a stale conversationId (the
+        // switch's commit→rebind window) must never leave the adopted runtime
+        // feedable into the record's save.
+        syncRuntimeUnderAdoption(
+          tab,
+          tab.service,
+          () => { tab.service?.syncConversationState(conversation, externalContextPaths); },
+          { conversationId: tab.conversationId ?? null },
+        );
       };
 
       for (const tab of affectedTabs) {
@@ -710,6 +914,7 @@ export default class ClaudianPlugin extends Plugin {
 
     const conversation = this.conversations[index];
     this.conversations.splice(index, 1);
+    for (const view of this.getAllViews()) view.onConversationDeleted(id);
 
     await ProviderRegistry
       .getConversationHistoryService(conversation.providerId)
@@ -784,6 +989,14 @@ export default class ClaudianPlugin extends Plugin {
     return this.conversations.find(c => c.id === id) || null;
   }
 
+  getConversationHistoryCoordinator(): ConversationHistoryCoordinator {
+    return this.conversationHistoryCoordinator;
+  }
+
+  getConversationMetadataSavePort(): ConversationMetadataSavePort {
+    return this.conversationMetadataSavePort;
+  }
+
   findEmptyConversation(): Conversation | null {
     return this.conversations.find(conversation =>
       conversation.hasHistory !== true
@@ -801,6 +1014,7 @@ export default class ClaudianPlugin extends Plugin {
       lastResponseAt: c.lastResponseAt,
       messageCount: c.messageCount ?? c.messages.length,
       preview: c.preview ?? this.getConversationPreview(c),
+      sizeSnapshot: this.conversationSizes.getSnapshot(c.id),
       titleGenerationStatus: c.titleGenerationStatus,
     }));
   }

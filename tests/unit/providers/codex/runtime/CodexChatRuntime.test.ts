@@ -120,6 +120,11 @@ function createMockPlugin(overrides: Record<string, unknown> = {}): any {
   return {
     settings: {
       model: DEFAULT_CODEX_PRIMARY_MODEL,
+      // Codex model identity is provider-scoped: the top-level fields are
+      // settingsProvider-denominated and never inherited cross-provider.
+      settingsProvider: 'codex',
+      providerConfigs: { codex: { enabled: true } },
+      savedProviderModel: { codex: DEFAULT_CODEX_PRIMARY_MODEL },
       effortLevel: 'medium',
       systemPrompt: '',
       mediaFolder: '',
@@ -1374,7 +1379,7 @@ describe('CodexChatRuntime', () => {
     });
 
     it('sends model on thread/resume', async () => {
-      const plugin = createMockPlugin({ model: 'gpt-5.4-mini' });
+      const plugin = createMockPlugin({ savedProviderModel: { codex: 'gpt-5.4-mini' } });
       const rt = new CodexChatRuntime(plugin);
 
       rt.syncConversationState({
@@ -1395,7 +1400,7 @@ describe('CodexChatRuntime', () => {
     });
 
     it('sends serviceTier on thread/resume when fast mode is enabled', async () => {
-      const plugin = createMockPlugin({ model: DEFAULT_CODEX_PRIMARY_MODEL, serviceTier: 'fast' });
+      const plugin = createMockPlugin({ savedProviderServiceTier: { codex: 'fast' } });
       const rt = new CodexChatRuntime(plugin);
 
       rt.syncConversationState({
@@ -1452,7 +1457,7 @@ describe('CodexChatRuntime', () => {
     });
 
     it('sends serviceTier fast on thread/start and turn/start when fast mode is enabled', async () => {
-      const plugin = createMockPlugin({ serviceTier: 'fast' });
+      const plugin = createMockPlugin({ serviceTier: 'fast', savedProviderServiceTier: { codex: 'fast' } });
       const rt = new CodexChatRuntime(plugin);
 
       await collectChunks(rt.query(createTurn()));

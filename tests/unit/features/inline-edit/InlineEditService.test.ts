@@ -340,6 +340,38 @@ describe('InlineEditService', () => {
       expect(options?.permissionMode).toBe('bypassPermissions');
     });
 
+    it.each(['auto', 'manual', 'acceptEdits', 'yolo', 'plan'])(
+      'keeps the fixed read-only bypass invariant regardless of the toolbar mode %s',
+      async (mode: string) => {
+        // Auxiliary inline edit is never wired to the main canUseTool: the
+        // four-mode toolbar selection cannot change its read-only contract.
+        mockPlugin.settings.permissionMode = mode;
+        service = new InlineEditService(mockPlugin);
+        setMockMessages([
+          { type: 'system', subtype: 'init', session_id: 'test-session' },
+          {
+            type: 'assistant',
+            message: { content: [{ type: 'text', text: '<replacement>fixed</replacement>' }] },
+          },
+          { type: 'result' },
+        ]);
+
+        await service.editText({
+          mode: 'selection',
+          selectedText: 'test',
+          instruction: 'fix',
+          notePath: 'test.md',
+        });
+
+        const options = getLastOptions();
+        expect(options?.permissionMode).toBe('bypassPermissions');
+        expect(options?.canUseTool).toBeUndefined();
+        // The mock Options type lacks extraArgs; read it through the bag.
+        expect((options as unknown as Record<string, unknown>).extraArgs)
+          .toEqual({ 'enable-auto-mode': null });
+      },
+    );
+
     it('should set settingSources to project only when loadUserClaudeSettings is false', async () => {
       mockPlugin.settings.loadUserClaudeSettings = false;
       service = new InlineEditService(mockPlugin);
@@ -700,6 +732,122 @@ describe('InlineEditService', () => {
 
     it('should handle cancel when no request is running', () => {
       expect(() => service.cancel()).not.toThrow();
+    });
+  });
+
+  describe('concurrent lifecycle', () => {
+    beforeEach(() => {
+      (fs.existsSync as jest.Mock).mockReturnValue(true);
+    });
+
+    // The SDK mock resolves turns immediately; a controlled spy lets each test
+    // decide when a turn's init/assistant/result messages actually arrive, so
+    // completions can be released after a reset/cancel and observed.
+    type ControlledTurnOptions = {
+      abortController?: AbortController;
+      resume?: string;
+    };
+
+    function installControlledQuery() {
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      const sdk = require('@anthropic-ai/claude-agent-sdk');
+      const spy = jest.spyOn(sdk, 'query');
+      const turns: Array<{
+        options: ControlledTurnOptions;
+        release: (value: { sessionId: string; text: string }) => void;
+      }> = [];
+
+      spy.mockImplementation((({ prompt, options }: { prompt: unknown; options: ControlledTurnOptions }) => {
+        let release!: (value: { sessionId: string; text: string }) => void;
+        const released = new Promise<{ sessionId: string; text: string }>((resolve) => {
+          release = resolve;
+        });
+        turns.push({ options, release });
+        const generator = (async function* () {
+          const { sessionId, text } = await released;
+          yield { type: 'system', subtype: 'init', session_id: sessionId };
+          yield { type: 'assistant', message: { content: [{ type: 'text', text }] } };
+          yield { type: 'result' };
+        })();
+        return Object.assign(generator, { interrupt: jest.fn().mockResolvedValue(undefined) });
+      }) as typeof sdk.query);
+
+      return { spy, turns };
+    }
+
+    const REQUEST: InlineEditRequest = {
+      mode: 'selection',
+      selectedText: 'text',
+      instruction: 'edit',
+      notePath: 'test.md',
+    };
+
+    it('keeps a later request abortable after an earlier request finishes', async () => {
+      const { spy, turns } = installControlledQuery();
+      try {
+        const editA = service.editText(REQUEST);
+        const editB = service.editText(REQUEST);
+
+        turns[0].release({ sessionId: 'session-A', text: '<replacement>A</replacement>' });
+        await editA;
+
+        service.cancel();
+        expect(turns[1].options.abortController?.signal.aborted).toBe(true);
+
+        turns[1].release({ sessionId: 'session-B', text: '<replacement>B</replacement>' });
+        const resultB = await editB;
+        expect(resultB.success).toBe(false);
+        expect(resultB.error).toBe('Cancelled');
+      } finally {
+        spy.mockRestore();
+      }
+    });
+
+    it('cancel aborts every pending request', async () => {
+      const { spy, turns } = installControlledQuery();
+      try {
+        const editA = service.editText(REQUEST);
+        const editB = service.editText(REQUEST);
+
+        service.cancel();
+        expect(turns[0].options.abortController?.signal.aborted).toBe(true);
+        expect(turns[1].options.abortController?.signal.aborted).toBe(true);
+
+        turns[0].release({ sessionId: 'session-A', text: '<replacement>A</replacement>' });
+        turns[1].release({ sessionId: 'session-B', text: '<replacement>B</replacement>' });
+        const [resultA, resultB] = await Promise.all([editA, editB]);
+        expect(resultA.success).toBe(false);
+        expect(resultB.success).toBe(false);
+      } finally {
+        spy.mockRestore();
+      }
+    });
+
+    it('a late pre-reset completion must not hijack the session id', async () => {
+      const { spy, turns } = installControlledQuery();
+      try {
+        const editA = service.editText(REQUEST);
+        service.resetConversation();
+        const editB = service.editText(REQUEST);
+
+        turns[1].release({ sessionId: 'session-B', text: '<replacement>B</replacement>' });
+        await editB;
+
+        turns[0].release({ sessionId: 'session-A', text: '<replacement>A</replacement>' });
+        const resultA = await editA;
+        expect(resultA.success).toBe(true);
+
+        const continuation = service.continueConversation('more');
+        expect(turns).toHaveLength(3);
+        expect(turns[2].options.resume).toBe('session-B');
+
+        turns[2].release({ sessionId: 'session-B', text: '<replacement>C</replacement>' });
+        const resultC = await continuation;
+        expect(resultC.success).toBe(true);
+        expect(resultC.editedText).toBe('C');
+      } finally {
+        spy.mockRestore();
+      }
     });
   });
 

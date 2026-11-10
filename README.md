@@ -141,6 +141,25 @@ If different, GUI apps like Obsidian may not find Node.js.
 
 Codex and Opencode support are live but features might be incomplete, and still need more testing across platforms and installation methods. If you have feature request or run into any bugs, please [submit a GitHub issue](https://github.com/YishenTu/claudian/issues).
 
+## Regression Index — Model Selection & Provider Identity
+
+Every model-selection entry point carries a complete `{ providerId, modelId }` pair; a bare model ID is never re-attributed to a provider by name or ID matching. When touching the model selector, routing, or draft persistence, run the suites below.
+
+| Entry point | Coverage |
+|---|---|
+| Mixed blank-tab list (groups, icons, single selected pair) | `tests/integration/features/chat/modelSelectionRouting.test.ts` — mixed list test |
+| Blank selection → first send → runtime/SDK/RPC model | `modelSelectionRouting.test.ts` — blank claude/codex transport tests |
+| Bound tab same-provider model switch (cold + active, no runtime rebuild) | `modelSelectionRouting.test.ts` — bound claude/codex switch tests |
+| Bound tab cross-provider rejection (options filtered + handler guard) | `modelSelectionRouting.test.ts` — never-offers tests; `tests/unit/features/chat/tabs/Tab.test.ts` — cross-provider rejection |
+| New session / clear → blank with complete pair | `modelSelectionRouting.test.ts` — new-session reset test |
+| Draft save/reload (pair round-trip, legacy unique fill, ambiguity reset) | `modelSelectionRouting.test.ts` — draft persistence describe; `tests/unit/app/storage` + `tests/unit/providers/claude/storage` validator tests |
+| Provider disabled / preset removed fallback | `modelSelectionRouting.test.ts` — availability fallback describe |
+| Effort/budget isolation and settings-provider projection | `modelSelectionRouting.test.ts` — effort isolation test; `tests/unit/core/providers/ProviderSettingsCoordinator.test.ts` |
+| Inline edit under shared top-level model ID | `modelSelectionRouting.test.ts` — inline edit test |
+| Provider-native env model override (OPENAI_MODEL) | `modelSelectionRouting.test.ts` — env override test |
+| Routing/pair contract units | `tests/unit/core/providers/modelRouting.test.ts`, `tests/unit/core/providers/tabLifecycle.test.ts` |
+| Preset row move persistence (ModelPresetSettings.moveRow commits) | `tests/unit/providers/claude/ui/ModelPresetSettings.test.ts` |
+
 ## Architecture
 
 ```

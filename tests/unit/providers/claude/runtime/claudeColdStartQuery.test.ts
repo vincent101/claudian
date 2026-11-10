@@ -135,8 +135,12 @@ describe('runColdStartQuery', () => {
       expect(opts?.systemPrompt).toBe('Custom prompt');
       expect(opts?.tools).toEqual([]);
       expect(opts?.model).toBe('claude-haiku-4-5');
+      // Auxiliary queries keep a fixed bypass and never gain a canUseTool.
       expect(opts?.permissionMode).toBe('bypassPermissions');
       expect(opts?.allowDangerouslySkipPermissions).toBe(true);
+      expect(opts?.canUseTool).toBeUndefined();
+      // Chrome merge and the unified auto-mode opt-in ride the launch flags.
+      expect(opts?.extraArgs).toEqual({ 'enable-auto-mode': null });
     });
 
     it('passes hooks to SDK', async () => {

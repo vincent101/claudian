@@ -48,8 +48,9 @@ export function createReadOnlyHook(): HookCallbackMatcher {
 }
 
 export class InlineEditService {
+  private conversationToken = 0;
+  private readonly pendingControllers = new Set<AbortController>();
   private plugin: ClaudianPlugin;
-  private abortController: AbortController | null = null;
   private sessionId: string | null = null;
 
   constructor(plugin: ClaudianPlugin) {
@@ -64,11 +65,14 @@ export class InlineEditService {
   }
 
   resetConversation(): void {
+    // Invalidation precedes local clearing so a completion that unblocks after
+    // a reset can never publish a stale session id.
+    this.conversationToken += 1;
     this.sessionId = null;
   }
 
   async editText(request: InlineEditRequest): Promise<InlineEditResult> {
-    this.sessionId = null;
+    this.resetConversation();
     const prompt = buildInlineEditPrompt(request);
     return this.sendMessage(prompt);
   }
@@ -86,8 +90,9 @@ export class InlineEditService {
 
   private async sendMessage(prompt: string): Promise<InlineEditResult> {
     const settings = this.getScopedSettings();
-
-    this.abortController = new AbortController();
+    const conversationToken = this.conversationToken;
+    const abortController = new AbortController();
+    this.pendingControllers.add(abortController);
 
     const hooks = {
       PreToolUse: [createReadOnlyHook()],
@@ -100,23 +105,29 @@ export class InlineEditService {
         tools: [...READ_ONLY_TOOLS],
         hooks,
         resumeSessionId: this.sessionId ?? undefined,
-        abortController: this.abortController,
+        abortController,
         providerSettings: settings,
       }, prompt);
 
-      this.sessionId = result.sessionId;
+      if (this.canPublishCompletion(conversationToken, abortController)) {
+        this.sessionId = result.sessionId;
+      }
       return parseInlineEditResponse(result.text);
     } catch (error) {
       const msg = error instanceof Error ? error.message : 'Unknown error';
       return { success: false, error: msg };
     } finally {
-      this.abortController = null;
+      this.pendingControllers.delete(abortController);
     }
   }
 
+  private canPublishCompletion(conversationToken: number, abortController: AbortController): boolean {
+    return conversationToken === this.conversationToken && !abortController.signal.aborted;
+  }
+
   cancel(): void {
-    if (this.abortController) {
-      this.abortController.abort();
+    for (const abortController of this.pendingControllers) {
+      abortController.abort();
     }
   }
 }

@@ -132,6 +132,54 @@ function buildService(cliPath: string): ClaudianServiceInstance {
 }
 
 /**
+ * Promise.race with a deadline timer. The timer handle is cleared in a
+ * finally block once the race settles — without this, the losing deadline
+ * setTimeout stays pending and Jest --detectOpenHandles reports it as an
+ * open handle even when the turn settled early.
+ */
+async function raceWithDeadline<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
+  let deadlineTimer: NodeJS.Timeout | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_, reject) => {
+        deadlineTimer = setTimeout(() => reject(new Error('__DEADLINE__')), timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (deadlineTimer) clearTimeout(deadlineTimer);
+  }
+}
+
+/**
+ * Drains the iterator until it settles (done) or the overall deadline
+ * expires, collecting chunk types. Mirrors the cancel-test drain loop.
+ */
+async function drainUntilTerminated(
+  iterator: AsyncIterator<StreamChunk>,
+  deadlineMs: number,
+): Promise<{ terminated: boolean; chunks: string[] }> {
+  const chunks: string[] = [];
+  const deadline = Date.now() + deadlineMs;
+  for (;;) {
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) return { terminated: false, chunks };
+    let next: IteratorResult<StreamChunk>;
+    try {
+      next = await raceWithDeadline(iterator.next(), remaining);
+    } catch (e) {
+      // Deadline expiry is a failure signal, never a settled turn — rethrow.
+      if ((e as Error).message === '__DEADLINE__') throw e;
+      chunks.push(`throw:${(e as Error).message}`);
+      next = { done: true, value: undefined } as IteratorResult<StreamChunk>;
+    }
+    if (next.done) return { terminated: true, chunks };
+    const value = next.value as { type: string; content?: string };
+    chunks.push(value.type === 'error' ? `error:${value.content}` : value.type);
+  }
+}
+
+/**
  * Drives service.query() to completion with an overall deadline. Returns the
  * chunk types observed. Resolves { timedOut: true } if the generator is still
  * pending when the deadline expires — that is the defect signature.
@@ -156,14 +204,14 @@ async function consumeQueryWithDeadline(
   for (;;) {
     const remaining = deadline - Date.now();
     if (remaining <= 0) return { timedOut: true, chunks, lastError };
-    const next = await Promise.race([
-      iterator.next(),
-      new Promise<never>((_, reject) => setTimeout(() => reject(new Error('__DEADLINE__')), remaining)),
-    ]).catch((e: Error) => {
-      if (e.message === '__DEADLINE__') throw e;
-      lastError = e.message;
-      return { done: true, value: undefined } as IteratorResult<StreamChunk>;
-    });
+    let next: IteratorResult<StreamChunk>;
+    try {
+      next = await raceWithDeadline(iterator.next(), remaining);
+    } catch (e) {
+      if ((e as Error).message === '__DEADLINE__') throw e;
+      lastError = (e as Error).message;
+      next = { done: true, value: undefined } as IteratorResult<StreamChunk>;
+    }
     if (next.done) return { timedOut: false, chunks, lastError };
     const value = next.value as { type: string; content?: string };
     chunks.push(value.type === 'error' ? `error:${value.content}` : value.type);
@@ -237,46 +285,49 @@ describe('CLI death settlement (end-to-end, real SDK + fake CLI)', () => {
   it('settles the active turn when cancel() aborts a hanging CLI (forced close still fires)', async () => {
     const fakeCli = writeHangingCli();
     const service = buildService(fakeCli.path);
-    const prepared = service.prepareTurn({ turnId: `abort-turn-${Date.now()}`, text: 'run the task' });
-    const history: ChatMessage[] = [
-      { id: 'h1', role: 'user', content: 'earlier task', timestamp: 1 },
-      { id: 'h2', role: 'assistant', content: 'earlier answer', timestamp: 2 },
-    ];
-    const iterator = service.query(prepared, history)[Symbol.asyncIterator]();
+    const cleanupSpy = jest.spyOn(service, 'cleanup');
+    try {
+      const prepared = service.prepareTurn({ turnId: `abort-turn-${Date.now()}`, text: 'run the task' });
+      const history: ChatMessage[] = [
+        { id: 'h1', role: 'user', content: 'earlier task', timestamp: 1 },
+        { id: 'h2', role: 'assistant', content: 'earlier answer', timestamp: 2 },
+      ];
+      const iterator = service.query(prepared, history)[Symbol.asyncIterator]();
 
-    // First chunk arrives while the CLI is alive and hanging mid-turn.
-    const first = await Promise.race([
-      iterator.next(),
-      new Promise<never>((_, reject) => setTimeout(() => reject(new Error('__DEADLINE__')), 8000)),
-    ]);
-    expect((first.value as { type: string }).type).toBe('text');
+      // First chunk arrives while the CLI is alive and hanging mid-turn.
+      const first = await raceWithDeadline(iterator.next(), 8000);
+      expect((first.value as { type: string }).type).toBe('text');
 
-    // cancel() aborts the turn controller -> SIGTERM -> the CLI dies with
-    // signal.aborted set, so the SDK's exit listener records "aborted by
-    // user" as the exitError; the forced stdout close still fires (the
-    // killed CLI's sleep child holds the pipe) and surfaces that error.
-    service.cancel();
+      // cancel() aborts the turn controller -> SIGTERM -> the CLI dies with
+      // signal.aborted set, so the SDK's exit listener records "aborted by
+      // user" as the exitError; the forced stdout close still fires (the
+      // killed CLI's sleep child holds the pipe) and surfaces that error.
+      service.cancel();
 
-    const chunks: string[] = [];
-    const deadline = Date.now() + 8000;
-    let terminated = false;
-    for (;;) {
-      const remaining = deadline - Date.now();
-      if (remaining <= 0) break;
-      const next = await Promise.race([
-        iterator.next(),
-        new Promise<never>((_, reject) => setTimeout(() => reject(new Error('__DEADLINE__')), remaining)),
-      ]).catch((e: Error) => {
-        chunks.push(`throw:${e.message}`);
-        return { done: true, value: undefined } as IteratorResult<StreamChunk>;
-      });
-      if (next.done) { terminated = true; break; }
-      const value = next.value as { type: string; content?: string };
-      chunks.push(value.type === 'error' ? `error:${value.content}` : value.type);
+      const { terminated, chunks } = await drainUntilTerminated(iterator, 8000);
+      expect(terminated).toBe(true);
+      expect(chunks).toContainEqual(expect.stringContaining('error:'));
+    } finally {
+      service.cleanup();
     }
-    expect(terminated).toBe(true);
-    expect(chunks).toContainEqual(expect.stringContaining('error:'));
-    service.cleanup();
+    expect(cleanupSpy).toHaveBeenCalledTimes(1);
+  });
+
+  // Deterministic regression (no CLI): a turn that surfaces an error chunk
+  // and then hangs forever must NOT count as settled when the deadline
+  // expires — the deadline is a failure signal, not success.
+  it('rejects with the deadline error when the iterator hangs after an error chunk', async () => {
+    let calls = 0;
+    const hangingIterator: AsyncIterator<StreamChunk> = {
+      next: async () => {
+        if (calls++ === 0) {
+          return { done: false, value: { type: 'error', content: 'synthetic error before hang' } };
+        }
+        return new Promise<IteratorResult<StreamChunk>>(() => {});
+      },
+    };
+
+    await expect(drainUntilTerminated(hangingIterator, 200)).rejects.toThrow('__DEADLINE__');
   });
 });
 

@@ -88,6 +88,8 @@ export interface TranscriptHistoryIndex {
   ino: number;
   snapshotSize: number;
   mtimeMs: number;
+  ctimeMs: number;
+  readonly projectionVariantKey: string;
   /** Offset just past the last fully processed newline; tail reads start here. */
   committedSize: number;
   entries: TranscriptIndexEntry[];
@@ -123,10 +125,14 @@ interface BuildOptions {
   maxLineBytes?: number;
   useWorker?: boolean;
   resumeAtMessageId?: string;
+  /** Reobserve the source; an unchanged snapshot may still use the completed cache. */
+  forceNewSnapshot?: boolean;
   signal?: AbortSignal;
   onProgress?: (bytesRead: number, snapshotSize: number) => void;
   onFinalize?: () => void;
   onLineSkipped?: (event: TranscriptLineSkipEvent) => void;
+  /** Synchronous handoff: retain a successful index before its temporary flight pin is released. */
+  onIndex?: (index: TranscriptHistoryIndex) => void;
 }
 
 const FINALIZE_BATCH_SIZE = 2_000;
@@ -717,10 +723,11 @@ async function appendOversizedEntry(
 
 async function finalizeIndex(
   filePath: string,
-  snapshot: { dev: number; ino: number; size: number; mtimeMs: number },
+  snapshot: { dev: number; ino: number; size: number; mtimeMs: number; ctimeMs: number },
   rawEntries: RawIndexEntry[],
   skippedLines: number,
   committedSize: number,
+  projectionVariantKey: string,
   resumeAtMessageId?: string,
   signal?: AbortSignal,
 ): Promise<TranscriptHistoryIndex> {
@@ -827,6 +834,8 @@ async function finalizeIndex(
     ino: snapshot.ino,
     snapshotSize: snapshot.size,
     mtimeMs: snapshot.mtimeMs,
+    ctimeMs: snapshot.ctimeMs,
+    projectionVariantKey,
     committedSize,
     entries: canonical,
     turns,
@@ -851,12 +860,12 @@ async function scanSnapshot(
   skippedLines: number;
   incomplete: boolean;
   committedSize: number;
-  snapshot: { dev: number; ino: number; size: number; mtimeMs: number };
+  snapshot: { dev: number; ino: number; size: number; mtimeMs: number; ctimeMs: number };
   peakHeapBytes: number;
 }> {
   const handle = await open(filePath, 'r');
   const info = await handle.stat();
-  const snapshot = { dev: info.dev, ino: info.ino, size: info.size, mtimeMs: info.mtimeMs };
+  const snapshot = { dev: info.dev, ino: info.ino, size: info.size, mtimeMs: info.mtimeMs, ctimeMs: info.ctimeMs };
   const entries: RawIndexEntry[] = [];
   let skippedLines = 0;
   let position = 0;
@@ -884,6 +893,7 @@ async function scanSnapshot(
       const line = data.subarray(start, cursor);
       if (line.length > maxLineBytes) {
         const recovery = await appendOversizedEntry(handle, entries, lineOffset, line.length, lineNumber);
+        skippedLines += 1;
         onLineSkipped?.({
           reason: 'oversized',
           offset: lineOffset,
@@ -932,6 +942,7 @@ async function scanSnapshot(
         } else {
           oversizedLineBytes += newlineIndex;
           const recovery = await appendOversizedEntry(handle, entries, oversizedLineOffset, oversizedLineBytes, lineNumber);
+          skippedLines += 1;
           onLineSkipped?.({
             reason: 'oversized',
             offset: oversizedLineOffset,
@@ -968,7 +979,7 @@ async function scanSnapshot(
   return {
     entries,
     skippedLines,
-    incomplete: partial.length > 0 || discardingOversizedLine,
+    incomplete: partial.length > 0 || discardingOversizedLine || position < snapshot.size,
     committedSize,
     snapshot,
     peakHeapBytes,
@@ -993,6 +1004,7 @@ async function buildDirect(filePath: string, options: BuildOptions): Promise<Tra
       scanned.entries,
       scanned.skippedLines,
       scanned.committedSize,
+      projectionVariantKeyFor(options.resumeAtMessageId, options.maxLineBytes ?? DEFAULT_MAX_LINE_BYTES),
       options.resumeAtMessageId,
       options.signal,
     );
@@ -1010,8 +1022,22 @@ const MAX_COMPLETED_INDEX_METADATA_BYTES = 128 * 1024 * 1024;
 /** Only successful builds enter the completed cache; failed results are never cached. */
 type CompletedCacheEntry = Exclude<TranscriptIndexResult, { status: 'failed' }>;
 const completed = new Map<string, CompletedCacheEntry>();
-const inFlight = new Map<string, Promise<TranscriptIndexResult>>();
+interface BuildSubscription {
+  options: BuildOptions;
+  finish: (result: TranscriptIndexResult) => void;
+}
+
+interface BuildFlight {
+  controller: AbortController;
+  subscribers: Set<BuildSubscription>;
+  promise: Promise<TranscriptIndexResult>;
+  settled: boolean;
+  temporaryIndex?: TranscriptHistoryIndex;
+}
+
+const inFlight = new Map<string, BuildFlight>();
 const protectedPaths = new Map<string, number>();
+const protectedIndexes = new Map<TranscriptHistoryIndex, number>();
 
 function touchCompleted(key: string, result: CompletedCacheEntry): void {
   completed.delete(key);
@@ -1019,6 +1045,7 @@ function touchCompleted(key: string, result: CompletedCacheEntry): void {
 }
 
 function isProtectedCompletedKey(key: string, result: CompletedCacheEntry): boolean {
+  if (protectedIndexes.has(result.index)) return true;
   if (!protectedPaths.has(result.index.filePath)) return false;
   const keys = [...completed.entries()]
     .filter(([, candidate]) => candidate.index.filePath === result.index.filePath)
@@ -1029,6 +1056,7 @@ function isProtectedCompletedKey(key: string, result: CompletedCacheEntry): bool
 function estimateIndexMetadataBytes(result: CompletedCacheEntry): number {
   const index = result.index;
   return index.searchText.length * 2
+    + index.projectionVariantKey.length * 2
     + index.entries.length * 192
     + index.turns.length * 64
     + index.searchCorpus.length * 80
@@ -1054,23 +1082,37 @@ function evictCompleted(): void {
   }
 }
 
+function snapshotIdentity(
+  filePath: string,
+  snapshot: { dev: number; ino: number; size: number; mtimeMs: number; ctimeMs: number },
+): string {
+  return JSON.stringify([filePath, snapshot.dev, snapshot.ino, snapshot.size, snapshot.mtimeMs, snapshot.ctimeMs]);
+}
+
 async function snapshotKey(filePath: string): Promise<string> {
-  const info = await stat(filePath);
-  return `${filePath}:${info.dev}:${info.ino}:${info.size}:${info.mtimeMs}`;
+  return snapshotIdentity(filePath, await stat(filePath));
 }
 
-/** Resume projection variant of a build. Truthiness matches finalizeIndex's
- * resume handling, so an empty anchor encodes as plain, never a third variant. */
-function resumeVariantKey(resumeAtMessageId: string | undefined): string {
-  return resumeAtMessageId ? `resume=${resumeAtMessageId}` : 'plain';
+export function builtIndexCacheKey(index: TranscriptHistoryIndex): string {
+  return indexCacheKey(snapshotIdentity(index.filePath, { ...index, size: index.snapshotSize }), index.projectionVariantKey);
 }
 
-/** Cache identity of a built index: snapshot identity plus projection variant.
- * finalizeIndex applies anchor truncation and the oversized-ancestry fail-close
- * only on the resume path, so plain and resume builds of the same snapshot
- * must never share a completed or in-flight entry. */
-function indexCacheKey(snapshot: string, resumeAtMessageId: string | undefined): string {
-  return `${snapshot}:${resumeVariantKey(resumeAtMessageId)}`;
+export function transcriptIndexResultIdentity(result: CompletedCacheEntry): string {
+  return JSON.stringify([builtIndexCacheKey(result.index), result.status, result.index.committedSize,
+    result.status === 'partial' ? result.error : null]);
+}
+
+function isSameScannedSnapshot(reference: CompletedCacheEntry, candidate: TranscriptIndexResult): candidate is CompletedCacheEntry {
+  return candidate.status !== 'failed' && transcriptIndexResultIdentity(candidate) === transcriptIndexResultIdentity(reference);
+}
+
+function projectionVariantKeyFor(resumeAtMessageId: string | undefined, maxLineBytes: number): string {
+  // Preserve finalizeIndex's truthiness without trimming or case normalization.
+  return JSON.stringify([resumeAtMessageId || null, maxLineBytes]);
+}
+
+function indexCacheKey(snapshot: string, projectionVariantKey: string): string {
+  return JSON.stringify([snapshot, projectionVariantKey]);
 }
 
 function serializeWorkerFunction(fn: (...args: never[]) => unknown): string {
@@ -1138,6 +1180,7 @@ function buildInWorker(filePath: string, options: BuildOptions): Promise<Transcr
     const filterActiveBranchEntries = (${serializeWorkerFunction(filterActiveBranchEntries)});
     const finalizeIndex = (${serializeWorkerFunction(finalizeIndex)});
     const scanSnapshot = (${serializeWorkerFunction(scanSnapshot)});
+    const projectionVariantKeyFor = (${serializeWorkerFunction(projectionVariantKeyFor)});
     const buildDirect = (${serializeWorkerFunction(buildDirect)});
     // ts-jest CJS output references imported symbols through module namespaces
     // (name_1.symbol); alias them so the serialized sources resolve in both
@@ -1154,7 +1197,7 @@ function buildInWorker(filePath: string, options: BuildOptions): Promise<Transcr
     buildDirect(workerData.filePath, options).then(result => parentPort.postMessage({ kind: 'result', result }), error => parentPort.postMessage({ kind: 'result', result: { status: 'failed', error: String(error) } }));
   `;
   return new Promise((resolve, reject) => {
-    const { onProgress: _, onFinalize: __, onLineSkipped: ____, signal: ___, ...workerOptions } = options;
+    const { onProgress: _, onFinalize: __, onLineSkipped: ____, onIndex: _____, signal: ___, ...workerOptions } = options;
     const worker = new Worker(source, { eval: true, workerData: { filePath, options: { ...workerOptions, useWorker: false } } });
     let settled = false;
     const finish = (result: TranscriptIndexResult): void => {
@@ -1194,7 +1237,88 @@ function buildInWorker(filePath: string, options: BuildOptions): Promise<Transcr
   });
 }
 
-const requests = new Map<string, Promise<TranscriptIndexResult>>();
+const requests = new Map<string, BuildFlight>();
+
+function failedBuildResult(error: unknown): TranscriptIndexResult {
+  return { status: 'failed', error: error instanceof Error ? error.message : String(error) };
+}
+
+function retainFlightIndex(flight: BuildFlight, index: TranscriptHistoryIndex): void {
+  if (flight.controller.signal.aborted || flight.subscribers.size === 0 || flight.temporaryIndex === index) return;
+  protectTranscriptIndex(index);
+  const previous = flight.temporaryIndex;
+  flight.temporaryIndex = index;
+  if (previous) releaseTranscriptIndex(previous);
+}
+
+function releaseFlightIndex(flight: BuildFlight): void {
+  if (flight.subscribers.size > 0 || !flight.temporaryIndex) return;
+  const index = flight.temporaryIndex;
+  flight.temporaryIndex = undefined;
+  releaseTranscriptIndex(index);
+}
+
+function dispatchBuildCallback(flight: BuildFlight, call: (options: BuildOptions) => void): void {
+  for (const subscriber of [...flight.subscribers]) {
+    if (!flight.subscribers.has(subscriber)) continue;
+    try { call(subscriber.options); }
+    catch (error) { subscriber.finish(failedBuildResult(error)); }
+  }
+}
+
+function createBuildFlight(
+  run: (options: BuildOptions, flight: BuildFlight) => Promise<TranscriptIndexResult>,
+  remove: (flight: BuildFlight) => void,
+  publish?: (flight: BuildFlight, result: TranscriptIndexResult) => void,
+): BuildFlight {
+  const controller = new AbortController();
+  const flight: BuildFlight = { controller, subscribers: new Set(), settled: false, promise: undefined! };
+  controller.signal.addEventListener('abort', () => remove(flight), { once: true });
+  const options: BuildOptions = {
+    signal: controller.signal,
+    onProgress: (bytes, total) => dispatchBuildCallback(flight, subscriber => subscriber.onProgress?.(bytes, total)),
+    onFinalize: () => dispatchBuildCallback(flight, subscriber => subscriber.onFinalize?.()),
+    onLineSkipped: event => dispatchBuildCallback(flight, subscriber => subscriber.onLineSkipped?.(event)),
+    onIndex: index => retainFlightIndex(flight, index),
+  };
+  // Subscribe before starting discovery/build, including same-tick cancellation.
+  flight.promise = Promise.resolve().then(() => run(options, flight)).catch(failedBuildResult).then(result => {
+    flight.settled = true;
+    if (result.status !== 'failed') retainFlightIndex(flight, result.index);
+    publish?.(flight, result);
+    remove(flight);
+    releaseFlightIndex(flight);
+    return result;
+  });
+  return flight;
+}
+
+function subscribeBuildFlight(flight: BuildFlight, options: BuildOptions): Promise<TranscriptIndexResult> {
+  return new Promise(resolve => {
+    let settled = false;
+    const finish = (result: TranscriptIndexResult): void => {
+      if (settled) return;
+      settled = true;
+      options.signal?.removeEventListener('abort', abort);
+      if (result.status !== 'failed') {
+        // Each successor flight/lease retains synchronously, before its
+        // predecessor drops the exact-instance handoff protection.
+        try { options.onIndex?.(result.index); }
+        catch (error) { result = failedBuildResult(error); }
+      }
+      flight.subscribers.delete(subscriber);
+      if (!flight.settled && flight.subscribers.size === 0) flight.controller.abort();
+      releaseFlightIndex(flight);
+      resolve(result);
+    };
+    const subscriber: BuildSubscription = { options: { ...options }, finish };
+    const abort = (): void => finish({ status: 'failed', error: 'History index build aborted' });
+    flight.subscribers.add(subscriber);
+    options.signal?.addEventListener('abort', abort, { once: true });
+    if (options.signal?.aborted) abort();
+    void flight.promise.then(finish);
+  });
+}
 
 export interface TranscriptIndexDiagnosticEvent {
   phase: 'index_worker_fallback' | 'queued' | 'start' | 'progress' | 'finalize' | 'complete' | 'failed' | 'aborted' | 'stalled' | 'cache_hit' | 'cache_evict' | 'cache_overcommit' | 'line_skipped';
@@ -1377,89 +1501,146 @@ export function resetTranscriptIndexWorkerProbe(): void {
   workerProbe = null;
 }
 
+async function runPhysicalBuild(filePath: string, options: BuildOptions): Promise<TranscriptIndexResult> {
+  if (options.useWorker === false || !await probeWorkerAvailability()) {
+    return scheduleDirectBuild(filePath, options);
+  }
+  const queuedAt = performance.now();
+  const buildId = `index-${Date.now().toString(36)}-${(++buildSequence).toString(36)}`;
+  diagnosticSink?.({ phase: 'queued', buildId, mode: 'worker' });
+  try {
+    return await observeBuild(buildId, 'worker', queuedAt, options, observed => buildInWorker(filePath, observed), false);
+  } catch (error) {
+    if (options.signal?.aborted) throw error;
+    workerAvailability = false;
+    recordWorkerFallback(error);
+    return scheduleDirectBuild(filePath, options, buildId);
+  }
+}
+
 export function buildTranscriptIndex(filePath: string, options: BuildOptions = {}): Promise<TranscriptIndexResult> {
-  // The request key reuses the same variant encoding as the snapshot cache
-  // identity below so the layers can never drift into separate rule sets.
-  const requestKey = `${filePath}:${options.chunkSize ?? DEFAULT_CHUNK_SIZE}:${options.maxLineBytes ?? DEFAULT_MAX_LINE_BYTES}:${options.useWorker !== false}:${resumeVariantKey(options.resumeAtMessageId)}`;
+  // A flight's variant and scan options cannot change while source observation awaits IO.
+  options = { ...options };
+  if (options.signal?.aborted) {
+    diagnosticSink?.({ phase: 'aborted', mode: options.useWorker === false ? 'direct' : undefined, errorName: 'AbortError' });
+    return Promise.resolve({ status: 'failed', error: 'History index build aborted' });
+  }
+  const chunkSize = options.chunkSize === undefined ? DEFAULT_CHUNK_SIZE : options.chunkSize;
+  const maxLineBytes = options.maxLineBytes === undefined ? DEFAULT_MAX_LINE_BYTES : options.maxLineBytes;
+  for (const [name, value] of [['chunkSize', chunkSize], ['maxLineBytes', maxLineBytes]] as const) {
+    if (!Number.isSafeInteger(value) || value <= 0) {
+      return Promise.resolve({ status: 'failed', error: `Invalid history index ${name}: expected a positive finite safe integer` });
+    }
+  }
+  options = { ...options, chunkSize, maxLineBytes };
+  const projectionVariantKey = projectionVariantKeyFor(options.resumeAtMessageId, maxLineBytes);
+  const requestKey = JSON.stringify([filePath, chunkSize, options.useWorker !== false, projectionVariantKey]);
   const existingRequest = requests.get(requestKey);
-  if (existingRequest) return existingRequest;
-  const request = snapshotKey(filePath).then(snapshot => {
-    const key = indexCacheKey(snapshot, options.resumeAtMessageId);
+  if (!options.forceNewSnapshot && existingRequest && !existingRequest.controller.signal.aborted) {
+    return subscribeBuildFlight(existingRequest, options);
+  }
+  const request = createBuildFlight(async (requestOptions, requestFlight) => {
+    const snapshot = await snapshotKey(filePath);
+    throwIfAborted(requestOptions.signal);
+    const key = indexCacheKey(snapshot, projectionVariantKey);
     const cached = completed.get(key);
     if (cached) {
+      retainFlightIndex(requestFlight, cached.index);
       touchCompleted(key, cached);
       diagnosticSink?.({ phase: 'cache_hit' });
-      // Mark on a copy: the stored object stays pristine so this caller's
-      // "served without a rescan" flag never leaks into other consumers of
-      // the same completed entry.
-      const served: TranscriptIndexResult = { ...cached, fromCache: true };
-      return served;
+      return { ...cached, fromCache: true };
     }
-    const existing = inFlight.get(key);
-    if (existing) return existing;
-    const build = (async (): Promise<TranscriptIndexResult> => {
-      if (options.useWorker === false || !await probeWorkerAvailability()) {
-        return scheduleDirectBuild(filePath, options);
-      }
-      try {
-        const queuedAt = performance.now();
-        const buildId = `index-${Date.now().toString(36)}-${(++buildSequence).toString(36)}`;
-        diagnosticSink?.({ phase: 'queued', buildId, mode: 'worker' });
-        try {
-          return await observeBuild(buildId, 'worker', queuedAt, options, observed => buildInWorker(filePath, observed), false);
-        } catch (error) {
-          workerAvailability = false;
-          recordWorkerFallback(error);
-          return scheduleDirectBuild(filePath, options, buildId);
+    let build = inFlight.get(key);
+    if (!build || build.controller.signal.aborted) {
+      const ownedKeys = new Set([key]);
+      build = createBuildFlight(async (subscriptionOptions, flight) => {
+        // Physical build cancellation belongs to the flight, never to the
+        // first caller. Request flights are themselves independent subscribers.
+        const result = await runPhysicalBuild(filePath, { ...options, ...subscriptionOptions });
+        if (result.status !== 'failed') {
+          // Worker structured cloning does not preserve property descriptors.
+          Object.defineProperty(result.index, 'projectionVariantKey', {
+            value: result.index.projectionVariantKey, enumerable: true, writable: false, configurable: false,
+          });
         }
-      } catch (error) {
-        return { status: 'failed', error: error instanceof Error ? error.message : String(error) };
-      }
-    })();
-    inFlight.set(key, build);
-    // Same supersede race as the request cache below, one layer deeper: an
-    // aborted build only settles after its scanSnapshot close() IO completes,
-    // so a same-tick rebuild would otherwise join the doomed in-flight build.
-    const removeInFlight = (): void => {
-      if (inFlight.get(key) === build) inFlight.delete(key);
-    };
-    options.signal?.addEventListener('abort', removeInFlight, { once: true });
-    void build.then(result => {
-      options.signal?.removeEventListener('abort', removeInFlight);
-      inFlight.delete(key);
-      if (result.status !== 'failed') {
-        touchCompleted(key, result);
+        if (result.status === 'failed' || flight.controller.signal.aborted) return result;
+        const actualKey = builtIndexCacheKey(result.index);
+        if (actualKey === key) return result;
+        // The source changed between pre-observation and open/stat. Retire the
+        // predicted identity before following an actual-key owner: followers
+        // are no longer discoverable, so identity reconciliation cannot cycle.
+        if (inFlight.get(key) === flight) inFlight.delete(key);
+        // Keep our proven result pinned while a predicted owner is still in IO.
+        // Its eventual success/failure cannot change our snapshot or boundary.
+        retainFlightIndex(flight, result.index);
+        while (true) {
+          throwIfAborted(subscriptionOptions.signal);
+          const actualCached = completed.get(actualKey);
+          if (actualCached) {
+            if (!isSameScannedSnapshot(result, actualCached)) return result;
+            retainFlightIndex(flight, actualCached.index);
+            touchCompleted(actualKey, actualCached);
+            // We did scan, so fromCache stays absent despite instance reuse.
+            return actualCached;
+          }
+          const candidate = inFlight.get(actualKey);
+          if (!candidate || candidate === flight || candidate.controller.signal.aborted) {
+            ownedKeys.add(actualKey);
+            inFlight.set(actualKey, flight);
+            return result;
+          }
+          let candidatePin: TranscriptHistoryIndex | undefined;
+          try {
+            const candidateResult = await subscribeBuildFlight(candidate, {
+              // No callback replay. Retain the candidate separately through
+              // verification; never replace our proven pin on a prediction.
+              signal: subscriptionOptions.signal,
+              onIndex: index => { protectTranscriptIndex(index); candidatePin = index; },
+            });
+            throwIfAborted(subscriptionOptions.signal);
+            if (isSameScannedSnapshot(result, candidateResult)) {
+              retainFlightIndex(flight, candidateResult.index);
+              return candidateResult;
+            }
+          } finally {
+            if (candidatePin) releaseTranscriptIndex(candidatePin);
+          }
+          // A settled candidate removed/rekeyed only its own identities. Observe
+          // the now-vacant or reassigned slot, without rescanning or stealing it.
+          // A failed/different candidate's result is never returned to our callers.
+        }
+      }, flight => {
+        for (const ownedKey of ownedKeys) {
+          if (inFlight.get(ownedKey) === flight) inFlight.delete(ownedKey);
+        }
+      }, (flight, result) => {
+        if (result.status === 'failed' || flight.controller.signal.aborted) return;
+        const actualKey = builtIndexCacheKey(result.index);
+        // A retired/aborting build can neither overwrite nor remove its replacement.
+        if (inFlight.get(actualKey) !== flight) return;
+        touchCompleted(actualKey, result);
         evictCompleted();
-      }
-    });
-    return build;
+      });
+      inFlight.set(key, build);
+    }
+    return subscribeBuildFlight(build, requestOptions);
+  }, flight => {
+    if (requests.get(requestKey) === flight) requests.delete(requestKey);
   });
   requests.set(requestKey, request);
-  // A supersede caller aborts the old controller and synchronously starts a
-  // new build for the same request key; the .finally cleanup below only runs
-  // on a later microtask, so the doomed entry must leave the shared cache
-  // inside the abort listener itself.
-  const removeRequest = (): void => {
-    if (requests.get(requestKey) === request) requests.delete(requestKey);
-  };
-  options.signal?.addEventListener('abort', removeRequest, { once: true });
-  void request.finally(() => {
-    options.signal?.removeEventListener('abort', removeRequest);
-    removeRequest();
-  });
-  return request;
+  return subscribeBuildFlight(request, options);
 }
 
 async function readIndexEntries(
   index: TranscriptHistoryIndex,
   entries: TranscriptIndexEntry[],
 ): Promise<SDKNativeMessage[]> {
-  const info = await stat(index.filePath);
-  if (info.dev !== index.dev || info.ino !== index.ino || info.size < index.snapshotSize) {
-    throw new Error('Transcript index invalidated by replacement or truncation');
-  }
   const handle = await open(index.filePath, 'r');
   try {
+    const info = await handle.stat();
+    if (info.dev !== index.dev || info.ino !== index.ino || info.size < index.snapshotSize) {
+      throw new Error('Transcript index invalidated by replacement or truncation');
+    }
     const messages: SDKNativeMessage[] = [];
     for (const entry of entries) {
       // Oversized lines are never read back — that read is the exact failure
@@ -1521,14 +1702,21 @@ export async function materializeTranscriptToolAssociations(
   return [...pageEntries, ...extras.filter(message => !message.uuid || !byUuid.has(message.uuid))];
 }
 
-export function protectTranscriptIndex(filePath: string): void {
-  protectedPaths.set(filePath, (protectedPaths.get(filePath) ?? 0) + 1);
+export function protectTranscriptIndex(index: TranscriptHistoryIndex | string): void {
+  if (typeof index === 'string') protectedPaths.set(index, (protectedPaths.get(index) ?? 0) + 1);
+  else protectedIndexes.set(index, (protectedIndexes.get(index) ?? 0) + 1);
 }
 
-export function releaseTranscriptIndex(filePath: string): void {
-  const count = protectedPaths.get(filePath) ?? 0;
-  if (count <= 1) protectedPaths.delete(filePath);
-  else protectedPaths.set(filePath, count - 1);
+export function releaseTranscriptIndex(index: TranscriptHistoryIndex | string): void {
+  if (typeof index === 'string') {
+    const count = protectedPaths.get(index) ?? 0;
+    if (count <= 1) protectedPaths.delete(index);
+    else protectedPaths.set(index, count - 1);
+  } else {
+    const count = protectedIndexes.get(index) ?? 0;
+    if (count <= 1) protectedIndexes.delete(index);
+    else protectedIndexes.set(index, count - 1);
+  }
   evictCompleted();
 }
 

@@ -12,9 +12,10 @@ import type {
 import type { AuxQueryRunner } from './AuxQueryRunner';
 
 export class QueryBackedInlineEditService implements InlineEditService {
-  private abortController: AbortController | null = null;
+  private conversationToken = 0;
   private hasConversation = false;
   private modelOverride: string | undefined;
+  private readonly pendingControllers = new Set<AbortController>();
 
   constructor(private readonly runner: AuxQueryRunner) {}
 
@@ -24,8 +25,11 @@ export class QueryBackedInlineEditService implements InlineEditService {
   }
 
   resetConversation(): void {
-    this.runner.reset();
+    // Invalidation precedes local clearing, which precedes runner teardown, so
+    // any completion that a reset unblocks can never publish stale state.
+    this.conversationToken += 1;
     this.hasConversation = false;
+    this.runner.reset();
   }
 
   async editText(request: InlineEditRequest): Promise<InlineEditResult> {
@@ -46,20 +50,25 @@ export class QueryBackedInlineEditService implements InlineEditService {
   }
 
   cancel(): void {
-    this.abortController?.abort();
-    this.abortController = null;
+    for (const abortController of this.pendingControllers) {
+      abortController.abort();
+    }
   }
 
   private async sendMessage(prompt: string): Promise<InlineEditResult> {
-    this.abortController = new AbortController();
+    const conversationToken = this.conversationToken;
+    const abortController = new AbortController();
+    this.pendingControllers.add(abortController);
 
     try {
       const text = await this.runner.query({
-        abortController: this.abortController,
+        abortController,
         model: this.modelOverride,
         systemPrompt: getInlineEditSystemPrompt(),
       }, prompt);
-      this.hasConversation = true;
+      if (this.canPublishCompletion(conversationToken, abortController)) {
+        this.hasConversation = true;
+      }
       return parseInlineEditResponse(text);
     } catch (error) {
       return {
@@ -67,7 +76,11 @@ export class QueryBackedInlineEditService implements InlineEditService {
         error: error instanceof Error ? error.message : 'Unknown error',
       };
     } finally {
-      this.abortController = null;
+      this.pendingControllers.delete(abortController);
     }
+  }
+
+  private canPublishCompletion(conversationToken: number, abortController: AbortController): boolean {
+    return conversationToken === this.conversationToken && !abortController.signal.aborted;
   }
 }

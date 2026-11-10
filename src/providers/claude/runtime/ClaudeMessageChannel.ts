@@ -266,6 +266,30 @@ export class MessageChannel implements AsyncIterable<SDKUserMessage> {
     this.resolveNext = null;
   }
 
+  /**
+   * Takes every still-queued item out, preserving order, canonical UUIDs,
+   * host aliases, merged payloads, and attachment-replacement results. The
+   * lease is untouched — retirement closes the input afterwards; the rebuild
+   * restores these items onto the NEW channel verbatim (no replay of the
+   * already-dispatched input).
+   */
+  extractUnsentQueue(): PendingMessage[] {
+    const items = this.queue;
+    this.queue = [];
+    return items;
+  }
+
+  /** Puts previously extracted items back in order; a waiting consumer picks up immediately. */
+  restoreQueue(items: PendingMessage[]): void {
+    if (this.closed || items.length === 0) {
+      return;
+    }
+    for (const item of items) {
+      this.queue.push(item);
+    }
+    this.deliverNextIfWaiting();
+  }
+
   getQueueLength(): number {
     return this.queue.length;
   }
@@ -341,18 +365,29 @@ export class MessageChannel implements AsyncIterable<SDKUserMessage> {
     message: SDKUserMessage,
     hostTurnIds: string[],
   ): DequeuedTurnInfo {
+    return this.describeDispatch(leaseTurnId, message, hostTurnIds, this.extractTextContent(message));
+  }
+
+  private describePending(pending: PendingMessage): DequeuedTurnInfo {
+    // The FINAL sent payload decides the command kind — queue merges may have
+    // appended text after the original /compact was prepared.
+    const finalText = pending.type === 'text' ? pending.content : '';
+    return this.describeDispatch(pending.turnId, pending.message, pending.hostTurnIds, finalText);
+  }
+
+  /** All three dequeue paths report the REAL dispatch description (fix 3). */
+  private describeDispatch(
+    leaseTurnId: string,
+    message: SDKUserMessage,
+    hostTurnIds: string[],
+    finalText: string,
+  ): DequeuedTurnInfo {
     return {
       leaseTurnId,
       canonicalTurnId: message.uuid ?? '',
       hostTurnIds,
-    };
-  }
-
-  private describePending(pending: PendingMessage): DequeuedTurnInfo {
-    return {
-      leaseTurnId: pending.turnId,
-      canonicalTurnId: pending.message.uuid ?? '',
-      hostTurnIds: pending.hostTurnIds,
+      dispatchedAt: Date.now(),
+      isManualCompact: /^\/compact(\s|$)/i.test(finalText.trim()),
     };
   }
 

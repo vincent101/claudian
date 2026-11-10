@@ -760,4 +760,197 @@ describe('MentionDropdownController', () => {
       localController.destroy();
     });
   });
+
+  // Destroy is terminal: every asynchronous entry point must check it before
+  // registering a timer, mutating the input, or re-rendering the dropdown.
+  // A stale callback (debounce fire, pre-scan timer, detached item click,
+  // Escape return-to-first-level) must never revive a destroyed controller.
+  describe('terminal lifecycle protection', () => {
+    it('destroy is idempotent and tears the dropdown down once', () => {
+      inputEl.value = '@';
+      inputEl.selectionStart = 1;
+      controller.handleInputChange();
+
+      controller.destroy();
+      controller.destroy();
+
+      const instance = getLatestDropdownInstance();
+      expect(instance.destroy).toHaveBeenCalledTimes(1);
+    });
+
+    it('does not register a new debounce timer after destroy', () => {
+      const agentService = createMockAgentService([
+        { id: 'Explore', name: 'Explore', source: 'builtin' },
+      ]);
+      controller.setAgentService(agentService);
+
+      controller.destroy();
+      inputEl.value = '@E';
+      inputEl.selectionStart = 2;
+      controller.handleInputChange();
+      jest.advanceTimersByTime(500);
+
+      expect(agentService.searchAgents).not.toHaveBeenCalled();
+      const instance = getLatestDropdownInstance();
+      expect(instance.render).not.toHaveBeenCalled();
+    });
+
+    it('clears a registered pre-scan timer on destroy', () => {
+      const { externalContextScanner } = jest.requireMock('@/utils/externalContextScanner');
+      (externalContextScanner.scanPaths as jest.Mock).mockClear();
+      (callbacks.getExternalContexts as jest.Mock).mockReturnValue(['/external']);
+
+      controller.preScanExternalContexts();
+      controller.destroy();
+      jest.runAllTimers();
+
+      expect((externalContextScanner.scanPaths as jest.Mock).mock.calls.length).toBe(0);
+    });
+
+    it('does not register a pre-scan timer after destroy', () => {
+      const { externalContextScanner } = jest.requireMock('@/utils/externalContextScanner');
+      (externalContextScanner.scanPaths as jest.Mock).mockClear();
+      controller.destroy();
+      (callbacks.getExternalContexts as jest.Mock).mockReturnValue(['/external']);
+
+      controller.preScanExternalContexts();
+      jest.runAllTimers();
+
+      expect((externalContextScanner.scanPaths as jest.Mock).mock.calls.length).toBe(0);
+    });
+
+    it('a stale rendered item click cannot reselect or mutate the input after destroy', () => {
+      const onAttachFile = jest.fn();
+      (callbacks as any).onAttachFile = onAttachFile;
+      (callbacks.getCachedVaultFiles as jest.Mock).mockReturnValue([
+        { path: 'note.md', name: 'note.md', stat: { mtime: 1 } },
+      ]);
+      inputEl.value = '@note';
+      inputEl.selectionStart = 5;
+      controller.handleInputChange();
+      jest.advanceTimersByTime(200);
+
+      const renderOptions = getLatestDropdownRenderOptions();
+      expect(renderOptions).toBeTruthy();
+      const instance = getLatestDropdownInstance();
+      const rendersBefore = (instance.render as jest.Mock).mock.calls.length;
+      const itemsBefore = renderOptions.items.length;
+      expect(itemsBefore).toBeGreaterThan(0);
+
+      controller.destroy();
+      renderOptions.onItemClick(
+        { type: 'file', name: 'note.md', path: 'note.md', file: { path: 'note.md' } },
+        0,
+        { stopPropagation: jest.fn() } as any,
+      );
+
+      expect(inputEl.value).toBe('@note');
+      expect(onAttachFile).not.toHaveBeenCalled();
+      expect((instance.render as jest.Mock).mock.calls.length).toBe(rendersBefore);
+    });
+
+    it('a stale agent-folder callback cannot reopen the agents submenu after destroy', () => {
+      const agentService = createMockAgentService([
+        { id: 'Explore', name: 'Explore', source: 'builtin' },
+      ]);
+      controller.setAgentService(agentService);
+      inputEl.value = '@';
+      inputEl.selectionStart = 1;
+      controller.handleInputChange();
+      jest.advanceTimersByTime(200);
+
+      const renderOptions = getLatestDropdownRenderOptions();
+      const agentFolderItem = renderOptions.items.find((item: any) => item.type === 'agent-folder');
+      expect(agentFolderItem).toBeDefined();
+      const instance = getLatestDropdownInstance();
+      const rendersBefore = (instance.render as jest.Mock).mock.calls.length;
+
+      controller.destroy();
+      renderOptions.onItemClick(agentFolderItem, 0, { stopPropagation: jest.fn() } as any);
+
+      expect((instance.render as jest.Mock).mock.calls.length).toBe(rendersBefore);
+      // Only the initial hasAgents probe ran; the submenu path never re-fired.
+      expect(agentService.searchAgents).toHaveBeenCalledTimes(1);
+    });
+
+    it('a stale hover callback cannot mutate selection after destroy', () => {
+      (callbacks.getCachedVaultFiles as jest.Mock).mockReturnValue([
+        { path: 'note.md', name: 'note.md', stat: { mtime: 1 } },
+      ]);
+      inputEl.value = '@';
+      inputEl.selectionStart = 1;
+      controller.handleInputChange();
+      jest.advanceTimersByTime(200);
+
+      const renderOptions = getLatestDropdownRenderOptions();
+      const instance = getLatestDropdownInstance();
+      const rendersBefore = (instance.render as jest.Mock).mock.calls.length;
+
+      controller.destroy();
+      expect(() => {
+        renderOptions.onItemHover(renderOptions.items[0], 1);
+      }).not.toThrow();
+      expect((instance.render as jest.Mock).mock.calls.length).toBe(rendersBefore);
+    });
+
+    it('handleKeydown returns false for Enter after destroy even if the dropdown stays visible', () => {
+      mockDropdownVisible = true;
+      controller.destroy();
+
+      const enterEvent = { key: 'Enter', preventDefault: jest.fn(), isComposing: false } as any;
+      expect(controller.handleKeydown(enterEvent)).toBe(false);
+      expect(enterEvent.preventDefault).not.toHaveBeenCalled();
+    });
+
+    it('handleKeydown does not run the Escape return-to-first-level path after destroy', () => {
+      mockDropdownVisible = true;
+      const agentService = createMockAgentService([
+        { id: 'Explore', name: 'Explore', source: 'builtin' },
+      ]);
+      controller.setAgentService(agentService);
+      inputEl.value = '@Agents/';
+      inputEl.selectionStart = 8;
+      controller.handleInputChange();
+      jest.advanceTimersByTime(200);
+      const instance = getLatestDropdownInstance();
+      const rendersBefore = (instance.render as jest.Mock).mock.calls.length;
+
+      controller.destroy();
+      const escapeEvent = { key: 'Escape', preventDefault: jest.fn(), isComposing: false } as any;
+      expect(controller.handleKeydown(escapeEvent)).toBe(false);
+      expect(escapeEvent.preventDefault).not.toHaveBeenCalled();
+      expect((instance.render as jest.Mock).mock.calls.length).toBe(rendersBefore);
+    });
+
+    it('does not propagate MCP mention updates after destroy', () => {
+      const mcpManager = createMockMcpService([{ name: 'test' }]);
+      controller.setMcpManager(mcpManager);
+
+      controller.destroy();
+      controller.updateMcpMentionsFromText('@test');
+
+      expect(callbacks.setMentionedMcpServers).not.toHaveBeenCalled();
+      expect(mcpManager.getContextSavingServers).not.toHaveBeenCalled();
+    });
+
+    it('destroying one controller does not affect a fresh controller instance', () => {
+      controller.destroy();
+
+      const freshInput = createMockInput();
+      const freshCallbacks = createMockCallbacks();
+      const freshController = new MentionDropdownController(
+        createMockEl(),
+        freshInput,
+        freshCallbacks,
+      );
+      freshInput.value = '@a';
+      freshInput.selectionStart = 2;
+      freshController.handleInputChange();
+      jest.advanceTimersByTime(200);
+
+      const instance = getLatestDropdownInstance();
+      expect((instance.render as jest.Mock).mock.calls.length).toBe(1);
+      freshController.destroy();
+    });
+  });
 });

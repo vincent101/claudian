@@ -4,6 +4,8 @@ import { Notice } from 'obsidian';
 import { SESSIONS_PATH, SessionStorage } from '../../core/bootstrap/SessionStorage';
 import type { SharedAppStorage } from '../../core/bootstrap/storage';
 import { CLAUDIAN_STORAGE_PATH } from '../../core/bootstrap/StoragePaths';
+import type { AppTabManagerState } from '../../core/providers/types';
+import { PersistenceCoordinator, TAB_LAYOUT_RESOURCE } from '../../core/storage/PersistenceCoordinator';
 import { VaultFileAdapter } from '../../core/storage/VaultFileAdapter';
 import { ClaudianSettingsStorage, type StoredClaudianSettings } from '../settings/ClaudianSettingsStorage';
 
@@ -13,12 +15,17 @@ export class SharedStorageService implements SharedAppStorage {
 
   private adapter: VaultFileAdapter;
   private plugin: Plugin;
+  private readonly persistence: PersistenceCoordinator;
 
   constructor(plugin: Plugin) {
     this.plugin = plugin;
     this.adapter = new VaultFileAdapter(plugin.app);
+    // Same-host write ordering (S slice): the coordinator is shared with the
+    // provider StorageService over the same app, so layout RMWs and metadata
+    // writes serialize across both services.
+    this.persistence = PersistenceCoordinator.forHost(plugin.app);
     this.claudianSettings = new ClaudianSettingsStorage(this.adapter);
-    this.sessions = new SessionStorage(this.adapter);
+    this.sessions = new SessionStorage(this.adapter, this.persistence);
   }
 
   async initialize(): Promise<{ claudian: Record<string, unknown> }> {
@@ -31,18 +38,26 @@ export class SharedStorageService implements SharedAppStorage {
     await this.claudianSettings.save(settings as StoredClaudianSettings);
   }
 
-  async setTabManagerState(state: { openTabs: Array<{ tabId: string; conversationId: string | null; draftModel?: string | null }>; activeTabId: string | null }): Promise<void> {
+  async setTabManagerState(state: AppTabManagerState): Promise<void> {
     try {
-      const data = (await this.plugin.loadData()) || {};
-      data.tabManagerState = state;
-      await this.plugin.saveData(data);
+      // The whole loadData→merge→saveData RMW is one lane job: concurrent
+      // layout saves (or one racing a provider-service save on the same app)
+      // can no longer interleave their reads before each other's writes.
+      await this.persistence.enqueue(TAB_LAYOUT_RESOURCE, async () => {
+        const data = (await this.plugin.loadData()) || {};
+        data.tabManagerState = state;
+        await this.plugin.saveData(data);
+      });
     } catch {
       new Notice('Failed to save tab layout');
     }
   }
 
-  async getTabManagerState(): Promise<{ openTabs: Array<{ tabId: string; conversationId: string | null; draftModel?: string | null }>; activeTabId: string | null } | null> {
+  async getTabManagerState(): Promise<AppTabManagerState | null> {
     try {
+      // Read barrier: a reopen read must observe layout saves already admitted
+      // on this host, including unload-style writes the host never awaited.
+      await this.persistence.drain(TAB_LAYOUT_RESOURCE);
       const data = await this.plugin.loadData();
       if (!data?.tabManagerState) {
         return null;
@@ -63,7 +78,7 @@ export class SharedStorageService implements SharedAppStorage {
     await this.adapter.ensureFolder(SESSIONS_PATH);
   }
 
-  private validateTabManagerState(data: unknown): { openTabs: Array<{ tabId: string; conversationId: string | null; draftModel?: string | null }>; activeTabId: string | null } | null {
+  private validateTabManagerState(data: unknown): AppTabManagerState | null {
     if (!data || typeof data !== 'object') {
       return null;
     }
@@ -73,7 +88,7 @@ export class SharedStorageService implements SharedAppStorage {
       return null;
     }
 
-    const validatedTabs: Array<{ tabId: string; conversationId: string | null; draftModel?: string | null }> = [];
+    const validatedTabs: AppTabManagerState['openTabs'] = [];
     for (const tab of state.openTabs) {
       if (!tab || typeof tab !== 'object') {
         continue;
@@ -89,6 +104,9 @@ export class SharedStorageService implements SharedAppStorage {
         conversationId: typeof tabObj.conversationId === 'string' ? tabObj.conversationId : null,
         ...(typeof tabObj.draftModel === 'string'
           ? { draftModel: tabObj.draftModel }
+          : {}),
+        ...(typeof tabObj.draftProviderId === 'string' && tabObj.draftProviderId.trim()
+          ? { draftProviderId: tabObj.draftProviderId }
           : {}),
       });
     }

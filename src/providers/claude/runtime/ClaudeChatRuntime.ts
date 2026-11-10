@@ -25,11 +25,19 @@ import { query as agentQuery } from '@anthropic-ai/claude-agent-sdk';
 import { Notice } from 'obsidian';
 
 import type { McpServerManager } from '../../../core/mcp/McpServerManager';
+import type {
+  CommandDiscoveryToken,
+  CommandRuntimeEligibility,
+  QueryCommandSourceReceipt,
+  RuntimeCommandDiscovery,
+  RuntimeCommandRead,
+} from '../../../core/providers/commands/ProviderCommandDiscovery';
 import { ProviderSettingsCoordinator } from '../../../core/providers/ProviderSettingsCoordinator';
 import type {
   AppAgentManager,
   AppPluginManager,
   FullHistoryIterable,
+  HistoryTailStart,
 } from '../../../core/providers/types';
 import type { ChatRuntime, HistoryRecoveryStatus } from '../../../core/runtime/ChatRuntime';
 import type {
@@ -61,7 +69,7 @@ import type {
   StreamChunk,
   ToolCallInfo,
 } from '../../../core/types';
-import type { ClaudianSettings, PermissionMode } from '../../../core/types/settings';
+import type { ClaudianSettings } from '../../../core/types/settings';
 import { t } from '../../../i18n/i18n';
 import type ClaudianPlugin from '../../../main';
 import { stripCurrentNoteContext } from '../../../utils/context';
@@ -79,13 +87,17 @@ import { extractXmlTag } from '../history/sdkMessageParsing';
 import { getSDKSessionPath } from '../history/sdkSessionPaths';
 import {
   createStopSubagentHook,
-  type StopHookCircuitBreaker,
   type SubagentHookState,
 } from '../hooks/SubagentHooks';
+import {
+  isClaudePermissionMode,
+  resolveClaudeAppPermissionModeFromSdk,
+  resolveClaudeRuntimePermissionMode,
+  resolveClaudeSdkPermissionModeForRuntime,
+} from '../permissionModes';
 import { encodeClaudeTurn } from '../prompt/ClaudeTurnEncoder';
 import { isSessionInitEvent, isStreamChunk } from '../sdk/typeGuards';
 import type { SessionInitEvent, TransformEvent } from '../sdk/types';
-import { getClaudeProviderSettings } from '../settings';
 import {
   transformSDKMessage,
 } from '../stream/transformClaudeMessage';
@@ -145,8 +157,15 @@ type QueryOptions = ChatRuntimeQueryOptions;
  */
 const RESULT_WATCHDOG_MS = 120_000;
 const RESULT_WATCHDOG_GRACE_MS = 15_000;
+const STOP_TASK_GRACE_MS = 15_000;
+const STOP_TASK_TURN_SILENCE_MS = 30 * 60_000;
+const STOP_TASK_AGENT_MIN_AGE_MS = 2 * 60 * 60 * 1000;
 /** P0-3: escalate an interrupt the CLI never acknowledged. */
 const INTERRUPT_ACK_WATCHDOG_MS = 5_000;
+/** Retirement rebuild: max wait for the old CLI's real process exit. */
+const QUERY_EXIT_CONFIRM_TIMEOUT_MS = 15_000;
+/** Plain user-cancel isolation: how long the old-turn boundary may hold the lease. */
+const CANCEL_BOUNDARY_TIMEOUT_MS = 15_000;
 
 /** Chunk-wait state of the queryViaPersistent generator loop. */
 interface ChunkWaitState {
@@ -154,6 +173,103 @@ interface ChunkWaitState {
   resolveChunk: ((chunk: StreamChunk | null) => void) | null;
   done: boolean;
   error: Error | null;
+}
+
+/**
+ * Independent recovery attempt (2026-11-05 fix 1): the stopTask→interrupt→
+ * cancel chain runs on its OWN timers, decoupled from the generator's
+ * chunk-wait timer. Identity is frozen at creation — turn, generation,
+ * query epoch, evidence revision, CLI version — and every liveness check
+ * re-verifies all of them, so chunks arriving mid-window (the old
+ * resolveChunk-as-recovery-identity bug) can never restart or extend the
+ * chain, and a late stopTask response can never read mutated identity.
+ */
+interface StopTaskRecoveryAttempt {
+  readonly attemptId: number;
+  readonly turnId: string;
+  readonly generation: number;
+  readonly queryEpoch: number | undefined;
+  readonly evidenceRevision: number;
+  readonly cliVersion: string | undefined;
+  phase: 'observing_stop' | 'observing_interrupt' | 'retiring' | 'finished';
+}
+
+/** Frozen diagnostic context for stopTask sends (2026-11-05 fix 4). */
+interface StopTaskDiagnosticSnapshot {
+  turnId: string;
+  generation: number;
+  queryEpoch: number | undefined;
+  attemptId: number | null;
+  cliVersion: string | undefined;
+  sentAt: number;
+}
+
+/**
+ * Query boundary (2026-11-05 fix 2): one scope per persistent query
+ * incarnation. Every consumer/routing/handoff side effect must verify it
+ * still acts on the CURRENT, un-retired scope — a result arriving through an
+ * old consumer must never settle a turn leased by a newer query, and an old
+ * consumer's error/teardown must never act on the new query.
+ */
+type QueryCommandResult =
+  | { status: 'ready'; entries: readonly SlashCommand[] }
+  | { status: 'failed' | 'cancelled' | 'stale' | 'unavailable' };
+
+type QueryCommandWaiter = (result: QueryCommandResult) => void;
+
+interface QueryCommandFlight {
+  readonly waiters: Set<QueryCommandWaiter>;
+}
+
+interface QueryCommandCell {
+  readonly query: Query;
+  state: 'unobserved' | 'pending' | 'ready' | 'revoked';
+  entries: readonly SlashCommand[];
+  lastOutcome: 'failed' | null;
+  flight: QueryCommandFlight | null;
+}
+
+interface QueryScope {
+  readonly epoch: number;
+  readonly query: Query;
+  readonly channel: MessageChannel;
+  readonly abortController: AbortController;
+  readonly commandCell: QueryCommandCell;
+  /** Retired scopes reject routing and block new dispatches (watchdog rebuild). */
+  retired: boolean;
+  /** Prevents a second consumer loop on the same scope. */
+  consumerStarted: boolean;
+  /** Set once this scope's CLI truly exited (spawn exit notification). */
+  exitNotified: boolean;
+}
+
+/**
+ * W4a command-eligibility generation. Kept separate from P1 cell state: every
+ * scope install/replace/revoke/removal mints a new generation, so captured
+ * receipts — including unavailable and failed ones — become invalid the
+ * moment the underlying truth moves. Getter completion does NOT mint one.
+ */
+interface CommandEligibilityGeneration {
+  /** Stable public eligibility object handed out with every typed read. */
+  readonly eligibility: CommandRuntimeEligibility;
+  /** The readable scope/cell this generation certifies; null = absence. */
+  readonly readable: { readonly scope: QueryScope; readonly cell: QueryCommandCell } | null;
+}
+
+/**
+ * W4a per-scope command source observation. Binds an opaque token to the
+ * Query's observation without exposing the SDK Query object. Applied option
+ * dims absent at capture time stay listed in `unknown` and are never
+ * re-derived from the mutable currentConfig.
+ */
+interface QueryCommandSourceMeta {
+  readonly token: CommandDiscoveryToken;
+  readonly scope: QueryScope;
+  readonly cell: QueryCommandCell;
+  cwd?: string;
+  additionalDirectories?: readonly string[];
+  settingSources?: readonly string[];
+  readonly unknown: string[];
 }
 
 function isChatMessageArray(value: unknown): value is ChatMessage[] {
@@ -197,9 +313,12 @@ export class ClaudianService implements ChatRuntime {
   private abortController: AbortController | null = null;
   private approvalCallback: ApprovalCallback | null = null;
   private approvalDismisser: (() => void) | null = null;
+  /** canUseTool callbacks pending on approval, questions, or plan-exit input. */
+  private pendingCanUseToolCount = 0;
   private askUserQuestionCallback: AskUserQuestionCallback | null = null;
   private exitPlanModeCallback: ExitPlanModeCallback | null = null;
-  private permissionModeSyncCallback: ((sdkMode: string) => void) | null = null;
+  /** Receives provider-normalized app permission modes (see setPermissionModeSyncCallback). */
+  private permissionModeSyncCallback: ((appMode: string) => void) | null = null;
   private vaultPath: string | null = null;
   private currentExternalContextPaths: string[] = [];
   private readyStateListeners = new Set<(ready: boolean) => void>();
@@ -231,9 +350,6 @@ export class ClaudianService implements ChatRuntime {
   private crashRecoveryAttempted = false;
   private coldStartInProgress = false;  // Prevent consumer error restarts during cold-start
 
-  // SDK command cache — populated on system/init, cleared on persistent query close
-  private cachedSdkCommands: SlashCommand[] = [];
-
   // SDK-resolved model from system/init (concrete id, not the settings alias).
   // Session-scoped so turns after the first still label usage with what
   // actually serves the query.
@@ -241,10 +357,6 @@ export class ClaudianService implements ChatRuntime {
 
   // Subagent hook state provider (set from feature layer to avoid core→feature dependency)
   private _subagentStateProvider: (() => SubagentHookState) | null = null;
-
-  // Fix 1 (熔断): consecutive Stop-hook blocks since the last allow / user message.
-  private _stopHookConsecutiveBlocks = 0;
-  private static readonly STOP_HOOK_MAX_CONSECUTIVE_BLOCKS = 3;
 
   // Fix 2 (通知直接销账): live task-notification sink (set from feature layer).
   private _subagentNotificationHandler: SubagentTaskNotificationHandler | null = null;
@@ -272,9 +384,54 @@ export class ClaudianService implements ChatRuntime {
   private transcriptObserver: ClaudeTranscriptTurnObserver | null = null;
   private transcriptObserverTarget: string | null = null;
   private transcriptObserverRestartChain: Promise<void> = Promise.resolve();
-  private transcriptObserverStartOffset: number | null = null;
+  private transcriptObserverTailStart: HistoryTailStart | null = null;
   private historyRecoverySource: (() => FullHistoryIterable) | null = null;
   private transcriptDiagnosticLog: ClaudeTranscriptDiagnosticLog | null = null;
+  private transcriptCliVersion: string | undefined;
+  /** Query boundary isolation (2.4): the live persistent-query scope, null when retired/absent. */
+  private currentQueryScope: QueryScope | null = null;
+  // W4a typed command facet: eligibility/source metadata and invalidation
+  // listeners live beside the P1 cell but advance independently of it.
+  private commandDiscoveryFacet: RuntimeCommandDiscovery | null = null;
+  private commandDiscoveryListeners = new Set<() => void>();
+  private commandEligibility: CommandEligibilityGeneration = {
+    eligibility: { token: {}, revision: 0 },
+    readable: null,
+  };
+  private commandSourceRevision = 0;
+  private commandSourceMeta: QueryCommandSourceMeta | null = null;
+  private queryEpochCounter = 0;
+  private stopTaskAttemptCounter = 0;
+  /** Single-flight retirement/rebuild chain: query()/ensureReady() wait on it (2.4 gate). */
+  private queryRetirementChain: Promise<void> | null = null;
+  /** Spawn-exit waiters per query epoch: retirement waits for the REAL exit, not abort flags. */
+  private scopeExitNotifications = new Map<number, { scope: QueryScope; waiters: Array<() => void> }>();
+  /** Latest real dispatch description (observer rebuild restore anchor, fix 3). */
+  private currentDispatchDescriptor: DequeuedTurnInfo | null = null;
+  /** Live host projection turn id (observer rebuild restore, survives async observer start). */
+  private beginUserTurnProjectionTarget: string | null = null;
+  /**
+   * Plain user-cancel boundary tombstone (2.4): a cancelled turn's lease is
+   * NOT proof the CLI turn ended — the queued input must not dispatch into
+   * the same still-running CLI turn. The lease holds until the old turn's
+   * REAL result arrives (unknown-lease release) or the window expires with
+   * an explicit "input held" notice. Never auto-closes the query.
+   */
+  private cancelBoundaryTombstone: { turnId: string; timer: ReturnType<typeof setTimeout> } | null = null;
+  /**
+   * Persistent-query start single-flight (2.4): concurrent callers (ensureReady
+   * fire-and-forget, query, rewind, retirement rebuild) must all join the
+   * SAME start attempt — a second entry during the options await would build
+   * a second channel and race the first into the slot.
+   */
+  private persistentQueryStart: Promise<void> | null = null;
+  /**
+   * Send prohibition (2.4): a retirement whose CLI never exited (15s timeout)
+   * or whose rebuild failed locks ALL query starts — persistent and
+   * cold-start alike. Starting a second CLI over a possibly-live one is
+   * never an option; only an explicit close/reset clears this.
+   */
+  private queryStartProhibited: string | null = null;
   /**
    * Turn-identity reconciliation (batch 1, observe mode): read-only bypass
    * recording host/observer facts and rate diagnostics. Never consulted by
@@ -500,6 +657,23 @@ export class ClaudianService implements ChatRuntime {
   async ensureReady(options?: ClaudeEnsureReadyOptions): Promise<boolean> {
     const vaultPath = getVaultPath(this.plugin.app);
 
+    // Retirement/start gate (2.4): a rebuild in flight owns the slot — never
+    // start a second CLI on top of it (concurrent ensureReady stays single).
+    if (this.queryRetirementChain) {
+      await this.queryRetirementChain;
+      if (this.persistentQuery) {
+        return false;
+      }
+    }
+
+    // Send prohibition (2.4): force/config restarts close FIRST — that close
+    // must never clear the prohibition and start a second CLI over the
+    // possibly-live orphan. Fail fast here; only explicit reset/switch/cleanup
+    // entries (which pass clearStartProhibition) can lift it.
+    if (this.queryStartProhibited && !this.persistentQuery) {
+      throw new Error(this.queryStartBlockedMessage());
+    }
+
     // Track external context paths for dynamic updates (empty list clears)
     if (options && options.externalContextPaths !== undefined) {
       this.currentExternalContextPaths = options.externalContextPaths;
@@ -555,6 +729,9 @@ export class ClaudianService implements ChatRuntime {
 
   /**
    * Starts the persistent query for the active chat conversation.
+   * Single-flight gate (2.4): concurrent callers join the in-flight attempt;
+   * the send prohibition turns starts into explicit errors instead of
+   * spawning a second CLI over a possibly-live one.
    */
   private async startPersistentQuery(
     vaultPath: string,
@@ -565,7 +742,32 @@ export class ClaudianService implements ChatRuntime {
     if (this.persistentQuery) {
       return;
     }
+    if (this.queryStartProhibited) {
+      throw new Error(this.queryStartBlockedMessage());
+    }
+    if (this.persistentQueryStart) {
+      return this.persistentQueryStart;
+    }
+    const gated = this.executePersistentQueryStart(
+      vaultPath,
+      cliPath,
+      resumeSessionId,
+      externalContextPaths
+    ).finally(() => {
+      if (this.persistentQueryStart === gated) {
+        this.persistentQueryStart = null;
+      }
+    });
+    this.persistentQueryStart = gated;
+    return gated;
+  }
 
+  private async executePersistentQueryStart(
+    vaultPath: string,
+    cliPath: string,
+    resumeSessionId?: string,
+    externalContextPaths?: string[]
+  ): Promise<void> {
     this.shuttingDown = false;
     this.vaultPath = vaultPath;
 
@@ -584,21 +786,50 @@ export class ClaudianService implements ChatRuntime {
     const config = this.buildPersistentQueryConfig(vaultPath, cliPath, externalContextPaths);
     this.currentConfig = config;
 
+    // Query-scope exit sink: the spawn callback lands here once THIS CLI
+    // truly exits; the binding to the scope happens right after creation.
+    const exitSink: { handler: ((code: number | null) => void) | null } = { handler: null };
+
     // await is intentional: yields to microtask queue so fire-and-forget callers
     // (e.g. setSessionId → ensureReady) don't synchronously set persistentQuery
     const resumeAtMessageId = this.pendingResumeAt;
+    const channel = this.messageChannel;
+    const abortController = this.queryAbortController;
     const options = await this.buildPersistentQueryOptions(
       vaultPath,
       cliPath,
       resumeSessionId,
       resumeAtMessageId,
-      externalContextPaths
+      externalContextPaths,
+      code => exitSink.handler?.(code)
     );
+
+    // Slot identity re-check after the options await (2.4): a concurrent
+    // close/reset (or anything that took the slot down during the await)
+    // must orphan this attempt instead of reviving it — the channel it
+    // built is discarded closed, never spawning a CLI nobody owns.
+    if (this.persistentQuery !== null || this.messageChannel !== channel || this.queryAbortController !== abortController) {
+      channel.close();
+      abortController.abort();
+      return;
+    }
 
     this.persistentQuery = agentQuery({
       prompt: this.messageChannel,
       options,
     });
+
+    const scope = this.ensureQueryScope();
+    if (scope) {
+      // W4a: copy the applied options whitelist onto the scope's command
+      // source meta at Query creation, before any later settings mutation.
+      this.recordAppliedCommandScope(scope, options);
+      exitSink.handler = () => {
+        // Epoch-bound notification: a retirement waiting on THIS scope
+        // resolves; a replaced scope (new epoch) is never falsely confirmed.
+        this.notifyQueryProcessExit(scope.epoch);
+      };
+    }
 
     if (this.pendingResumeAt === resumeAtMessageId) {
       this.pendingResumeAt = undefined;
@@ -609,6 +840,108 @@ export class ClaudianService implements ChatRuntime {
     this.notifyReadyStateChange();
   }
 
+  /**
+   * Send prohibition (2.4): set when a retirement lost the CLI (exit timeout
+   * or rebuild failure). Blocks every start path — starting a second CLI over
+   * a possibly-live one is never an option. Cleared only by an explicit
+   * close/reset.
+   */
+  private setQueryStartProhibited(reason: string): void {
+    this.queryStartProhibited = reason;
+    this.recordTranscriptDiagnostic({ phase: 'query_start_prohibited', detail: reason });
+  }
+
+  /** Single source of the blocked-start message (ensureReady, start, send paths). */
+  private queryStartBlockedMessage(): string {
+    return `Claude session start is blocked after a failed query recovery (${this.queryStartProhibited}). Reload the conversation or reset the session to recover.`;
+  }
+
+  /**
+   * Query boundary: materializes the scope for the query currently sitting in
+   * the slot fields. Idempotent — the lazy attach also serves the test seams
+   * that install persistentQuery/messageChannel directly, so every consumer
+   * started after those installs is scope-guarded without test changes.
+   */
+  private ensureQueryScope(): QueryScope | null {
+    const query = this.persistentQuery;
+    const channel = this.messageChannel;
+    if (!query || !channel) return null;
+    if (this.currentQueryScope?.query === query) return this.currentQueryScope;
+    if (this.currentQueryScope) this.revokeQueryCommands(this.currentQueryScope.commandCell);
+    const scope: QueryScope = {
+      epoch: ++this.queryEpochCounter,
+      query,
+      channel,
+      abortController: this.queryAbortController ?? new AbortController(),
+      commandCell: {
+        query,
+        state: 'unobserved',
+        entries: [],
+        lastOutcome: null,
+        flight: null,
+      },
+      retired: false,
+      consumerStarted: false,
+      exitNotified: false,
+    };
+    this.currentQueryScope = scope;
+    this.queryAbortController = scope.abortController;
+    // W4a: mint the scope's command source observation (all dims unknown
+    // until the applied options are recorded) and advance the eligibility —
+    // an absence eligibility captured earlier dies with this install.
+    this.commandSourceMeta = {
+      token: {},
+      scope,
+      cell: scope.commandCell,
+      unknown: ['cwd', 'additionalDirectories', 'settingSources'],
+    };
+    this.advanceCommandEligibility({ scope, cell: scope.commandCell });
+    return scope;
+  }
+
+  /** The scope still owning the runtime slot, or null once retired/replaced. */
+  private liveQueryScope(): QueryScope | null {
+    const scope = this.currentQueryScope;
+    if (!scope || scope.retired) return null;
+    return scope;
+  }
+
+  private isCurrentQueryScope(scope: QueryScope | null | undefined): boolean {
+    if (!scope) return false;
+    return this.currentQueryScope === scope && !scope.retired;
+  }
+
+  /** Query boundary (2.4): a turn dispatched under a retired/replaced scope. */
+  private isOldScopeTurn(turn: RuntimeTurn): boolean {
+    const scope = this.currentQueryScope;
+    return turn.queryEpoch !== undefined && scope !== null && scope.epoch !== turn.queryEpoch;
+  }
+
+  /**
+   * The channel a turn's settlement may act on — null for old-scope turns.
+   * Every completion path (settle, handoff, cancel) must release through
+   * this so a lease handed to a replacement channel is never escalated on
+   * from behind a retired scope.
+   */
+  private turnReleaseChannel(turn: RuntimeTurn): MessageChannel | null {
+    return this.isOldScopeTurn(turn) ? null : this.messageChannel;
+  }
+
+  /**
+   * Spawn exit notification (query-scope-bound by epoch): resolves any
+   * retirement wait for THIS scope. Epoch isolation guarantees an old
+   * process's late exit can never mark a replacement scope as exited.
+   */
+  notifyQueryProcessExit(scopeEpoch: number): void {
+    const scope = this.currentQueryScope;
+    if (scope?.epoch === scopeEpoch) this.revokeQueryCommands(scope.commandCell);
+    const entry = this.scopeExitNotifications.get(scopeEpoch);
+    if (!entry) return;
+    this.scopeExitNotifications.delete(scopeEpoch);
+    entry.scope.exitNotified = true;
+    for (const resolve of entry.waiters.splice(0)) resolve();
+  }
+
   private attachPersistentQueryStdinErrorHandler(query: Query): void {
     const stdin = (query as { transport?: { processStdin?: NodeJS.WritableStream } }).transport?.processStdin;
     if (!stdin || typeof stdin.on !== 'function' || typeof stdin.once !== 'function') {
@@ -617,6 +950,11 @@ export class ClaudianService implements ChatRuntime {
 
     const handler = (error: NodeJS.ErrnoException) => {
       if (this.shuttingDown || this.isPipeError(error)) {
+        return;
+      }
+      // Query boundary: an old query's stdin must never close the scope that
+      // replaced it — identity check, not slot liveness (2026-11-05 fix 2).
+      if (this.currentQueryScope && this.currentQueryScope.query !== query) {
         return;
       }
       this.closePersistentQuery('stdin error');
@@ -642,7 +980,26 @@ export class ClaudianService implements ChatRuntime {
     // vs session reset) — it was already plumbed but never recorded.
     this.recordTranscriptDiagnostic({ phase: 'query_close', detail: reason });
     this.abortUserTurnCompletionBarriers();
+    const scope = this.currentQueryScope;
     if (!this.persistentQuery) {
+      if (scope) this.revokeQueryCommands(scope.commandCell);
+      // A start may be mid-flight: it has built the channel and the abort
+      // controller but not yet the query. Tear the half-built slot down so
+      // the start's post-await identity re-check orphans it (2.4) — a query
+      // must never revive after an explicit close. A channel holding an
+      // active turn cannot be a mid-flight start (no dispatch happens
+      // before the query exists) — it is left untouched. Idempotent for
+      // the plain already-closed case (all fields are null there).
+      if (this.messageChannel && this.messageChannel.getActiveTurnId() === null) {
+        this.messageChannel = null;
+        this.queryAbortController = null;
+      }
+      // Only an explicit recovery entry may lift the prohibition here; a
+      // zombie stdin error or internal close must not revive starts over a
+      // possibly-live orphaned CLI (2.4).
+      if (options?.clearStartProhibition) {
+        this.queryStartProhibited = null;
+      }
       return;
     }
 
@@ -650,14 +1007,25 @@ export class ClaudianService implements ChatRuntime {
 
     this.shuttingDown = true;
 
+    // Retire the scope FIRST (2.4): from here the old consumer rejects
+    // routing and its teardown can never act on a replacement scope.
+    if (scope) {
+      scope.retired = true;
+      this.revokeQueryCommands(scope.commandCell);
+    }
+
     // Close the message channel (ends the async iterable). close() reports
     // every turn that still held lease/queue state so the runtime can settle it.
     const channelTurnIds = this.messageChannel?.close() ?? [];
 
-    // Interrupt the query
-    void this.persistentQuery.interrupt().catch(() => {
-      // Silence abort/interrupt errors during shutdown
-    });
+    // Official Query.close(): terminates the CLI subprocess and cleans up
+    // pending requests/MCP transports. interrupt()+abort() alone cannot
+    // guarantee the process is gone (2026-11-05 fix 2); close() replaces it.
+    try {
+      this.persistentQuery.close();
+    } catch {
+      // Already-closed/failed transports are fine: abort below is the backup.
+    }
 
     // Abort as backup
     this.queryAbortController?.abort();
@@ -698,10 +1066,25 @@ export class ClaudianService implements ChatRuntime {
     this.persistentQuery = null;
     this.messageChannel = null;
     this.queryAbortController = null;
+    this.currentQueryScope = null;
+    // W4a: the slot fields are actually gone — advance to an absence
+    // generation and drop the source meta so the old Query is not retained.
+    this.commandSourceMeta = null;
+    this.advanceCommandEligibility(null);
+    if (this.cancelBoundaryTombstone) {
+      clearTimeout(this.cancelBoundaryTombstone.timer);
+      this.cancelBoundaryTombstone = null;
+    }
+    // Explicit teardown may lift the send prohibition — but only the explicit
+    // recovery entries (session reset/switch, plugin cleanup) pass the flag.
+    // Internal closes (force restarts, stdin errors, session invalidation)
+    // must never revive starts over a possibly-live orphaned CLI (2.4).
+    if (options?.clearStartProhibition) {
+      this.queryStartProhibited = null;
+    }
     this.responseConsumerRunning = false;
     this.responseConsumerPromise = null;
     this.currentConfig = null;
-    this.cachedSdkCommands = [];
     if (!preserveHandlers) {
       this.responseHandlers = [];
       this.currentAllowedTools = null;
@@ -779,7 +1162,8 @@ export class ClaudianService implements ChatRuntime {
     cliPath: string,
     resumeSessionId?: string,
     resumeAtMessageId?: string,
-    externalContextPaths?: string[]
+    externalContextPaths?: string[],
+    onProcessExit?: (code: number | null) => void
   ): Options {
     const baseContext = this.buildQueryOptionsContext(vaultPath, cliPath);
     const hooks = this.buildHooks();
@@ -793,6 +1177,7 @@ export class ClaudianService implements ChatRuntime {
       canUseTool: this.createApprovalCallback(),
       hooks,
       externalContextPaths,
+      onProcessExit,
     };
 
     return QueryOptionsBuilder.buildPersistentQueryOptions(ctx);
@@ -805,67 +1190,54 @@ export class ClaudianService implements ChatRuntime {
   private buildHooks() {
     const hooks: Options['hooks'] = {};
 
-    // Fix 1 (熔断): the hook is a stateless closure, so the consecutive-block
-    // counter lives on this runtime instance. Reset on every allow and on every
-    // user-initiated turn (see query()).
-    const breaker: StopHookCircuitBreaker = {
-      registerBlock: () => {
-        this._stopHookConsecutiveBlocks += 1;
-        if (this._stopHookConsecutiveBlocks > ClaudianService.STOP_HOOK_MAX_CONSECUTIVE_BLOCKS) {
-          this._stopHookConsecutiveBlocks = 0;
-          new Notice(
-            `Claudian: Stop hook blocked ${ClaudianService.STOP_HOOK_MAX_CONSECUTIVE_BLOCKS} times while background tasks were still marked running. Allowing stop (circuit breaker) — please verify your background tasks.`
-          );
-          return true;
-        }
-        return false;
-      },
-      reset: () => {
-        this._stopHookConsecutiveBlocks = 0;
-      },
-    };
-
     // Always register subagent hooks — closures resolve provider at execution time
     // so hooks work even when provider is set after the persistent query starts.
     hooks.Stop = [createStopSubagentHook(
       () => this._subagentStateProvider?.() ?? { hasRunning: false },
-      breaker
     )];
 
     return hooks;
   }
 
   /**
-   * Starts the background consumer loop that routes chunks to handlers.
+   * Starts the background consumer loop that routes chunks to handlers. The
+   * loop captures the query SCOPE, not the mutable slot fields: once a scope
+   * is retired or replaced, the loop stops routing, its error handler stops
+   * restarting anything, and its teardown never touches the new scope.
    */
   private startResponseConsumer(): void {
-    if (this.responseConsumerRunning) {
+    const scope = this.ensureQueryScope();
+    if (!scope) {
       return;
     }
-
+    if (scope.consumerStarted) {
+      return;
+    }
+    scope.consumerStarted = true;
     this.responseConsumerRunning = true;
 
-    // Track which query this consumer is for, to detect if we were replaced
-    const queryForThisConsumer = this.persistentQuery;
-
     this.responseConsumerPromise = (async () => {
-      if (!this.persistentQuery) return;
-
       try {
-        for await (const message of this.persistentQuery) {
-          if (this.shuttingDown) break;
+        for await (const message of scope.query) {
+          if (this.shuttingDown || scope.retired || this.currentQueryScope !== scope) break;
 
           // P0-2 runPhase bypass (read-only): the SDK session-state channel
           // tells whether the CLI agent loop is running/idle — the U1
           // discriminator for the stall family. Must never affect routing.
           this.noteSessionStateChange(message);
-          await this.routeMessage(message);
+          await this.routeMessage(message, scope);
+          // Post-await re-check (2.4): routing may have awaited chunk delivery
+          // while the scope was retired/replaced; further messages must not route.
+          if (scope.retired || this.currentQueryScope !== scope) break;
         }
       } catch (error) {
-        // Skip error handling if this consumer was replaced by a new one.
-        // This prevents race conditions where the OLD consumer's error handler
-        // interferes with the NEW handler after a restart (e.g., from applyDynamicUpdates).
-        if (this.persistentQuery !== queryForThisConsumer && this.persistentQuery !== null) {
+        // Skip error handling if this consumer's scope was replaced or retired,
+        // or the slot query was swapped out from under it (test seam / manual
+        // installs). This prevents race conditions where the OLD consumer's
+        // error handler interferes with the NEW handler after a restart (e.g.,
+        // from applyDynamicUpdates), and keeps a retired scope's teardown from
+        // restarting crash recovery.
+        if (!this.isCurrentQueryScope(scope) || this.persistentQuery !== scope.query) {
           return;
         }
 
@@ -879,6 +1251,11 @@ export class ClaudianService implements ChatRuntime {
             this.crashRecoveryAttempted = true;
             try {
               await this.ensureReady({ force: true, preserveHandlers: true });
+              // Crash recovery is a LEGITIMATE cross-scope rebuild: the close
+              // above retired THIS consumer's own scope by design, so the
+              // isCurrentQueryScope guard must not run here — the replay
+              // targets the freshly rebuilt channel and its own preserved
+              // turn, never a third party's scope.
               if (!this.messageChannel) {
                 throw new Error('Persistent query restart did not create message channel', {
                   cause: error,
@@ -904,13 +1281,18 @@ export class ClaudianService implements ChatRuntime {
               if (isSessionExpiredError(restartError)) {
                 this.sessionManager.invalidateSession();
               }
-              handler.onError(errorInstance);
+              // The turn MUST settle even though this scope retired itself
+              // during the failed restart — a dropped onError hangs the
+              // user's generator forever.
+              if (handler) {
+                handler.onError(errorInstance);
+              }
               return;
             }
           }
 
           // Notify active handler of error
-          if (handler) {
+          if (handler && this.isCurrentQueryScope(scope)) {
             handler.onError(errorInstance);
           }
 
@@ -930,10 +1312,11 @@ export class ClaudianService implements ChatRuntime {
           }
         }
       } finally {
+        this.revokeQueryCommands(scope.commandCell);
         // Only clear the flag if this consumer wasn't replaced by a new one (e.g., after restart)
         // If ensureReady() restarted, it starts a new consumer which sets the flag true,
         // so we shouldn't clear it here.
-        if (this.persistentQuery === queryForThisConsumer || this.persistentQuery === null) {
+        if (this.currentQueryScope === scope || this.currentQueryScope === null) {
           this.responseConsumerRunning = false;
         }
       }
@@ -976,12 +1359,43 @@ export class ClaudianService implements ChatRuntime {
    * 6. Chunks go to the owning turn's waiters; a turn without waiters buffers
    *    chunks and flushes through the auto-turn callback adapter on result.
    */
-  private async routeMessage(message: SDKMessage): Promise<void> {
+  private async routeMessage(message: SDKMessage, scope: QueryScope | null = this.currentQueryScope): Promise<void> {
     // Note: Session expiration errors are handled in catch blocks (queryViaSDK, handleAbort)
     // The SDK throws errors as exceptions, not as message types
 
+    // Query boundary (2.4): any side effect requires the CURRENT, un-retired
+    // scope. A result arriving through an old consumer must never settle a
+    // turn leased by a newer query (the 2026-11-05 defect 2 shape). A null
+    // scope means no query incarnation exists to discriminate against.
+    if (scope !== null && !this.isCurrentQueryScope(scope)) {
+      this.recordTranscriptDiagnostic({
+        phase: 'query_scope_stale',
+        detail: `epoch=${scope.epoch} type=${message.type}`,
+      });
+      return;
+    }
+
     if (message.type === 'user' && (message as SDKUserMessage & { isReplay?: boolean }).isReplay === true) {
       return;
+    }
+
+    // Plain-cancel isolation (2.4): the cancelled turn's boundary tombstone
+    // dissolves ONLY on that CLI turn's real result. Chunks still streaming
+    // from the cancelled turn prove it is running; releasing on them would
+    // dispatch the queued input into that live turn (the defect-2 shape).
+    if (this.cancelBoundaryTombstone && isTurnCompleteMessage(message)) {
+      const tombstonedLease = this.messageChannel?.getActiveTurnId();
+      if (tombstonedLease === this.cancelBoundaryTombstone.turnId) {
+        this.settleCancelBoundaryTombstone(tombstonedLease);
+      }
+    }
+
+    // Native permission reports (status/system, and init redundantly with the
+    // transform path) sync through one scope-guarded helper for BOTH the
+    // leased and leaseless entries; unknown native modes are ignored rather
+    // than misattributed to a toolbar value (design §5.2).
+    if (message.type === 'system' && (message as { permissionMode?: unknown }).permissionMode !== undefined) {
+      this.syncNativePermissionMode((message as { permissionMode?: unknown }).permissionMode, scope);
     }
 
     const turn = this.resolveActiveTurn();
@@ -1005,14 +1419,20 @@ export class ClaudianService implements ChatRuntime {
     if (this.dispatchTaskNotification(message)) return;
 
     if (!turn) {
-      if (isLeaselessSessionControlMessage(message)) this.applyLeaselessSystemMessage(message);
+      if (isLeaselessSessionControlMessage(message)) this.applyLeaselessSystemMessage(message, scope);
       return;
     }
     // P0-3 evidence: any message routed to this turn's lease proves CLI
     // activity on the turn — recorded before the cancelled-phase gate so a
     // trailing result being dropped still counts as an interrupt response.
     turn.lastRoutedMessageAt = Date.now();
-    if (turn.phase === 'cancelled' && isTurnCompleteMessage(message)) return;
+    if (turn.phase === 'cancelled' && isTurnCompleteMessage(message)) {
+      // Plain-cancel boundary (2.4): the CLI turn is provably over — the
+      // handoff skips the 15s tombstone window instead of holding the
+      // queued input for a result that already arrived.
+      turn.sawTerminalResult = true;
+      return;
+    }
     const activeTurn = turn;
 
     // Result attribution (2.3.2 fix ①): a result armed as belonging to an
@@ -1038,7 +1458,7 @@ export class ClaudianService implements ChatRuntime {
       });
 
       if (isSessionInitEvent(event)) {
-        this.applySessionInitSideEffects(event);
+        this.applySessionInitSideEffects(event, scope);
       } else if (isStreamChunk(event)) {
         // Dedup: SDK delivers text via stream_events (incremental) AND the assistant message
         // (complete). Skip the assistant message text if stream text was already seen.
@@ -1055,15 +1475,9 @@ export class ClaudianService implements ChatRuntime {
 
         // SDK auto-approves EnterPlanMode (checkPermissions → allow),
         // so canUseTool is never called. Detect the tool_use in the stream
-        // and fire the sync callback to update the UI.
+        // and sync the transient plan state through the shared native helper.
         if (event.type === 'tool_use' && event.name === TOOL_ENTER_PLAN_MODE) {
-          if (this.currentConfig) {
-            this.currentConfig.permissionMode = 'plan';
-            this.currentConfig.sdkPermissionMode = 'plan';
-          }
-          if (this.permissionModeSyncCallback) {
-            try { this.permissionModeSyncCallback('plan'); } catch { /* non-critical */ }
-          }
+          this.syncNativePermissionMode('plan', scope);
         }
 
         const normalizedChunk = event.type === 'usage'
@@ -1071,6 +1485,11 @@ export class ClaudianService implements ChatRuntime {
           : event;
 
         await this.deliverChunkToTurn(activeTurn, normalizedChunk);
+        // Post-await re-check (2.4): chunk delivery can await the feature
+        // projection; a scope/turn replaced mid-delivery must not keep routing.
+        if ((scope !== null && !this.isCurrentQueryScope(scope)) || this.runtimeTurns.get(activeTurn.id) !== activeTurn) {
+          return;
+        }
       }
     }
 
@@ -1082,6 +1501,17 @@ export class ClaudianService implements ChatRuntime {
     // session_init alone is not a completion signal for persistent queries.
     if (isTurnCompleteMessage(message)) {
       const result = message as SDKMessage & { session_id?: string; subtype?: string; is_error?: boolean };
+      // Pre-settlement scope re-check: the transform loop above may have
+      // awaited chunk delivery while the scope was retired/replaced. An old
+      // query's result must never settle a turn owned by a newer query.
+      if (scope !== null && !this.isCurrentQueryScope(scope)) {
+        this.recordTranscriptDiagnostic({
+          phase: 'query_scope_stale',
+          turnId: activeTurn.id,
+          detail: `result epoch=${scope.epoch}`,
+        });
+        return;
+      }
       if (activeTurn.recoveryGeneration !== undefined) {
         this.sessionManager.confirmRecovery(
           activeTurn.recoveryGeneration,
@@ -1102,7 +1532,7 @@ export class ClaudianService implements ChatRuntime {
    * applied) / compact_boundary separator (only meaningful in a live turn)
    * for system messages; all other subtypes produce no output.
    */
-  private applyLeaselessSystemMessage(message: SDKMessage): void {
+  private applyLeaselessSystemMessage(message: SDKMessage, scope: QueryScope | null): void {
     const scratch = createRuntimeTurn({
       id: `system-event-${Date.now()}-${Math.random().toString(36).slice(2)}`,
       kind: 'auto',
@@ -1111,14 +1541,14 @@ export class ClaudianService implements ChatRuntime {
 
     for (const event of transformSDKMessage(message, this.getTransformOptions(scratch))) {
       if (isSessionInitEvent(event)) {
-        this.applySessionInitSideEffects(event);
+        this.applySessionInitSideEffects(event, scope);
       }
       // Everything else has no consumer — dropped with the scratch state.
     }
   }
 
   /** Session-level side effects of a session_init event, shared by the leased and lease-less routing paths. */
-  private applySessionInitSideEffects(event: SessionInitEvent): void {
+  private applySessionInitSideEffects(event: SessionInitEvent, scope: QueryScope | null): void {
     if (event.model) {
       this.sessionResolvedModel = event.model;
     }
@@ -1131,13 +1561,11 @@ export class ClaudianService implements ChatRuntime {
     if (event.agents) {
       try { this.getAgentManager()?.setBuiltinAgentNames(event.agents); } catch { /* non-critical */ }
     }
-    if (event.permissionMode && this.permissionModeSyncCallback) {
-      try { this.permissionModeSyncCallback(event.permissionMode); } catch { /* non-critical */ }
+    if (event.permissionMode !== undefined) {
+      this.syncNativePermissionMode(event.permissionMode, scope);
     }
-    // Cache SDK commands on init (SDK already scans the vault).
-    // Pass the current query instance so late completions from a dead query
-    // cannot overwrite the active cache after a restart or shutdown.
-    void this.fetchAndCacheCommands(this.persistentQuery);
+    // Init adds an observation for the originating scope, never a replacement.
+    void this.readQueryCommands(scope, undefined, false);
   }
 
   /** Returns the turn owning the channel lease, settling an unknown lease locally. */
@@ -1151,6 +1579,15 @@ export class ClaudianService implements ChatRuntime {
     if (!turn) {
       // Lease held for a turn unknown to the runtime (cancelled/crashed
       // earlier). v4 §3.3: settle that queue item, keep the consumer alive.
+      // Plain-cancel isolation (2.4): while the tombstone owns this lease the
+      // release is forbidden here — chunks from the still-running cancelled
+      // turn would pump the queue into it. Only the real result (routeMessage
+      // dissolves the tombstone first, then this branch releases) may
+      // release; the 15s window only prompts that the input stays staged —
+      // it never releases.
+      if (this.cancelBoundaryTombstone?.turnId === activeTurnId) {
+        return null;
+      }
       this.completeChannelTurn(activeTurnId);
     }
     return turn;
@@ -1233,6 +1670,10 @@ export class ClaudianService implements ChatRuntime {
     // hardest signal to separate from cancel/force settlement in the case
     // post-mortem (the CLI never reached this line during the 5m18s stall).
     this.recordTranscriptDiagnostic({ phase: 'settle_result', turnId: turn.id, generation: turn.generation, leaseKind: turn.kind });
+    // Attempt teardown: a REAL result settles the turn — any live recovery
+    // attempt ends here and its outcome attribution reads this flag.
+    turn.terminalSettlementKind = 'result';
+    turn.recoveryAttemptId = null;
     this.noteTurnIdentitySettled(turn.id);
     // Defensive only: terminal cleanup cannot prove attribution when the
     // notification result itself never arrives; the dual-track state machine
@@ -1260,7 +1701,7 @@ export class ClaudianService implements ChatRuntime {
         this.completeUserRuntimeHandoff(turn, barrier);
       } else {
         this.runtimeTurns.delete(turn.id);
-        this.completeChannelTurn(turn.id);
+        this.completeChannelTurn(turn.id, this.turnReleaseChannel(turn));
       }
       return;
     }
@@ -1292,7 +1733,7 @@ export class ClaudianService implements ChatRuntime {
     this.runtimeTurns.delete(turn.id);
     // Step 6: release the lease so the async iterator may dequeue the next
     // queued user message.
-    this.completeChannelTurn(turn.id);
+    this.completeChannelTurn(turn.id, this.turnReleaseChannel(turn));
     // Step 7: release remains the only feature queue pump. If a pending
     // external turn was promoted, its newly acquired feature lease blocks it.
     if (turn.kind === 'auto') {
@@ -1321,7 +1762,10 @@ export class ClaudianService implements ChatRuntime {
     // missing notification result before a host result reaches routeMessage.
     turn.notificationResultPending = false;
     this.runtimeTurns.delete(turn.id);
-    this.completeChannelTurn(turn.id);
+    // Query boundary (2.4), mirroring the cancel handoff: a handoff that
+    // resumes after a retirement/rebuild must never release — or escalate a
+    // lease mismatch — on the replacement channel.
+    this.completeChannelTurn(turn.id, this.turnReleaseChannel(turn));
     barrier.resolveRuntimeHandoffDone();
     this.userTurnCompletionBarriers.delete(turn.id);
   }
@@ -1335,6 +1779,9 @@ export class ClaudianService implements ChatRuntime {
   }
 
   beginUserTurnProjection(turnId: string): void {
+    // Remember the target: the observer may not exist yet (async start after
+    // session init) — the rebuild restores the projection onto it (fix 3).
+    this.beginUserTurnProjectionTarget = turnId;
     this.transcriptObserver?.beginUserTurnProjection(turnId);
   }
 
@@ -1358,6 +1805,21 @@ export class ClaudianService implements ChatRuntime {
     } catch {
       // Reconciliation is a read-only bypass; lease handling must not depend on it.
     }
+    // Real dispatch anchor (fix 3): the channel stamps delivery time and the
+    // merge-safe command kind; the observer attributes compact boundary
+    // evidence against THIS, never the feature-begin timestamp.
+    this.currentDispatchDescriptor = info;
+    try {
+      this.transcriptObserver?.observeDispatch({
+        leaseTurnId: info.leaseTurnId,
+        canonicalUuid: info.canonicalTurnId,
+        hostTurnIds: info.hostTurnIds,
+        dispatchedAt: info.dispatchedAt,
+        isManualCompact: info.isManualCompact,
+      });
+    } catch {
+      // Observer dispatch notification is best-effort.
+    }
     const turnId = info.leaseTurnId;
     const turn = this.runtimeTurns.get(turnId);
     if (!turn) {
@@ -1373,6 +1835,10 @@ export class ClaudianService implements ChatRuntime {
       }
       return;
     }
+    // Query boundary: the turn was dispatched under this scope's epoch; lease
+    // release and delayed handoffs for it resolve against this scope only.
+    turn.queryEpoch = this.liveQueryScope()?.epoch;
+    turn.dispatchedAt = info.dispatchedAt;
     if (turn.phase === 'queued') {
       turn.phase = 'collecting';
     }
@@ -1412,10 +1878,18 @@ export class ClaudianService implements ChatRuntime {
    * (v4 §3.3): cancel the turn that actually holds the lease, retry the
    * release once; only a lease stuck on an unknown turn closes the channel.
    * Never throws — the consumer loop must survive protocol errors.
+   *
+   * Query boundary (2.4): when an explicit channel is passed (the turn's own
+   * scope), an old-scope completion must never act on the live channel — no
+   * "lease mismatch → cancel the actual holder" escalation across scopes.
    */
-  private completeChannelTurn(turnId: string): void {
-    const channel = this.messageChannel;
+  private completeChannelTurn(turnId: string, channel: MessageChannel | null = this.messageChannel): void {
     if (!channel) {
+      return;
+    }
+    if (channel !== this.messageChannel) {
+      // Old-scope channel: its queue/lease are being torn down by the
+      // retirement path itself; cross-scope escalation is forbidden.
       return;
     }
     const result = channel.completeTurn(turnId);
@@ -1462,6 +1936,14 @@ export class ClaudianService implements ChatRuntime {
     if (!turn) {
       return;
     }
+    // P0-2 blind-spot closure (2026-11-04 U-A): cancelTurn had no diagnostic
+    // at all, so silent settles like the d8912b5b host_only@11:46:08 could
+    // never be attributed. reason answers "who cancelled what, when".
+    this.recordTranscriptDiagnostic({ phase: 'turn_cancel', turnId, generation: turn.generation, detail: reason });
+    // Attempt teardown: a cancelled turn ends any live recovery attempt and
+    // records HOW the turn ended for the attempt's result-attribution check.
+    turn.terminalSettlementKind = 'cancel';
+    turn.recoveryAttemptId = null;
     this.noteTurnIdentitySettled(turnId);
     // Clear before branching so every cancellation exit drops stale defensive
     // attribution state. This cannot fix a missing notification result while
@@ -1518,9 +2000,12 @@ export class ClaudianService implements ChatRuntime {
     turn.waiters.clear();
     this.runtimeTurns.delete(turnId);
 
-    // Holds the lease → release so the next queued message can flow.
-    if (this.messageChannel?.getActiveTurnId() === turnId) {
-      this.completeChannelTurn(turnId);
+    // Holds the lease → release so the next queued message can flow. The
+    // release resolves against the turn's OWN scope channel (2.4): an old
+    // turn's cancellation must never release or escalate on a newer channel.
+    const releaseChannel = this.turnReleaseChannel(turn);
+    if (releaseChannel?.getActiveTurnId() === turnId) {
+      this.completeChannelTurn(turnId, releaseChannel);
         if (turn.kind === 'auto') this.fireOnAutoTurnReleased(turnId);
     }
   }
@@ -1538,10 +2023,67 @@ export class ClaudianService implements ChatRuntime {
     turn.waiters.clear();
     void barrier.featureFinished.then(async () => {
       await this.executeDeferredRestartIfAny(turn.id);
-      this.completeUserRuntimeHandoff(turn, barrier);
+      this.completeUserCancelHandoffWithBoundary(turn, barrier);
     }).catch(() => {
-      this.completeUserRuntimeHandoff(turn, barrier);
+      this.completeUserCancelHandoffWithBoundary(turn, barrier);
     });
+  }
+
+  /**
+   * Plain-cancel handoff (2.4 isolation): local cancellation proceeds, but
+   * the channel lease becomes the old turn's boundary tombstone. A late
+   * result from that CLI turn settles nothing (the turn is gone); it only
+   * releases the tombstone so the queue pumps. No result within the window
+   * → explicit notice that the input stays staged; the lease is never
+   * released by the timeout — only the real result dissolves the tombstone.
+   * The query itself is never closed.
+   */
+  private completeUserCancelHandoffWithBoundary(turn: RuntimeTurn, barrier: UserTurnCompletionBarrier): void {
+    turn.notificationResultPending = false;
+    this.runtimeTurns.delete(turn.id);
+    // Query boundary (2.4): an old-scope turn's handoff must never tombstone
+    // the replacement channel — its lease lived on the retired channel.
+    const oldScopeTurn = this.isOldScopeTurn(turn);
+    const channel = this.turnReleaseChannel(turn);
+    const holdsLease = channel !== null && channel.getActiveTurnId() === turn.id;
+    if (holdsLease && channel && !turn.sawTerminalResult) {
+      if (this.cancelBoundaryTombstone) clearTimeout(this.cancelBoundaryTombstone.timer);
+      const tombstone = {
+        turnId: turn.id,
+        timer: setTimeout(() => this.expireCancelBoundaryTombstone(turn.id), CANCEL_BOUNDARY_TIMEOUT_MS),
+      };
+      this.cancelBoundaryTombstone = tombstone;
+      this.recordTranscriptDiagnostic({
+        phase: 'turn_cancel', turnId: turn.id, generation: turn.generation,
+        detail: 'user_cancel_boundary_held',
+      });
+    } else if (!oldScopeTurn) {
+      this.completeChannelTurn(turn.id);
+    }
+    // An old-scope turn owns no release on the live channel — its lease died
+    // with the retired channel (2.4: no cross-scope escalation).
+    barrier.resolveRuntimeHandoffDone();
+    this.userTurnCompletionBarriers.delete(turn.id);
+  }
+
+  /** The old turn's real result arrived: the tombstone dissolves silently and the queue pumps. */
+  private settleCancelBoundaryTombstone(turnId: string): void {
+    const tombstone = this.cancelBoundaryTombstone;
+    if (!tombstone || tombstone.turnId !== turnId) return;
+    clearTimeout(tombstone.timer);
+    this.cancelBoundaryTombstone = null;
+    this.recordTranscriptDiagnostic({ phase: 'turn_cancel', turnId, detail: 'cancel_boundary_result_arrived' });
+  }
+
+  private expireCancelBoundaryTombstone(turnId: string): void {
+    const tombstone = this.cancelBoundaryTombstone;
+    if (!tombstone || tombstone.turnId !== turnId) return;
+    // 2.4 correction: the 15s timeout only PROMPTS that the input is staged.
+    // The tombstone stays armed and the lease stays held — only the real
+    // result dissolves it and pumps the queue. Releasing here would let the
+    // cancelled CLI turn race a fresh dispatch.
+    this.recordTranscriptDiagnostic({ phase: 'turn_cancel', turnId, detail: 'cancel_boundary_timeout' });
+    new Notice(t('chat.cancel.boundaryHeld'));
   }
 
   /** Cancels every live turn plus any turn still holding channel state. */
@@ -1810,10 +2352,6 @@ export class ClaudianService implements ChatRuntime {
       return;
     }
 
-    // Fix 1 (熔断): a user-initiated turn resets the consecutive Stop-hook
-    // block count — the breaker scope is "since last user message / last allow".
-    this._stopHookConsecutiveBlocks = 0;
-
     const vaultPath = getVaultPath(this.plugin.app);
     if (!vaultPath) {
       yield { type: 'error', content: 'Could not determine vault path' };
@@ -1831,6 +2369,23 @@ export class ClaudianService implements ChatRuntime {
     const missingNodeError = getMissingNodeError(resolvedClaudePath, enhancedPath);
     if (missingNodeError) {
       yield { type: 'error', content: missingNodeError };
+      return;
+    }
+
+    // Every send path joins the same lifecycle gate before choosing either
+    // persistent or cold-start. Checking only inside shouldUsePersistent
+    // would let forceColdStart bypass a retiring, possibly-live CLI (2.4).
+    if (this.queryRetirementChain) await this.queryRetirementChain;
+    if (this.persistentQueryStart) await this.persistentQueryStart;
+
+    // Send prohibition (2.4): after a failed recovery (CLI never exited /
+    // rebuild failed) no path may start another CLI — not persistent, not
+    // cold-start. An explicit close/reset (session switch, reload) clears it.
+    if (this.queryStartProhibited) {
+      yield {
+        type: 'error',
+        content: this.queryStartBlockedMessage(),
+      };
       return;
     }
 
@@ -1898,13 +2453,27 @@ export class ClaudianService implements ChatRuntime {
     const shouldUsePersistent = !effectiveQueryOptions?.forceColdStart;
 
     if (shouldUsePersistent) {
+      // Retirement/start gate (2.4): the rebuild chain owns the slot until
+      // it finishes; a query arriving mid-rebuild must never cold-start
+      // around it.
+      if (this.queryRetirementChain) {
+        await this.queryRetirementChain;
+      }
       // Start persistent query if not running
       if (!this.persistentQuery && !this.shuttingDown) {
-        await this.startPersistentQuery(
-          vaultPath,
-          resolvedClaudePath,
-          this.sessionManager.getSessionId() ?? undefined
-        );
+        try {
+          await this.startPersistentQuery(
+            vaultPath,
+            resolvedClaudePath,
+            this.sessionManager.getSessionId() ?? undefined
+          );
+        } catch (error) {
+          yield {
+            type: 'error',
+            content: error instanceof Error ? error.message : 'Failed to start the Claude session',
+          };
+          return;
+        }
       }
 
       if (this.persistentQuery && !this.shuttingDown) {
@@ -2042,7 +2611,15 @@ export class ClaudianService implements ChatRuntime {
 
     // Apply dynamic updates before sending (Phase 1.6). With an active turn
     // on the channel this only defers a config restart instead of rebuilding.
-    await this.applyDynamicUpdates(queryOptions);
+    // A failed permission setter aborts THIS send with a visible error — the
+    // message is never enqueued to run under the previous mode (design §5.1).
+    try {
+      await this.applyDynamicUpdates(queryOptions);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      yield { type: 'error', content: message };
+      return;
+    }
 
     // Restore allowedTools in case restart cleared it
     this.currentAllowedTools = savedAllowedTools;
@@ -2138,9 +2715,11 @@ export class ClaudianService implements ChatRuntime {
           // eligible for crash-recovery replay either. onError flips
           // state.done, so the loop below is skipped and the error is
           // yielded on the shared drain path.
-          this.lastSentMessage = null;
-          this.lastSentQueryOptions = null;
-          this.lastSentTurnId = null;
+          if (this.lastSentTurnId === turn.id) {
+            this.lastSentMessage = null;
+            this.lastSentQueryOptions = null;
+            this.lastSentTurnId = null;
+          }
           handler.onError(new Error('Message queue is full; the newest message was dropped.'));
         } else if (enqueueResult.canonicalTurnId !== turn.id) {
           // Merged into an already queued item (text merge / attachment
@@ -2192,10 +2771,14 @@ export class ClaudianService implements ChatRuntime {
         yield { type: 'error', content: state.error.message };
       }
 
-      // Clear message tracking after completion
-      this.lastSentMessage = null;
-      this.lastSentQueryOptions = null;
-      this.lastSentTurnId = null;
+      // Clear message tracking after completion — ownership-checked (2.4): a
+      // late generator finishing behind a retirement/rebuild must not wipe
+      // the replacement dispatch's crash-replay anchor.
+      if (this.lastSentTurnId === turn.id) {
+        this.lastSentMessage = null;
+        this.lastSentQueryOptions = null;
+        this.lastSentTurnId = null;
+      }
 
       yield { type: 'done' };
     } finally {
@@ -2242,10 +2825,32 @@ export class ClaudianService implements ChatRuntime {
     if (state.resolveChunk !== settle || state.done) return;
     // The turn left the registry (settled/cancelled elsewhere): stop ticking.
     if (this.runtimeTurns.get(turn.id) !== turn) return;
+    // Fix 1 (2026-11-05): once an independent attempt owns the chain, the
+    // chunk-wait timer must NOT re-fire — a chunk resolving the wait used to
+    // re-arm 120s and fire a SECOND stop round on the same agents. The
+    // generator stays parked: the attempt's terminal (cancelTurn/result
+    // settle) resolves the waiters' onDone which wakes it.
+    if (turn.recoveryAttemptId !== null) return;
     const terminalSeenAt = turn.transcriptTerminalSeenAt;
     if (terminalSeenAt === null) {
-      // T4 red line: no transcript terminal evidence — a legitimately long
-      // turn (blocking Agent/TaskOutput) keeps waiting.
+      // No evidence permits only the one-shot background-agent probe. A
+      // blocking sync Agent is absent from the candidate list, and a pending
+      // permission/question wait suppresses the probe altogether.
+      const now = Date.now();
+      if (turn.phase === 'collecting' && !turn.stopTaskProbeSent && this.pendingCanUseToolCount === 0
+        && now - Math.max(turn.lastChunkAt ?? turn.dispatchedAt, turn.dispatchedAt) > STOP_TASK_TURN_SILENCE_MS
+        && this.persistentQuery && !this.shuttingDown) {
+        const candidates = this.getRunningAgentCandidates()
+          .filter(agent => now - agent.startedAt > STOP_TASK_AGENT_MIN_AGE_MS);
+        if (candidates.length > 0) {
+          turn.stopTaskProbeSent = true;
+          // Shared per-logical-turn registry (B-(a)/(b)): the armed recovery
+          // later filters out ids the probe already stopped.
+          for (const agent of candidates) turn.stopTaskSentAgentIds.add(agent.agentId);
+          void this.sendStopTasks(turn, candidates, 'silent_probe', null);
+        }
+      }
+      // T4 red line: a probe never interrupts or force-settles an unproven turn.
       arm();
       return;
     }
@@ -2257,30 +2862,365 @@ export class ClaudianService implements ChatRuntime {
       arm(RESULT_WATCHDOG_MS - (now - terminalSeenAt));
       return;
     }
+    // Fire: hand the chain to an INDEPENDENT attempt with frozen identity.
+    this.startStopTaskRecovery(turn, now);
+  }
+
+  /**
+   * Fix 1 (2026-11-05): the recovery chain runs as an independent attempt —
+   * its own timers, its own liveness checks, decoupled from the generator's
+   * chunk-wait timer. resolveChunk only wakes the generator; it never
+   * participates in attempt survival.
+   */
+  private startStopTaskRecovery(turn: RuntimeTurn, firedAt: number): void {
+    const scope = this.currentQueryScope;
+    const attempt: StopTaskRecoveryAttempt = {
+      attemptId: ++this.stopTaskAttemptCounter,
+      turnId: turn.id,
+      generation: turn.generation,
+      queryEpoch: scope?.epoch,
+      evidenceRevision: turn.evidenceRevision,
+      cliVersion: turn.transcriptTerminalCliVersion ?? this.transcriptCliVersion,
+      phase: 'observing_stop',
+    };
+    turn.recoveryAttemptId = attempt.attemptId;
+    const candidates = this.getRunningAgentCandidates();
+    const unsent = candidates.filter(agent => !turn.stopTaskSentAgentIds.has(agent.agentId));
     this.recordTranscriptDiagnostic({
       phase: 'settle_watchdog_fire',
       turnId: turn.id,
-      generation: turn.generation,
+      generation: attempt.generation,
       leaseKind: turn.kind,
-      terminalSeenAgeMs: now - terminalSeenAt,
-      ...(turn.lastChunkAt !== null ? { lastChunkAgeMs: now - turn.lastChunkAt } : {}),
+      terminalSeenAgeMs: firedAt - (turn.transcriptTerminalSeenAt ?? firedAt),
+      ...(turn.lastChunkAt !== null ? { lastChunkAgeMs: firedAt - turn.lastChunkAt } : {}),
+      evidenceKind: turn.transcriptTerminalSource ?? 'stop_hook',
+      ...(attempt.cliVersion ? { cliVersion: attempt.cliVersion } : {}),
+      agentCandidateCount: unsent.length,
+      queryEpoch: attempt.queryEpoch,
+      attemptId: attempt.attemptId,
     });
-    // One interrupt so the CLI gets a chance to flush its belated result.
-    if (this.persistentQuery && !this.shuttingDown) {
-      this.recordTranscriptDiagnostic({ phase: 'interrupt_sent', turnId: turn.id, generation: turn.generation, detail: 'result_watchdog' });
-      void this.persistentQuery.interrupt().catch(() => {
-        // Silence abort/interrupt errors
+    void this.runStopTaskRecovery(turn, attempt, unsent);
+  }
+
+  /** Full re-verification of every frozen identity dimension. */
+  private attemptAlive(turn: RuntimeTurn, attempt: StopTaskRecoveryAttempt): boolean {
+    if (this.runtimeTurns.get(turn.id) !== turn) return false;
+    if (turn.phase === 'settled' || turn.phase === 'cancelled') return false;
+    if (turn.recoveryAttemptId !== attempt.attemptId) return false;
+    if (turn.evidenceRevision !== attempt.evidenceRevision) return false;
+    if ((this.currentQueryScope?.epoch ?? undefined) !== attempt.queryEpoch) return false;
+    return true;
+  }
+
+  private async runStopTaskRecovery(
+    turn: RuntimeTurn,
+    attempt: StopTaskRecoveryAttempt,
+    unsent: Array<{ agentId: string; startedAt: number }>,
+  ): Promise<void> {
+    try {
+      const scope = this.currentQueryScope;
+      let sentAny = false;
+      if (unsent.length > 0 && scope && !this.shuttingDown) {
+        sentAny = true;
+        // Register BEFORE the SDK call: a reject or a never-settling request
+        // must never trigger a re-send of the same agent id (fix 1).
+        for (const agent of unsent) turn.stopTaskSentAgentIds.add(agent.agentId);
+        void this.sendStopTasks(turn, unsent, 'result_watchdog', attempt);
+      } else {
+        this.recordTranscriptDiagnostic({
+          phase: 'stop_task_outcome', turnId: attempt.turnId, generation: attempt.generation,
+          outcome: 'no_candidates', agentCandidateCount: 0,
+          queryEpoch: attempt.queryEpoch, attemptId: attempt.attemptId,
+          ...(attempt.cliVersion ? { cliVersion: attempt.cliVersion } : {}),
+        });
+      }
+      if (sentAny) {
+        // Observation window: attempt-owned timer — chunk arrivals never
+        // reset or extend it (fix 1).
+        await this.attemptDelay(STOP_TASK_GRACE_MS);
+        if (!this.attemptAlive(turn, attempt)) {
+          this.noteAttemptTerminatedByResult(turn, attempt, unsent.length);
+          return;
+        }
+      }
+      attempt.phase = 'observing_interrupt';
+      const interruptScope = this.currentQueryScope;
+      if (interruptScope && interruptScope.query === scope?.query && !this.shuttingDown) {
+        this.recordTranscriptDiagnostic({
+          phase: 'interrupt_sent', turnId: attempt.turnId, generation: attempt.generation,
+          detail: 'result_watchdog', queryEpoch: attempt.queryEpoch, attemptId: attempt.attemptId,
+        });
+        void interruptScope.query.interrupt().catch(() => {
+          // Silence abort/interrupt errors
+        });
+      }
+      await this.attemptDelay(RESULT_WATCHDOG_GRACE_MS);
+      if (!this.attemptAlive(turn, attempt)) {
+        this.noteAttemptTerminatedByResult(turn, attempt, unsent.length);
+        return;
+      }
+      attempt.phase = 'retiring';
+      // Terminal: retire the old query (extract+rebuild the unsent queue),
+      // then cancel this turn. Retiring FIRST matters: the lease is not a
+      // proof the CLI turn ended, and cancelling before the rebuild would
+      // pump the queue into the same dead query. A result arriving later is
+      // dropped by the stale-scope routing guard.
+      await this.retireAndRebuildQuery('result_watchdog', turn.id);
+      this.cancelTurn(turn.id, 'result_watchdog');
+    } finally {
+      attempt.phase = 'finished';
+      if (this.runtimeTurns.get(turn.id) === turn && turn.recoveryAttemptId === attempt.attemptId) {
+        turn.recoveryAttemptId = null;
+      }
+    }
+  }
+
+  private noteAttemptTerminatedByResult(turn: RuntimeTurn, attempt: StopTaskRecoveryAttempt, candidateCount: number): void {
+    // settled_by_result means a REAL result settled the turn inside the
+    // observation window — time order alone never implies causation.
+    if (turn.terminalSettlementKind === 'result') {
+      this.recordTranscriptDiagnostic({
+        phase: 'stop_task_outcome', turnId: attempt.turnId, generation: attempt.generation,
+        outcome: 'settled_by_result', agentCandidateCount: candidateCount,
+        queryEpoch: attempt.queryEpoch, attemptId: attempt.attemptId,
+        ...(attempt.cliVersion ? { cliVersion: attempt.cliVersion } : {}),
       });
     }
-    await new Promise<void>(resolve => {
-      setTimeout(resolve, RESULT_WATCHDOG_GRACE_MS);
+  }
+
+  private attemptDelay(ms: number): Promise<void> {
+    return new Promise<void>(resolve => {
+      setTimeout(resolve, ms);
     });
-    // Grace over and the wait is still parked on this turn: force-settle so
-    // the lease releases and the queue pumps (a result arriving later is
-    // dropped lease-less by routeMessage).
-    if (state.resolveChunk !== settle || state.done) return;
-    if (this.runtimeTurns.get(turn.id) !== turn) return;
-    this.cancelTurn(turn.id, 'result_watchdog');
+  }
+
+  /**
+   * Watchdog force settlement = retire the old query and rebuild (2.4): the
+   * lease is NOT a proof the CLI turn ended, so cancel-and-reuse would let
+   * the old result settle the NEXT turn. Single-flight — concurrent callers
+   * (query/ensureReady/cold fallback) all wait on the same chain.
+   */
+  retireAndRebuildQuery(reason: string, exemptTurnId?: string): Promise<void> {
+    if (this.queryRetirementChain) {
+      return this.queryRetirementChain;
+    }
+    this.queryRetirementChain = this.executeQueryRetirement(reason, exemptTurnId).finally(() => {
+      this.queryRetirementChain = null;
+    });
+    return this.queryRetirementChain;
+  }
+
+  private async executeQueryRetirement(reason: string, exemptTurnId?: string): Promise<void> {
+    const scope = this.currentQueryScope;
+    const query = this.persistentQuery;
+    const channel = this.messageChannel;
+    if (!scope || !query || !channel) {
+      return;
+    }
+
+    // 1. Retire FIRST: routing stops, new dispatches are blocked.
+    scope.retired = true;
+    this.revokeQueryCommands(scope.commandCell);
+    // 2. Extract the never-dispatched queue BEFORE closing the input —
+    //    canonical UUIDs, host aliases, merged payloads, order all survive.
+    const unsent = channel.extractUnsentQueue();
+    // Baseline closePersistentQuery parity: close() reports every id that
+    // still held lease/queue state on the dying channel. The retirement
+    // caller settles its own stalled turn afterwards (exemptTurnId); any
+    // OTHER live holder is a protocol anomaly — it is settled below so its
+    // waiters cannot hang on a channel that will never route again.
+    const retiredChannelTurnIds = channel.close();
+    // 3. Remove from the slot. A plain-cancel tombstone belonged to the dying
+    //    channel; its 15s window must never fire against the replacement.
+    if (this.cancelBoundaryTombstone) {
+      clearTimeout(this.cancelBoundaryTombstone.timer);
+      this.cancelBoundaryTombstone = null;
+    }
+    this.currentQueryScope = null;
+    this.persistentQuery = null;
+    this.messageChannel = null;
+    this.queryAbortController = null;
+    this.responseConsumerRunning = false;
+    // W4a: actual removal completed — advance to an absence generation and
+    // drop the source meta so the retired Query is not retained.
+    this.commandSourceMeta = null;
+    this.advanceCommandEligibility(null);
+    this.recordTranscriptDiagnostic({
+      phase: 'query_retire',
+      detail: `${reason} epoch=${scope.epoch} unsent=${unsent.length}`,
+    });
+    // Anomaly fallback (the slot is already cleared, so cancelTurn's lease
+    // release is a no-op — settling never touches the replacement channel):
+    // a lease holder the retirement caller does not settle itself must not
+    // keep waiters parked on a dead channel.
+    for (const id of retiredChannelTurnIds) {
+      if (id === exemptTurnId) continue;
+      if (this.runtimeTurns.has(id)) {
+        this.cancelTurn(id, 'persistent_query_retired');
+      }
+    }
+    // 4. Official close + abort (no extra interrupt — close terminates).
+    //    Register the exit wait BEFORE close: the spawn exit notification can
+    //    fire synchronously inside close() and must find its waiter.
+    const exitWait = this.waitForScopeExit(scope);
+    try {
+      query.close();
+    } catch {
+      // Already-closed transports are fine; abort below is the backup.
+    }
+    scope.abortController.abort();
+
+    // 6a. Confirm the old CLI TRULY exited (abort/killed/loop-end are not proof).
+    const exited = await exitWait;
+    if (!exited) {
+      this.recordTranscriptDiagnostic({ phase: 'query_exit_confirmed', detail: `timeout epoch=${scope.epoch}` });
+      this.setQueryStartProhibited('query_exit_timeout');
+      // Explicit failure: settle the affected unsent turns with an error and
+      // keep the send prohibition — never start a second CLI, never claim recovery.
+      const failure = new Error('The Claude CLI process did not exit after close; unsent input stays queued locally.');
+      for (const item of unsent) {
+        if (this.runtimeTurns.has(item.turnId)) {
+          this.cancelTurn(item.turnId, 'query_exit_timeout', failure);
+        }
+      }
+      return;
+    }
+    this.recordTranscriptDiagnostic({ phase: 'query_exit_confirmed', detail: `epoch=${scope.epoch}` });
+
+    // 6b. Rebuild under the original session configuration.
+    const vaultPath = getVaultPath(this.plugin.app);
+    const cliPath = this.plugin.getResolvedProviderCliPath('claude');
+    if (!vaultPath || !cliPath) {
+      this.setQueryStartProhibited('query_rebuild_failed');
+      const failure = new Error('Persistent query rebuild failed: vault path or CLI path unavailable.');
+      for (const item of unsent) {
+        if (this.runtimeTurns.has(item.turnId)) {
+          this.cancelTurn(item.turnId, 'query_rebuild_failed', failure);
+        }
+      }
+      return;
+    }
+    try {
+      await this.startPersistentQuery(
+        vaultPath,
+        cliPath,
+        this.sessionManager.getSessionId() ?? undefined,
+        this.currentExternalContextPaths
+      );
+    } catch (error) {
+      this.setQueryStartProhibited('query_rebuild_failed');
+      const failure = error instanceof Error ? error : new Error(String(error));
+      for (const item of unsent) {
+        if (this.runtimeTurns.has(item.turnId)) {
+          this.cancelTurn(item.turnId, 'query_rebuild_failed', failure);
+        }
+      }
+      return;
+    }
+
+    // 6c. Restore the never-sent queue onto the new channel (the already
+    //     dispatched input is never re-sent).
+    const rebuiltScope = this.liveQueryScope();
+    const newChannel = rebuiltScope?.channel ?? null;
+    if (newChannel && unsent.length > 0) {
+      newChannel.restoreQueue(unsent);
+      this.recordTranscriptDiagnostic({
+        phase: 'query_rebuilt',
+        detail: `epoch=${rebuiltScope?.epoch ?? 'none'} restored=${unsent.length}`,
+      });
+    } else {
+      this.recordTranscriptDiagnostic({ phase: 'query_rebuilt', detail: `epoch=${rebuiltScope?.epoch ?? 'none'} restored=0` });
+    }
+  }
+
+  /** Waits for the real spawn exit; resolves false on timeout (15s). */
+  private waitForScopeExit(scope: QueryScope): Promise<boolean> {
+    if (scope.exitNotified) {
+      return Promise.resolve(true);
+    }
+    return new Promise<boolean>(resolve => {
+      let timer: ReturnType<typeof setTimeout> | null = null;
+      const notify = () => {
+        if (timer !== null) clearTimeout(timer);
+        this.scopeExitNotifications.delete(scope.epoch);
+        resolve(true);
+      };
+      const entry = this.scopeExitNotifications.get(scope.epoch) ?? { scope, waiters: [] };
+      entry.waiters.push(notify);
+      this.scopeExitNotifications.set(scope.epoch, entry);
+      timer = setTimeout(() => {
+        const current = this.scopeExitNotifications.get(scope.epoch);
+        if (current && current.waiters.length > 0) {
+          current.waiters = current.waiters.filter(waiter => waiter !== notify);
+          if (current.waiters.length === 0) this.scopeExitNotifications.delete(scope.epoch);
+        }
+        resolve(scope.exitNotified);
+      }, QUERY_EXIT_CONFIRM_TIMEOUT_MS);
+    });
+  }
+
+  private getRunningAgentCandidates(): Array<{ agentId: string; startedAt: number }> {
+    try {
+      // Read only runningAgents: hasRunning is a lazy getter with stale
+      // cleanup, so accessing it would orphanize the candidates before send.
+      return this._subagentStateProvider?.().runningAgents ?? [];
+    } catch {
+      return [];
+    }
+  }
+
+  /**
+   * Fix 4 (2026-11-05): the diagnostic context is an IMMUTABLE snapshot taken
+   * before the send. A late stopTask response must never read the turn's
+   * mutated generation or the current CLI version — sent/success/reject/
+   * outcome events all carry the frozen copy.
+   */
+  private async sendStopTasks(
+    turn: RuntimeTurn,
+    candidates: Array<{ agentId: string; startedAt: number }>,
+    context: 'result_watchdog' | 'silent_probe',
+    attempt: StopTaskRecoveryAttempt | null,
+  ): Promise<void> {
+    const query = attempt ? this.currentQueryScope?.query : this.persistentQuery;
+    if (!query || this.shuttingDown) return;
+    const snapshot: StopTaskDiagnosticSnapshot = {
+      turnId: turn.id,
+      generation: attempt ? attempt.generation : turn.generation,
+      queryEpoch: attempt ? attempt.queryEpoch : this.currentQueryScope?.epoch,
+      attemptId: attempt ? attempt.attemptId : null,
+      cliVersion: attempt ? attempt.cliVersion : (turn.transcriptTerminalCliVersion ?? this.transcriptCliVersion),
+      sentAt: Date.now(),
+    };
+    const log = this.transcriptDiagnosticLog;
+    await Promise.allSettled(candidates.map(async agent => {
+      this.recordTranscriptDiagnostic({
+        phase: 'stop_task_sent', turnId: snapshot.turnId, generation: snapshot.generation,
+        agentIdHash: log?.hashId(agent.agentId), detail: context,
+        queryEpoch: snapshot.queryEpoch, attemptId: snapshot.attemptId ?? undefined,
+        ...(snapshot.cliVersion ? { cliVersion: snapshot.cliVersion } : {}),
+      });
+      try {
+        await query.stopTask(agent.agentId);
+        if (context === 'silent_probe') {
+          this.recordTranscriptDiagnostic({
+            phase: 'stop_task_outcome', turnId: snapshot.turnId, generation: snapshot.generation,
+            agentIdHash: log?.hashId(agent.agentId), outcome: 'sent', detail: context,
+            queryEpoch: snapshot.queryEpoch, attemptId: snapshot.attemptId ?? undefined,
+            ...(snapshot.cliVersion ? { cliVersion: snapshot.cliVersion } : {}),
+          });
+        }
+      } catch (error) {
+        // CLI 2.1.311 may reject missing tasks. A rejected stop is benign:
+        // retain diagnostic evidence and let the recovery chain continue.
+        this.recordTranscriptDiagnostic({
+          phase: 'stop_task_outcome', turnId: snapshot.turnId, generation: snapshot.generation,
+          agentIdHash: log?.hashId(agent.agentId), outcome: 'error', detail: context,
+          errorName: error instanceof Error ? error.name : 'UnknownError',
+          queryEpoch: snapshot.queryEpoch, attemptId: snapshot.attemptId ?? undefined,
+          ...(snapshot.cliVersion ? { cliVersion: snapshot.cliVersion } : {}),
+        });
+      }
+    }));
   }
 
   /**
@@ -2330,7 +3270,8 @@ export class ClaudianService implements ChatRuntime {
         getVaultPath: () => this.vaultPath,
         getCliPath: () => this.plugin.getResolvedProviderCliPath('claude'),
         getScopedSettings: () => this.getScopedSettings(),
-        getPermissionMode: () => this.plugin.settings.permissionMode,
+        // Scoped snapshot, never the top-level projection another provider owns.
+        getPermissionMode: () => this.getScopedSettings().permissionMode,
         resolveSDKPermissionMode: (mode) => this.resolveSDKPermissionMode(mode),
         mcpManager: this.mcpManager,
         buildPersistentQueryConfig: (vaultPath, cliPath, externalContextPaths) =>
@@ -2566,8 +3507,10 @@ export class ClaudianService implements ChatRuntime {
    * Closes the persistent query since session is changing.
    */
   resetSession() {
-    // Close persistent query (new session will use cold-start resume)
-    this.closePersistentQuery('session reset');
+    // Close persistent query (new session will use cold-start resume).
+    // Reset is an explicit recovery entry: it owns the slot lifecycle from
+    // scratch and may lift a send prohibition left by a failed recovery.
+    this.closePersistentQuery('session reset', { clearStartProhibition: true });
     this.turnReconciliation.advanceSessionGeneration();
 
     // Reset crash recovery for fresh start
@@ -2596,31 +3539,61 @@ export class ClaudianService implements ChatRuntime {
     return this.isPersistentQueryActive();
   }
 
-  /**
-   * Get supported commands (SDK skills).
-   * Returns cached commands populated on system/init. Falls back to a fresh
-   * supportedCommands() call if the cache is empty (e.g., dropdown opened
-   * before the first init event).
-   */
-  async getSupportedCommands(): Promise<SlashCommand[]> {
-    if (this.cachedSdkCommands.length > 0) {
-      return this.cachedSdkCommands;
-    }
-    if (!this.persistentQuery) {
+  /** The array API remains a compatibility shell over the current Query's observation. */
+  async getSupportedCommands(signal?: AbortSignal): Promise<SlashCommand[]> {
+    const scope = this.liveQueryScope();
+    const result = await this.readQueryCommands(scope, signal);
+    if (result.status !== 'ready' || !scope || signal?.aborted ||
+        !this.isCurrentQueryCommandCell(scope, scope.commandCell)) {
       return [];
     }
-    return this.fetchAndCacheCommands(this.persistentQuery);
+    return result.entries.map(entry => ({ ...entry }));
   }
 
-  /**
-   * Fetches commands from the SDK and caches them. Called on system/init
-   * (fire-and-forget) and as a fallback from getSupportedCommands().
-   */
-  private async fetchAndCacheCommands(query: Query | null): Promise<SlashCommand[]> {
-    if (!query) return [];
+  private isCurrentQueryCommandCell(scope: QueryScope, cell: QueryCommandCell): boolean {
+    return !this.shuttingDown && this.currentQueryScope === scope && !scope.retired &&
+      this.persistentQuery === scope.query && scope.commandCell === cell &&
+      cell.query === scope.query && cell.state !== 'revoked';
+  }
+
+  private async readQueryCommands(
+    scope: QueryScope | null,
+    signal?: AbortSignal,
+    retryFailed = true,
+  ): Promise<QueryCommandResult> {
+    if (signal?.aborted) return { status: 'cancelled' };
+    if (!scope) return { status: 'unavailable' };
+    const cell = scope.commandCell;
+    if (!this.isCurrentQueryCommandCell(scope, cell)) return { status: 'stale' };
+    if (cell.state === 'ready') return { status: 'ready', entries: cell.entries };
+    if (cell.state === 'unobserved' && cell.lastOutcome === 'failed' && !retryFailed) {
+      return { status: 'failed' };
+    }
+
+    const flight = cell.flight ?? this.startQueryCommandFlight(scope, cell);
+    if (!this.isCurrentQueryCommandCell(scope, cell) || cell.flight !== flight) {
+      return { status: 'stale' };
+    }
+    const result = await this.waitForQueryCommandFlight(scope, cell, flight, signal);
+    if (signal?.aborted) return { status: 'cancelled' };
+    if (!this.isCurrentQueryCommandCell(scope, cell)) return { status: 'stale' };
+    return result;
+  }
+
+  private startQueryCommandFlight(scope: QueryScope, cell: QueryCommandCell): QueryCommandFlight {
+    const flight: QueryCommandFlight = { waiters: new Set() };
+    cell.state = 'pending';
+    cell.flight = flight;
+
+    // Install the flight before invoking the SDK, including synchronous re-entry.
+    let pending: Promise<SDKSlashCommand[]>;
     try {
-      const sdkCommands: SDKSlashCommand[] = await query.supportedCommands();
-      const mappedCommands = sdkCommands.map((cmd) => ({
+      pending = Promise.resolve(scope.query.supportedCommands());
+    } catch (error) {
+      pending = Promise.reject(error);
+    }
+    void pending.then(sdkCommands => {
+      const entries = sdkCommands.map(cmd => ({
         id: `sdk:${cmd.name}`,
         name: cmd.name,
         description: cmd.description,
@@ -2628,14 +3601,232 @@ export class ClaudianService implements ChatRuntime {
         content: '',
         source: 'sdk' as const,
       }));
-      if (this.persistentQuery !== query) {
-        return this.cachedSdkCommands;
-      }
-      this.cachedSdkCommands = mappedCommands;
-      return this.cachedSdkCommands;
-    } catch {
-      return [];
+      this.finishQueryCommandFlight(scope, cell, flight, { status: 'ready', entries });
+    }, () => {
+      this.finishQueryCommandFlight(scope, cell, flight, { status: 'failed' });
+    }).catch(() => {
+      this.finishQueryCommandFlight(scope, cell, flight, { status: 'failed' });
+    });
+    return flight;
+  }
+
+  private finishQueryCommandFlight(
+    scope: QueryScope,
+    cell: QueryCommandCell,
+    flight: QueryCommandFlight,
+    result: QueryCommandResult,
+  ): void {
+    if (!this.isCurrentQueryCommandCell(scope, cell) || cell.flight !== flight) {
+      this.settleQueryCommandWaiters(flight, { status: 'stale' });
+      return;
     }
+    cell.flight = null;
+    if (result.status === 'ready') {
+      cell.state = 'ready';
+      cell.entries = result.entries;
+      cell.lastOutcome = null;
+    } else {
+      cell.state = 'unobserved';
+      cell.lastOutcome = 'failed';
+    }
+    this.settleQueryCommandWaiters(flight, result);
+    // W4a: the committed snapshot is a fresh source observation. Advance the
+    // source revision and notify — listeners only invalidate UI; this never
+    // re-enters the SDK here.
+    this.commandSourceRevision += 1;
+    this.notifyCommandDiscoveryChanged();
+  }
+
+  private waitForQueryCommandFlight(
+    scope: QueryScope,
+    cell: QueryCommandCell,
+    flight: QueryCommandFlight,
+    signal?: AbortSignal,
+  ): Promise<QueryCommandResult> {
+    return new Promise(resolve => {
+      let finished = false;
+      const onAbort = () => finish({ status: 'cancelled' });
+      const finish: QueryCommandWaiter = result => {
+        if (finished) return;
+        finished = true;
+        flight.waiters.delete(finish);
+        try { signal?.removeEventListener('abort', onAbort); } catch { /* caller-owned signal */ }
+        if (signal?.aborted) resolve({ status: 'cancelled' });
+        else if (!this.isCurrentQueryCommandCell(scope, cell)) resolve({ status: 'stale' });
+        else resolve(result);
+      };
+      flight.waiters.add(finish);
+      try { signal?.addEventListener('abort', onAbort, { once: true }); } catch {
+        finish({ status: 'cancelled' });
+        return;
+      }
+      if (signal?.aborted) finish({ status: 'cancelled' });
+      else if (!this.isCurrentQueryCommandCell(scope, cell) || cell.flight !== flight) {
+        finish({ status: 'stale' });
+      }
+    });
+  }
+
+  private settleQueryCommandWaiters(flight: QueryCommandFlight, result: QueryCommandResult): void {
+    const waiters = [...flight.waiters];
+    flight.waiters.clear();
+    for (const waiter of waiters) {
+      try { waiter(result); } catch { /* command waiters cannot interrupt lifecycle */ }
+    }
+  }
+
+  private revokeQueryCommands(cell: QueryCommandCell): void {
+    if (cell.state === 'revoked') return;
+    cell.state = 'revoked';
+    cell.entries = [];
+    cell.lastOutcome = null;
+    const flight = cell.flight;
+    cell.flight = null;
+    if (flight) this.settleQueryCommandWaiters(flight, { status: 'stale' });
+    // W4a: revoking a readable cell ends its eligibility generation — an
+    // already-replaced cell (old consumer teardown, late old child exit)
+    // never matches the current generation, so it cannot revoke Q2.
+    if (this.commandEligibility.readable?.cell === cell) {
+      this.advanceCommandEligibility(null);
+    }
+  }
+
+  // ---- W4a: public typed command discovery facet --------------------------
+  // Read-only bypass over the P1 command cell. P1 keeps owning the getter
+  // flight, waiters, revocation, and the array compatibility shell; the facet
+  // only adds eligibility generations, an opaque per-scope source
+  // observation, and invalidation listeners.
+
+  getCommandDiscovery(): RuntimeCommandDiscovery {
+    if (!this.commandDiscoveryFacet) {
+      this.commandDiscoveryFacet = {
+        read: (waiterSignal, options) => this.readCommandDiscoverySnapshot(waiterSignal, options),
+        subscribe: listener => this.subscribeCommandDiscovery(listener),
+        isCurrent: eligibility => this.isCommandEligibilityCurrent(eligibility),
+      };
+    }
+    return this.commandDiscoveryFacet;
+  }
+
+  private subscribeCommandDiscovery(listener: () => void): () => void {
+    this.commandDiscoveryListeners.add(listener);
+    return () => { this.commandDiscoveryListeners.delete(listener); };
+  }
+
+  /** Invalidation fan-out only — a throwing listener must never break the runtime. */
+  private notifyCommandDiscoveryChanged(): void {
+    if (this.commandDiscoveryListeners.size === 0) return;
+    for (const listener of [...this.commandDiscoveryListeners]) {
+      try { listener(); } catch { /* isolated by contract */ }
+    }
+  }
+
+  private advanceCommandEligibility(readable: CommandEligibilityGeneration['readable']): void {
+    const token: CommandDiscoveryToken = {};
+    const revision = this.commandEligibility.eligibility.revision + 1;
+    this.commandEligibility = { eligibility: { token, revision }, readable };
+    this.notifyCommandDiscoveryChanged();
+  }
+
+  private isCommandEligibilityCurrent(eligibility: CommandRuntimeEligibility): boolean {
+    const generation = this.commandEligibility;
+    // (1) The eligibility object itself must be the current generation.
+    if (!eligibility ||
+        eligibility.token !== generation.eligibility.token ||
+        eligibility.revision !== generation.eligibility.revision) {
+      return false;
+    }
+    // (2)+(3) Query-bound generations must still own a live, unrevoked
+    // scope-cell; absence generations stay current until the next advance.
+    return generation.readable === null ||
+      this.isCurrentQueryCommandCell(generation.readable.scope, generation.readable.cell);
+  }
+
+  private async readCommandDiscoverySnapshot(
+    waiterSignal?: AbortSignal,
+    options?: { retryFailed?: boolean },
+  ): Promise<RuntimeCommandRead> {
+    // Capture the eligibility generation and the readable scope/cell BEFORE
+    // any await: a cell already revoked/exited/EOF'd reads as a fresh
+    // no-readable-query absence, never as a stale carry-over, and a read
+    // started on one Query never re-binds to a replacement.
+    const eligibility = this.commandEligibility.eligibility;
+    const scope = this.currentQueryScope;
+    const cell = scope?.commandCell ?? null;
+    if (waiterSignal?.aborted) {
+      return { status: 'cancelled', eligibility };
+    }
+    if (!scope || !cell || !this.isCurrentQueryCommandCell(scope, cell)) {
+      return { status: 'unavailable', reason: 'no-readable-query', eligibility };
+    }
+    // Typed reads are passive by default: a cached failure is preserved
+    // unless the caller explicitly asks for retryFailed.
+    const result = await this.readQueryCommands(scope, waiterSignal, options?.retryFailed === true);
+    if (result.status === 'ready') {
+      return {
+        status: 'ready',
+        entries: result.entries.map(entry => ({ ...entry })),
+        receipt: this.buildQueryCommandReceipt(scope, cell),
+        eligibility,
+      };
+    }
+    if (result.status === 'failed') {
+      return { status: 'failed', code: 'query-command-read-failed', eligibility };
+    }
+    return { status: result.status, eligibility };
+  }
+
+  private buildQueryCommandReceipt(
+    scope: QueryScope,
+    cell: QueryCommandCell,
+  ): QueryCommandSourceReceipt {
+    const meta = this.commandSourceMeta;
+    const bound = meta && meta.scope === scope && meta.cell === cell ? meta : null;
+    // Unknown dims are reported as unknown — never fabricated from
+    // currentConfig or the live slot state.
+    const sourceToken: CommandDiscoveryToken = bound ? bound.token : {};
+    return {
+      sourceKind: 'initialize-response',
+      sourceToken,
+      sourceRevision: this.commandSourceRevision,
+      scope: {
+        kind: 'actual-query',
+        sourceToken,
+        cwd: bound?.cwd,
+        additionalDirectories: bound?.additionalDirectories,
+        settingSources: bound?.settingSources,
+        unknown: [...(bound ? bound.unknown : ['cwd', 'additionalDirectories', 'settingSources'])],
+      },
+      coverage: 'initialize-observed',
+    };
+  }
+
+  /**
+   * W4a: copy the applied options whitelist (cwd / additionalDirectories /
+   * settingSources) onto the scope's command source meta. Dimensions absent
+   * from the applied options stay in `unknown` — the meta is never repaired
+   * from the mutable currentConfig.
+   */
+  private recordAppliedCommandScope(scope: QueryScope, options: Options): void {
+    const meta = this.commandSourceMeta;
+    if (!meta || meta.scope !== scope) return;
+    if (typeof options.cwd === 'string') {
+      meta.cwd = options.cwd;
+      this.dropUnknownCommandScopeDim(meta, 'cwd');
+    }
+    if (options.additionalDirectories) {
+      meta.additionalDirectories = [...options.additionalDirectories];
+      this.dropUnknownCommandScopeDim(meta, 'additionalDirectories');
+    }
+    if (options.settingSources) {
+      meta.settingSources = [...options.settingSources];
+      this.dropUnknownCommandScopeDim(meta, 'settingSources');
+    }
+  }
+
+  private dropUnknownCommandScopeDim(meta: QueryCommandSourceMeta, dim: string): void {
+    const index = meta.unknown.indexOf(dim);
+    if (index !== -1) meta.unknown.splice(index, 1);
   }
 
   /**
@@ -2649,9 +3840,11 @@ export class ClaudianService implements ChatRuntime {
     const currentId = this.sessionManager.getSessionId();
     const sessionChanged = currentId !== id;
 
-    // Close synchronously when session changes
+    // Close synchronously when session changes. A session switch (reload,
+    // restore) is an explicit recovery entry: it may lift a send prohibition
+    // left by a failed recovery and start the new session fresh.
     if (sessionChanged) {
-      this.closePersistentQuery('session switch');
+      this.closePersistentQuery('session switch', { clearStartProhibition: true });
       this.crashRecoveryAttempted = false;
       // Bindings are scoped to the session generation: late events from the
       // old session must never hit the new session's map (batch 1 §2.4).
@@ -2670,8 +3863,8 @@ export class ClaudianService implements ChatRuntime {
     // Runtime starts on demand when query() is called.
   }
 
-  setTranscriptObserverStartOffset(offset: number | null): void {
-    this.transcriptObserverStartOffset = offset;
+  setTranscriptObserverTailStart(tailStart: HistoryTailStart | null): void {
+    this.transcriptObserverTailStart = tailStart;
   }
 
   setHistoryRecoverySource(source: (() => FullHistoryIterable) | null): void {
@@ -2697,6 +3890,7 @@ export class ClaudianService implements ChatRuntime {
     const target = ready ? getSDKSessionPath(vaultPath!, sessionId!) : null;
     if (target === this.transcriptObserverTarget && (target === null || this.transcriptObserver)) return;
     this.transcriptObserverTarget = target;
+    this.transcriptCliVersion = undefined;
     this.transcriptObserverRestartChain = this.transcriptObserverRestartChain.then(async () => {
       if (target !== this.transcriptObserverTarget) return;
       this.transcriptObserver?.stop('session_switch');
@@ -2711,21 +3905,60 @@ export class ClaudianService implements ChatRuntime {
         released: turnId => this._onAutoTurnReleased?.(turnId),
         cancelled: event => this._onAutoTurnCancelled?.(event),
         projectEmbeddedExternal: event => this._onEmbeddedExternal?.(event) ?? Promise.resolve(),
-        onHostTurnTerminalObserved: turnId => this.noteTranscriptTerminalSeen(turnId),
+        onHostTurnTerminalObserved: (turnId, evidence) => this.noteTranscriptTerminalSeen(turnId, evidence),
+        onHostTurnTerminalRetracted: (turnId, reason) => this.noteTranscriptTerminalRetracted(turnId, reason),
+        onCliVersionObserved: version => { this.transcriptCliVersion = version; },
       }, () => true, this.transcriptDiagnosticLog, {
         // Observe-mode bypass: verdicts are recorded as diagnostics only.
         recordObservedStart: fact => this.turnReconciliation.recordObservedStart(fact),
       });
       this.transcriptObserver = observer;
       try {
-        const fromOffset = this.transcriptObserverStartOffset ?? undefined;
-        this.transcriptObserverStartOffset = null;
-        await observer.start(target, fromOffset);
-      } catch {
+        // The tail-start credentials are consumed exactly once: the first
+        // observer start after runtime creation primes at the committed
+        // boundary only after re-verifying the snapshot's source identity.
+        const tailStart = this.transcriptObserverTailStart ?? undefined;
+        this.transcriptObserverTailStart = null;
+        await observer.start(target, tailStart);
+      } catch (error) {
+        // A source-change rejection kills this observer on purpose; the
+        // diagnostic carries the session identity (hashed — no paths or raw
+        // ids land in the log) so the restart-loop cause stays auditable.
+        if (error instanceof Error && /source.*changed/i.test(error.message)) {
+          this.transcriptDiagnosticLog?.record({
+            phase: 'prime_rejected',
+            reason: 'source_changed',
+            conversationIdHash: this.transcriptDiagnosticLog.hashId(sessionId ?? 'unknown'),
+            detail: 'observer_start',
+          });
+        }
         observer.stop('start_failed');
         if (this.transcriptObserver === observer) this.transcriptObserver = null;
         if (this.transcriptObserverTarget === target) this.transcriptObserverTarget = null;
         return;
+      }
+      // Observer rebuild (session init/switch): restore the CURRENT dispatch
+      // anchor AFTER start (start's internal stop would clear it). A late
+      // observer initialization must never stamp "now" in place of the real
+      // dispatch time, and the live host projection carries over (fix 3).
+      const savedDispatch = this.currentDispatchDescriptor;
+      const liveHostTurnId = this.beginUserTurnProjectionTarget;
+      if (liveHostTurnId && savedDispatch
+        && (savedDispatch.leaseTurnId === liveHostTurnId || savedDispatch.hostTurnIds.includes(liveHostTurnId))) {
+        observer.beginUserTurnProjection(liveHostTurnId);
+      }
+      if (savedDispatch) {
+        try {
+          observer.observeDispatch({
+            leaseTurnId: savedDispatch.leaseTurnId,
+            canonicalUuid: savedDispatch.canonicalTurnId,
+            hostTurnIds: savedDispatch.hostTurnIds,
+            dispatchedAt: savedDispatch.dispatchedAt,
+            isManualCompact: savedDispatch.isManualCompact,
+          });
+        } catch {
+          // Best-effort anchor restore.
+        }
       }
       if (target !== this.transcriptObserverTarget && this.transcriptObserver === observer) {
         observer.stop('session_switch');
@@ -2743,8 +3976,9 @@ export class ClaudianService implements ChatRuntime {
     this.transcriptObserver?.stop('plugin_cleanup');
     this.transcriptObserver = null;
     this.turnReconciliation.advanceSessionGeneration();
-    // Close persistent query
-    this.closePersistentQuery('plugin cleanup');
+    // Close persistent query. Plugin teardown is an explicit recovery entry:
+    // the next plugin load owns the slot lifecycle from scratch.
+    this.closePersistentQuery('plugin cleanup', { clearStartProhibition: true });
 
     // Cancel any in-flight cold-start query
     this.cancel();
@@ -2816,8 +4050,40 @@ export class ClaudianService implements ChatRuntime {
     this.exitPlanModeCallback = callback;
   }
 
-  setPermissionModeSyncCallback(callback: ((sdkMode: string) => void) | null): void {
+  /**
+   * Payload contract (#1894 semantics): the value is the PROVIDER-NORMALIZED
+   * app permission mode (a policy value, plus the fork's transient 'plan'),
+   * never the raw Claude SDK mode. The runtime reverse-maps observations
+   * before invoking this callback.
+   */
+  setPermissionModeSyncCallback(callback: ((appMode: string) => void) | null): void {
     this.permissionModeSyncCallback = callback;
+  }
+
+  /**
+   * Scope-guarded native permission sync (design §5.2): reverse-maps an
+   * observed SDK mode onto the provider app mode, updates the live config,
+   * and notifies the feature layer — all through the same owner. Unknown
+   * native modes (dontAsk, delegate, ...) never masquerade as a toolbar
+   * value; a retired scope's late message never writes back.
+   */
+  private syncNativePermissionMode(sdkMode: unknown, scope: QueryScope | null): void {
+    if (scope !== null && !this.isCurrentQueryScope(scope)) {
+      return;
+    }
+    const appMode = resolveClaudeAppPermissionModeFromSdk(sdkMode);
+    if (appMode === null) {
+      return;
+    }
+    if (this.currentConfig) {
+      this.currentConfig.permissionMode = appMode;
+      this.currentConfig.sdkPermissionMode = isClaudePermissionMode(appMode)
+        ? resolveClaudeSdkPermissionModeForRuntime(appMode)
+        : 'plan';
+    }
+    if (this.permissionModeSyncCallback) {
+      try { this.permissionModeSyncCallback(appMode); } catch { /* non-critical */ }
+    }
   }
 
   setSubagentHookProvider(getState: () => SubagentHookState): void {
@@ -2876,13 +4142,38 @@ export class ClaudianService implements ChatRuntime {
   /**
    * P0-1: stamp the observer tick time at which the transcript first showed
    * the host turn's terminal state. First-seen wins: later ticks (quiet
-   * settle, trailing rows) must not extend the threshold.
+   * settle, trailing rows) must not extend the threshold. The evidence
+   * payload (compact vs stop_hook, CLI version) only rides the compact path.
    */
-  private noteTranscriptTerminalSeen(turnId: string): void {
+  private noteTranscriptTerminalSeen(turnId: string, evidence?: { kind: 'compact' | 'stop_hook'; cliVersion?: string }): void {
     const turn = this.runtimeTurns.get(turnId);
     if (!turn || turn.phase === 'settled' || turn.phase === 'cancelled') return;
     if (turn.transcriptTerminalSeenAt === null) {
       turn.transcriptTerminalSeenAt = Date.now();
+      if (evidence) {
+        turn.transcriptTerminalSource = evidence.kind;
+        if (evidence.cliVersion) turn.transcriptTerminalCliVersion = evidence.cliVersion;
+      }
+    }
+  }
+
+  /**
+   * Fix 1 (2026-11-05): strong continuation proof retracts the stamped
+   * terminal evidence. The watchdog can re-arm on the turn's NEW terminal;
+   * any live recovery attempt freezes out via the evidence revision bump
+   * (its liveness check re-verifies the revision).
+   */
+  private noteTranscriptTerminalRetracted(turnId: string, reason: string): void {
+    const turn = this.runtimeTurns.get(turnId);
+    if (!turn || turn.phase === 'settled' || turn.phase === 'cancelled') return;
+    if (turn.transcriptTerminalSeenAt !== null) {
+      turn.transcriptTerminalSeenAt = null;
+      turn.transcriptTerminalSource = undefined;
+      turn.transcriptTerminalCliVersion = undefined;
+      turn.evidenceRevision += 1;
+      this.recordTranscriptDiagnostic({
+        phase: 'host_terminal_retracted', turnId, generation: turn.generation, detail: reason,
+      });
     }
   }
 
@@ -2932,12 +4223,16 @@ export class ClaudianService implements ChatRuntime {
   }
 
   private createApprovalCallback(): CanUseTool {
-    return createClaudeApprovalCallback({
+    const callback = createClaudeApprovalCallback({
       getAllowedTools: () => this.currentAllowedTools,
       getApprovalCallback: () => this.approvalCallback,
       getAskUserQuestionCallback: () => this.askUserQuestionCallback,
       getExitPlanModeCallback: () => this.exitPlanModeCallback,
-      getPermissionMode: () => this.plugin.settings.permissionMode,
+      // Scoped snapshot, never the top-level projection another provider owns.
+      getPermissionMode: () => resolveClaudeRuntimePermissionMode(
+        this.getScopedSettings().permissionMode,
+        this.getScopedSettings() as unknown as Record<string, unknown>,
+      ),
       resolveSDKPermissionMode: (mode) => this.resolveSDKPermissionMode(mode),
       syncPermissionMode: (mode, sdkMode) => {
         if (this.currentConfig) {
@@ -2946,12 +4241,20 @@ export class ClaudianService implements ChatRuntime {
         }
       },
     });
+    return async (...args) => {
+      this.pendingCanUseToolCount += 1;
+      try {
+        return await callback(...args);
+      } finally {
+        this.pendingCanUseToolCount -= 1;
+      }
+    };
   }
 
-  private resolveSDKPermissionMode(mode: PermissionMode): SDKPermissionMode {
+  private resolveSDKPermissionMode(mode: string): SDKPermissionMode {
     return QueryOptionsBuilder.resolveClaudeSdkPermissionMode(
       mode,
-      getClaudeProviderSettings(this.plugin.settings as unknown as Record<string, unknown>).safeMode,
+      this.getScopedSettings() as unknown as Record<string, unknown>,
     ) as SDKPermissionMode;
   }
 }

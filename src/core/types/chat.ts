@@ -1,3 +1,4 @@
+import type { ConversationSizeSnapshot } from '../providers/types';
 import type { SDKToolUseResult } from './diff';
 import type { ProviderId } from './provider';
 import type { SubagentMode, ToolCallInfo } from './tools';
@@ -136,6 +137,8 @@ export interface ConversationMeta {
   lastResponseAt?: number;
   messageCount: number;
   preview: string;
+  /** Current native file reading from the in-memory size service. */
+  sizeSnapshot?: ConversationSizeSnapshot;
   /** Status of AI title generation. */
   titleGenerationStatus?: 'pending' | 'success' | 'failed';
 }

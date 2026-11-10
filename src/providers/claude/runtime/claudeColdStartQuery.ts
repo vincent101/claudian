@@ -89,6 +89,8 @@ export async function runColdStartQuery(
       ...customEnv,
       PATH: enhancedPath,
     },
+    // Auxiliary queries (inline/title/refine) keep a fixed bypass: their
+    // tool/hook restrictions answer approvals, never the main canUseTool.
     permissionMode: 'bypassPermissions',
     allowDangerouslySkipPermissions: true,
     settingSources: resolveClaudeSettingSources(claudeSettings.loadUserSettings),
@@ -111,9 +113,9 @@ export async function runColdStartQuery(
     options.resume = config.resumeSessionId;
   }
 
-  if (claudeSettings.safeMode === 'auto') {
-    options.extraArgs = { ...options.extraArgs, 'enable-auto-mode': null };
-  }
+  // Match chat launches, which always enable auto mode (design §5.4): the
+  // auxiliary runner itself stays fixed-bypass regardless of the toolbar mode.
+  options.extraArgs = { ...options.extraArgs, 'enable-auto-mode': null };
 
   if (!config.thinking?.disabled) {
     const effortLevel = resolveAdaptiveEffortLevel(selectedModel, settings.effortLevel);
