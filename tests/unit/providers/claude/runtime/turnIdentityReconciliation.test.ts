@@ -199,6 +199,23 @@ describe('Turn identity reconciliation wiring (batch 1 observe bypass)', () => {
     expect((service as any).turnReconciliation.getResultEchoStats().consulted).toBe(0);
   });
 
+  it('does not consult when the frame carries counters but no uuid echo (CLI >= 2.1.303 shape)', async () => {
+    sdkMock.setMockMessages([
+      { type: 'system', subtype: 'init', session_id: 'echo-session' },
+      { type: 'assistant', message: { content: [{ type: 'text', text: 'reply' }] } },
+      { type: 'result', subtype: 'success', queued_turn_count: 0, result_index: 4 },
+    ], { appendResult: false });
+    await startPersistentQuery(service);
+    const reconcileSpy = jest.spyOn((service as any).turnReconciliation, 'recordResultEcho');
+
+    const turn = service.prepareTurn({ turnId: 'echo-turn-4', text: 'hello' });
+    const chunks = await collectChunks(service.query(turn));
+
+    expect(chunks.some(chunk => chunk.type === 'done')).toBe(true);
+    expect(reconcileSpy).not.toHaveBeenCalled();
+    expect((service as any).turnReconciliation.getResultEchoStats().consulted).toBe(0);
+  });
+
   it('never lets a failing echo consultation break settlement', async () => {
     sdkMock.setMockMessages([
       { type: 'system', subtype: 'init', session_id: 'echo-session' },

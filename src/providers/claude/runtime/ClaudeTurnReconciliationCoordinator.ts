@@ -71,8 +71,10 @@ export interface ResultEchoFact {
 /**
  * Read-only binding verdict. `bound` means the echo's canonical uuid is the
  * one this lease dispatched (or one of its merged aliases); `mismatch` means
- * the echo provably belongs to a different host turn (the G1 3-in-2-result
- * shape); `unbound` means the echo maps to no dispatched turn at all.
+ * a REGISTERED lease's echo provably belongs to a different host turn (the
+ * G1 3-in-2-result shape); `unbound` means the echo cannot be attributed to
+ * this lease — no dispatch record, an unregistered lease (canonical_rebind
+ * replays), or an echo naming no dispatched turn.
  */
 export type ResultEchoVerdict =
   | { kind: 'bound'; leaseTurnId: string; canonicalTurnId: string }
@@ -251,7 +253,12 @@ export class ClaudeTurnReconciliationCoordinator {
       this.recordResultEchoDiagnostic(leaseRecord.canonicalTurnId, 'bound', fact);
       return { kind: 'bound', leaseTurnId: fact.leaseTurnId, canonicalTurnId: leaseRecord.canonicalTurnId };
     }
-    if (echoedRecord !== undefined) {
+    // Mismatch requires a registered lease that provably differs. An
+    // unregistered lease (e.g. after canonical_rebind: recordDispatched
+    // refuses to map the new leaseTurnId) must stay unbound — otherwise the
+    // same canonical UUID replaying under a new lease would read as "belongs
+    // to another host turn" and pollute the batch-2 mismatch rate.
+    if (leaseRecord !== undefined && echoedRecord !== undefined) {
       this.resultEchoStats.mismatch += 1;
       this.recordResultEchoDiagnostic(echoedRecord.canonicalTurnId, 'mismatch', fact);
       return {

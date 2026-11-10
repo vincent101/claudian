@@ -1945,16 +1945,32 @@ export class ClaudianService implements ChatRuntime {
    */
   private noteResultTurnEcho(message: SDKMessage, turn: RuntimeTurn): void {
     const read = readResultTurnEcho(message);
-    this.recordResultEchoDiagnostic(turn, read);
+    try {
+      this.recordResultEchoDiagnostic(turn, read);
+    } catch {
+      // Diagnostics are best-effort and must never break settlement.
+    }
     // Auto turns never dispatched a client uuid, so there is no binding to
     // consult — only the raw echo stays in diagnostics.
     if (read.echo === null || turn.kind !== 'user') {
       return;
     }
+    const consumedUuids = resultEchoConsumedUuids(read.echo);
+    // CLI >= 2.1.303 always writes result_index/queued_turn_count, so a
+    // non-empty read alone does NOT mean a uuid echo arrived. Consulting with
+    // no consumed uuid would report unbound and blur the green/red split of
+    // the real-wire check; only bindable evidence enters the consultation.
+    if (consumedUuids.length === 0) {
+      return;
+    }
     try {
+      // A duplicated result frame counts as a second consultation: there is
+      // no reliable dedupe key across CLI versions (result_index is absent
+      // before 2.1.303), and duplicates only inflate `consulted`/`bound`
+      // together, never the mismatch evidence.
       this.turnReconciliation.recordResultEcho({
         leaseTurnId: turn.id,
-        consumedUuids: resultEchoConsumedUuids(read.echo),
+        consumedUuids,
         ...(read.echo.queuedTurnCount !== null ? { queuedTurnCount: read.echo.queuedTurnCount } : {}),
         ...(read.echo.resultIndex !== null ? { resultIndex: read.echo.resultIndex } : {}),
       });

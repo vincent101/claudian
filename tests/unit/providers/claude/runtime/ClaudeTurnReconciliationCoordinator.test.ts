@@ -315,6 +315,25 @@ describe('ClaudeTurnReconciliationCoordinator result-echo consultation (G1)', ()
     expect(coordinator.getResultEchoStats()).toEqual({ consulted: 1, bound: 0, mismatch: 0, unbound: 1 });
   });
 
+  it('keeps a canonical_rebind replay unbound instead of reporting a false mismatch', () => {
+    // canonical_rebind reachable shape: the same canonical UUID dispatches
+    // under a new lease, recordDispatched refuses to map that lease, and the
+    // replay's result echoes the canonical UUID. The new lease is simply
+    // unregistered — never evidence that the result belongs elsewhere.
+    const sink = new MemorySink();
+    const coordinator = new ClaudeTurnReconciliationCoordinator('observe', sink);
+    coordinator.recordDispatched({ leaseTurnId: 'turn-1', canonicalTurnId: 'uuid-1', hostTurnIds: ['turn-1'] });
+    coordinator.recordDispatched({ leaseTurnId: 'turn-replay', canonicalTurnId: 'uuid-1', hostTurnIds: ['turn-replay'] });
+
+    const verdict = coordinator.recordResultEcho({ leaseTurnId: 'turn-replay', consumedUuids: ['uuid-1'] });
+
+    expect(verdict).toEqual({ kind: 'unbound', leaseTurnId: 'turn-replay' });
+    expect(coordinator.getResultEchoStats()).toEqual({ consulted: 1, bound: 0, mismatch: 0, unbound: 1 });
+    expect(sink.events.find(event => event.phase === 'turn_identity_result_echo')).toEqual(
+      expect.objectContaining({ echoOutcome: 'unbound' }),
+    );
+  });
+
   it('reports unbound for a lease with no binding and for an empty echo', () => {
     const coordinator = new ClaudeTurnReconciliationCoordinator('observe', new MemorySink());
 
