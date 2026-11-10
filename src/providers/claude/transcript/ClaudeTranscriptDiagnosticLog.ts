@@ -2,6 +2,8 @@ import { createHash, randomBytes } from 'crypto';
 import { appendFileSync, existsSync, mkdirSync, renameSync, rmSync, statSync, writeFileSync } from 'fs';
 import { dirname, join } from 'path';
 
+import { RESULT_TURN_ECHO_LOG_HASH_LIMIT } from '../runtime/ClaudeResultTurnEcho';
+
 export type TranscriptDiagnosticPhase =
   | 'tick_start' | 'tick_end' | 'map'
   | 'lease_begin' | 'lease_finish' | 'lease_release'
@@ -18,6 +20,9 @@ export type TranscriptDiagnosticPhase =
   | 'turn_identity_reserved' | 'turn_identity_dispatched' | 'turn_identity_matched'
   | 'turn_identity_host_only' | 'turn_identity_observer_only'
   | 'turn_identity_duplicate' | 'turn_identity_conflict'
+  // G1 result-frame turn echo: the raw passthrough read (`turn_result_echo`)
+  // and the coordinator's binding verdict (`turn_identity_result_echo`).
+  | 'turn_result_echo' | 'turn_identity_result_echo'
   // Turn settlement & cancellation reliability (P0 batch, 2026-11-01):
   // cancel/close/settle/interrupt trace plus the SDK session-state (runPhase)
   // bypass. reconcile_fix is reserved for the P1-2 reconciler.
@@ -85,6 +90,26 @@ export interface TranscriptDiagnosticEvent {
   hostAliases?: number;
   /** Turn-identity reconciliation: observed external source kind (category only). */
   sourceKind?: string;
+  /** Result-frame turn echo (G1): read status. Absent is normal degradation. */
+  echoStatus?: 'absent' | 'present' | 'invalid';
+  /** Result-frame turn echo (G1): hash of the singular uuid, never the raw id. */
+  echoUuidHash?: string;
+  /** Result-frame turn echo (G1): hashes of the consumed uuid list (bounded, count carries the total). */
+  echoUuidHashes?: string[];
+  /** Result-frame turn echo (G1): consumed uuid count after the 64-uuid cap. */
+  echoUuidCount?: number;
+  /** Result-frame turn echo (G1): pending user sends when the result was written. */
+  queuedTurnCount?: number;
+  /** Result-frame turn echo (G1): result write index — not turn order. */
+  resultIndex?: number;
+  /** Result-frame turn echo (G1): producer exceeded the 64-uuid cap. */
+  echoPluralTruncated?: boolean;
+  /** Result-frame turn echo (G1): plural omitted the singular uuid (contract violation). */
+  echoSingularMissingFromPlural?: boolean;
+  /** Result-frame turn echo (G1): version-derived capability expectation (diagnostics only). */
+  echoSupport?: string;
+  /** Result-frame turn echo (G1): coordinator binding verdict. */
+  echoOutcome?: 'bound' | 'mismatch' | 'unbound';
   /** Feature-layer cancel snapshot (cancel_request): queued message slots held at cancel time. */
   queueLength?: number;
   /** Feature-layer cancel snapshot (cancel_request): streaming flag state. */
@@ -191,9 +216,18 @@ export class ClaudeTranscriptDiagnosticLog {
   private serialize(event: TranscriptDiagnosticEvent): string {
     if (event.phase === 'markdown_render_summary') return this.serializeMarkdown(event);
     const clean: Record<string, unknown> = { ts: Date.now(), seq: ++this.seq, phase: event.phase };
-    for (const key of ['tabIdHash', 'turnIdHash', 'pageKeyHash', 'previousPageKeyHash', 'rangeStart', 'rangeEnd', 'generation', 'renderTicket', 'projectedWeight', 'leaseKind', 'batchBytes', 'batchLines', 'elapsedMs', 'errorName', 'buildId', 'mode', 'reason', 'outcome', 'trigger', 'identityRecovery', 'recoveredIdentityFields', 'offset', 'queueMs', 'bytes', 'totalBytes', 'entries', 'turns', 'turnCount', 'sourceBytes', 'projectedChars', 'oversizedTurns', 'hostAliases', 'sourceKind', 'queueLength', 'isStreaming', 'terminalSeenAgeMs', 'lastChunkAgeMs', 'evidenceKind', 'cliVersion', 'agentIdHash', 'agentCandidateCount', 'queryEpoch', 'attemptId', 'detail'] as const) {
+    for (const key of ['tabIdHash', 'turnIdHash', 'pageKeyHash', 'previousPageKeyHash', 'rangeStart', 'rangeEnd', 'generation', 'renderTicket', 'projectedWeight', 'leaseKind', 'batchBytes', 'batchLines', 'elapsedMs', 'errorName', 'buildId', 'mode', 'reason', 'outcome', 'trigger', 'identityRecovery', 'recoveredIdentityFields', 'offset', 'queueMs', 'bytes', 'totalBytes', 'entries', 'turns', 'turnCount', 'sourceBytes', 'projectedChars', 'oversizedTurns', 'hostAliases', 'sourceKind', 'queueLength', 'isStreaming', 'terminalSeenAgeMs', 'lastChunkAgeMs', 'evidenceKind', 'cliVersion', 'agentIdHash', 'agentCandidateCount', 'queryEpoch', 'attemptId', 'detail', 'echoStatus', 'echoUuidHash', 'echoUuidCount', 'queuedTurnCount', 'resultIndex', 'echoPluralTruncated', 'echoSingularMissingFromPlural', 'echoSupport', 'echoOutcome'] as const) {
       const value = event[key];
       if (value !== undefined) clean[key] = typeof value === 'string' ? value.slice(0, 128) : value;
+    }
+    // Echo uuid hashes are already salted hashes; keep the row bounded while
+    // echoUuidCount carries the full list size.
+    const echoHashes = event.echoUuidHashes;
+    if (Array.isArray(echoHashes)) {
+      const validHashes = echoHashes
+        .filter(hash => typeof hash === 'string' && /^[a-f0-9]{12}$/.test(hash))
+        .slice(0, RESULT_TURN_ECHO_LOG_HASH_LIMIT);
+      if (validHashes.length > 0) clean.echoUuidHashes = validHashes;
     }
     let line = `${JSON.stringify(clean)}\n`;
     if (Buffer.byteLength(line) > ENTRY_BYTES) {

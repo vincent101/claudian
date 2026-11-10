@@ -258,3 +258,113 @@ describe('ClaudeTurnReconciliationCoordinator (batch 1: observe-only bypass)', (
     expect(coordinator.getStats().hostUnmatchedTurns).toBe(0);
   });
 });
+
+describe('ClaudeTurnReconciliationCoordinator result-echo consultation (G1)', () => {
+  it('binds the settling lease when the echo consumed its canonical UUID', () => {
+    const sink = new MemorySink();
+    const coordinator = new ClaudeTurnReconciliationCoordinator('observe', sink);
+    coordinator.recordDispatched({ leaseTurnId: 'turn-1', canonicalTurnId: 'uuid-1', hostTurnIds: ['turn-1'] });
+
+    const verdict = coordinator.recordResultEcho({
+      leaseTurnId: 'turn-1',
+      consumedUuids: ['uuid-1'],
+      queuedTurnCount: 0,
+      resultIndex: 0,
+    });
+
+    expect(verdict).toEqual({ kind: 'bound', leaseTurnId: 'turn-1', canonicalTurnId: 'uuid-1' });
+    expect(coordinator.getResultEchoStats()).toEqual({ consulted: 1, bound: 1, mismatch: 0, unbound: 0 });
+    expect(sink.events.find(event => event.phase === 'turn_identity_result_echo')).toEqual(
+      expect.objectContaining({ echoOutcome: 'bound', queuedTurnCount: 0, resultIndex: 0 }),
+    );
+  });
+
+  it('binds a merged turn through any host alias, not only the lease owner', () => {
+    const coordinator = new ClaudeTurnReconciliationCoordinator('observe', new MemorySink());
+    coordinator.recordDispatched({ leaseTurnId: 'turn-1', canonicalTurnId: 'uuid-1', hostTurnIds: ['turn-1', 'turn-2'] });
+
+    const verdict = coordinator.recordResultEcho({ leaseTurnId: 'turn-2', consumedUuids: ['uuid-1'] });
+
+    expect(verdict).toEqual({ kind: 'bound', leaseTurnId: 'turn-2', canonicalTurnId: 'uuid-1' });
+  });
+
+  it('reports mismatch when the echo belongs to a different host turn (the G1 3-in-2-result shape)', () => {
+    const sink = new MemorySink();
+    const coordinator = new ClaudeTurnReconciliationCoordinator('observe', sink);
+    coordinator.recordDispatched({ leaseTurnId: 'turn-1', canonicalTurnId: 'uuid-1', hostTurnIds: ['turn-1'] });
+    coordinator.recordDispatched({ leaseTurnId: 'turn-2', canonicalTurnId: 'uuid-2', hostTurnIds: ['turn-2'] });
+
+    const verdict = coordinator.recordResultEcho({ leaseTurnId: 'turn-1', consumedUuids: ['uuid-2'] });
+
+    expect(verdict).toEqual({ kind: 'mismatch', leaseTurnId: 'turn-1', echoedCanonicalTurnId: 'uuid-2' });
+    expect(coordinator.getResultEchoStats()).toEqual({ consulted: 1, bound: 0, mismatch: 1, unbound: 0 });
+    // The echoed canonical UUID (never the raw string) keys the diagnostic.
+    expect(sink.events.find(event => event.phase === 'turn_identity_result_echo')).toEqual(
+      expect.objectContaining({ echoOutcome: 'mismatch' }),
+    );
+    expect(JSON.stringify(sink.events)).not.toContain('uuid-2');
+  });
+
+  it('reports unbound when the echo maps to no dispatched turn', () => {
+    const coordinator = new ClaudeTurnReconciliationCoordinator('observe', new MemorySink());
+    coordinator.recordDispatched({ leaseTurnId: 'turn-1', canonicalTurnId: 'uuid-1', hostTurnIds: ['turn-1'] });
+
+    const verdict = coordinator.recordResultEcho({ leaseTurnId: 'turn-1', consumedUuids: ['uuid-unknown'] });
+
+    expect(verdict).toEqual({ kind: 'unbound', leaseTurnId: 'turn-1' });
+    expect(coordinator.getResultEchoStats()).toEqual({ consulted: 1, bound: 0, mismatch: 0, unbound: 1 });
+  });
+
+  it('keeps a canonical_rebind replay unbound instead of reporting a false mismatch', () => {
+    // canonical_rebind reachable shape: the same canonical UUID dispatches
+    // under a new lease, recordDispatched refuses to map that lease, and the
+    // replay's result echoes the canonical UUID. The new lease is simply
+    // unregistered — never evidence that the result belongs elsewhere.
+    const sink = new MemorySink();
+    const coordinator = new ClaudeTurnReconciliationCoordinator('observe', sink);
+    coordinator.recordDispatched({ leaseTurnId: 'turn-1', canonicalTurnId: 'uuid-1', hostTurnIds: ['turn-1'] });
+    coordinator.recordDispatched({ leaseTurnId: 'turn-replay', canonicalTurnId: 'uuid-1', hostTurnIds: ['turn-replay'] });
+
+    const verdict = coordinator.recordResultEcho({ leaseTurnId: 'turn-replay', consumedUuids: ['uuid-1'] });
+
+    expect(verdict).toEqual({ kind: 'unbound', leaseTurnId: 'turn-replay' });
+    expect(coordinator.getResultEchoStats()).toEqual({ consulted: 1, bound: 0, mismatch: 0, unbound: 1 });
+    expect(sink.events.find(event => event.phase === 'turn_identity_result_echo')).toEqual(
+      expect.objectContaining({ echoOutcome: 'unbound' }),
+    );
+  });
+
+  it('reports unbound for a lease with no binding and for an empty echo', () => {
+    const coordinator = new ClaudeTurnReconciliationCoordinator('observe', new MemorySink());
+
+    expect(coordinator.recordResultEcho({ leaseTurnId: 'turn-auto', consumedUuids: [] }))
+      .toEqual({ kind: 'unbound', leaseTurnId: 'turn-auto' });
+    expect(coordinator.getResultEchoStats()).toEqual({ consulted: 1, bound: 0, mismatch: 0, unbound: 1 });
+  });
+
+  it('keeps batch-1 stats untouched by echo consultation', () => {
+    const coordinator = new ClaudeTurnReconciliationCoordinator('observe', new MemorySink());
+    coordinator.recordDispatched({ leaseTurnId: 'turn-1', canonicalTurnId: 'uuid-1', hostTurnIds: ['turn-1'] });
+
+    coordinator.recordResultEcho({ leaseTurnId: 'turn-1', consumedUuids: ['uuid-1'] });
+
+    expect(coordinator.getStats()).toEqual({
+      eligibleHostTurns: 1,
+      matchedHostTurns: 0,
+      hostUnmatchedTurns: 0,
+      externalTurns: 0,
+      mirrorEventsDropped: 0,
+      identityConflicts: 0,
+    });
+  });
+
+  it('drops echo bindings with the session generation, never re-binding a stale echo', () => {
+    const coordinator = new ClaudeTurnReconciliationCoordinator('observe', new MemorySink());
+    coordinator.recordDispatched({ leaseTurnId: 'turn-1', canonicalTurnId: 'uuid-1', hostTurnIds: ['turn-1'] });
+
+    coordinator.advanceSessionGeneration();
+
+    expect(coordinator.recordResultEcho({ leaseTurnId: 'turn-1', consumedUuids: ['uuid-1'] }))
+      .toEqual({ kind: 'unbound', leaseTurnId: 'turn-1' });
+  });
+});

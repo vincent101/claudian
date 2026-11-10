@@ -22,7 +22,7 @@ Open the chat sidebar from the ribbon icon or command palette. Select text and u
 
 **Instruction Mode (`#`)** — Refined custom instructions added from the chat input.
 
-**MCP Servers** — Connect external tools via Model Context Protocol (stdio, SSE, HTTP). Claude manages vault MCP in-app; Codex uses its own CLI-managed MCP configuration.
+**MCP Servers** — Connect external tools via Model Context Protocol (stdio, SSE, HTTP). MCP is provider-native: Claude resolves project/user native configuration and Codex uses its own CLI-managed config. In-app MCP management has been removed — former Claudian-managed config files are left untouched but no longer injected, and the first switch to native configuration needs a one-time confirmation (nothing is migrated, exported, or deleted).
 
 **Multi-Tab & Conversations** — Multiple chat tabs, conversation history, fork, resume, and compact.
 
@@ -159,6 +159,16 @@ Every model-selection entry point carries a complete `{ providerId, modelId }` p
 | Provider-native env model override (OPENAI_MODEL) | `modelSelectionRouting.test.ts` — env override test |
 | Routing/pair contract units | `tests/unit/core/providers/modelRouting.test.ts`, `tests/unit/core/providers/tabLifecycle.test.ts` |
 | Preset row move persistence (ModelPresetSettings.moveRow commits) | `tests/unit/providers/claude/ui/ModelPresetSettings.test.ts` |
+
+## Design Index — Native MCP Alignment
+
+MCP ownership belongs to the providers; Claudian keeps only a one-time cutover admission gate. Legacy config files are preserved untouched and never parsed, migrated or deleted. Until the user confirms, Claude requests (including aux and auto runs) do not start, while history stays readable. Design record: [`docs/designs/2026-11-09-provider-native-mcp-alignment.md`](docs/designs/2026-11-09-provider-native-mcp-alignment.md).
+
+| Entry point | Coverage |
+|---|---|
+| Cutover state machine and launch admission (existence check only, no legacy read) | `src/providers/claude/app/ClaudeNativeMcpCutover.ts`; `tests/unit/providers/claude/app/ClaudeNativeMcpCutover.test.ts` |
+| One-time confirmation modal (help / later / confirm, no migration controls) | `src/providers/claude/ui/ClaudeNativeMcpCutoverModal.ts`; `tests/unit/providers/claude/ui/ClaudeNativeMcpCutoverModal.test.ts` |
+| Every Claude launch path shares the same gate | `tests/integration/providers/claude/runtime/NativeMcpCutover.test.ts` |
 
 ## Architecture
 

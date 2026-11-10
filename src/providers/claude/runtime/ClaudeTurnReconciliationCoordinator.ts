@@ -53,6 +53,41 @@ export interface ReconciliationStats {
   identityConflicts: number;
 }
 
+/**
+ * Result-frame echo fact (G1): the CLI's own account of which user uuids the
+ * turn consumed. This is canonical-UUID evidence, not an order heuristic.
+ */
+export interface ResultEchoFact {
+  /** Host turnId that owns the settling channel lease. */
+  leaseTurnId: string;
+  /** Consumed canonical uuids in consumption order (singular included). */
+  consumedUuids: readonly string[];
+  /** Echo context: pending user sends at result write time. Diagnostics only. */
+  queuedTurnCount?: number;
+  /** Echo context: result write index, never turn order. Diagnostics only. */
+  resultIndex?: number;
+}
+
+/**
+ * Read-only binding verdict. `bound` means the echo's canonical uuid is the
+ * one this lease dispatched (or one of its merged aliases); `mismatch` means
+ * a REGISTERED lease's echo provably belongs to a different host turn (the
+ * G1 3-in-2-result shape); `unbound` means the echo cannot be attributed to
+ * this lease — no dispatch record, an unregistered lease (canonical_rebind
+ * replays), or an echo naming no dispatched turn.
+ */
+export type ResultEchoVerdict =
+  | { kind: 'bound'; leaseTurnId: string; canonicalTurnId: string }
+  | { kind: 'mismatch'; leaseTurnId: string; echoedCanonicalTurnId: string }
+  | { kind: 'unbound'; leaseTurnId: string };
+
+export interface ResultEchoStats {
+  consulted: number;
+  bound: number;
+  mismatch: number;
+  unbound: number;
+}
+
 interface TurnRecord {
   canonicalTurnId: string;
   sessionGeneration: number;
@@ -75,6 +110,13 @@ export class ClaudeTurnReconciliationCoordinator {
     mirrorEventsDropped: 0,
     identityConflicts: 0,
   };
+  /** Separate from batch-1 stats: echo consultation must not perturb that denominator. */
+  private readonly resultEchoStats: ResultEchoStats = {
+    consulted: 0,
+    bound: 0,
+    mismatch: 0,
+    unbound: 0,
+  };
 
   constructor(
     private readonly mode: ClaudeTurnReconciliationMode = 'observe',
@@ -92,6 +134,10 @@ export class ClaudeTurnReconciliationCoordinator {
 
   getStats(): ReconciliationStats {
     return { ...this.stats };
+  }
+
+  getResultEchoStats(): ResultEchoStats {
+    return { ...this.resultEchoStats };
   }
 
   /**
@@ -175,6 +221,58 @@ export class ClaudeTurnReconciliationCoordinator {
   }
 
   /**
+   * Result-echo consultation (G1, batch-2 evidence path, still observe-safe).
+   *
+   * When the CLI result frame echoes the uuids the turn consumed, that
+   * canonical evidence is the primary binding key — order/lease heuristics
+   * are only the fallback for producers that carry no echo. This call is
+   * read-only: it records a verdict and diagnostics and never mutates
+   * settlement, leases or batch-1 statistics.
+   */
+  recordResultEcho(fact: ResultEchoFact): ResultEchoVerdict {
+    this.resultEchoStats.consulted += 1;
+
+    const leaseCanonical = this.canonicalByHostTurnId.get(fact.leaseTurnId);
+    const leaseRecord = leaseCanonical === undefined ? undefined : this.records.get(leaseCanonical);
+
+    let echoedRecord: TurnRecord | undefined;
+    for (const uuid of fact.consumedUuids) {
+      const record = this.records.get(uuid);
+      if (!record) continue;
+      if (leaseRecord !== undefined && record === leaseRecord) {
+        echoedRecord = record;
+        break;
+      }
+      if (echoedRecord === undefined) {
+        echoedRecord = record;
+      }
+    }
+
+    if (leaseRecord !== undefined && echoedRecord === leaseRecord) {
+      this.resultEchoStats.bound += 1;
+      this.recordResultEchoDiagnostic(leaseRecord.canonicalTurnId, 'bound', fact);
+      return { kind: 'bound', leaseTurnId: fact.leaseTurnId, canonicalTurnId: leaseRecord.canonicalTurnId };
+    }
+    // Mismatch requires a registered lease that provably differs. An
+    // unregistered lease (e.g. after canonical_rebind: recordDispatched
+    // refuses to map the new leaseTurnId) must stay unbound — otherwise the
+    // same canonical UUID replaying under a new lease would read as "belongs
+    // to another host turn" and pollute the batch-2 mismatch rate.
+    if (leaseRecord !== undefined && echoedRecord !== undefined) {
+      this.resultEchoStats.mismatch += 1;
+      this.recordResultEchoDiagnostic(echoedRecord.canonicalTurnId, 'mismatch', fact);
+      return {
+        kind: 'mismatch',
+        leaseTurnId: fact.leaseTurnId,
+        echoedCanonicalTurnId: echoedRecord.canonicalTurnId,
+      };
+    }
+    this.resultEchoStats.unbound += 1;
+    this.recordResultEchoDiagnostic(fact.leaseTurnId, 'unbound', fact);
+    return { kind: 'unbound', leaseTurnId: fact.leaseTurnId };
+  }
+
+  /**
    * observed (§2.2): the transcript observer saw a user row with this UUID.
    * Returns the batch-1 verdict for the fact; observe mode keeps every
    * caller free to ignore it.
@@ -245,6 +343,22 @@ export class ClaudeTurnReconciliationCoordinator {
     this.sessionGeneration += 1;
     this.records.clear();
     this.canonicalByHostTurnId.clear();
+  }
+
+  private recordResultEchoDiagnostic(
+    identity: string,
+    outcome: 'bound' | 'mismatch' | 'unbound',
+    fact: ResultEchoFact,
+  ): void {
+    this.diagnostics?.record({
+      phase: 'turn_identity_result_echo',
+      turnIdHash: this.diagnostics.hashId(identity),
+      generation: this.sessionGeneration,
+      leaseKind: 'user',
+      echoOutcome: outcome,
+      ...(fact.queuedTurnCount !== undefined ? { queuedTurnCount: fact.queuedTurnCount } : {}),
+      ...(fact.resultIndex !== undefined ? { resultIndex: fact.resultIndex } : {}),
+    });
   }
 
   private recordConflict(
