@@ -148,6 +148,11 @@
   margin-top: 2px;
 }
 
+.claudian-history-item-identity {
+  color: var(--text-faint);
+  font-size: 11px;
+}
+
 .claudian-history-item-actions {
   display: flex;
   gap: 4px;
