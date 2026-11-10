@@ -58,12 +58,6 @@ import {
   type TabManagerViewHost,
 } from './types';
 
-function isTabManagerViewHost(value: unknown): value is TabManagerViewHost {
-  return !!value
-    && typeof value === 'object'
-    && 'getTabManager' in (value as Record<string, unknown>);
-}
-
 type CreateTabOptions = {
   activate?: boolean;
   draftModel?: string;
@@ -205,34 +199,12 @@ export class TabManager implements TabManagerInterface {
     containerEl: HTMLElement,
     view: TabManagerViewHost,
     callbacks?: TabManagerCallbacks,
-  );
-  constructor(
-    plugin: ClaudianPlugin,
-    legacyArg: unknown,
-    containerEl: HTMLElement,
-    view: TabManagerViewHost,
-    callbacks?: TabManagerCallbacks,
-  );
-  constructor(
-    plugin: ClaudianPlugin,
-    arg2: HTMLElement | unknown,
-    arg3: HTMLElement | TabManagerViewHost,
-    arg4?: TabManagerViewHost | TabManagerCallbacks,
-    arg5: TabManagerCallbacks = {},
   ) {
     this.plugin = plugin;
     this.conversationOpenRegistry = plugin.conversationOpenRegistry ?? new ConversationOpenRegistry();
-
-    if (isTabManagerViewHost(arg3)) {
-      this.containerEl = arg2 as HTMLElement;
-      this.view = arg3;
-      this.callbacks = (arg4 as TabManagerCallbacks | undefined) ?? {};
-      return;
-    }
-
-    this.containerEl = arg3 as HTMLElement;
-    this.view = arg4 as TabManagerViewHost;
-    this.callbacks = arg5;
+    this.containerEl = containerEl;
+    this.view = view;
+    this.callbacks = callbacks ?? {};
   }
 
   isOpen(): boolean {

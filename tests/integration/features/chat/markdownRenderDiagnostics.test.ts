@@ -1291,10 +1291,6 @@ it('R1a characterization: a real send holds the live lease while the next sessio
     .mockImplementation(conversation => conversation.id === SECOND_ID ? historyService : null);
 
   const runtime = new ClaudianService(plugin, {
-    mcpManager: {
-      getAllDisallowedMcpTools: () => [], getActiveServers: () => ({}), getDisallowedMcpTools: () => [],
-      extractMentions: () => new Set<string>(), transformMentions: (text: string) => text,
-    },
     pluginManager: { getPluginsKey: () => '' },
     agentManager: { setBuiltinAgentNames: () => {} },
   } as never);

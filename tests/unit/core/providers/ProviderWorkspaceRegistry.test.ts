@@ -134,7 +134,10 @@ describe('ProviderWorkspaceRegistry', () => {
     try {
       const catalog1 = makeCatalog();
       const catalog2 = makeCatalog();
-      const services: { commandCatalog?: ProviderCommandCatalog; mcpServerManager?: unknown } = {
+      const services: {
+        commandCatalog?: ProviderCommandCatalog;
+        agentMentionProvider?: unknown;
+      } = {
         commandCatalog: catalog1,
       };
 
@@ -142,9 +145,9 @@ describe('ProviderWorkspaceRegistry', () => {
       expect(listener).toHaveBeenCalledTimes(1);
       expect(ProviderWorkspaceRegistry.getCommandCatalogRevision('claude')).toBe(revisionBefore + 1);
 
-      // Same services object mutated in place, MCP slot only: the command
-      // slot is unchanged, so its revision must not advance.
-      services.mcpServerManager = { replaced: true };
+      // Same services object mutated in place, an unrelated slot only: the
+      // command slot is unchanged, so its revision must not advance.
+      services.agentMentionProvider = { searchAgents: () => [] };
       ProviderWorkspaceRegistry.setServices('claude', services as any);
       expect(listener).toHaveBeenCalledTimes(1);
       expect(ProviderWorkspaceRegistry.getCommandCatalogRevision('claude')).toBe(revisionBefore + 1);
@@ -221,15 +224,18 @@ describe('ProviderWorkspaceRegistry', () => {
     try {
       const revisionBefore = ProviderWorkspaceRegistry.getCommandCatalogRevision('claude');
       const catalog = makeCatalog();
-      const services: { commandCatalog?: ProviderCommandCatalog; mcpServerManager?: unknown } = {
+      const services: {
+        commandCatalog?: ProviderCommandCatalog;
+        agentMentionProvider?: unknown;
+      } = {
         commandCatalog: catalog,
       };
 
       ProviderWorkspaceRegistry.setServices('claude', services as any);
       expect(claudeListener).toHaveBeenCalledTimes(1);
 
-      // MCP-only change on the same services object.
-      services.mcpServerManager = { replaced: true };
+      // Unrelated-slot-only change on the same services object.
+      services.agentMentionProvider = { searchAgents: () => [] };
       ProviderWorkspaceRegistry.setServices('claude', services as any);
       expect(claudeListener).toHaveBeenCalledTimes(1);
       expect(ProviderWorkspaceRegistry.getCommandCatalogRevision('claude')).toBe(revisionBefore + 1);

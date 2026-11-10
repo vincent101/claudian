@@ -713,31 +713,9 @@ export async function initializeTabService(
   plugin: ClaudianPlugin,
   conversationOverride?: Conversation | null,
   isManagerActive?: () => boolean,
-): Promise<void>;
-export async function initializeTabService(
-  tab: TabData,
-  plugin: ClaudianPlugin,
-  _legacyArg: unknown,
-  conversationOverride?: Conversation | null,
-  isManagerActive?: () => boolean,
-): Promise<void>;
-export async function initializeTabService(
-  tab: TabData,
-  plugin: ClaudianPlugin,
-  argOrOverride?: unknown,
-  overrideOrPredicate?: Conversation | null | (() => boolean),
-  legacyPredicate?: () => boolean,
 ): Promise<void> {
-  const isManagerActive = typeof overrideOrPredicate === 'function'
-    ? overrideOrPredicate
-    : legacyPredicate;
   const canInitialize = (): boolean => tab.lifecycleState !== 'closing' && (isManagerActive?.() ?? true);
   if (!canInitialize()) return;
-
-  // Support legacy call sites (3rd arg was previously an MCP manager).
-  const conversationOverride = isConversationLike(argOrOverride)
-    ? argOrOverride
-    : (argOrOverride === null ? null : typeof overrideOrPredicate === 'function' ? undefined : overrideOrPredicate);
 
   const conversation = conversationOverride ?? (
     tab.conversationId
@@ -832,13 +810,6 @@ export async function initializeTabService(
     // Re-throw to let caller handle (e.g., show error to user)
     throw error;
   }
-}
-
-function isConversationLike(value: unknown): value is Conversation {
-  return !!value
-    && typeof value === 'object'
-    && typeof (value as Conversation).id === 'string'
-    && Array.isArray((value as Conversation).messages);
 }
 
 function initializeContextManagers(tab: TabData, plugin: ClaudianPlugin): void {
@@ -1410,40 +1381,10 @@ export function initializeTabControllers(
   getProviderCatalogConfig?: () => ProviderCatalogInfo,
   hydrationHooks?: TabHydrationHooks,
   enableMarkdownDiagnostics?: boolean,
-): void;
-/** @deprecated Legacy 7-arg overload — 4th arg was previously an MCP manager. */
-export function initializeTabControllers(
-  tab: TabData,
-  plugin: ClaudianPlugin,
-  component: Component,
-  _legacyArg: unknown,
-  forkRequestCallback?: (forkContext: ForkContext) => Promise<void>,
-  openConversation?: (conversationId: string) => Promise<void>,
-  getProviderCatalogConfig?: () => ProviderCatalogInfo,
-  hydrationHooks?: TabHydrationHooks,
-  enableMarkdownDiagnostics?: boolean,
-): void;
-export function initializeTabControllers(
-  tab: TabData,
-  plugin: ClaudianPlugin,
-  component: Component,
-  arg4?: unknown,
-  arg5?: unknown,
-  arg6?: unknown,
-  arg7?: unknown,
-  arg8?: unknown,
-  arg9?: unknown,
 ): void {
-  // Support legacy 7-arg call sites (4th arg was previously an MCP manager)
-  const isLegacy = arg4 !== undefined && typeof arg4 !== 'function';
-  const forkRequestCallback = (isLegacy ? arg5 : arg4) as
-    ((forkContext: ForkContext) => Promise<void>) | undefined;
-  const openConversation = (isLegacy ? arg6 : arg5) as
-    ((conversationId: string) => Promise<void>) | undefined;
-  const getProviderCatalogConfig = (isLegacy ? arg7 : arg6) as
-    (() => ProviderCatalogInfo) | undefined;
-  const hydrationHooks = (isLegacy ? arg8 : arg7) as TabHydrationHooks | undefined;
-  const enableMarkdownDiagnostics = (isLegacy ? arg9 : arg8) !== false;
+  // Diagnostics default ON: only an explicit `false` opt-out disables them
+  // (preserved from the pre-cutover call contract).
+  const enableMarkdownDiagnosticsByDefault = enableMarkdownDiagnostics !== false;
   const isManagerActive = (): boolean => hydrationHooks?.isManagerActive?.() ?? true;
 
   const { dom, state, services, ui } = tab;
@@ -1463,7 +1404,7 @@ export function initializeTabControllers(
   });
 
   let diagnostics: MarkdownRenderDiagnosticBinding | null = null;
-  if (enableMarkdownDiagnostics) {
+  if (enableMarkdownDiagnosticsByDefault) {
     try {
       diagnostics = plugin.registerMarkdownRenderDiagnostics?.(
         tab.id,

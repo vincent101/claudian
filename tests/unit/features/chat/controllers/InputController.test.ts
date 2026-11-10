@@ -129,10 +129,6 @@ function createMockDeps(overrides: Partial<InputControllerDeps> = {}): InputCont
         permissionMode: 'yolo',
         enableAutoTitleGeneration: true,
       },
-      mcpManager: {
-        extractMentions: jest.fn().mockReturnValue(new Set()),
-        transformMentions: jest.fn().mockImplementation((text: string) => text),
-      },
       renameConversation: jest.fn(),
       updateConversation: jest.fn(),
       getConversationSync: jest.fn().mockReturnValue(null),

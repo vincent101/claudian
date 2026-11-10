@@ -7,8 +7,7 @@ describe('ProviderRegistry', () => {
   beforeEach(() => {
     ProviderWorkspaceRegistry.clear();
     ProviderWorkspaceRegistry.setServices('claude', {
-      mcpManager: {} as any,
-      mcpServerManager: {} as any,
+      commandCatalog: null,
     } as any);
   });
 
