@@ -183,6 +183,23 @@ describe('ClaudeTranscriptDiagnosticLog', () => {
     expect(content).not.toContain('private-agent-id');
   });
 
+  it('persists the Stop-hook single-source snapshot with hashed agent ids', async () => {
+    const log = new ClaudeTranscriptDiagnosticLog(vault);
+    const hashes = Array.from({ length: 10 }, (_, index) => log.hashId(`agent-${index}`));
+    log.record({
+      phase: 'stop_hook_state',
+      detail: 'running',
+      agentCandidateCount: hashes.length,
+      agentIdHashes: [...hashes, 'not-a-hash', 'aaaaaaaaaaaa'],
+    });
+    const content = await readFile(join(vault, '.claudian/diagnostics/transcript-tail.current.jsonl'), 'utf8');
+    const row = JSON.parse(content.trim());
+    expect(row).toMatchObject({ phase: 'stop_hook_state', detail: 'running', agentCandidateCount: 10 });
+    expect(row.agentIdHashes).toHaveLength(8);
+    expect(row.agentIdHashes).toEqual(hashes.slice(0, 8));
+    expect(content).not.toContain('agent-0');
+  });
+
   it('persists result-echo diagnostics with hashed uuids and a bounded hash list', async () => {
     const log = new ClaudeTranscriptDiagnosticLog(vault);
     const hashes = Array.from({ length: 12 }, (_, index) => log.hashId(`uuid-${index}`));

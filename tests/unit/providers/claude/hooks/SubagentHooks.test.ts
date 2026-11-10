@@ -72,19 +72,74 @@ describe('SubagentHooks', () => {
       expect(result2).toEqual({});
     });
 
-    it.each(['provider', 'getter'])('warns and fails open when the %s throws', async (source) => {
+    it.each(['provider', 'getter'])('reports %s failures to the diagnostic sink and fails open', async (source) => {
       const error = new Error(`${source} failed`);
+      const onProviderError = jest.fn();
+      const onEvaluate = jest.fn();
       const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
       const hook = createStopSubagentHook(() => {
         if (source === 'provider') throw error;
         return { get hasRunning(): boolean { throw error; } };
-      });
+      }, { onProviderError, onEvaluate });
       try {
         expect(await hook.hooks[0](createHookInput(), undefined, opts)).toEqual({});
-        expect(warn).toHaveBeenCalledWith('[Claudian] Stop hook state provider failed; failing open', error);
+        expect(onProviderError).toHaveBeenCalledWith(error);
+        expect(onEvaluate).not.toHaveBeenCalled();
+        expect(warn).not.toHaveBeenCalled();
       } finally {
         warn.mockRestore();
       }
+    });
+
+    it('emits the single-source evaluation (hasRunning + running agent ids) for the Stop diagnostic', async () => {
+      const onEvaluate = jest.fn();
+      const hook = createStopSubagentHook(
+        () => ({
+          hasRunning: true,
+          runningAgents: [
+            { agentId: 'agent-a', startedAt: 1 },
+            { agentId: 'agent-b', startedAt: 2 },
+          ],
+        }),
+        { onEvaluate },
+      );
+
+      expect(await hook.hooks[0](createHookInput(), undefined, opts)).toEqual({});
+      expect(onEvaluate).toHaveBeenCalledWith({
+        hasRunning: true,
+        runningAgentIds: ['agent-a', 'agent-b'],
+      });
+    });
+
+    it('reads hasRunning before the running snapshot so stale cleanup is reflected', async () => {
+      const onEvaluate = jest.fn();
+      let running = [{ agentId: 'stale-agent', startedAt: 0 }];
+      const hook = createStopSubagentHook(
+        () => ({
+          get hasRunning() {
+            // Lazy getter owns the stale cleanup; the snapshot must follow it.
+            running = [];
+            return false;
+          },
+          get runningAgents() {
+            return running;
+          },
+        }),
+        { onEvaluate },
+      );
+
+      await hook.hooks[0](createHookInput(), undefined, opts);
+
+      expect(onEvaluate).toHaveBeenCalledWith({ hasRunning: false, runningAgentIds: [] });
+    });
+
+    it('never blocks the stop when the diagnostic sink throws', async () => {
+      const hook = createStopSubagentHook(
+        () => ({ hasRunning: true }),
+        { onEvaluate: () => { throw new Error('sink failed'); } },
+      );
+
+      expect(await hook.hooks[0](createHookInput(), undefined, opts)).toEqual({});
     });
 
     it('still allows on repeated calls with stop_hook_active set', async () => {

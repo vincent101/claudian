@@ -2272,13 +2272,24 @@ export function setupServiceCallbacks(
         return decision;
       }
     );
+    // Single source of truth (2026-11-10 hardening): the hook provider must
+    // read the exact SubagentManager instance StreamController writes to.
+    // Capture it here (same object passed as the StreamController dep) and
+    // read through the capture — a future tab-level replacement would surface
+    // as a diagnostic instead of a silent hook false negative.
+    const hookSubagentManager = tab.services.subagentManager;
     service.setSubagentHookProvider(
-      () => ({
-        // Stop reads this getter and retains its existing stale cleanup. The
-        // probe reads runningAgents only, without invoking that cleanup.
-        get hasRunning() { return tab.services.subagentManager.hasRunningSubagents(); },
-        runningAgents: tab.services.subagentManager.getRunningAsyncAgents(),
-      })
+      () => {
+        if (tab.services.subagentManager !== hookSubagentManager) {
+          service.recordAutoTurnDiagnostic?.({ phase: 'subagent_state_source_mismatch', detail: 'hook_provider' });
+        }
+        return {
+          // Stop reads this getter and retains its existing stale cleanup. The
+          // probe reads runningAgents only, without invoking that cleanup.
+          get hasRunning() { return hookSubagentManager.hasRunningSubagents(); },
+          runningAgents: hookSubagentManager.getRunningAsyncAgents(),
+        };
+      }
     );
     // Fix 2 (通知直接销账) + 0823 工具明细修复: terminal task-notifications go
     // through the StreamController entry so the settled subagent is hydrated

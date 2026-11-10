@@ -1265,8 +1265,31 @@ export class ClaudianService implements ChatRuntime {
 
     // Always register subagent hooks — closures resolve provider at execution time
     // so hooks work even when provider is set after the persistent query starts.
+    // The Stop decision is always allow; the evaluation is recorded so a
+    // cross-instance read (hook instance != StreamController instance) leaves
+    // evidence instead of a silent false negative (2026-11-10 hardening).
     hooks.Stop = [createStopSubagentHook(
       () => this._subagentStateProvider?.() ?? { hasRunning: false },
+      {
+        onEvaluate: ({ hasRunning, runningAgentIds }) => {
+          const log = this.transcriptDiagnosticLog;
+          this.recordTranscriptDiagnostic({
+            phase: 'stop_hook_state',
+            detail: hasRunning ? 'running' : 'idle',
+            agentCandidateCount: runningAgentIds.length,
+            ...(log && runningAgentIds.length > 0
+              ? { agentIdHashes: runningAgentIds.map(agentId => log.hashId(agentId)) }
+              : {}),
+          });
+        },
+        onProviderError: error => {
+          this.recordTranscriptDiagnostic({
+            phase: 'stop_hook_state',
+            detail: 'provider_error',
+            errorName: error instanceof Error ? error.name : 'UnknownError',
+          });
+        },
+      },
     )];
 
     return hooks;
