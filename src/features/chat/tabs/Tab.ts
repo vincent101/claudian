@@ -174,6 +174,69 @@ type ProviderCatalogInfo = {
   getEntries: () => Promise<ProviderCommandEntry[]>;
 } | null;
 
+interface TabRegistryCatalogBinding {
+  providerId: ProviderId | null;
+  identity: object | null;
+  unsubscribe: (() => void) | null;
+  disposed: boolean;
+}
+
+const tabRegistryCatalogBindings = new WeakMap<TabData, TabRegistryCatalogBinding>();
+
+/**
+ * Manager-provided catalog accessors, saved for availability-driven rebinding.
+ * Manager tabs have no registry binding; without the saved accessor a provider
+ * fallback could never re-resolve the manager's target-specific config.
+ */
+const tabManagerCatalogAccessors = new WeakMap<TabData, () => ProviderCatalogInfo>();
+
+function bindRegistryCatalogProvider(tab: TabData, plugin: ClaudianPlugin, providerId: ProviderId): void {
+  const binding = tabRegistryCatalogBindings.get(tab);
+  if (!binding || binding.disposed || tab.lifecycleState === 'closing' || binding.providerId === providerId) return;
+
+  const unsubscribe = binding.unsubscribe;
+  binding.providerId = null;
+  binding.identity = null;
+  binding.unsubscribe = null;
+  unsubscribe?.();
+
+  const identity = {};
+  binding.providerId = providerId;
+  binding.identity = identity;
+  binding.unsubscribe = ProviderWorkspaceRegistry.subscribeCommandCatalog(providerId, () => {
+    if (
+      binding.disposed
+      || tab.lifecycleState === 'closing'
+      || tabRegistryCatalogBindings.get(tab) !== binding
+      || binding.identity !== identity
+      || binding.providerId !== providerId
+      || getTabProviderId(tab, plugin) !== providerId
+    ) return;
+    syncSlashCommandDropdownForProvider(tab, plugin);
+  });
+}
+
+function initializeRegistryCatalogBinding(tab: TabData, plugin: ClaudianPlugin, providerId: ProviderId): void {
+  const binding: TabRegistryCatalogBinding = {
+    providerId: null,
+    identity: null,
+    unsubscribe: null,
+    disposed: false,
+  };
+  tabRegistryCatalogBindings.set(tab, binding);
+  tab.dom.eventCleanups.push(() => {
+    if (binding.disposed) return;
+    binding.disposed = true;
+    binding.identity = null;
+    binding.providerId = null;
+    const unsubscribe = binding.unsubscribe;
+    binding.unsubscribe = null;
+    unsubscribe?.();
+    if (tabRegistryCatalogBindings.get(tab) === binding) tabRegistryCatalogBindings.delete(tab);
+  });
+  bindRegistryCatalogProvider(tab, plugin, providerId);
+}
+
 function getRegistryProviderCatalogInfo(providerId: ProviderId): ProviderCatalogInfo {
   const catalog = ProviderWorkspaceRegistry.getCommandCatalog(providerId);
   if (!catalog) {
@@ -201,14 +264,23 @@ function syncSlashCommandDropdownForProvider(
     return;
   }
 
-  const catalogInfo = getProviderCatalogConfig?.()
-    ?? getRegistryProviderCatalogInfo(getTabProviderId(tab, plugin, conversation));
-
-  if (catalogInfo) {
-    dropdown.setProviderCatalog?.(catalogInfo.config, catalogInfo.getEntries);
+  const providerId = getTabProviderId(tab, plugin, conversation);
+  bindRegistryCatalogProvider(tab, plugin, providerId);
+  // Resolution order: explicit argument, saved manager accessor, registry
+  // unbound factory. A manager accessor returning null is final — falling
+  // back to the unbound factory would install a second writer beside the
+  // manager's own subscriptions.
+  let catalogInfo: ProviderCatalogInfo | null;
+  if (getProviderCatalogConfig) {
+    catalogInfo = getProviderCatalogConfig();
   } else {
-    dropdown.resetSdkSkillsCache();
+    const managerAccessor = tabManagerCatalogAccessors.get(tab);
+    catalogInfo = managerAccessor
+      ? managerAccessor()
+      : getRegistryProviderCatalogInfo(providerId);
   }
+
+  dropdown.setProviderCatalog?.(catalogInfo?.config ?? null, catalogInfo?.getEntries ?? null, providerId);
 
   dropdown.setHiddenCommands(getTabHiddenCommands(tab, plugin, conversation));
 }
@@ -287,6 +359,47 @@ function syncTabProviderServices(
   );
 }
 
+const tabCommandContextListeners = new WeakMap<TabData, Set<() => void>>();
+
+/**
+ * Subscribes to this tab's command-context changes: actual runtime
+ * install/removal commits, provider/conversation binding commits, and
+ * effective external-context directory commits. Listeners run synchronously
+ * before the dropdown resets, so manager-side eligibility revocation always
+ * precedes any menu refresh.
+ */
+export function subscribeTabCommandContextChanges(tab: TabData, listener: () => void): () => void {
+  let listeners = tabCommandContextListeners.get(tab);
+  if (!listeners) {
+    listeners = new Set();
+    tabCommandContextListeners.set(tab, listeners);
+  }
+  listeners.add(listener);
+  return () => {
+    listeners.delete(listener);
+  };
+}
+
+/**
+ * Notifies command consumers that this tab's command context changed. The
+ * manager/capture listeners run first (they synchronously revoke stale
+ * command eligibility); the dropdown reset follows, so no menu read can race
+ * a revocation. Idempotent: repeated notifications only advance epochs.
+ */
+function notifyTabCommandContextChanged(tab: TabData): void {
+  const listeners = tabCommandContextListeners.get(tab);
+  if (listeners) {
+    for (const listener of [...listeners]) {
+      try {
+        listener();
+      } catch {
+        // One broken consumer must never block command-context notification.
+      }
+    }
+  }
+  tab.ui.slashCommandDropdown?.resetSdkSkillsCache();
+}
+
 export function cleanupTabRuntime(tab: TabData): void {
   // Drop conversation-bound closures before cleanup so a retained runtime can
   // never traverse a transcript after the tab has detached from its owner.
@@ -308,6 +421,7 @@ export function onProviderAvailabilityChanged(tab: TabData, plugin: ClaudianPlug
 
   const settingsSnapshot = plugin.settings as unknown as Record<string, unknown>;
   const enabledProviderIds = ProviderRegistry.getEnabledProviderIds(settingsSnapshot);
+  const previousProviderId = tab.providerId;
   let selection = { providerId: tab.providerId, modelId: tab.draftModel ?? '' };
   if (!isValidProviderModelSelection(selection, settingsSnapshot)) {
     selection = getDefaultProviderModelSelection(settingsSnapshot, enabledProviderIds[0]);
@@ -326,11 +440,27 @@ export function onProviderAvailabilityChanged(tab: TabData, plugin: ClaudianPlug
     tab.service.cleanup();
     tab.service = null;
     tab.serviceInitialized = false;
+    notifyTabCommandContextChanged(tab);
   }
 
   syncTabProviderServices(tab, plugin);
   tab.ui.slashCommandDropdown?.setHiddenCommands(getTabHiddenCommands(tab, plugin));
   tab.ui.slashCommandDropdown?.resetSdkSkillsCache();
+  let reboundForProviderChange = false;
+  if (nextProviderId !== previousProviderId) {
+    // An identity swap revokes stale command eligibility even without a
+    // runtime, then rebinds the dropdown through the manager accessor (or
+    // the registry binding for manager-less tabs).
+    notifyTabCommandContextChanged(tab);
+    syncSlashCommandDropdownForProvider(tab, plugin);
+    reboundForProviderChange = true;
+  }
+  if (!reboundForProviderChange) {
+    const binding = tabRegistryCatalogBindings.get(tab);
+    if (binding && binding.providerId !== getTabProviderId(tab, plugin)) {
+      syncSlashCommandDropdownForProvider(tab, plugin);
+    }
+  }
   refreshTabProviderUI(tab, plugin);
   applyProviderUIGating(tab, plugin);
 }
@@ -576,8 +706,12 @@ export async function initializeTabService(
     if (typeof previousService?.cleanup === 'function') {
       previousService.cleanup();
     }
+    const hadPreviousService = tab.service !== null;
     tab.service = null;
     tab.serviceInitialized = false;
+    if (hadPreviousService) {
+      notifyTabCommandContextChanged(tab);
+    }
 
     const runtime = ProviderRegistry.createChatRuntime({ plugin, providerId });
     service = runtime;
@@ -608,6 +742,7 @@ export async function initializeTabService(
     tab.providerId = providerId;
     tab.service = service;
     tab.serviceInitialized = true;
+    notifyTabCommandContextChanged(tab);
 
     // Update lifecycle state
     if (tab.lifecycleState === 'blank') {
@@ -627,6 +762,7 @@ export async function initializeTabService(
     service?.cleanup();
     tab.service = null;
     tab.serviceInitialized = false;
+    notifyTabCommandContextChanged(tab);
 
     // Re-throw to let caller handle (e.g., show error to user)
     throw error;
@@ -683,6 +819,7 @@ function initializeContextManagers(tab: TabData, plugin: ClaudianPlugin): void {
 
 function initializeSlashCommands(
   tab: TabData,
+  providerId: ProviderId,
   getHiddenCommands?: () => Set<string>,
   catalogInfo?: { config: ProviderCommandDropdownConfig; getEntries: () => Promise<ProviderCommandEntry[]> } | null,
 ): void {
@@ -699,6 +836,7 @@ function initializeSlashCommands(
       hiddenCommands: getHiddenCommands?.() ?? new Set(),
       providerConfig: catalogInfo?.config,
       getProviderEntries: catalogInfo?.getEntries,
+      builtInProviderId: providerId,
     }
   );
 }
@@ -801,6 +939,10 @@ function initializeInputToolbar(
           cleanupTabRuntime(tab);
         }
         tab.providerId = newProvider;
+        // Blank provider/model switches rebind the command target; notify
+        // after the field commit and before the settings await so no stale
+        // request survives the switch.
+        notifyTabCommandContextChanged(tab);
         if (didProviderChange) {
           syncTabProviderServices(tab, plugin);
         }
@@ -904,8 +1046,11 @@ function initializeInputToolbar(
     tab.ui.mcpServerSelector?.addMentionedServers(servers);
   });
 
-  // Wire external context changes
+  // Wire external context changes: revoke manager-side command eligibility
+  // synchronously (before the dropdown reset and the prescan) so an effective
+  // directory change can never leave an old request clickable.
   tab.ui.externalContextSelector.setOnChange(() => {
+    notifyTabCommandContextChanged(tab);
     tab.ui.fileContextManager?.preScanExternalContexts();
   });
 
@@ -955,12 +1100,30 @@ export function initializeTabUI(
   dom.canvasIndicatorEl = dom.contextRowEl.createDiv({ cls: 'claudian-canvas-indicator' });
   dom.canvasIndicatorEl.style.display = 'none';
 
-  const catalogInfo = options.getProviderCatalogConfig?.() ?? null;
+  const providerId = getTabProviderId(tab, plugin);
+  const catalogInfo = options.getProviderCatalogConfig
+    ? options.getProviderCatalogConfig()
+    : getRegistryProviderCatalogInfo(providerId);
   initializeSlashCommands(
     tab,
+    providerId,
     () => getTabHiddenCommands(tab, plugin),
     catalogInfo,
   );
+  if (!options.getProviderCatalogConfig) {
+    // The manager owns target-specific factories; only its absence permits a
+    // per-tab binding to the registry's unbound factory.
+    initializeRegistryCatalogBinding(tab, plugin, providerId);
+  } else {
+    // Saved for availability-driven rebinding: onProviderAvailabilityChanged
+    // resolves the manager accessor again instead of falling back to the
+    // unbound registry factory. It dies with the tab's UI cleanups.
+    const managerAccessor = options.getProviderCatalogConfig;
+    tabManagerCatalogAccessors.set(tab, managerAccessor);
+    dom.eventCleanups.push(() => {
+      tabManagerCatalogAccessors.delete(tab);
+    });
+  }
 
   if (dom.messagesEl.parentElement) {
     tab.ui.navigationSidebar = new NavigationSidebar(
@@ -1367,6 +1530,8 @@ export function initializeTabControllers(
       ensureServiceForConversation: async (conversation) => {
         const nextProviderId = getTabProviderId(tab, plugin, conversation);
         const providerChanged = tab.providerId !== nextProviderId;
+        const previousConversationId = tab.conversationId;
+        const previousLifecycleState = tab.lifecycleState;
         tab.providerId = nextProviderId;
 
         if (providerChanged) {
@@ -1380,6 +1545,15 @@ export function initializeTabControllers(
         tab.draftProviderId = draft?.providerId ?? null;
         tab.providerId = draft?.providerId ?? nextProviderId;
         tab.lifecycleState = conversation ? 'bound_cold' : 'blank';
+        // Binding changes must revoke stale command requests even when the
+        // runtime object stays the same (§6 W4c).
+        if (
+          providerChanged
+          || tab.conversationId !== previousConversationId
+          || tab.lifecycleState !== previousLifecycleState
+        ) {
+          notifyTabCommandContextChanged(tab);
+        }
         syncSlashCommandDropdownForProvider(tab, plugin, getProviderCatalogConfig, conversation);
 
         // If the runtime already exists for the right provider, sync it passively
@@ -1401,6 +1575,9 @@ export function initializeTabControllers(
         // Reset to blank state and drop the bound runtime so the next send
         // reinitializes against the currently selected blank-tab provider.
         const previousProviderId = tab.providerId;
+        const previousLifecycleState = tab.lifecycleState;
+        const previousConversationId = tab.conversationId;
+        const previousDraftModel = tab.draftModel;
         cleanupTabRuntime(tab);
         tab.lifecycleState = 'blank';
         const draft = resolveBlankTabModel(plugin, previousProviderId);
@@ -1408,6 +1585,17 @@ export function initializeTabControllers(
         tab.draftProviderId = draft.providerId;
         tab.conversationId = null;
         tab.providerId = draft.providerId;
+        // Blank rebinding is a passive command-context commit (§6 W4c): only
+        // an actual binding change notifies — cleanupTabRuntime already
+        // covered a real runtime detach.
+        if (
+          tab.providerId !== previousProviderId
+          || tab.lifecycleState !== previousLifecycleState
+          || tab.conversationId !== previousConversationId
+          || tab.draftModel !== previousDraftModel
+        ) {
+          notifyTabCommandContextChanged(tab);
+        }
         if (tab.providerId !== previousProviderId) {
           syncTabProviderServices(tab, plugin);
         }
@@ -1888,6 +2076,9 @@ export async function destroyTab(tab: TabData): Promise<void> {
   // Clean up runtime before removing DOM
   tab.service?.cleanup();
   tab.service = null;
+  // Destroy is a runtime commit in its own right (§6 W4c): settle command
+  // captures even when the service was already null.
+  notifyTabCommandContextChanged(tab);
   tab.dom.contentEl.remove();
 }
 

@@ -1,5 +1,8 @@
 import { Notice } from 'obsidian';
 
+import {
+  type CommandDiscoveryToken,
+} from '../../../core/providers/commands/ProviderCommandDiscovery';
 import { ProviderRegistry } from '../../../core/providers/ProviderRegistry';
 import { ProviderSettingsCoordinator } from '../../../core/providers/ProviderSettingsCoordinator';
 import { ProviderWorkspaceRegistry } from '../../../core/providers/ProviderWorkspaceRegistry';
@@ -31,6 +34,7 @@ import {
   initializeTabUI,
   renderTabHydrationPlaceholder,
   setupServiceCallbacks,
+  subscribeTabCommandContextChanges,
   wireTabInputEvents,
 } from './Tab';
 import {
@@ -87,6 +91,23 @@ type ProviderCommandWarmupEntry = {
   promise: Promise<SlashCommand[]>;
 };
 
+type ProviderCommandTicket = {
+  key: string;
+};
+
+/**
+ * Per-tab command capture controller (§6 W4c): one entry per tab holds the
+ * eligibility AbortController (revoked on every invalidation), an opaque
+ * target token, the capture listeners, and the last frozen context key so a
+ * context change detected inside capture() revokes the old ticket first.
+ */
+type TabCommandCaptureEntry = {
+  controller: AbortController;
+  targetToken: CommandDiscoveryToken;
+  listeners: Set<() => void>;
+  lastContextKey: string | null;
+};
+
 /**
  * TabManager coordinates multiple chat tabs.
  */
@@ -100,6 +121,10 @@ export class TabManager implements TabManagerInterface {
   private callbacks: TabManagerCallbacks;
   private providerCommandWarmups = new Map<TabId, ProviderCommandWarmupEntry>();
   private providerCommandCache = new Map<TabId, ProviderCommandCacheEntry>();
+  private readonly providerCommandTickets = new WeakMap<TabData, ProviderCommandTicket>();
+  private readonly providerCommandGenerations = new WeakMap<TabData, number>();
+  private readonly tabCommandCaptures = new WeakMap<TabData, TabCommandCaptureEntry>();
+  private readonly commandCatalogUnsubscribers = new Map<ProviderId, () => void>();
   private isRestoringState = false;
   private readonly conversationOpenRegistry: ConversationOpenRegistry;
   private pendingConversationClaims = new Map<TabId, ConversationOpenClaim>();
@@ -281,6 +306,12 @@ export class TabManager implements TabManagerInterface {
         tab.state.currentConversationId = null;
         tab.lifecycleState = 'blank';
         tab.hydrationState = 'READY';
+    // revokes stale manager-side command eligibility synchronously (§6 W4c).
+    // Unsubscribe rides the tab's own event cleanups (destroyTab).
+    tab.dom.eventCleanups.push(subscribeTabCommandContextChanges(tab, () => {
+      this.invalidateProviderCommandState(tab);
+    }));
+
       }
     }
 
@@ -294,6 +325,7 @@ export class TabManager implements TabManagerInterface {
         });
       },
     });
+          this.invalidateProviderCommandState(tab);
 
     initializeTabControllers(
       tab,
@@ -322,6 +354,8 @@ export class TabManager implements TabManagerInterface {
 
     this.tabs.set(tab.id, tab);
     this.callbacks.onTabCreated?.(tab);
+      this.ensureCommandCatalogSubscription(tab.service?.providerId ?? tab.providerId);
+      this.callbacks.onTabCreated?.(tab);
 
     if (!this.isRestoringState && (activate || !this.activeTabId)) {
       await this.switchToTab(tab.id);
@@ -830,10 +864,80 @@ export class TabManager implements TabManagerInterface {
 
   invalidateProviderCommandCaches(providerIds?: ProviderId | ProviderId[]): void {
     for (const tab of this.filterTabsByProvider(providerIds, (tab) => getTabProviderId(tab, this.plugin))) {
-      this.providerCommandWarmups.delete(tab.id);
-      this.providerCommandCache.delete(tab.id);
+      this.invalidateProviderCommandState(tab);
       tab.ui?.slashCommandDropdown?.resetSdkSkillsCache();
     }
+  }
+
+  private invalidateProviderCommandState(tab: TabData): void {
+    this.revokeTabCommandCapture(tab);
+    // Settle target-capture listeners synchronously (§6 W4c): a pending
+    // typed read must go stale in this round, never wait for its underlying
+    // vault/SDK promise. The subscription set is inherited by the new entry.
+    const entry = this.tabCommandCaptures.get(tab);
+    if (entry) {
+      for (const listener of [...entry.listeners]) {
+        try { listener(); } catch { /* One broken consumer must not block revocation. */ }
+      }
+    }
+  }
+
+  /**
+   * Revokes manager-side command eligibility without notifying capture
+   * listeners: bumps the generation, drops the ticket/warmup/cache, aborts
+   * the old eligibility controller, and installs a fresh capture entry. Old
+   * receipts lose eligibility through the generation/ticket checks in
+   * isCurrent; the old read's waiter settles through the aborted signal.
+   */
+  private revokeTabCommandCapture(tab: TabData): void {
+    this.providerCommandGenerations.set(tab, (this.providerCommandGenerations.get(tab) ?? 0) + 1);
+    this.providerCommandTickets.delete(tab);
+    this.providerCommandWarmups.delete(tab.id);
+    this.providerCommandCache.delete(tab.id);
+    const previousEntry = this.tabCommandCaptures.get(tab);
+    if (previousEntry) {
+      previousEntry.controller.abort();
+      this.tabCommandCaptures.set(tab, {
+        controller: new AbortController(),
+        targetToken: {},
+        listeners: previousEntry.listeners,
+        lastContextKey: previousEntry.lastContextKey,
+      });
+    }
+  }
+
+  /**
+   * Freezes the tab's command target for one typed read (§6 W4c): the opaque
+   * target token, ticket object, generation, provider/runtime/context key,
+   * registry revision, and a copy of the requested external paths. isCurrent
+   * keeps the original isTabActive/provider/ticket/generation/runtime/context
+   * checks and re-checks the registry revision; it never re-resolves the tab
+   * by id.
+   */
+  private getTabCommandCaptureEntry(tab: TabData): TabCommandCaptureEntry {
+    let entry = this.tabCommandCaptures.get(tab);
+    if (!entry) {
+      entry = {
+        controller: new AbortController(),
+        targetToken: {},
+        listeners: new Set(),
+        lastContextKey: null,
+      };
+      this.tabCommandCaptures.set(tab, entry);
+    }
+    return entry;
+  }
+
+  private ensureCommandCatalogSubscription(providerId: ProviderId): void {
+    if (this.commandCatalogUnsubscribers.has(providerId)) return;
+    const unsubscribe = ProviderWorkspaceRegistry.subscribeCommandCatalog(providerId, () => {
+      for (const tab of this.filterTabsByProvider(providerId, current => getTabProviderId(current, this.plugin))) {
+        this.invalidateProviderCommandState(tab);
+        const info = this.getProviderCatalogConfig(tab);
+        tab.ui.slashCommandDropdown?.setProviderCatalog(info?.config ?? null, info?.getEntries ?? null, providerId);
+      }
+    });
+    this.commandCatalogUnsubscribers.set(providerId, unsubscribe);
   }
 
   primeProviderRuntime(providerIds?: ProviderId | ProviderId[]): void {

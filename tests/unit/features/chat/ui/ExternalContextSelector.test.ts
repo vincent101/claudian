@@ -363,6 +363,9 @@ describe('ExternalContextSelector', () => {
       selector.setOnChange(onChange);
 
       selector.setExternalContexts(['/path/a', '/path/b']);
+      // setExternalContexts now notifies the effective-directory change too;
+      // isolate the removal notification.
+      onChange.mockClear();
       selector.removePath('/path/a');
 
       expect(onChange).toHaveBeenCalledTimes(1);
@@ -496,6 +499,117 @@ describe('ExternalContextSelector', () => {
       const normalizedInside = insidePath.replace(/\\/g, '/');
       const expected = '~' + normalizedInside.slice(normalizedHome.length);
       expect(result).toBe(expected);
+    });
+  });
+
+  describe('Effective directory commit point', () => {
+    it('commits every effective directory mutator before change and persistence callbacks', () => {
+      const seenOnCommit: string[][] = [];
+      selector.setOnChange(() => {
+        seenOnCommit.push(selector.getExternalContexts());
+      });
+
+      // add: the new list is already assigned when the change callback runs.
+      const added = path.resolve('external', 'added');
+      expect(selector.addExternalContext(added).success).toBe(true);
+      expect(seenOnCommit.at(-1)).toEqual([added]);
+
+      // remove (non-persistent): synchronous commit before the callback.
+      selector.removePath(added);
+      expect(seenOnCommit.at(-1)).toEqual([]);
+
+      // set (exact restore) commits before the callback.
+      const restored = path.resolve('external', 'restored');
+      selector.setExternalContexts([restored]);
+      expect(seenOnCommit.at(-1)).toEqual([restored]);
+
+      // persistent merge commits through the same point.
+      const persisted = path.resolve('external', 'persisted');
+      selector.setPersistentPaths([persisted]);
+      expect(seenOnCommit.at(-1)).toEqual([restored, persisted]);
+
+      // clear falls back to the persistent list through the same point.
+      selector.clearExternalContexts();
+      expect(seenOnCommit.at(-1)).toEqual([persisted]);
+
+      // Removing a persistent path notifies the effective-directory change
+      // before the persistence callback.
+      const changeSpy = jest.fn();
+      const persistenceSpy = jest.fn();
+      selector.setOnChange(changeSpy);
+      selector.setOnPersistenceChange(persistenceSpy);
+      selector.removePath(persisted);
+      expect(changeSpy).toHaveBeenCalledTimes(1);
+      expect(changeSpy).toHaveBeenCalledWith([]);
+      expect(persistenceSpy).toHaveBeenCalledTimes(1);
+      expect(changeSpy.mock.invocationCallOrder[0])
+        .toBeLessThan(persistenceSpy.mock.invocationCallOrder[0]);
+    });
+
+    it('does not revoke commands for invalid duplicate or persistence only changes', () => {
+      const onChange = jest.fn();
+      const onPersistenceChange = jest.fn();
+      selector.setOnChange(onChange);
+      selector.setOnPersistenceChange(onPersistenceChange);
+
+      // Invalid add keeps the existing validation rules and stays silent.
+      (fs.statSync as jest.Mock).mockImplementation(() => {
+        const error = new Error('ENOENT') as NodeJS.ErrnoException;
+        error.code = 'ENOENT';
+        throw error;
+      });
+      expect(selector.addExternalContext(path.resolve('missing')).success).toBe(false);
+      expect(onChange).not.toHaveBeenCalled();
+      (fs.statSync as jest.Mock).mockReturnValue({ isDirectory: () => true });
+
+      // Duplicate add stays silent.
+      const duplicate = path.resolve('external', 'ctx');
+      expect(selector.addExternalContext(duplicate).success).toBe(true);
+      onChange.mockClear();
+      expect(selector.addExternalContext(duplicate).success).toBe(false);
+      expect(onChange).not.toHaveBeenCalled();
+
+      // set with the same effective directories stays silent.
+      selector.setExternalContexts(['/same/a']);
+      onChange.mockClear();
+      selector.setExternalContexts(['/same/a']);
+      expect(onChange).not.toHaveBeenCalled();
+
+      // clear that keeps the same effective directories stays silent.
+      selector.setPersistentPaths(['/same/a']);
+      onChange.mockClear();
+      selector.clearExternalContexts();
+      expect(onChange).not.toHaveBeenCalled();
+
+      // Persistence-only toggles never touch the effective directories.
+      selector.setPersistentPaths([]);
+      selector.setExternalContexts(['/persist/only']);
+      onChange.mockClear();
+      selector.togglePersistence('/persist/only');
+      expect(onChange).not.toHaveBeenCalled();
+      expect(onPersistenceChange).toHaveBeenCalledWith(['/persist/only']);
+    });
+
+    it('emits two synchronous effective changes for A B A', () => {
+      selector.setExternalContexts(['/dir/a']);
+      const received: string[][] = [];
+      selector.setOnChange((paths) => {
+        paths.push('/mutated');
+        received.push(paths);
+      });
+
+      selector.setExternalContexts(['/dir/b']);
+      // Synchronous: the notification already fired when the mutator returned.
+      expect(received).toEqual([['/dir/b', '/mutated']]);
+
+      // Returning to the original string still notifies: freshness rides on
+      // the commit itself, never on remembered path strings.
+      selector.setExternalContexts(['/dir/a']);
+      expect(received).toEqual([['/dir/b', '/mutated'], ['/dir/a', '/mutated']]);
+
+      // The callback received defensive copies; mutating them never reaches
+      // the internal list.
+      expect(selector.getExternalContexts()).toEqual(['/dir/a']);
     });
   });
 

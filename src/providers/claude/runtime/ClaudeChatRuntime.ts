@@ -25,6 +25,13 @@ import { query as agentQuery } from '@anthropic-ai/claude-agent-sdk';
 import { Notice } from 'obsidian';
 
 import type { McpServerManager } from '../../../core/mcp/McpServerManager';
+import type {
+  CommandDiscoveryToken,
+  CommandRuntimeEligibility,
+  QueryCommandSourceReceipt,
+  RuntimeCommandDiscovery,
+  RuntimeCommandRead,
+} from '../../../core/providers/commands/ProviderCommandDiscovery';
 import { ProviderSettingsCoordinator } from '../../../core/providers/ProviderSettingsCoordinator';
 import type {
   AppAgentManager,
@@ -198,17 +205,65 @@ interface StopTaskDiagnosticSnapshot {
  * old consumer must never settle a turn leased by a newer query, and an old
  * consumer's error/teardown must never act on the new query.
  */
+type QueryCommandResult =
+  | { status: 'ready'; entries: readonly SlashCommand[] }
+  | { status: 'failed' | 'cancelled' | 'stale' | 'unavailable' };
+
+type QueryCommandWaiter = (result: QueryCommandResult) => void;
+
+interface QueryCommandFlight {
+  readonly waiters: Set<QueryCommandWaiter>;
+}
+
+interface QueryCommandCell {
+  readonly query: Query;
+  state: 'unobserved' | 'pending' | 'ready' | 'revoked';
+  entries: readonly SlashCommand[];
+  lastOutcome: 'failed' | null;
+  flight: QueryCommandFlight | null;
+}
+
 interface QueryScope {
   readonly epoch: number;
   readonly query: Query;
   readonly channel: MessageChannel;
   readonly abortController: AbortController;
+  readonly commandCell: QueryCommandCell;
   /** Retired scopes reject routing and block new dispatches (watchdog rebuild). */
   retired: boolean;
   /** Prevents a second consumer loop on the same scope. */
   consumerStarted: boolean;
   /** Set once this scope's CLI truly exited (spawn exit notification). */
   exitNotified: boolean;
+}
+
+/**
+ * W4a command-eligibility generation. Kept separate from P1 cell state: every
+ * scope install/replace/revoke/removal mints a new generation, so captured
+ * receipts — including unavailable and failed ones — become invalid the
+ * moment the underlying truth moves. Getter completion does NOT mint one.
+ */
+interface CommandEligibilityGeneration {
+  /** Stable public eligibility object handed out with every typed read. */
+  readonly eligibility: CommandRuntimeEligibility;
+  /** The readable scope/cell this generation certifies; null = absence. */
+  readonly readable: { readonly scope: QueryScope; readonly cell: QueryCommandCell } | null;
+}
+
+/**
+ * W4a per-scope command source observation. Binds an opaque token to the
+ * Query's observation without exposing the SDK Query object. Applied option
+ * dims absent at capture time stay listed in `unknown` and are never
+ * re-derived from the mutable currentConfig.
+ */
+interface QueryCommandSourceMeta {
+  readonly token: CommandDiscoveryToken;
+  readonly scope: QueryScope;
+  readonly cell: QueryCommandCell;
+  cwd?: string;
+  additionalDirectories?: readonly string[];
+  settingSources?: readonly string[];
+  readonly unknown: string[];
 }
 
 function isChatMessageArray(value: unknown): value is ChatMessage[] {
@@ -288,9 +343,6 @@ export class ClaudianService implements ChatRuntime {
   private crashRecoveryAttempted = false;
   private coldStartInProgress = false;  // Prevent consumer error restarts during cold-start
 
-  // SDK command cache — populated on system/init, cleared on persistent query close
-  private cachedSdkCommands: SlashCommand[] = [];
-
   // SDK-resolved model from system/init (concrete id, not the settings alias).
   // Session-scoped so turns after the first still label usage with what
   // actually serves the query.
@@ -331,6 +383,16 @@ export class ClaudianService implements ChatRuntime {
   private transcriptCliVersion: string | undefined;
   /** Query boundary isolation (2.4): the live persistent-query scope, null when retired/absent. */
   private currentQueryScope: QueryScope | null = null;
+  // W4a typed command facet: eligibility/source metadata and invalidation
+  // listeners live beside the P1 cell but advance independently of it.
+  private commandDiscoveryFacet: RuntimeCommandDiscovery | null = null;
+  private commandDiscoveryListeners = new Set<() => void>();
+  private commandEligibility: CommandEligibilityGeneration = {
+    eligibility: { token: {}, revision: 0 },
+    readable: null,
+  };
+  private commandSourceRevision = 0;
+  private commandSourceMeta: QueryCommandSourceMeta | null = null;
   private queryEpochCounter = 0;
   private stopTaskAttemptCounter = 0;
   /** Single-flight retirement/rebuild chain: query()/ensureReady() wait on it (2.4 gate). */
@@ -752,6 +814,9 @@ export class ClaudianService implements ChatRuntime {
 
     const scope = this.ensureQueryScope();
     if (scope) {
+      // W4a: copy the applied options whitelist onto the scope's command
+      // source meta at Query creation, before any later settings mutation.
+      this.recordAppliedCommandScope(scope, options);
       exitSink.handler = () => {
         // Epoch-bound notification: a retirement waiting on THIS scope
         // resolves; a replaced scope (new epoch) is never falsely confirmed.
@@ -795,17 +860,35 @@ export class ClaudianService implements ChatRuntime {
     const channel = this.messageChannel;
     if (!query || !channel) return null;
     if (this.currentQueryScope?.query === query) return this.currentQueryScope;
+    if (this.currentQueryScope) this.revokeQueryCommands(this.currentQueryScope.commandCell);
     const scope: QueryScope = {
       epoch: ++this.queryEpochCounter,
       query,
       channel,
       abortController: this.queryAbortController ?? new AbortController(),
+      commandCell: {
+        query,
+        state: 'unobserved',
+        entries: [],
+        lastOutcome: null,
+        flight: null,
+      },
       retired: false,
       consumerStarted: false,
       exitNotified: false,
     };
     this.currentQueryScope = scope;
     this.queryAbortController = scope.abortController;
+    // W4a: mint the scope's command source observation (all dims unknown
+    // until the applied options are recorded) and advance the eligibility —
+    // an absence eligibility captured earlier dies with this install.
+    this.commandSourceMeta = {
+      token: {},
+      scope,
+      cell: scope.commandCell,
+      unknown: ['cwd', 'additionalDirectories', 'settingSources'],
+    };
+    this.advanceCommandEligibility({ scope, cell: scope.commandCell });
     return scope;
   }
 
@@ -843,6 +926,8 @@ export class ClaudianService implements ChatRuntime {
    * process's late exit can never mark a replacement scope as exited.
    */
   notifyQueryProcessExit(scopeEpoch: number): void {
+    const scope = this.currentQueryScope;
+    if (scope?.epoch === scopeEpoch) this.revokeQueryCommands(scope.commandCell);
     const entry = this.scopeExitNotifications.get(scopeEpoch);
     if (!entry) return;
     this.scopeExitNotifications.delete(scopeEpoch);
@@ -890,6 +975,7 @@ export class ClaudianService implements ChatRuntime {
     this.abortUserTurnCompletionBarriers();
     const scope = this.currentQueryScope;
     if (!this.persistentQuery) {
+      if (scope) this.revokeQueryCommands(scope.commandCell);
       // A start may be mid-flight: it has built the channel and the abort
       // controller but not yet the query. Tear the half-built slot down so
       // the start's post-await identity re-check orphans it (2.4) — a query
@@ -918,6 +1004,7 @@ export class ClaudianService implements ChatRuntime {
     // routing and its teardown can never act on a replacement scope.
     if (scope) {
       scope.retired = true;
+      this.revokeQueryCommands(scope.commandCell);
     }
 
     // Close the message channel (ends the async iterable). close() reports
@@ -973,6 +1060,10 @@ export class ClaudianService implements ChatRuntime {
     this.messageChannel = null;
     this.queryAbortController = null;
     this.currentQueryScope = null;
+    // W4a: the slot fields are actually gone — advance to an absence
+    // generation and drop the source meta so the old Query is not retained.
+    this.commandSourceMeta = null;
+    this.advanceCommandEligibility(null);
     if (this.cancelBoundaryTombstone) {
       clearTimeout(this.cancelBoundaryTombstone.timer);
       this.cancelBoundaryTombstone = null;
@@ -987,7 +1078,6 @@ export class ClaudianService implements ChatRuntime {
     this.responseConsumerRunning = false;
     this.responseConsumerPromise = null;
     this.currentConfig = null;
-    this.cachedSdkCommands = [];
     if (!preserveHandlers) {
       this.responseHandlers = [];
       this.currentAllowedTools = null;
@@ -1215,6 +1305,7 @@ export class ClaudianService implements ChatRuntime {
           }
         }
       } finally {
+        this.revokeQueryCommands(scope.commandCell);
         // Only clear the flag if this consumer wasn't replaced by a new one (e.g., after restart)
         // If ensureReady() restarted, it starts a new consumer which sets the flag true,
         // so we shouldn't clear it here.
@@ -1313,7 +1404,7 @@ export class ClaudianService implements ChatRuntime {
     if (this.dispatchTaskNotification(message)) return;
 
     if (!turn) {
-      if (isLeaselessSessionControlMessage(message)) this.applyLeaselessSystemMessage(message);
+      if (isLeaselessSessionControlMessage(message)) this.applyLeaselessSystemMessage(message, scope);
       return;
     }
     // P0-3 evidence: any message routed to this turn's lease proves CLI
@@ -1352,7 +1443,7 @@ export class ClaudianService implements ChatRuntime {
       });
 
       if (isSessionInitEvent(event)) {
-        this.applySessionInitSideEffects(event);
+        this.applySessionInitSideEffects(event, scope);
       } else if (isStreamChunk(event)) {
         // Dedup: SDK delivers text via stream_events (incremental) AND the assistant message
         // (complete). Skip the assistant message text if stream text was already seen.
@@ -1432,7 +1523,7 @@ export class ClaudianService implements ChatRuntime {
    * applied) / compact_boundary separator (only meaningful in a live turn)
    * for system messages; all other subtypes produce no output.
    */
-  private applyLeaselessSystemMessage(message: SDKMessage): void {
+  private applyLeaselessSystemMessage(message: SDKMessage, scope: QueryScope | null): void {
     const scratch = createRuntimeTurn({
       id: `system-event-${Date.now()}-${Math.random().toString(36).slice(2)}`,
       kind: 'auto',
@@ -1441,14 +1532,14 @@ export class ClaudianService implements ChatRuntime {
 
     for (const event of transformSDKMessage(message, this.getTransformOptions(scratch))) {
       if (isSessionInitEvent(event)) {
-        this.applySessionInitSideEffects(event);
+        this.applySessionInitSideEffects(event, scope);
       }
       // Everything else has no consumer — dropped with the scratch state.
     }
   }
 
   /** Session-level side effects of a session_init event, shared by the leased and lease-less routing paths. */
-  private applySessionInitSideEffects(event: SessionInitEvent): void {
+  private applySessionInitSideEffects(event: SessionInitEvent, scope: QueryScope | null): void {
     if (event.model) {
       this.sessionResolvedModel = event.model;
     }
@@ -1467,7 +1558,8 @@ export class ClaudianService implements ChatRuntime {
     // Cache SDK commands on init (SDK already scans the vault).
     // Pass the current query instance so late completions from a dead query
     // cannot overwrite the active cache after a restart or shutdown.
-    void this.fetchAndCacheCommands(this.persistentQuery);
+    // Init adds an observation for the originating scope, never a replacement.
+    void this.readQueryCommands(scope, undefined, false);
   }
 
   /** Returns the turn owning the channel lease, settling an unknown lease locally. */
@@ -2914,6 +3006,7 @@ export class ClaudianService implements ChatRuntime {
 
     // 1. Retire FIRST: routing stops, new dispatches are blocked.
     scope.retired = true;
+    this.revokeQueryCommands(scope.commandCell);
     // 2. Extract the never-dispatched queue BEFORE closing the input —
     //    canonical UUIDs, host aliases, merged payloads, order all survive.
     const unsent = channel.extractUnsentQueue();
@@ -2934,6 +3027,10 @@ export class ClaudianService implements ChatRuntime {
     this.messageChannel = null;
     this.queryAbortController = null;
     this.responseConsumerRunning = false;
+    // W4a: actual removal completed — advance to an absence generation and
+    // drop the source meta so the retired Query is not retained.
+    this.commandSourceMeta = null;
+    this.advanceCommandEligibility(null);
     this.recordTranscriptDiagnostic({
       phase: 'query_retire',
       detail: `${reason} epoch=${scope.epoch} unsent=${unsent.length}`,
@@ -3427,31 +3524,61 @@ export class ClaudianService implements ChatRuntime {
     return this.isPersistentQueryActive();
   }
 
-  /**
-   * Get supported commands (SDK skills).
-   * Returns cached commands populated on system/init. Falls back to a fresh
-   * supportedCommands() call if the cache is empty (e.g., dropdown opened
-   * before the first init event).
-   */
-  async getSupportedCommands(): Promise<SlashCommand[]> {
-    if (this.cachedSdkCommands.length > 0) {
-      return this.cachedSdkCommands;
-    }
-    if (!this.persistentQuery) {
+  /** The array API remains a compatibility shell over the current Query's observation. */
+  async getSupportedCommands(signal?: AbortSignal): Promise<SlashCommand[]> {
+    const scope = this.liveQueryScope();
+    const result = await this.readQueryCommands(scope, signal);
+    if (result.status !== 'ready' || !scope || signal?.aborted ||
+        !this.isCurrentQueryCommandCell(scope, scope.commandCell)) {
       return [];
     }
-    return this.fetchAndCacheCommands(this.persistentQuery);
+    return result.entries.map(entry => ({ ...entry }));
   }
 
-  /**
-   * Fetches commands from the SDK and caches them. Called on system/init
-   * (fire-and-forget) and as a fallback from getSupportedCommands().
-   */
-  private async fetchAndCacheCommands(query: Query | null): Promise<SlashCommand[]> {
-    if (!query) return [];
+  private isCurrentQueryCommandCell(scope: QueryScope, cell: QueryCommandCell): boolean {
+    return !this.shuttingDown && this.currentQueryScope === scope && !scope.retired &&
+      this.persistentQuery === scope.query && scope.commandCell === cell &&
+      cell.query === scope.query && cell.state !== 'revoked';
+  }
+
+  private async readQueryCommands(
+    scope: QueryScope | null,
+    signal?: AbortSignal,
+    retryFailed = true,
+  ): Promise<QueryCommandResult> {
+    if (signal?.aborted) return { status: 'cancelled' };
+    if (!scope) return { status: 'unavailable' };
+    const cell = scope.commandCell;
+    if (!this.isCurrentQueryCommandCell(scope, cell)) return { status: 'stale' };
+    if (cell.state === 'ready') return { status: 'ready', entries: cell.entries };
+    if (cell.state === 'unobserved' && cell.lastOutcome === 'failed' && !retryFailed) {
+      return { status: 'failed' };
+    }
+
+    const flight = cell.flight ?? this.startQueryCommandFlight(scope, cell);
+    if (!this.isCurrentQueryCommandCell(scope, cell) || cell.flight !== flight) {
+      return { status: 'stale' };
+    }
+    const result = await this.waitForQueryCommandFlight(scope, cell, flight, signal);
+    if (signal?.aborted) return { status: 'cancelled' };
+    if (!this.isCurrentQueryCommandCell(scope, cell)) return { status: 'stale' };
+    return result;
+  }
+
+  private startQueryCommandFlight(scope: QueryScope, cell: QueryCommandCell): QueryCommandFlight {
+    const flight: QueryCommandFlight = { waiters: new Set() };
+    cell.state = 'pending';
+    cell.flight = flight;
+
+    // Install the flight before invoking the SDK, including synchronous re-entry.
+    let pending: Promise<SDKSlashCommand[]>;
     try {
-      const sdkCommands: SDKSlashCommand[] = await query.supportedCommands();
-      const mappedCommands = sdkCommands.map((cmd) => ({
+      pending = Promise.resolve(scope.query.supportedCommands());
+    } catch (error) {
+      pending = Promise.reject(error);
+    }
+    void pending.then(sdkCommands => {
+      const entries = sdkCommands.map(cmd => ({
         id: `sdk:${cmd.name}`,
         name: cmd.name,
         description: cmd.description,
@@ -3459,14 +3586,232 @@ export class ClaudianService implements ChatRuntime {
         content: '',
         source: 'sdk' as const,
       }));
-      if (this.persistentQuery !== query) {
-        return this.cachedSdkCommands;
-      }
-      this.cachedSdkCommands = mappedCommands;
-      return this.cachedSdkCommands;
-    } catch {
-      return [];
+      this.finishQueryCommandFlight(scope, cell, flight, { status: 'ready', entries });
+    }, () => {
+      this.finishQueryCommandFlight(scope, cell, flight, { status: 'failed' });
+    }).catch(() => {
+      this.finishQueryCommandFlight(scope, cell, flight, { status: 'failed' });
+    });
+    return flight;
+  }
+
+  private finishQueryCommandFlight(
+    scope: QueryScope,
+    cell: QueryCommandCell,
+    flight: QueryCommandFlight,
+    result: QueryCommandResult,
+  ): void {
+    if (!this.isCurrentQueryCommandCell(scope, cell) || cell.flight !== flight) {
+      this.settleQueryCommandWaiters(flight, { status: 'stale' });
+      return;
     }
+    cell.flight = null;
+    if (result.status === 'ready') {
+      cell.state = 'ready';
+      cell.entries = result.entries;
+      cell.lastOutcome = null;
+    } else {
+      cell.state = 'unobserved';
+      cell.lastOutcome = 'failed';
+    }
+    this.settleQueryCommandWaiters(flight, result);
+    // W4a: the committed snapshot is a fresh source observation. Advance the
+    // source revision and notify — listeners only invalidate UI; this never
+    // re-enters the SDK here.
+    this.commandSourceRevision += 1;
+    this.notifyCommandDiscoveryChanged();
+  }
+
+  private waitForQueryCommandFlight(
+    scope: QueryScope,
+    cell: QueryCommandCell,
+    flight: QueryCommandFlight,
+    signal?: AbortSignal,
+  ): Promise<QueryCommandResult> {
+    return new Promise(resolve => {
+      let finished = false;
+      const onAbort = () => finish({ status: 'cancelled' });
+      const finish: QueryCommandWaiter = result => {
+        if (finished) return;
+        finished = true;
+        flight.waiters.delete(finish);
+        try { signal?.removeEventListener('abort', onAbort); } catch { /* caller-owned signal */ }
+        if (signal?.aborted) resolve({ status: 'cancelled' });
+        else if (!this.isCurrentQueryCommandCell(scope, cell)) resolve({ status: 'stale' });
+        else resolve(result);
+      };
+      flight.waiters.add(finish);
+      try { signal?.addEventListener('abort', onAbort, { once: true }); } catch {
+        finish({ status: 'cancelled' });
+        return;
+      }
+      if (signal?.aborted) finish({ status: 'cancelled' });
+      else if (!this.isCurrentQueryCommandCell(scope, cell) || cell.flight !== flight) {
+        finish({ status: 'stale' });
+      }
+    });
+  }
+
+  private settleQueryCommandWaiters(flight: QueryCommandFlight, result: QueryCommandResult): void {
+    const waiters = [...flight.waiters];
+    flight.waiters.clear();
+    for (const waiter of waiters) {
+      try { waiter(result); } catch { /* command waiters cannot interrupt lifecycle */ }
+    }
+  }
+
+  private revokeQueryCommands(cell: QueryCommandCell): void {
+    if (cell.state === 'revoked') return;
+    cell.state = 'revoked';
+    cell.entries = [];
+    cell.lastOutcome = null;
+    const flight = cell.flight;
+    cell.flight = null;
+    if (flight) this.settleQueryCommandWaiters(flight, { status: 'stale' });
+    // W4a: revoking a readable cell ends its eligibility generation — an
+    // already-replaced cell (old consumer teardown, late old child exit)
+    // never matches the current generation, so it cannot revoke Q2.
+    if (this.commandEligibility.readable?.cell === cell) {
+      this.advanceCommandEligibility(null);
+    }
+  }
+
+  // ---- W4a: public typed command discovery facet --------------------------
+  // Read-only bypass over the P1 command cell. P1 keeps owning the getter
+  // flight, waiters, revocation, and the array compatibility shell; the facet
+  // only adds eligibility generations, an opaque per-scope source
+  // observation, and invalidation listeners.
+
+  getCommandDiscovery(): RuntimeCommandDiscovery {
+    if (!this.commandDiscoveryFacet) {
+      this.commandDiscoveryFacet = {
+        read: (waiterSignal, options) => this.readCommandDiscoverySnapshot(waiterSignal, options),
+        subscribe: listener => this.subscribeCommandDiscovery(listener),
+        isCurrent: eligibility => this.isCommandEligibilityCurrent(eligibility),
+      };
+    }
+    return this.commandDiscoveryFacet;
+  }
+
+  private subscribeCommandDiscovery(listener: () => void): () => void {
+    this.commandDiscoveryListeners.add(listener);
+    return () => { this.commandDiscoveryListeners.delete(listener); };
+  }
+
+  /** Invalidation fan-out only — a throwing listener must never break the runtime. */
+  private notifyCommandDiscoveryChanged(): void {
+    if (this.commandDiscoveryListeners.size === 0) return;
+    for (const listener of [...this.commandDiscoveryListeners]) {
+      try { listener(); } catch { /* isolated by contract */ }
+    }
+  }
+
+  private advanceCommandEligibility(readable: CommandEligibilityGeneration['readable']): void {
+    const token: CommandDiscoveryToken = {};
+    const revision = this.commandEligibility.eligibility.revision + 1;
+    this.commandEligibility = { eligibility: { token, revision }, readable };
+    this.notifyCommandDiscoveryChanged();
+  }
+
+  private isCommandEligibilityCurrent(eligibility: CommandRuntimeEligibility): boolean {
+    const generation = this.commandEligibility;
+    // (1) The eligibility object itself must be the current generation.
+    if (!eligibility ||
+        eligibility.token !== generation.eligibility.token ||
+        eligibility.revision !== generation.eligibility.revision) {
+      return false;
+    }
+    // (2)+(3) Query-bound generations must still own a live, unrevoked
+    // scope-cell; absence generations stay current until the next advance.
+    return generation.readable === null ||
+      this.isCurrentQueryCommandCell(generation.readable.scope, generation.readable.cell);
+  }
+
+  private async readCommandDiscoverySnapshot(
+    waiterSignal?: AbortSignal,
+    options?: { retryFailed?: boolean },
+  ): Promise<RuntimeCommandRead> {
+    // Capture the eligibility generation and the readable scope/cell BEFORE
+    // any await: a cell already revoked/exited/EOF'd reads as a fresh
+    // no-readable-query absence, never as a stale carry-over, and a read
+    // started on one Query never re-binds to a replacement.
+    const eligibility = this.commandEligibility.eligibility;
+    const scope = this.currentQueryScope;
+    const cell = scope?.commandCell ?? null;
+    if (waiterSignal?.aborted) {
+      return { status: 'cancelled', eligibility };
+    }
+    if (!scope || !cell || !this.isCurrentQueryCommandCell(scope, cell)) {
+      return { status: 'unavailable', reason: 'no-readable-query', eligibility };
+    }
+    // Typed reads are passive by default: a cached failure is preserved
+    // unless the caller explicitly asks for retryFailed.
+    const result = await this.readQueryCommands(scope, waiterSignal, options?.retryFailed === true);
+    if (result.status === 'ready') {
+      return {
+        status: 'ready',
+        entries: result.entries.map(entry => ({ ...entry })),
+        receipt: this.buildQueryCommandReceipt(scope, cell),
+        eligibility,
+      };
+    }
+    if (result.status === 'failed') {
+      return { status: 'failed', code: 'query-command-read-failed', eligibility };
+    }
+    return { status: result.status, eligibility };
+  }
+
+  private buildQueryCommandReceipt(
+    scope: QueryScope,
+    cell: QueryCommandCell,
+  ): QueryCommandSourceReceipt {
+    const meta = this.commandSourceMeta;
+    const bound = meta && meta.scope === scope && meta.cell === cell ? meta : null;
+    // Unknown dims are reported as unknown — never fabricated from
+    // currentConfig or the live slot state.
+    const sourceToken: CommandDiscoveryToken = bound ? bound.token : {};
+    return {
+      sourceKind: 'initialize-response',
+      sourceToken,
+      sourceRevision: this.commandSourceRevision,
+      scope: {
+        kind: 'actual-query',
+        sourceToken,
+        cwd: bound?.cwd,
+        additionalDirectories: bound?.additionalDirectories,
+        settingSources: bound?.settingSources,
+        unknown: [...(bound ? bound.unknown : ['cwd', 'additionalDirectories', 'settingSources'])],
+      },
+      coverage: 'initialize-observed',
+    };
+  }
+
+  /**
+   * W4a: copy the applied options whitelist (cwd / additionalDirectories /
+   * settingSources) onto the scope's command source meta. Dimensions absent
+   * from the applied options stay in `unknown` — the meta is never repaired
+   * from the mutable currentConfig.
+   */
+  private recordAppliedCommandScope(scope: QueryScope, options: Options): void {
+    const meta = this.commandSourceMeta;
+    if (!meta || meta.scope !== scope) return;
+    if (typeof options.cwd === 'string') {
+      meta.cwd = options.cwd;
+      this.dropUnknownCommandScopeDim(meta, 'cwd');
+    }
+    if (options.additionalDirectories) {
+      meta.additionalDirectories = [...options.additionalDirectories];
+      this.dropUnknownCommandScopeDim(meta, 'additionalDirectories');
+    }
+    if (options.settingSources) {
+      meta.settingSources = [...options.settingSources];
+      this.dropUnknownCommandScopeDim(meta, 'settingSources');
+    }
+  }
+
+  private dropUnknownCommandScopeDim(meta: QueryCommandSourceMeta, dim: string): void {
+    const index = meta.unknown.indexOf(dim);
+    if (index !== -1) meta.unknown.splice(index, 1);
   }
 
   /**

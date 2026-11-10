@@ -1,6 +1,8 @@
 import '@/providers';
 
 import * as sdkModule from '@anthropic-ai/claude-agent-sdk';
+import { tmpdir } from 'os';
+import { join } from 'path';
 
 import type { McpServerManager } from '@/core/mcp/McpServerManager';
 import type ClaudianPlugin from '@/main';
@@ -695,7 +697,105 @@ describe('ClaudianService', () => {
     });
   });
 
+  describe('Stop hook registration (Stop minimal fix)', () => {
+    beforeEach(() => {
+      sdkMock.resetMockMessages();
+      sdkMock.setMockMessages([{ type: 'result', subtype: 'success' }]);
+      (mockPlugin as any).app.vault.adapter.basePath = tmpdir();
+      (mockPlugin.getResolvedProviderCliPath as jest.Mock).mockReturnValue(join(tmpdir(), 'fake-claude'));
+    });
+
+    afterEach(() => {
+      service.cleanup();
+      sdkMock.resetMockMessages();
+    });
+
+    const stopInput = () => ({
+      hook_event_name: 'Stop' as const,
+      session_id: 'test-session',
+      transcript_path: join(tmpdir(), 'transcript'),
+      cwd: tmpdir(),
+      stop_hook_active: true,
+    });
+    const stopOpts = { signal: new AbortController().signal };
+
+    async function assertRegisteredStopAllows(options: any) {
+      expect(options.hooks?.Stop).toHaveLength(1);
+      expect(options.hooks.Stop[0].matcher).toBeUndefined();
+      let running = true;
+      const getter = jest.fn(() => running);
+      const getState = jest.fn(() => ({ get hasRunning() { return getter(); } }));
+      service.setSubagentHookProvider(getState);
+      expect(getState).not.toHaveBeenCalled();
+      expect(getter).not.toHaveBeenCalled();
+
+      expect(await options.hooks.Stop[0].hooks[0](stopInput(), undefined, stopOpts)).toEqual({});
+      expect(getState).toHaveBeenCalledTimes(1);
+      expect(getter).toHaveBeenCalledTimes(1);
+      expect(getter.mock.results[0].value).toBe(true);
+      running = false;
+      expect(await options.hooks.Stop[0].hooks[0](stopInput(), undefined, stopOpts)).toEqual({});
+      expect(getState).toHaveBeenCalledTimes(2);
+      expect(getter).toHaveBeenCalledTimes(2);
+      expect(getter.mock.results[1].value).toBe(false);
+    }
+
+    it('persistent query options register a Stop hook that reads the provider and allows', async () => {
+      expect(await service.ensureReady()).toBe(true);
+
+      const options = sdkMock.getLastOptions();
+      // Persistent-entry proof: enableFileCheckpointing is only set on the
+      // persistent options builder.
+      expect(options.enableFileCheckpointing).toBe(true);
+      await assertRegisteredStopAllows(options);
+    });
+
+    it('cold-start options register a Stop hook that reads the provider and allows', async () => {
+      const chunks = await collectChunks(
+        service.query('stop-cold-check', undefined, undefined, { forceColdStart: true })
+      );
+      expect(chunks.some(c => c.type === 'done')).toBe(true);
+
+      const options = sdkMock.getLastOptions();
+      expect(options.enableFileCheckpointing).toBeUndefined();
+      await assertRegisteredStopAllows(options);
+    });
+
+    it('still routes task notifications after the registered Stop callback', async () => {
+      const handler = jest.fn();
+      let delivered!: () => void;
+      const delivery = new Promise<void>(resolve => { delivered = resolve; });
+      service.setSubagentNotificationHandler((...args) => { handler(...args); delivered(); });
+      expect(await service.ensureReady()).toBe(true);
+      await assertRegisteredStopAllows(sdkMock.getLastOptions());
+      const query = sdkMock.getLastResponse();
+      query.pushStdoutMessage({
+        type: 'system', subtype: 'task_notification', task_id: 'agent-ntf', status: 'completed', summary: 'done',
+      });
+      await delivery;
+      expect(handler).toHaveBeenCalledWith('agent-ntf', 'completed', 'done');
+      expect((service as any).messageChannel.getActiveTurnId()).toBeNull();
+    });
+  });
+
   describe('SDK Skills (Supported Commands)', () => {
+    beforeEach(() => {
+      sdkMock.resetMockMessages();
+    });
+
+    afterEach(() => {
+      service.cleanup();
+      sdkMock.resetMockMessages();
+    });
+
+    async function startCommandQuery() {
+      expect(await service.ensureReady()).toBe(true);
+      expect(sdkMock.getQueryCallCount()).toBeGreaterThan(0);
+      const query = sdkMock.getLastResponse();
+      expect(query).toBeTruthy();
+      return query;
+    }
+
     it('should report not ready when no persistent query exists', () => {
       expect(service.isReady()).toBe(false);
     });
@@ -726,10 +826,8 @@ describe('ClaudianService', () => {
         { name: 'pr', description: 'Create a pull request', argumentHint: '<title>' },
       ];
 
-      const mockQuery = {
-        supportedCommands: jest.fn().mockResolvedValue(mockSdkCommands),
-      };
-      (service as any).persistentQuery = mockQuery;
+      const mockQuery = await startCommandQuery();
+      mockQuery.supportedCommands.mockResolvedValue(mockSdkCommands);
 
       const commands = await service.getSupportedCommands();
 
@@ -754,13 +852,13 @@ describe('ClaudianService', () => {
     });
 
     it('should return empty array on SDK error', async () => {
-      const mockQuery = {
-        supportedCommands: jest.fn().mockRejectedValue(new Error('SDK error')),
-      };
-      (service as any).persistentQuery = mockQuery;
+      const mockQuery = await startCommandQuery();
+      mockQuery.supportedCommands.mockRejectedValue(new Error('SDK error'));
 
       const commands = await service.getSupportedCommands();
 
+      expect(mockQuery.supportedCommands).toHaveBeenCalledTimes(1);
+      await expect(mockQuery.supportedCommands.mock.results[0].value).rejects.toThrow('SDK error');
       expect(commands).toEqual([]);
     });
 
@@ -770,25 +868,24 @@ describe('ClaudianService', () => {
         resolveStaleCommands = resolve;
       });
 
-      const staleQuery = {
-        supportedCommands: jest.fn().mockReturnValue(staleCommandsPromise),
-      };
-      const activeQuery = {
-        supportedCommands: jest.fn().mockResolvedValue([
-          { name: 'review', description: 'Review code', argumentHint: '' },
-        ]),
-      };
+      const staleQuery = await startCommandQuery();
+      staleQuery.supportedCommands.mockReturnValue(staleCommandsPromise);
+      const staleFetch = service.getSupportedCommands();
+      expect(staleQuery.supportedCommands).toHaveBeenCalledTimes(1);
 
-      (service as any).persistentQuery = staleQuery;
-      const staleFetch = (service as any).fetchAndCacheCommands(staleQuery);
-
-      (service as any).persistentQuery = activeQuery;
-      const activeCommands = await (service as any).fetchAndCacheCommands(activeQuery);
+      service.closePersistentQuery('replace command query');
+      expect(await staleFetch).toEqual([]);
+      const activeQuery = await startCommandQuery();
+      expect(activeQuery).not.toBe(staleQuery);
+      activeQuery.supportedCommands.mockResolvedValue([
+        { name: 'review', description: 'Review code', argumentHint: '' },
+      ]);
+      const activeCommands = await service.getSupportedCommands();
 
       resolveStaleCommands!([
         { name: 'commit', description: 'Create a commit', argumentHint: '' },
       ]);
-      const staleCommands = await staleFetch;
+      await Promise.resolve();
 
       expect(activeCommands).toEqual([{
         id: 'sdk:review',
@@ -798,8 +895,8 @@ describe('ClaudianService', () => {
         content: '',
         source: 'sdk',
       }]);
-      expect(staleCommands).toEqual(activeCommands);
-      expect((service as any).cachedSdkCommands).toEqual(activeCommands);
+      expect(await service.getSupportedCommands()).toEqual(activeCommands);
+      expect(activeQuery.supportedCommands).toHaveBeenCalledTimes(1);
     });
   });
 

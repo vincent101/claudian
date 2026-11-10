@@ -1,4 +1,5 @@
 import type { FullHistoryIterable, ProviderCapabilities, ProviderId } from '../providers/types';
+import type { RuntimeCommandDiscovery } from '../providers/commands/ProviderCommandDiscovery';
 import type { ChatMessage, Conversation, SlashCommand, StreamChunk, ToolCallInfo } from '../types';
 import type {
   ApprovalCallback,
@@ -60,6 +61,7 @@ export interface ChatRuntime {
   consumeSessionInvalidation(): boolean;
   isReady(): boolean;
   getSupportedCommands(): Promise<SlashCommand[]>;
+  getCommandDiscovery?(): RuntimeCommandDiscovery;
   getAuxiliaryModel?(): string | null;
   cleanup(): void;
   rewind(userMessageId: string, assistantMessageId: string): Promise<ChatRewindResult>;
