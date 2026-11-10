@@ -871,6 +871,27 @@ describe('AutoTurnProjectionController', () => {
     secondLease?.release();
   });
 
+  it('abandonStalledTurn drops the live lease even when DOM removal throws', async () => {
+    const coordinator = new ProjectionWriteCoordinator();
+    const { controller, state, removeMessage } = setup({ coordinator });
+    controller.started({ turnId: 'auto-stall-dom', generation: 0, source: { kind: 'coordinator' } });
+    await Promise.resolve();
+    await Promise.resolve();
+    removeMessage.mockImplementation(() => { throw new Error('dom failed'); });
+
+    expect(() => controller.abandonStalledTurn('auto-stall-dom')).not.toThrow();
+
+    // The lease must be free for the next turn despite the cleanup failure.
+    let granted = false;
+    const lease = await coordinator.acquireLive(() => false).then((grantedLease) => {
+      granted = !!grantedLease;
+      return grantedLease;
+    });
+    expect(granted).toBe(true);
+    expect(state.messages).toHaveLength(0);
+    lease?.release();
+  });
+
   it('abandonStalledTurn ignores a foreign turn id', async () => {
     const coordinator = new ProjectionWriteCoordinator();
     const { controller, state } = setup({ coordinator });

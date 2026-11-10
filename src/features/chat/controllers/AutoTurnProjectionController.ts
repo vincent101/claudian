@@ -564,16 +564,37 @@ export class AutoTurnProjectionController {
   abandonStalledTurn(turnId: string): void {
     const active = this.active;
     if (!active || active.turnId !== turnId) return;
-    this.deps.streamController.invalidateRenderFlush();
-    this.deps.streamController.hideThinkingIndicator();
-    if (!active.assistantMessage.content && (active.assistantMessage.toolCalls?.length ?? 0) === 0) {
-      this.deps.state.messages = this.deps.state.messages.filter(
-        message => message.id !== active.assistantMessage.id,
-      );
-      this.deps.renderer.removeMessage(active.assistantMessage.id);
-    }
-    this.releaseLiveLease(active);
+    // Critical actions first, exactly as abortActive: the lease and the active
+    // projection must drop even if DOM cleanup throws — a held live lease
+    // parks every later acquireLive. Neither statement can throw.
+    const liveLease = active.liveLease;
+    active.liveLease = null;
     this.active = null;
+    try {
+      liveLease?.release();
+    } catch {
+      // Lease cancellation must survive cleanup failures.
+    }
+    try {
+      this.deps.streamController.invalidateRenderFlush();
+    } catch {
+      // UI-only cleanup.
+    }
+    try {
+      this.deps.streamController.hideThinkingIndicator();
+    } catch {
+      // UI-only cleanup.
+    }
+    if (!active.assistantMessage.content && (active.assistantMessage.toolCalls?.length ?? 0) === 0) {
+      try {
+        this.deps.state.messages = this.deps.state.messages.filter(
+          message => message.id !== active.assistantMessage.id,
+        );
+        this.deps.renderer.removeMessage(active.assistantMessage.id);
+      } catch {
+        // DOM removal is cosmetic; the message stays until the next render.
+      }
+    }
   }
 
   private releaseLiveLease(active: AutoProjection): void {

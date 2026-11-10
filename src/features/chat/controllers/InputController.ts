@@ -211,18 +211,43 @@ export class InputController {
    * later acquireLive, so the pumped message never mounts).
    */
   abandonStalledTurn(turnId: string): void {
-    if (this.activeProjectionLeaseTurnId === turnId) {
-      this.activeProjectionLease?.release();
+    const ownsLease = this.activeProjectionLeaseTurnId === turnId;
+    let lease: ProjectionWriteLease | null = null;
+    if (ownsLease) {
+      // Drop the bookkeeping first: a throwing release must not leave the
+      // field pointing at a lease that will never be released again.
+      lease = this.activeProjectionLease;
       this.activeProjectionLease = null;
       this.activeProjectionLeaseTurnId = null;
       // The parked generator is about to be woken by the cancel: make it take
       // the interrupted path instead of projecting a late result into a tab
       // that may already belong to a newer turn.
       this.deps.state.cancelRequested = true;
-      this.deps.streamController.invalidateRenderFlush?.();
-      this.deps.streamController.hideThinkingIndicator();
     }
-    this.getAgentService()?.cancel();
+    // Same rule as abortActive: lease cancellation must survive cleanup
+    // failures, so the critical actions are each isolated from the rest.
+    try {
+      lease?.release();
+    } catch {
+      // Releasing a dead lease is a no-op; the runtime cancel below matters.
+    }
+    try {
+      this.getAgentService()?.cancel();
+    } catch {
+      // The feature lease still drops in TurnCoordinator.
+    }
+    if (ownsLease) {
+      try {
+        this.deps.streamController.invalidateRenderFlush?.();
+      } catch {
+        // UI-only cleanup.
+      }
+      try {
+        this.deps.streamController.hideThinkingIndicator();
+      } catch {
+        // UI-only cleanup.
+      }
+    }
   }
 
   private getAuxiliaryModel(): string | null {

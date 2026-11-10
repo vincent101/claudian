@@ -1654,6 +1654,51 @@ describe('InputController - Message Queue', () => {
       }
     });
 
+    it('abandonStalledTurn drops the lease and cancels the runtime even when UI cleanup throws', () => {
+      const localDeps = createMockDeps();
+      const localController = new InputController(localDeps);
+      const release = jest.fn();
+      // Fault injection: a live lease is held by the wedged turn.
+      (localController as any).activeProjectionLease = { release };
+      (localController as any).activeProjectionLeaseTurnId = 'turn-stall';
+      localDeps.streamController.invalidateRenderFlush = jest.fn(() => {
+        throw new Error('flush failed');
+      });
+      (localDeps.streamController as any).hideThinkingIndicator = jest.fn(() => {
+        throw new Error('thinking failed');
+      });
+
+      expect(() => localController.abandonStalledTurn('turn-stall')).not.toThrow();
+
+      expect(release).toHaveBeenCalledTimes(1);
+      expect((localController as any).activeProjectionLease).toBeNull();
+      expect(localDeps.state.cancelRequested).toBe(true);
+      expect((localDeps as any).mockAgentService.cancel).toHaveBeenCalled();
+    });
+
+    it('stall watchdog wiring: an input cleanup failure never skips the auto lease release', () => {
+      const askController = new InputController(createAskDeps());
+      jest.spyOn(askController, 'abandonStalledTurn').mockImplementation(() => {
+        throw new Error('input cleanup failed');
+      });
+      const abandonAuto = jest.fn();
+      const wiring = createTurnStallWatchdogDeps({
+        streamController: { hasRunningToolWork: () => false },
+        inputController: askController,
+        autoTurnProjectionController: { abandonStalledTurn: abandonAuto },
+      } as any);
+
+      expect(() => wiring.onStallForceSettle!({
+        turnId: 'turn-1',
+        kind: 'user',
+        generation: 1,
+        conversationId: 'conv-1',
+        lifecycleGeneration: 0,
+      })).not.toThrow();
+
+      expect(abandonAuto).toHaveBeenCalledWith('turn-1');
+    });
+
     it('stall watchdog wiring: force settle delegates to both controller abandon hooks', () => {
       const askDeps = createAskDeps();
       const askController = new InputController(askDeps);

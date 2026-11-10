@@ -1388,8 +1388,18 @@ export function createTurnStallWatchdogDeps(
       || (controllers.inputController?.hasPendingInteractivePrompt() ?? false)
     ),
     onStallForceSettle: (turn) => {
-      controllers.inputController?.abandonStalledTurn(turn.turnId);
-      controllers.autoTurnProjectionController?.abandonStalledTurn(turn.turnId);
+      // Independent isolation: a failing user-turn cleanup must never skip the
+      // auto-turn lease release (and vice versa).
+      try {
+        controllers.inputController?.abandonStalledTurn(turn.turnId);
+      } catch {
+        // The coordinator's own settle still runs.
+      }
+      try {
+        controllers.autoTurnProjectionController?.abandonStalledTurn(turn.turnId);
+      } catch {
+        // The coordinator's own settle still runs.
+      }
     },
   };
 }
