@@ -374,6 +374,7 @@ function parseSessionRecord(line: string): ParsedSessionRecord | null {
   } catch {
     return null;
   }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
 
   return {
     timestamp: parseTimestamp(parsed.timestamp),
@@ -1148,9 +1149,8 @@ export function parseCodexSessionContent(content: string): ChatMessage[] {
 }
 
 export function parseCodexSessionTurns(content: string): CodexParsedTurn[] {
-  const records = content
-    .split('\n')
-    .filter(line => line.trim())
+  const lines = content.split('\n').filter(line => line.trim());
+  const records = lines
     .map(parseSessionRecord)
     .filter((record): record is ParsedSessionRecord => record !== null);
 
