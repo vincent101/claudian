@@ -1,6 +1,13 @@
 import type { Conversation } from '../types';
+import {
+  resolveProviderPermissionMode,
+} from './permissionModes';
 import { ProviderRegistry } from './ProviderRegistry';
-import type { ProviderChatUIConfig, ProviderId } from './types';
+import type {
+  ProviderChatUIConfig,
+  ProviderId,
+  ProviderPermissionModePolicy,
+} from './types';
 
 export interface SettingsReconciliationResult {
   changed: boolean;
@@ -51,15 +58,13 @@ function cloneProviderSettings(settings: Record<string, unknown>): Record<string
   };
 }
 
-function normalizeToggleValue(
+/** Keeps a known value, migrates a retired one, and fails any other present value closed. */
+function normalizeStoredPermissionMode(
+  policy: ProviderPermissionModePolicy,
   value: unknown,
-  allowedValues: Set<string>,
+  settings: Record<string, unknown>,
 ): string | undefined {
-  if (typeof value !== 'string') {
-    return undefined;
-  }
-
-  return allowedValues.has(value) ? value : undefined;
+  return resolveProviderPermissionMode(policy, value, settings);
 }
 
 function mergeProviderSettings(
@@ -201,8 +206,14 @@ export class ProviderSettingsCoordinator {
     if (typeof settings.thinkingBudget === 'string') {
       savedBudget[providerId] = settings.thinkingBudget;
     }
-    if (typeof settings.permissionMode === 'string' && uiConfig.getPermissionModeToggle?.()) {
-      savedPermissionMode[providerId] = settings.permissionMode;
+    const permissionPolicy = uiConfig.permissionModes;
+    if (permissionPolicy && settings.permissionMode !== undefined) {
+      // In-memory map may hold the transient plan overlay; storage serializes it away.
+      savedPermissionMode[providerId] = resolveProviderPermissionMode(
+        permissionPolicy,
+        settings.permissionMode,
+        settings,
+      ) ?? permissionPolicy.fallbackValue;
     }
   }
 
@@ -216,6 +227,20 @@ export class ProviderSettingsCoordinator {
     const savedServiceTier = settings.savedProviderServiceTier as ProviderProjectionMap | undefined;
     const savedBudget = settings.savedProviderThinkingBudget as ProviderProjectionMap | undefined;
     const savedPermissionMode = settings.savedProviderPermissionMode as ProviderProjectionMap | undefined;
+
+    // Capture permission candidates before applyModelDefaults: that hook may run
+    // provider config updaters that retire legacy permission sources, and a
+    // late read could miss them (design §6).
+    const permissionPolicy = uiConfig.permissionModes ?? null;
+    const savedPermissionModeValue = permissionPolicy
+      ? normalizeStoredPermissionMode(permissionPolicy, savedPermissionMode?.[providerId], settings)
+      : undefined;
+    const derivedPermissionMode = permissionPolicy
+      ? normalizeStoredPermissionMode(permissionPolicy, uiConfig.resolvePermissionMode?.(settings), settings)
+      : undefined;
+    const currentPermissionMode = permissionPolicy
+      ? normalizeStoredPermissionMode(permissionPolicy, settings.permissionMode, settings)
+      : undefined;
 
     const shouldPreferCurrentProjection = providerId === getSettingsProviderId(settings);
     const currentModelRaw = typeof settings.model === 'string' ? settings.model : '';
@@ -286,34 +311,20 @@ export class ProviderSettingsCoordinator {
       settings.thinkingBudget = normalizeReasoningValue(uiConfig, settings, model, settings.thinkingBudget);
     }
 
-    const permissionToggle = uiConfig.getPermissionModeToggle?.() ?? null;
-    if (!permissionToggle) {
+    if (!permissionPolicy) {
       return;
     }
 
-    const allowedPermissionModes = new Set([
-      permissionToggle.inactiveValue,
-      permissionToggle.activeValue,
-      ...(permissionToggle.planValue ? [permissionToggle.planValue] : []),
-    ]);
-    const currentPermissionMode = normalizeToggleValue(settings.permissionMode, allowedPermissionModes);
-    const derivedPermissionMode = normalizeToggleValue(
-      uiConfig.resolvePermissionMode?.(settings),
-      allowedPermissionModes,
-    );
-    const savedPermissionModeValue = normalizeToggleValue(
-      savedPermissionMode?.[providerId],
-      allowedPermissionModes,
-    );
-
+    // Saved wins; derived (e.g. managed modes) next; the top-level projection
+    // belongs only to the settings provider — other providers fall to their
+    // own default instead of inheriting a value they never chose.
     const projectedPermissionMode = savedPermissionModeValue
       ?? derivedPermissionMode
       ?? (shouldPreferCurrentProjection ? currentPermissionMode : undefined)
-      ?? currentPermissionMode;
+      ?? permissionPolicy.defaultValue
+      ?? permissionPolicy.fallbackValue;
 
-    if (projectedPermissionMode !== undefined) {
-      settings.permissionMode = projectedPermissionMode;
-    }
+    settings.permissionMode = projectedPermissionMode;
   }
 
   /** Each provider's reconciler only processes its own conversations. */

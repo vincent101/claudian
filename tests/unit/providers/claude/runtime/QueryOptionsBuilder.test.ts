@@ -207,36 +207,81 @@ describe('QueryOptionsBuilder', () => {
       expect(config.claudeCliPath).toBe('/mock/claude');
     });
 
-    it('tracks resolved sdkPermissionMode for normal mode', () => {
+    it.each([
+      ['auto', 'auto'],
+      ['manual', 'default'],
+      ['acceptEdits', 'acceptEdits'],
+      ['yolo', 'bypassPermissions'],
+    ])('maps the %s app mode onto the %s SDK value', (appMode, sdkMode) => {
+      const ctx = createMockContext({
+        settings: createMockSettings({ permissionMode: appMode }),
+      });
+      const config = QueryOptionsBuilder.buildPersistentQueryConfig(ctx);
+
+      expect(config.permissionMode).toBe(appMode);
+      expect(config.sdkPermissionMode).toBe(sdkMode);
+    });
+
+    it('keeps the transient plan mode requestable on a persistent config', () => {
+      const ctx = createMockContext({
+        settings: createMockSettings({ permissionMode: 'plan' }),
+      });
+      const config = QueryOptionsBuilder.buildPersistentQueryConfig(ctx);
+
+      expect(config.permissionMode).toBe('plan');
+      expect(config.sdkPermissionMode).toBe('plan');
+    });
+
+    it('migrates legacy normal through the stored Safe selection', () => {
       const ctx = createMockContext({
         settings: createMockSettings({ permissionMode: 'normal', claudeSafeMode: 'default' }),
       });
       const config = QueryOptionsBuilder.buildPersistentQueryConfig(ctx);
 
-      expect(config.permissionMode).toBe('normal');
+      expect(config.permissionMode).toBe('manual');
       expect(config.sdkPermissionMode).toBe('default');
     });
 
-    it('tracks auto sdkPermissionMode for Claude safe mode', () => {
+    it('maps legacy normal without a Safe source onto historical acceptEdits', () => {
       const ctx = createMockContext({
-        settings: createMockSettings({ permissionMode: 'normal', claudeSafeMode: 'auto' }),
+        settings: createMockSettings({ permissionMode: 'normal' }),
       });
       const config = QueryOptionsBuilder.buildPersistentQueryConfig(ctx);
 
-      expect(config.permissionMode).toBe('normal');
-      expect(config.sdkPermissionMode).toBe('auto');
-      expect(config.enableAutoMode).toBe(true);
+      expect(config.permissionMode).toBe('acceptEdits');
+      expect(config.sdkPermissionMode).toBe('acceptEdits');
     });
 
-    it('enables auto mode startup capability whenever Claude safe mode is auto', () => {
+    it('fails unknown stored values closed onto manual', () => {
       const ctx = createMockContext({
-        settings: createMockSettings({ permissionMode: 'yolo', claudeSafeMode: 'auto' }),
+        settings: createMockSettings({ permissionMode: 'future' }),
       });
       const config = QueryOptionsBuilder.buildPersistentQueryConfig(ctx);
 
-      expect(config.permissionMode).toBe('yolo');
-      expect(config.sdkPermissionMode).toBe('bypassPermissions');
-      expect(config.enableAutoMode).toBe(true);
+      expect(config.permissionMode).toBe('manual');
+      expect(config.sdkPermissionMode).toBe('default');
+    });
+
+    it('always carries the auto-mode startup capability so mode switches stay live', () => {
+      for (const appMode of ['auto', 'manual', 'acceptEdits', 'yolo']) {
+        const config = QueryOptionsBuilder.buildPersistentQueryConfig(
+          createMockContext({ settings: createMockSettings({ permissionMode: appMode }) }),
+        );
+        expect(config.enableAutoMode).toBe(true);
+      }
+    });
+
+    it('does not require a restart when only the permission mode changes', () => {
+      const current = createMockPersistentQueryConfig({
+        permissionMode: 'manual',
+        sdkPermissionMode: 'default',
+      });
+      const next = createMockPersistentQueryConfig({
+        permissionMode: 'yolo',
+        sdkPermissionMode: 'bypassPermissions',
+      });
+
+      expect(QueryOptionsBuilder.needsRestart(current, next)).toBe(false);
     });
 
     it('includes thinking tokens when budget is set', () => {
@@ -477,7 +522,7 @@ describe('QueryOptionsBuilder', () => {
       expect(options.resume).toBe('session-123');
     });
 
-    it('sets extraArgs with chrome flag when enableChrome is enabled', () => {
+    it('always carries the auto-mode opt-in flag, with chrome when enabled', () => {
       const ctx = {
         ...createMockContext({
           settings: createMockSettings({ enableChrome: true }),
@@ -487,24 +532,10 @@ describe('QueryOptionsBuilder', () => {
       };
       const options = QueryOptionsBuilder.buildPersistentQueryOptions(ctx);
 
-      expect(options.extraArgs).toBeDefined();
-      expect(options.extraArgs).toEqual({ chrome: null });
-    });
-
-    it('sets extraArgs with chrome and auto mode flags when both are enabled', () => {
-      const ctx = {
-        ...createMockContext({
-          settings: createMockSettings({ enableChrome: true, claudeSafeMode: 'auto' }),
-        }),
-        abortController: new AbortController(),
-        hooks: {},
-      };
-      const options = QueryOptionsBuilder.buildPersistentQueryOptions(ctx);
-
       expect(options.extraArgs).toEqual({ 'enable-auto-mode': null, chrome: null });
     });
 
-    it('does not set extraArgs when enableChrome is disabled', () => {
+    it('keeps the auto-mode opt-in flag even when chrome is disabled', () => {
       const ctx = {
         ...createMockContext({
           settings: createMockSettings({ enableChrome: false }),
@@ -514,7 +545,7 @@ describe('QueryOptionsBuilder', () => {
       };
       const options = QueryOptionsBuilder.buildPersistentQueryOptions(ctx);
 
-      expect(options.extraArgs).toBeUndefined();
+      expect(options.extraArgs).toEqual({ 'enable-auto-mode': null });
     });
 
     it('sets additionalDirectories when externalContextPaths provided', () => {
@@ -686,7 +717,7 @@ describe('QueryOptionsBuilder', () => {
       expect(options.tools).toEqual(['Read', 'Grep']);
     });
 
-    it('sets extraArgs with chrome flag when enableChrome is enabled', () => {
+    it('always carries the auto-mode opt-in flag, with chrome when enabled', () => {
       const ctx = {
         ...createMockContext({
           settings: createMockSettings({ enableChrome: true }),
@@ -697,25 +728,10 @@ describe('QueryOptionsBuilder', () => {
       };
       const options = QueryOptionsBuilder.buildColdStartQueryOptions(ctx);
 
-      expect(options.extraArgs).toBeDefined();
-      expect(options.extraArgs).toEqual({ chrome: null });
+      expect(options.extraArgs).toEqual({ 'enable-auto-mode': null, chrome: null });
     });
 
-    it('sets extraArgs with auto mode flag when Claude safe mode is auto', () => {
-      const ctx = {
-        ...createMockContext({
-          settings: createMockSettings({ claudeSafeMode: 'auto' }),
-        }),
-        abortController: new AbortController(),
-        hooks: {},
-        hasEditorContext: false,
-      };
-      const options = QueryOptionsBuilder.buildColdStartQueryOptions(ctx);
-
-      expect(options.extraArgs).toEqual({ 'enable-auto-mode': null });
-    });
-
-    it('does not set extraArgs when enableChrome is disabled', () => {
+    it('keeps the auto-mode opt-in flag even when chrome is disabled', () => {
       const ctx = {
         ...createMockContext({
           settings: createMockSettings({ enableChrome: false }),
@@ -726,7 +742,30 @@ describe('QueryOptionsBuilder', () => {
       };
       const options = QueryOptionsBuilder.buildColdStartQueryOptions(ctx);
 
-      expect(options.extraArgs).toBeUndefined();
+      expect(options.extraArgs).toEqual({ 'enable-auto-mode': null });
+    });
+
+    it.each([
+      ['auto', 'auto'],
+      ['manual', 'default'],
+      ['acceptEdits', 'acceptEdits'],
+      ['yolo', 'bypassPermissions'],
+    ])('maps the %s app mode onto the %s SDK request value in cold starts', (appMode, sdkMode) => {
+      const ctx = {
+        ...createMockContext({
+          settings: createMockSettings({ permissionMode: appMode }),
+        }),
+        abortController: new AbortController(),
+        hooks: {},
+        hasEditorContext: false,
+        canUseTool: jest.fn(),
+      };
+      const options = QueryOptionsBuilder.buildColdStartQueryOptions(ctx);
+
+      expect(options.permissionMode).toBe(sdkMode);
+      // canUseTool stays registered in every mode (§5.1).
+      expect(typeof options.canUseTool).toBe('function');
+      expect(options.allowDangerouslySkipPermissions).toBe(true);
     });
 
     it('sets additionalDirectories when externalContextPaths provided', () => {

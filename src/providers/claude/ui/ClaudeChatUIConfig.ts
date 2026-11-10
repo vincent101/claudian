@@ -1,12 +1,17 @@
 import type {
   ProviderChatUIConfig,
-  ProviderPermissionModeToggleConfig,
   ProviderReasoningOption,
   ProviderUIOption,
 } from '../../../core/providers/types';
+import { t } from '../../../i18n/i18n';
 import { CLAUDE_PROVIDER_ICON } from '../../../shared/icons';
 import { getCustomModelIds } from '../env/claudeModelEnv';
 import { getClaudeModelOptions } from '../modelOptions';
+import {
+  CLAUDE_PERMISSION_MODE_PLAN,
+  CLAUDE_PERMISSION_MODE_POLICY,
+  getClaudePermissionModeOptions,
+} from '../permissionModes';
 import { getClaudeProviderSettings, updateClaudeProviderSettings } from '../settings';
 import {
   type ClaudeModel,
@@ -22,16 +27,9 @@ import {
   THINKING_BUDGETS,
 } from '../types/models';
 
-const CLAUDE_PERMISSION_MODE_TOGGLE: ProviderPermissionModeToggleConfig = {
-  inactiveValue: 'normal',
-  inactiveLabel: 'Safe',
-  activeValue: 'yolo',
-  activeLabel: 'YOLO',
-  planValue: 'plan',
-  planLabel: 'PLAN',
-};
-
 export const claudeChatUIConfig: ProviderChatUIConfig = {
+  permissionModes: CLAUDE_PERMISSION_MODE_POLICY,
+
   getModelOptions(settings) {
     return getClaudeModelOptions(settings);
   },
@@ -98,8 +96,12 @@ export const claudeChatUIConfig: ProviderChatUIConfig = {
     return getCustomModelIds(envVars);
   },
 
-  getPermissionModeToggle() {
-    return CLAUDE_PERMISSION_MODE_TOGGLE;
+  getPermissionModeOptions() {
+    return getClaudePermissionModeOptions();
+  },
+
+  getPermissionTransientModeLabel(value) {
+    return value === CLAUDE_PERMISSION_MODE_PLAN ? t('chat.claude.permission.plan') : null;
   },
 
   isBangBashEnabled(settings) {

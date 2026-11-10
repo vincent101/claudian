@@ -61,6 +61,30 @@ export class ItemView {
   }
 }
 
+export class Scope {
+  parent: unknown;
+  private handlers = new Map<string, Array<(...args: unknown[]) => unknown>>();
+
+  constructor(parent?: unknown) {
+    this.parent = parent;
+  }
+
+  register(modifiers: string[], key: string, handler: (...args: unknown[]) => unknown) {
+    const keyId = `${modifiers.join('+')}:${key}`;
+    this.handlers.set(keyId, [...(this.handlers.get(keyId) ?? []), handler]);
+  }
+
+  /** Test helper: invoke registered handlers for a key id, last-registered first. */
+  invoke(keyId: string, ...args: unknown[]): unknown {
+    const handlers = this.handlers.get(keyId) ?? [];
+    for (const handler of [...handlers].reverse()) {
+      const result = handler(...args);
+      if (result === false) return false;
+    }
+    return undefined;
+  }
+}
+
 export class WorkspaceLeaf {}
 
 export class App {

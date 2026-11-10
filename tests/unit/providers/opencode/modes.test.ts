@@ -81,20 +81,18 @@ describe('opencodeChatUIConfig permission mode wiring', () => {
       },
     }) ?? null).toBeNull();
 
-    expect(opencodeChatUIConfig.getPermissionModeToggle?.()).toEqual({
-      activeLabel: 'YOLO',
-      activeValue: 'yolo',
-      inactiveLabel: 'Safe',
-      inactiveValue: 'normal',
-      planLabel: 'Plan',
-      planValue: 'plan',
-    });
+    expect(opencodeChatUIConfig.getPermissionModeOptions?.({})).toEqual([
+      { value: 'normal', label: 'Safe' },
+      { value: 'yolo', label: 'YOLO', bypassesApprovals: true },
+    ]);
+    expect(opencodeChatUIConfig.permissionModes?.transientValues).toEqual(['plan']);
+    expect(opencodeChatUIConfig.getPermissionTransientModeLabel?.('plan')).toBe('Plan');
   });
 
   it('resolves model option and toggle copy at call time for locale switches', () => {
     try {
       expect(setLocale('zh-CN')).toBe(true);
-      expect(opencodeChatUIConfig.getPermissionModeToggle?.()?.inactiveLabel).toBe('安全');
+      expect(opencodeChatUIConfig.getPermissionModeOptions?.({})?.[0].label).toBe('安全');
       const fallback = opencodeChatUIConfig.getModelOptions({});
       expect(fallback[0].description).toBe('ACP 运行时');
       expect(opencodeChatUIConfig.getReasoningOptions(

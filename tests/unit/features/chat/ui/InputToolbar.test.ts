@@ -115,14 +115,21 @@ function createMockUIConfig() {
     ),
     applyModelDefaults: jest.fn(),
     normalizeModelVariant: jest.fn((model: string) => model),
-    getPermissionModeToggle: jest.fn().mockReturnValue({
-      inactiveValue: 'normal',
-      inactiveLabel: 'Safe',
-      activeValue: 'yolo',
-      activeLabel: 'YOLO',
-      planValue: 'plan',
-      planLabel: 'PLAN',
-    }),
+    permissionModes: {
+      values: ['auto', 'manual', 'acceptEdits', 'yolo'],
+      defaultValue: 'auto',
+      fallbackValue: 'manual',
+      transientValues: ['plan'],
+    },
+    getPermissionModeOptions: jest.fn().mockReturnValue([
+      { value: 'auto', label: 'Auto', description: 'Auto desc' },
+      { value: 'manual', label: 'Manual', description: 'Manual desc' },
+      { value: 'acceptEdits', label: 'Accept edits', description: 'Accept edits desc' },
+      { value: 'yolo', label: 'YOLO', description: 'YOLO desc', bypassesApprovals: true },
+    ]),
+    getPermissionTransientModeLabel: jest.fn().mockImplementation((value: string) => (
+      value === 'plan' ? 'Plan' : null
+    )),
     getServiceTierToggle: jest.fn().mockImplementation((settings: Record<string, unknown>) =>
       settings.model === DEFAULT_CODEX_PRIMARY_MODEL
         ? {
@@ -573,121 +580,301 @@ describe('ThinkingBudgetSelector', () => {
 });
 
 describe('PermissionToggle', () => {
-  let parentEl: any;
   let callbacks: ReturnType<typeof createMockCallbacks>;
+
+  function mockSettings(permissionMode: string) {
+    callbacks.getSettings.mockReturnValue({
+      model: 'sonnet',
+      thinkingBudget: 'low',
+      effortLevel: 'high',
+      serviceTier: 'default',
+      permissionMode,
+      enableOpus1M: false,
+      enableSonnet1M: false,
+    });
+  }
+
+  function renderToggle() {
+    const el = createMockEl();
+    const toggle = new PermissionToggle(el, callbacks);
+    return { el, toggle };
+  }
+
+  function findButton(el: any) {
+    return el.querySelector('.claudian-permission-button');
+  }
+
+  function findMenu(el: any) {
+    return el.querySelector('.claudian-permission-menu');
+  }
+
+  function findItems(el: any) {
+    return (findMenu(el)?.children ?? []) as any[];
+  }
+
+  function findLabel(el: any) {
+    return el.querySelector('.claudian-permission-label');
+  }
 
   beforeEach(() => {
     jest.clearAllMocks();
-    parentEl = createMockEl();
     callbacks = createMockCallbacks();
-    new PermissionToggle(parentEl, callbacks);
+    mockSettings('auto');
   });
 
-  it('should create a container with permission-toggle class', () => {
-    const container = parentEl.querySelector('.claudian-permission-toggle');
-    expect(container).not.toBeNull();
+  it('renders a real button with permission-menu aria', () => {
+    const { el } = renderToggle();
+
+    const button = findButton(el);
+    expect(button?.tagName).toBe('BUTTON');
+    expect(button?.getAttribute('aria-haspopup')).toBe('menu');
+    expect(button?.getAttribute('aria-expanded')).toBe('false');
+    expect(button?.getAttribute('aria-label')).toBe('Permission mode: Auto');
+    expect(findMenu(el)).not.toBeNull();
   });
 
-  it('should display Safe label when in normal mode', () => {
-    const label = parentEl.querySelector('.claudian-permission-label');
-    expect(label?.textContent).toBe('Safe');
+  it('shows the current mode label from the provider options', () => {
+    mockSettings('acceptEdits');
+    const { el } = renderToggle();
+
+    expect(findLabel(el)?.textContent).toBe('Accept edits');
+    expect(findButton(el)?.getAttribute('aria-label')).toBe('Permission mode: Accept edits');
   });
 
-  it('should display YOLO label when in yolo mode', () => {
-    callbacks.getSettings.mockReturnValue({
-      model: 'sonnet',
-      thinkingBudget: 'low',
-      serviceTier: 'default',
-      permissionMode: 'yolo',
-      enableOpus1M: false,
-      enableSonnet1M: false,
-    });
-    const parentEl2 = createMockEl();
-    new PermissionToggle(parentEl2, callbacks);
+  it('lists the four modes with descriptions and marks only the current one', () => {
+    mockSettings('manual');
+    const { el } = renderToggle();
 
-    const label = parentEl2.querySelector('.claudian-permission-label');
-    expect(label?.textContent).toBe('YOLO');
+    const items = findItems(el);
+    expect(items.length).toBe(4);
+    expect(items.map((item: any) => item.getAttribute('role'))).toEqual([
+      'menuitemradio', 'menuitemradio', 'menuitemradio', 'menuitemradio',
+    ]);
+    expect(items.map((item: any) => item.getAttribute('aria-checked')))
+      .toEqual(['false', 'true', 'false', 'false']);
+    const labelOf = (item: any) => item.querySelector('.claudian-permission-option-label')?.textContent;
+    const descOf = (item: any) => item.querySelector('.claudian-permission-option-desc')?.textContent;
+    expect(items.map(labelOf)).toEqual(['Auto', 'Manual', 'Accept edits', 'YOLO']);
+    expect(items.map(descOf)).toEqual(['Auto desc', 'Manual desc', 'Accept edits desc', 'YOLO desc']);
+    // Only the selected item carries a check icon span.
+    expect(items.filter((item: any) => item.querySelector('.claudian-permission-check')).length)
+      .toBe(1);
   });
 
-  it('should show PLAN label and hide toggle in plan mode', () => {
-    callbacks.getSettings.mockReturnValue({
-      model: 'sonnet',
-      thinkingBudget: 'low',
-      serviceTier: 'default',
-      permissionMode: 'plan',
-      enableOpus1M: false,
-      enableSonnet1M: false,
-    });
-    const parentEl2 = createMockEl();
-    new PermissionToggle(parentEl2, callbacks);
+  it('flags only bypassing modes with the shield-alert warning', () => {
+    const { el } = renderToggle();
+    expect(findButton(el)?.hasClass('claudian-permission-warning')).toBe(false);
 
-    const label = parentEl2.querySelector('.claudian-permission-label');
-    expect(label?.textContent).toBe('PLAN');
-    expect(label?.hasClass('plan-active')).toBe(true);
-
-    const toggle = parentEl2.querySelector('.claudian-toggle-switch');
-    expect(toggle?.style.display).toBe('none');
+    mockSettings('yolo');
+    const rendered = renderToggle();
+    expect(findButton(rendered.el)?.hasClass('claudian-permission-warning')).toBe(true);
+    expect(findLabel(rendered.el)?.textContent).toBe('YOLO');
   });
 
-  it('should add active class when in yolo mode', () => {
-    callbacks.getSettings.mockReturnValue({
-      model: 'sonnet',
-      thinkingBudget: 'low',
-      serviceTier: 'default',
-      permissionMode: 'yolo',
-    });
-    const parentEl2 = createMockEl();
-    new PermissionToggle(parentEl2, callbacks);
+  it('opens the menu on button click and closes it on a second click', () => {
+    const { el, toggle } = renderToggle();
+    const button = findButton(el);
 
-    const toggle = parentEl2.querySelector('.claudian-toggle-switch');
-    expect(toggle?.hasClass('active')).toBe(true);
+    button?.dispatchEvent('click');
+    expect(toggle.isMenuOpen()).toBe(true);
+    expect(button?.getAttribute('aria-expanded')).toBe('true');
+
+    button?.dispatchEvent('click');
+    expect(toggle.isMenuOpen()).toBe(false);
+    expect(button?.getAttribute('aria-expanded')).toBe('false');
   });
 
-  it('should not have active class in normal mode', () => {
-    const toggle = parentEl.querySelector('.claudian-toggle-switch');
-    expect(toggle?.hasClass('active')).toBe(false);
-  });
+  it('commits a different mode through onPermissionModeChange', async () => {
+    mockSettings('auto');
+    const { el } = renderToggle();
+    findButton(el)?.dispatchEvent('click');
 
-  it('should toggle from normal to yolo on click', async () => {
-    const toggle = parentEl.querySelector('.claudian-toggle-switch');
-    await toggle?.dispatchEvent('click');
+    const items = findItems(el);
+    const yolo = items.find((item: any) => item.querySelector('.claudian-permission-option-label')?.textContent === 'YOLO');
+    await yolo?.dispatchEvent('click', { stopPropagation: jest.fn() });
+
     expect(callbacks.onPermissionModeChange).toHaveBeenCalledWith('yolo');
   });
 
-  it('should toggle from yolo to normal on click', async () => {
-    callbacks.getSettings.mockReturnValue({
-      model: 'sonnet',
-      thinkingBudget: 'low',
-      permissionMode: 'yolo',
-    });
-    const parentEl2 = createMockEl();
-    new PermissionToggle(parentEl2, callbacks);
+  it('never commits a same-value selection', async () => {
+    mockSettings('yolo');
+    const { el, toggle } = renderToggle();
+    findButton(el)?.dispatchEvent('click');
 
-    const toggle = parentEl2.querySelector('.claudian-toggle-switch');
-    await toggle?.dispatchEvent('click');
-    expect(callbacks.onPermissionModeChange).toHaveBeenCalledWith('normal');
+    const items = findItems(el);
+    const yolo = items.find((item: any) => item.querySelector('.claudian-permission-option-label')?.textContent === 'YOLO');
+    await yolo?.dispatchEvent('click', { stopPropagation: jest.fn() });
+
+    expect(callbacks.onPermissionModeChange).not.toHaveBeenCalled();
+    expect(toggle.isMenuOpen()).toBe(false);
   });
 
-  it('should hide the control when provider exposes no permission toggle UI', () => {
+  it('shows plan as a read-only state without a fifth menu option', () => {
+    mockSettings('plan');
+    const { el } = renderToggle();
+
+    expect(findLabel(el)?.textContent).toBe('Plan');
+    expect(findLabel(el)?.hasClass('plan-active')).toBe(true);
+    const items = findItems(el);
+    expect(items.length).toBe(4);
+    expect(items.every((item: any) => item.getAttribute('aria-checked') === 'false')).toBe(true);
+  });
+
+  it('exits plan when a durable mode is explicitly selected', async () => {
+    mockSettings('plan');
+    const { el } = renderToggle();
+    findButton(el)?.dispatchEvent('click');
+
+    const items = findItems(el);
+    const manual = items.find((item: any) => item.querySelector('.claudian-permission-option-label')?.textContent === 'Manual');
+    await manual?.dispatchEvent('click', { stopPropagation: jest.fn() });
+
+    expect(callbacks.onPermissionModeChange).toHaveBeenCalledWith('manual');
+  });
+
+  it('renders an unknown mode as unavailable instead of falling back to options[0]', () => {
+    mockSettings('mystery');
+    const { el } = renderToggle();
+
+    expect(findLabel(el)?.textContent).toBe('Unavailable');
+    const items = findItems(el);
+    expect(items.every((item: any) => item.getAttribute('aria-checked') === 'false')).toBe(true);
+  });
+
+  it('supports keyboard open, navigate, and select', async () => {
+    mockSettings('auto');
+    const { el, toggle } = renderToggle();
+    const button = findButton(el);
+
+    // The handler lives on the toggle container; real DOM events bubble from
+    // the focused button/item, the mock dispatches at the listener element.
+    const container = el.querySelector('.claudian-permission-toggle');
+    const downEvent = { type: 'keydown', key: 'ArrowDown', target: button, preventDefault: jest.fn() };
+    container?.dispatchEvent(downEvent);
+    expect(toggle.isMenuOpen()).toBe(true);
+
+    // Arrow down to 'Accept edits' (index 2), then activate it with Enter.
+    container?.dispatchEvent({ type: 'keydown', key: 'ArrowDown', preventDefault: jest.fn() });
+    container?.dispatchEvent({ type: 'keydown', key: 'ArrowDown', preventDefault: jest.fn() });
+    const enterEvent = { type: 'keydown', key: 'Enter', preventDefault: jest.fn() };
+    container?.dispatchEvent(enterEvent);
+
+    await Promise.resolve();
+    expect(callbacks.onPermissionModeChange).toHaveBeenCalledWith('acceptEdits');
+  });
+
+  it('consumes Escape while the menu is open and closes it', () => {
+    const { el, toggle } = renderToggle();
+    findButton(el)?.dispatchEvent('click');
+
+    const escapeEvent = { type: 'keydown', key: 'Escape', preventDefault: jest.fn() };
+    const consumed = toggle.handleKeydown(escapeEvent as unknown as KeyboardEvent);
+
+    expect(consumed).toBe(true);
+    expect(toggle.isMenuOpen()).toBe(false);
+    expect(escapeEvent.preventDefault).toHaveBeenCalled();
+  });
+
+  it('does not consume Escape when the menu is closed', () => {
+    const { toggle } = renderToggle();
+
+    const consumed = toggle.handleKeydown({ key: 'Escape' } as unknown as KeyboardEvent);
+    expect(consumed).toBe(false);
+  });
+
+  it('closes on an outside document click and removes the listener', () => {
+    const listeners: Record<string, Array<(e: any) => void>> = {};
+    const docMock = {
+      addEventListener: jest.fn((event: string, handler: (e: any) => void) => {
+        listeners[event] = listeners[event] ?? [];
+        listeners[event].push(handler);
+      }),
+      removeEventListener: jest.fn((event: string, handler: (e: any) => void) => {
+        listeners[event] = (listeners[event] ?? []).filter(h => h !== handler);
+      }),
+    };
+    const originalDocument = (global as any).document;
+    (global as any).document = docMock;
+
+    try {
+      const { el, toggle } = renderToggle();
+      findButton(el)?.dispatchEvent('click');
+      expect(toggle.isMenuOpen()).toBe(true);
+      expect(docMock.addEventListener).toHaveBeenCalledWith('click', expect.any(Function));
+
+      // Outside click closes the menu.
+      listeners.click[0]({ target: createMockEl() });
+      expect(toggle.isMenuOpen()).toBe(false);
+
+      // The listener is detached once closed.
+      toggle.destroy();
+      expect(listeners.click.length).toBe(0);
+      expect(docMock.removeEventListener).toHaveBeenCalled();
+    } finally {
+      (global as any).document = originalDocument;
+    }
+  });
+
+  it('destroys idempotently and clears the DOM', () => {
+    const { el, toggle } = renderToggle();
+    findButton(el)?.dispatchEvent('click');
+
+    toggle.destroy();
+    toggle.destroy();
+
+    expect(el.querySelector('.claudian-permission-button')).toBeNull();
+    expect(el.querySelector('.claudian-permission-menu')).toBeNull();
+    expect(toggle.isMenuOpen()).toBe(false);
+  });
+
+  it('hides the control when the provider exposes no permission options', () => {
     callbacks.getUIConfig.mockReturnValue({
       ...createMockUIConfig(),
-      getPermissionModeToggle: jest.fn().mockReturnValue(null),
+      getPermissionModeOptions: jest.fn().mockReturnValue(null),
     });
-    const parentEl2 = createMockEl();
-    new PermissionToggle(parentEl2, callbacks);
+    const { el, toggle } = renderToggle();
 
-    const container = parentEl2.querySelector('.claudian-permission-toggle');
+    const container = el.querySelector('.claudian-permission-toggle');
     expect(container?.style.display).toBe('none');
+    expect(toggle.isMenuOpen()).toBe(false);
   });
 
-  it('should hide the control when visibility is disabled explicitly', () => {
-    const parentEl2 = createMockEl();
-    const toggle = new PermissionToggle(parentEl2, callbacks);
+  it('hides the control when visibility is disabled explicitly and closes an open menu', () => {
+    const { el, toggle } = renderToggle();
+    findButton(el)?.dispatchEvent('click');
 
     toggle.setVisible(false);
 
-    const container = parentEl2.querySelector('.claudian-permission-toggle');
+    const container = el.querySelector('.claudian-permission-toggle');
     expect(container?.style.display).toBe('none');
+    expect(toggle.isMenuOpen()).toBe(false);
+  });
+
+  it('drives a two-option provider through the same menu path', () => {
+    callbacks.getUIConfig.mockReturnValue({
+      ...createMockUIConfig(),
+      permissionModes: {
+        values: ['normal', 'yolo'],
+        defaultValue: 'normal',
+        fallbackValue: 'normal',
+        transientValues: ['plan'],
+      },
+      getPermissionModeOptions: jest.fn().mockReturnValue([
+        { value: 'normal', label: 'Safe' },
+        { value: 'yolo', label: 'YOLO', bypassesApprovals: true },
+      ]),
+      getPermissionTransientModeLabel: jest.fn().mockImplementation((value: string) => (
+        value === 'plan' ? 'Plan' : null
+      )),
+    });
+    mockSettings('normal');
+    const { el } = renderToggle();
+
+    const items = findItems(el);
+    expect(items.length).toBe(2);
+    expect(findLabel(el)?.textContent).toBe('Safe');
+    expect(items.map((item: any) =>
+      item.querySelector('.claudian-permission-option-label')?.textContent)).toEqual(['Safe', 'YOLO']);
   });
 });
 

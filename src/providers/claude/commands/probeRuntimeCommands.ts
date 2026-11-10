@@ -46,8 +46,10 @@ export async function probeRuntimeCommands(plugin: ClaudianPlugin): Promise<Slas
 
   const abortController = new AbortController();
   let commands: SlashCommand[] = [];
+  // Match chat launches, which always enable auto mode (design §5.4). The
+  // probe itself stays fixed-bypass; this is a legacy non-production probe.
   const extraArgs = {
-    ...(claudeSettings.safeMode === 'auto' ? { 'enable-auto-mode': null } : {}),
+    'enable-auto-mode': null,
     ...(claudeSettings.enableChrome ? { chrome: null } : {}),
   };
 
@@ -62,7 +64,7 @@ export async function probeRuntimeCommands(plugin: ClaudianPlugin): Promise<Slas
         permissionMode: 'bypassPermissions',
         allowDangerouslySkipPermissions: true,
         settingSources: resolveClaudeSettingSources(claudeSettings.loadUserSettings),
-        ...(Object.keys(extraArgs).length > 0 ? { extraArgs } : {}),
+        extraArgs,
         spawnClaudeCodeProcess: createCustomSpawnFunction(enhancedPath),
         persistSession: false,
       },

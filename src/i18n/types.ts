@@ -174,6 +174,22 @@ export type TranslationKey =
   | 'chat.resume.noConversations'
   | 'chat.resume.openFailed'
 
+  // Chat - Claude permission mode menu
+  | 'chat.claude.permission.auto'
+  | 'chat.claude.permission.autoDesc'
+  | 'chat.claude.permission.manual'
+  | 'chat.claude.permission.manualDesc'
+  | 'chat.claude.permission.acceptEdits'
+  | 'chat.claude.permission.acceptEditsDesc'
+  | 'chat.claude.permission.yolo'
+  | 'chat.claude.permission.yoloDesc'
+  | 'chat.claude.permission.plan'
+  | 'chat.claude.permission.updateFailed'
+
+  // Chat - Shared permission menu chrome
+  | 'chat.permission.ariaLabel'
+  | 'chat.permission.unavailable'
+
   // Chat - Codex chat UI config copy
   | 'chat.codex.effort.low'
   | 'chat.codex.effort.medium'
@@ -298,12 +314,11 @@ export type TranslationKey =
   | 'settings.subagents.modal.promptDesc'
   | 'settings.subagents.modal.promptPlaceholder'
 
-  // Settings - Safety
+  // Settings - Safety / Configuration
   | 'settings.safety'
   | 'settings.loadUserSettings.name'
   | 'settings.loadUserSettings.desc'
-  | 'settings.claudeSafeMode.name'
-  | 'settings.claudeSafeMode.desc'
+  | 'settings.claude.configuration'
   | 'settings.codexSafeMode.name'
   | 'settings.codexSafeMode.desc'
 

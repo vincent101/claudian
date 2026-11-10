@@ -72,7 +72,10 @@ export interface InstructionRefineResult {
   error?: string;               // Error message (if failed)
 }
 
-/** Permission mode for tool execution. */
+/**
+ * Narrow permission values for the two-mode providers (Codex, OpenCode).
+ * NOT the Claude four-mode type — Claude owns its values behind its policy.
+ */
 export type PermissionMode = 'yolo' | 'plan' | 'normal';
 
 /** Scope for environment variable storage and snippets. */
@@ -95,8 +98,8 @@ export interface ClaudianSettings {
   // User preferences
   userName: string;
 
-  // Security
-  permissionMode: PermissionMode;
+  // Security (provider interprets values via its permission-mode policy)
+  permissionMode: string;
 
   // Model & thinking (provider interprets values)
   model: string;

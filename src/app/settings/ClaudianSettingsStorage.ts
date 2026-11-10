@@ -6,11 +6,13 @@ import {
   normalizeHiddenCommandList,
   normalizeHiddenProviderCommands,
 } from '../../core/providers/commands/hiddenCommands';
+import { normalizeDurableProviderPermissionMode } from '../../core/providers/permissionModes';
 import {
   getSharedEnvironmentVariables,
   inferEnvironmentSnippetScope,
   resolveEnvironmentSnippetScope,
 } from '../../core/providers/providerEnvironment';
+import { ProviderRegistry } from '../../core/providers/ProviderRegistry';
 import type { VaultFileAdapter } from '../../core/storage/VaultFileAdapter';
 import {
   CHAT_VIEW_PLACEMENTS,
@@ -21,6 +23,7 @@ import {
   type HiddenProviderCommands,
   type ProviderConfigMap,
 } from '../../core/types/settings';
+import { migrateClaudePermissionMode } from '../../providers/claude/permissionModes';
 import {
   getClaudeProviderSettings,
   updateClaudeProviderSettings,
@@ -256,6 +259,109 @@ function mergeLegacyClaudeHiddenCommands(
   };
 }
 
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  return !!value && typeof value === 'object' && !Array.isArray(value);
+}
+
+function resolveTopPermissionOwnedByClaude(
+  record: Record<string, unknown>,
+  providerConfigs: ProviderConfigMap,
+): boolean {
+  try {
+    return ProviderRegistry.resolveSettingsProviderId({
+      ...record,
+      providerConfigs: providerConfigs as unknown as Record<string, unknown>,
+    }) === 'claude';
+  } catch {
+    // Registry not populated (isolated storage consumers): the historical
+    // default provider owns an unset top level.
+    return record.settingsProvider === undefined || record.settingsProvider === 'claude';
+  }
+}
+
+interface ClaudePermissionMigrationResult {
+  /** Rewritten top-level permissionMode; undefined leaves the stored value (another provider owns it). */
+  readonly topPermissionMode: string | undefined;
+  /** Saved map with the migrated Claude entry materialized. */
+  readonly savedProviderPermissionMode: Record<string, unknown>;
+  readonly claudeMode: string;
+  /** Whether this load must write the file back (design §4.1 step 6). */
+  readonly changed: boolean;
+}
+
+/**
+ * Permission migration over the RAW stored record (design §4.1): reads legacy
+ * sources before any stripping or provider-config rewriting, maps the Claude
+ * choice once, and decides whether the file needs a write-back. Idempotent —
+ * a file that already carries the normalized values reports changed=false.
+ */
+function migrateClaudePermissionSettings(
+  record: Record<string, unknown>,
+  providerConfigs: ProviderConfigMap,
+): ClaudePermissionMigrationResult {
+  const storedSavedMap = isPlainRecord(record.savedProviderPermissionMode)
+    ? { ...record.savedProviderPermissionMode }
+    : {};
+  const storedSavedClaudeMode = storedSavedMap.claude;
+  const nestedSafeModePresent = providerConfigs.claude?.safeMode !== undefined;
+  const topPermissionOwnedByClaude = resolveTopPermissionOwnedByClaude(record, providerConfigs);
+
+  const claudeMode = migrateClaudePermissionMode({
+    storedPermissionMode: record.permissionMode,
+    storedSavedClaudeMode,
+    providerConfigs,
+    topLevelSafeMode: record.claudeSafeMode,
+    topPermissionOwnedByClaude,
+  });
+
+  const savedProviderPermissionMode = { ...storedSavedMap, claude: claudeMode };
+  const topPermissionMode = topPermissionOwnedByClaude ? claudeMode : undefined;
+  const changed =
+    nestedSafeModePresent
+    || storedSavedClaudeMode !== claudeMode
+    || (topPermissionOwnedByClaude && record.permissionMode !== claudeMode);
+
+  return { topPermissionMode, savedProviderPermissionMode, claudeMode, changed };
+}
+
+/**
+ * Serializes durable permission values on a private copy: transient overlays
+ * (plan) settle on each provider's fallback and unmapped legacy values
+ * migrate, so nothing runtime-ephemeral ever reaches the settings file. The
+ * caller's live object is never mutated.
+ */
+function normalizeSerializedPermissionModes(record: Record<string, unknown>): void {
+  const policies = new Map(
+    ProviderRegistry.getRegisteredProviderIds().map(providerId => [
+      providerId,
+      ProviderRegistry.getChatUIConfig(providerId).permissionModes ?? null,
+    ]),
+  );
+
+  if (isPlainRecord(record.savedProviderPermissionMode)) {
+    const saved = { ...record.savedProviderPermissionMode };
+    for (const [providerId, policy] of policies) {
+      if (policy && saved[providerId] !== undefined) {
+        saved[providerId] = normalizeDurableProviderPermissionMode(policy, saved[providerId], record)
+          ?? policy.fallbackValue;
+      }
+    }
+    record.savedProviderPermissionMode = saved;
+  }
+
+  let settingsProviderId: string | undefined;
+  try {
+    settingsProviderId = ProviderRegistry.resolveSettingsProviderId(record);
+  } catch {
+    // Registry not populated (isolated storage consumers): no policy lookup.
+  }
+  const settingsPolicy = settingsProviderId ? policies.get(settingsProviderId) : null;
+  if (settingsPolicy && record.permissionMode !== undefined) {
+    record.permissionMode = normalizeDurableProviderPermissionMode(settingsPolicy, record.permissionMode, record)
+      ?? settingsPolicy.fallbackValue;
+  }
+}
+
 export class ClaudianSettingsStorage {
   constructor(private adapter: VaultFileAdapter) {}
 
@@ -285,10 +391,19 @@ export class ClaudianSettingsStorage {
       stored.chatViewPlacement,
       stored.openInMainTab,
     );
+
+    // Permission migration runs on the raw record before stripLegacyFields or
+    // the provider config updaters can retire the legacy sources (§4.1).
+    const permissionMigration = migrateClaudePermissionSettings(stored, providerConfigs);
+
     const legacyProviderSettings = {
       ...stored,
       hiddenProviderCommands,
       providerConfigs,
+      ...(permissionMigration.topPermissionMode !== undefined
+        ? { permissionMode: permissionMigration.topPermissionMode }
+        : {}),
+      savedProviderPermissionMode: permissionMigration.savedProviderPermissionMode,
     };
     const storedWithoutLegacy = stripLegacyFields({
       ...legacyProviderSettings,
@@ -323,6 +438,7 @@ export class ClaudianSettingsStorage {
       hasLegacyTopLevelProviderFields(stored)
       || needsClaudeModelPresetMigration(stored)
       || needsCodexModelPresetMigration(stored)
+      || permissionMigration.changed
       || 'show1MModel' in stored
       || 'slashCommands' in stored
       || 'hiddenSlashCommands' in stored
@@ -342,8 +458,26 @@ export class ClaudianSettingsStorage {
   }
 
   async save(settings: StoredClaudianSettings): Promise<void> {
+    // Same migration semantics as load: an old-format input maps first (never
+    // just stripped), then durable normalization runs on a private copy so a
+    // live in-memory plan overlay is serialized away without being erased.
+    const copy = { ...(settings as unknown as Record<string, unknown>) };
+    const providerConfigs = normalizeProviderConfigs(copy.providerConfigs);
+    const permissionMigration = migrateClaudePermissionSettings(copy, providerConfigs);
+    // The migration has consumed the retired Safe sources: the serialized copy
+    // must not carry them forward (Claude-only; Codex keeps its sandbox field).
+    if (providerConfigs.claude && providerConfigs.claude.safeMode !== undefined) {
+      delete providerConfigs.claude.safeMode;
+    }
+    copy.providerConfigs = providerConfigs;
+    copy.savedProviderPermissionMode = permissionMigration.savedProviderPermissionMode;
+    if (permissionMigration.topPermissionMode !== undefined) {
+      copy.permissionMode = permissionMigration.topPermissionMode;
+    }
+    normalizeSerializedPermissionModes(copy);
+
     const content = JSON.stringify(
-      stripLegacyFields(settings as unknown as Record<string, unknown>),
+      stripLegacyFields(copy),
       null,
       2,
     );

@@ -8,7 +8,8 @@ import type { McpServerManager } from '../../../core/mcp/McpServerManager';
 import type {
   ChatRuntimeQueryOptions,
 } from '../../../core/runtime/types';
-import type { ClaudianSettings, PermissionMode } from '../../../core/types/settings';
+import type { ClaudianSettings } from '../../../core/types/settings';
+import { t } from '../../../i18n/i18n';
 import {
   resolveAdaptiveEffortLevel,
   resolveThinkingTokens,
@@ -26,8 +27,8 @@ export interface ClaudeDynamicUpdateDeps {
   getVaultPath: () => string | null;
   getCliPath: () => string | null;
   getScopedSettings: () => ClaudianSettings;
-  getPermissionMode: () => PermissionMode;
-  resolveSDKPermissionMode: (mode: PermissionMode) => SDKPermissionMode;
+  getPermissionMode: () => string;
+  resolveSDKPermissionMode: (mode: string) => SDKPermissionMode;
   mcpManager: McpServerManager;
   buildPersistentQueryConfig: (
     vaultPath: string,
@@ -133,16 +134,21 @@ export async function applyClaudeDynamicUpdates(
     } else if (sdkMode !== currentSdkMode) {
       try {
         await persistentQuery.setPermissionMode(sdkMode);
+        // Only confirm the config after the SDK accepted the switch; a failed
+        // setter must surface and abort this send instead of quietly running
+        // the next message under the old mode (design §5.1).
         deps.mutateCurrentConfig(config => {
-          config.permissionMode = permissionMode;
+          config.permissionMode = permissionMode as PersistentQueryConfig['permissionMode'];
           config.sdkPermissionMode = sdkMode;
         });
-      } catch {
-        deps.notifyFailure('Failed to update permission mode');
+      } catch (error) {
+        const message = t('chat.claude.permission.updateFailed');
+        deps.notifyFailure(error instanceof Error ? error.message : message);
+        throw error instanceof Error ? error : new Error(message);
       }
     } else {
       deps.mutateCurrentConfig(config => {
-        config.permissionMode = permissionMode;
+        config.permissionMode = permissionMode as PersistentQueryConfig['permissionMode'];
         config.sdkPermissionMode = sdkMode;
       });
     }

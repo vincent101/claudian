@@ -400,6 +400,8 @@ describe('ClaudianSettingsStorage', () => {
       it('does not rewrite the file again once presets are stored', async () => {
         mockAdapter.exists.mockResolvedValue(true);
         mockAdapter.read.mockResolvedValue(JSON.stringify({
+          permissionMode: 'auto',
+          savedProviderPermissionMode: { claude: 'auto' },
           providerConfigs: {
             claude: {
               modelPresets: [{ label: 'Haiku', model: 'haiku' }],
@@ -454,6 +456,8 @@ describe('ClaudianSettingsStorage', () => {
       it('does not rewrite the file again once codex presets are stored', async () => {
         mockAdapter.exists.mockResolvedValue(true);
         mockAdapter.read.mockResolvedValue(JSON.stringify({
+          permissionMode: 'auto',
+          savedProviderPermissionMode: { claude: 'auto' },
           providerConfigs: {
             codex: {
               modelPresets: [{ label: 'Only', model: 'only-model' }],
@@ -472,6 +476,114 @@ describe('ClaudianSettingsStorage', () => {
       mockAdapter.read.mockRejectedValue(new Error('Read failed'));
 
       await expect(storage.load()).rejects.toThrow('Read failed');
+    });
+
+    describe('Claude permission mode migration', () => {
+      async function loadRaw(raw: Record<string, unknown>) {
+        mockAdapter.exists.mockResolvedValue(true);
+        mockAdapter.read.mockResolvedValue(JSON.stringify(raw));
+        return storage.load();
+      }
+
+      function lastWritten(): Record<string, unknown> {
+        return JSON.parse(
+          mockAdapter.write.mock.calls[mockAdapter.write.mock.calls.length - 1][1],
+        );
+      }
+
+      it('keeps a stored yolo and strips the legacy safeMode source', async () => {
+        const result = await loadRaw({
+          permissionMode: 'yolo',
+          providerConfigs: { claude: { safeMode: 'default' } },
+        });
+        const written = lastWritten();
+
+        expect(result.permissionMode).toBe('yolo');
+        expect(result.savedProviderPermissionMode.claude).toBe('yolo');
+        const writtenClaudeConfig = (written.providerConfigs as Record<string, Record<string, unknown>>).claude;
+        expect(writtenClaudeConfig).not.toHaveProperty('safeMode');
+        expect(written).not.toHaveProperty('claudeSafeMode');
+      });
+
+      it.each([
+        [{ providerConfigs: { claude: { safeMode: 'auto' } } }, 'auto'],
+        [{ providerConfigs: { claude: { safeMode: 'default' } } }, 'manual'],
+        [{ providerConfigs: { claude: { safeMode: 'acceptEdits' } } }, 'acceptEdits'],
+        [{}, 'acceptEdits'],
+        [{ claudeSafeMode: 'auto' }, 'auto'],
+        [{ providerConfigs: { claude: { safeMode: 'default' } }, claudeSafeMode: 'auto' }, 'manual'],
+        [{ providerConfigs: { claude: { safeMode: 'bogus' } }, claudeSafeMode: 'auto' }, 'manual'],
+      ])('maps legacy normal with %j to %s', async (raw, expected) => {
+        const result = await loadRaw({ permissionMode: 'normal', ...raw });
+
+        expect(result.permissionMode).toBe(expected);
+        expect(result.savedProviderPermissionMode.claude).toBe(expected);
+      });
+
+      it('fails an invalid stored permission value closed to manual, never back to auto', async () => {
+        for (const invalid of ['future', null, false, '']) {
+          const result = await loadRaw({ permissionMode: invalid });
+
+          expect(result.permissionMode).toBe('manual');
+        }
+      });
+
+      it('defaults an unowned top level to auto and keeps the other provider intact', async () => {
+        const result = await loadRaw({
+          settingsProvider: 'codex',
+          providerConfigs: { codex: { enabled: true } },
+          permissionMode: 'yolo',
+        });
+        const written = lastWritten();
+
+        expect(result.permissionMode).toBe('yolo');
+        expect(result.savedProviderPermissionMode.claude).toBe('auto');
+        expect(written.permissionMode).toBe('yolo');
+      });
+
+      it('lets a persisted plan never survive a reload', async () => {
+        const result = await loadRaw({ permissionMode: 'plan' });
+
+        expect(result.permissionMode).toBe('manual');
+        expect(result.savedProviderPermissionMode.claude).toBe('manual');
+      });
+
+      it('is idempotent: the second load of a migrated file does not rewrite', async () => {
+        mockAdapter.exists.mockResolvedValue(true);
+        mockAdapter.read.mockResolvedValue(JSON.stringify({
+          permissionMode: 'normal',
+          claudeSafeMode: 'auto',
+        }));
+
+        const first = await storage.load();
+        const writesAfterFirst = mockAdapter.write.mock.calls.length;
+        const diskContent = mockAdapter.write.mock.calls[writesAfterFirst - 1][1];
+
+        // Second load reads the migrated file back.
+        mockAdapter.read.mockResolvedValue(diskContent);
+        mockAdapter.write.mockClear();
+        const second = await storage.load();
+
+        expect(second.permissionMode).toBe(first.permissionMode);
+        expect(second.savedProviderPermissionMode.claude)
+          .toBe(first.savedProviderPermissionMode.claude);
+        expect(mockAdapter.write).not.toHaveBeenCalled();
+        expect(writesAfterFirst).toBe(1);
+      });
+
+      it('does not delete the legacy file when the write-back fails', async () => {
+        mockAdapter.exists.mockImplementation(async (path: string) => (
+          path === LEGACY_CLAUDIAN_SETTINGS_PATH
+        ));
+        mockAdapter.read.mockResolvedValue(JSON.stringify({
+          permissionMode: 'normal',
+          claudeSafeMode: 'auto',
+        }));
+        mockAdapter.write.mockRejectedValue(new Error('Write failed'));
+
+        await expect(storage.load()).rejects.toThrow('Write failed');
+        expect(mockAdapter.delete).not.toHaveBeenCalledWith(LEGACY_CLAUDIAN_SETTINGS_PATH);
+      });
     });
   });
 
@@ -527,6 +639,43 @@ describe('ClaudianSettingsStorage', () => {
 
       await expect(storage.save(DEFAULT_SETTINGS)).rejects.toThrow('Write failed');
     });
+
+    it('serializes a transient plan onto the durable fallback without mutating the caller object', async () => {
+      const live = {
+        ...DEFAULT_SETTINGS,
+        permissionMode: 'plan',
+        savedProviderPermissionMode: { claude: 'plan', codex: 'plan' as unknown as string },
+      } as typeof DEFAULT_SETTINGS;
+
+      await storage.save(live);
+
+      const written = JSON.parse(
+        mockAdapter.write.mock.calls[mockAdapter.write.mock.calls.length - 1][1],
+      );
+      expect(written.permissionMode).toBe('manual');
+      expect(written.savedProviderPermissionMode.claude).toBe('manual');
+      expect(written.savedProviderPermissionMode.codex).toBe('normal');
+      // The live in-memory plan overlay survives for the running session.
+      expect(live.permissionMode).toBe('plan');
+      expect(live.savedProviderPermissionMode.claude).toBe('plan');
+    });
+
+    it('maps an old-format input on save instead of only stripping legacy fields', async () => {
+      await storage.save({
+        ...DEFAULT_SETTINGS,
+        permissionMode: 'normal',
+        claudeSafeMode: 'auto',
+        providerConfigs: { claude: { safeMode: 'auto' } },
+      } as typeof DEFAULT_SETTINGS & { claudeSafeMode: unknown });
+
+      const written = JSON.parse(
+        mockAdapter.write.mock.calls[mockAdapter.write.mock.calls.length - 1][1],
+      );
+      expect(written.permissionMode).toBe('auto');
+      expect(written).not.toHaveProperty('claudeSafeMode');
+      const claudeConfig = (written.providerConfigs as Record<string, Record<string, unknown>>).claude;
+      expect(claudeConfig).not.toHaveProperty('safeMode');
+    });
   });
 
   describe('exists', () => {
@@ -572,7 +721,7 @@ describe('ClaudianSettingsStorage', () => {
 
       await storage.update({ model: 'claude-opus-4-5' });
 
-      const writeCall = mockAdapter.write.mock.calls[0];
+      const writeCall = mockAdapter.write.mock.calls[mockAdapter.write.mock.calls.length - 1];
       const writtenContent = JSON.parse(writeCall[1]);
       expect(writtenContent.model).toBe('claude-opus-4-5');
       expect(writtenContent.userName).toBe('ExistingUser');
@@ -586,7 +735,7 @@ describe('ClaudianSettingsStorage', () => {
 
       await storage.setLastModel('claude-sonnet-4-5', false);
 
-      const writeCall = mockAdapter.write.mock.calls[0];
+      const writeCall = mockAdapter.write.mock.calls[mockAdapter.write.mock.calls.length - 1];
       const writtenContent = JSON.parse(writeCall[1]);
       expect(writtenContent.providerConfigs.claude.lastModel).toBe('claude-sonnet-4-5');
       // lastCustomModel keeps its default value (empty string)
@@ -598,7 +747,7 @@ describe('ClaudianSettingsStorage', () => {
 
       await storage.setLastModel('custom-model-id', true);
 
-      const writeCall = mockAdapter.write.mock.calls[0];
+      const writeCall = mockAdapter.write.mock.calls[mockAdapter.write.mock.calls.length - 1];
       const writtenContent = JSON.parse(writeCall[1]);
       expect(writtenContent.lastCustomModel).toBe('custom-model-id');
       // lastClaudeModel keeps its default value
@@ -612,7 +761,7 @@ describe('ClaudianSettingsStorage', () => {
 
       await storage.setLastEnvHash('abc123');
 
-      const writeCall = mockAdapter.write.mock.calls[0];
+      const writeCall = mockAdapter.write.mock.calls[mockAdapter.write.mock.calls.length - 1];
       const writtenContent = JSON.parse(writeCall[1]);
       expect(writtenContent.providerConfigs.claude.environmentHash).toBe('abc123');
     });

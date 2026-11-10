@@ -68,7 +68,7 @@ import type {
   StreamChunk,
   ToolCallInfo,
 } from '../../../core/types';
-import type { ClaudianSettings, PermissionMode } from '../../../core/types/settings';
+import type { ClaudianSettings } from '../../../core/types/settings';
 import { t } from '../../../i18n/i18n';
 import type ClaudianPlugin from '../../../main';
 import { stripCurrentNoteContext } from '../../../utils/context';
@@ -88,10 +88,15 @@ import {
   createStopSubagentHook,
   type SubagentHookState,
 } from '../hooks/SubagentHooks';
+import {
+  isClaudePermissionMode,
+  resolveClaudeAppPermissionModeFromSdk,
+  resolveClaudeRuntimePermissionMode,
+  resolveClaudeSdkPermissionModeForRuntime,
+} from '../permissionModes';
 import { encodeClaudeTurn } from '../prompt/ClaudeTurnEncoder';
 import { isSessionInitEvent, isStreamChunk } from '../sdk/typeGuards';
 import type { SessionInitEvent, TransformEvent } from '../sdk/types';
-import { getClaudeProviderSettings } from '../settings';
 import {
   transformSDKMessage,
 } from '../stream/transformClaudeMessage';
@@ -311,7 +316,8 @@ export class ClaudianService implements ChatRuntime {
   private pendingCanUseToolCount = 0;
   private askUserQuestionCallback: AskUserQuestionCallback | null = null;
   private exitPlanModeCallback: ExitPlanModeCallback | null = null;
-  private permissionModeSyncCallback: ((sdkMode: string) => void) | null = null;
+  /** Receives provider-normalized app permission modes (see setPermissionModeSyncCallback). */
+  private permissionModeSyncCallback: ((appMode: string) => void) | null = null;
   private vaultPath: string | null = null;
   private currentExternalContextPaths: string[] = [];
   private readyStateListeners = new Set<(ready: boolean) => void>();
@@ -1383,6 +1389,14 @@ export class ClaudianService implements ChatRuntime {
       }
     }
 
+    // Native permission reports (status/system, and init redundantly with the
+    // transform path) sync through one scope-guarded helper for BOTH the
+    // leased and leaseless entries; unknown native modes are ignored rather
+    // than misattributed to a toolbar value (design §5.2).
+    if (message.type === 'system' && (message as { permissionMode?: unknown }).permissionMode !== undefined) {
+      this.syncNativePermissionMode((message as { permissionMode?: unknown }).permissionMode, scope);
+    }
+
     const turn = this.resolveActiveTurn();
     const user = message.type === 'user' ? message as SDKUserMessage : null;
     if (user?.origin) {
@@ -1460,15 +1474,9 @@ export class ClaudianService implements ChatRuntime {
 
         // SDK auto-approves EnterPlanMode (checkPermissions → allow),
         // so canUseTool is never called. Detect the tool_use in the stream
-        // and fire the sync callback to update the UI.
+        // and sync the transient plan state through the shared native helper.
         if (event.type === 'tool_use' && event.name === TOOL_ENTER_PLAN_MODE) {
-          if (this.currentConfig) {
-            this.currentConfig.permissionMode = 'plan';
-            this.currentConfig.sdkPermissionMode = 'plan';
-          }
-          if (this.permissionModeSyncCallback) {
-            try { this.permissionModeSyncCallback('plan'); } catch { /* non-critical */ }
-          }
+          this.syncNativePermissionMode('plan', scope);
         }
 
         const normalizedChunk = event.type === 'usage'
@@ -1552,12 +1560,9 @@ export class ClaudianService implements ChatRuntime {
     if (event.agents) {
       try { this.getAgentManager()?.setBuiltinAgentNames(event.agents); } catch { /* non-critical */ }
     }
-    if (event.permissionMode && this.permissionModeSyncCallback) {
-      try { this.permissionModeSyncCallback(event.permissionMode); } catch { /* non-critical */ }
+    if (event.permissionMode !== undefined) {
+      this.syncNativePermissionMode(event.permissionMode, scope);
     }
-    // Cache SDK commands on init (SDK already scans the vault).
-    // Pass the current query instance so late completions from a dead query
-    // cannot overwrite the active cache after a restart or shutdown.
     // Init adds an observation for the originating scope, never a replacement.
     void this.readQueryCommands(scope, undefined, false);
   }
@@ -2605,7 +2610,15 @@ export class ClaudianService implements ChatRuntime {
 
     // Apply dynamic updates before sending (Phase 1.6). With an active turn
     // on the channel this only defers a config restart instead of rebuilding.
-    await this.applyDynamicUpdates(queryOptions);
+    // A failed permission setter aborts THIS send with a visible error — the
+    // message is never enqueued to run under the previous mode (design §5.1).
+    try {
+      await this.applyDynamicUpdates(queryOptions);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      yield { type: 'error', content: message };
+      return;
+    }
 
     // Restore allowedTools in case restart cleared it
     this.currentAllowedTools = savedAllowedTools;
@@ -3256,7 +3269,8 @@ export class ClaudianService implements ChatRuntime {
         getVaultPath: () => this.vaultPath,
         getCliPath: () => this.plugin.getResolvedProviderCliPath('claude'),
         getScopedSettings: () => this.getScopedSettings(),
-        getPermissionMode: () => this.plugin.settings.permissionMode,
+        // Scoped snapshot, never the top-level projection another provider owns.
+        getPermissionMode: () => this.getScopedSettings().permissionMode,
         resolveSDKPermissionMode: (mode) => this.resolveSDKPermissionMode(mode),
         mcpManager: this.mcpManager,
         buildPersistentQueryConfig: (vaultPath, cliPath, externalContextPaths) =>
@@ -4021,8 +4035,40 @@ export class ClaudianService implements ChatRuntime {
     this.exitPlanModeCallback = callback;
   }
 
-  setPermissionModeSyncCallback(callback: ((sdkMode: string) => void) | null): void {
+  /**
+   * Payload contract (#1894 semantics): the value is the PROVIDER-NORMALIZED
+   * app permission mode (a policy value, plus the fork's transient 'plan'),
+   * never the raw Claude SDK mode. The runtime reverse-maps observations
+   * before invoking this callback.
+   */
+  setPermissionModeSyncCallback(callback: ((appMode: string) => void) | null): void {
     this.permissionModeSyncCallback = callback;
+  }
+
+  /**
+   * Scope-guarded native permission sync (design §5.2): reverse-maps an
+   * observed SDK mode onto the provider app mode, updates the live config,
+   * and notifies the feature layer — all through the same owner. Unknown
+   * native modes (dontAsk, delegate, ...) never masquerade as a toolbar
+   * value; a retired scope's late message never writes back.
+   */
+  private syncNativePermissionMode(sdkMode: unknown, scope: QueryScope | null): void {
+    if (scope !== null && !this.isCurrentQueryScope(scope)) {
+      return;
+    }
+    const appMode = resolveClaudeAppPermissionModeFromSdk(sdkMode);
+    if (appMode === null) {
+      return;
+    }
+    if (this.currentConfig) {
+      this.currentConfig.permissionMode = appMode;
+      this.currentConfig.sdkPermissionMode = isClaudePermissionMode(appMode)
+        ? resolveClaudeSdkPermissionModeForRuntime(appMode)
+        : 'plan';
+    }
+    if (this.permissionModeSyncCallback) {
+      try { this.permissionModeSyncCallback(appMode); } catch { /* non-critical */ }
+    }
   }
 
   setSubagentHookProvider(getState: () => SubagentHookState): void {
@@ -4167,7 +4213,11 @@ export class ClaudianService implements ChatRuntime {
       getApprovalCallback: () => this.approvalCallback,
       getAskUserQuestionCallback: () => this.askUserQuestionCallback,
       getExitPlanModeCallback: () => this.exitPlanModeCallback,
-      getPermissionMode: () => this.plugin.settings.permissionMode,
+      // Scoped snapshot, never the top-level projection another provider owns.
+      getPermissionMode: () => resolveClaudeRuntimePermissionMode(
+        this.getScopedSettings().permissionMode,
+        this.getScopedSettings() as unknown as Record<string, unknown>,
+      ),
       resolveSDKPermissionMode: (mode) => this.resolveSDKPermissionMode(mode),
       syncPermissionMode: (mode, sdkMode) => {
         if (this.currentConfig) {
@@ -4186,10 +4236,10 @@ export class ClaudianService implements ChatRuntime {
     };
   }
 
-  private resolveSDKPermissionMode(mode: PermissionMode): SDKPermissionMode {
+  private resolveSDKPermissionMode(mode: string): SDKPermissionMode {
     return QueryOptionsBuilder.resolveClaudeSdkPermissionMode(
       mode,
-      getClaudeProviderSettings(this.plugin.settings as unknown as Record<string, unknown>).safeMode,
+      this.getScopedSettings() as unknown as Record<string, unknown>,
     ) as SDKPermissionMode;
   }
 }

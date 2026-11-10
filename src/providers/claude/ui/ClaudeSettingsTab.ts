@@ -11,8 +11,6 @@ import { expandHomePath } from '../../../utils/path';
 import { getClaudeWorkspaceServices } from '../app/ClaudeWorkspaceServices';
 import { resolveClaudeModelSelection } from '../modelOptions';
 import {
-  CLAUDE_SAFE_MODES,
-  type ClaudeSafeMode,
   getClaudeProviderSettings,
   updateClaudeProviderSettings,
 } from '../settings';
@@ -144,27 +142,9 @@ export const claudeSettingsTabRenderer: ProviderSettingsTabRenderer = {
       updateCliPathValidation(currentValue, text.inputEl);
     });
 
-    // --- Safety ---
+    // --- Configuration ---
 
-    new Setting(container).setName(t('settings.safety')).setHeading();
-
-    new Setting(container)
-      .setName(t('settings.claudeSafeMode.name'))
-      .setDesc(t('settings.claudeSafeMode.desc'))
-      .addDropdown((dropdown) => {
-        for (const mode of CLAUDE_SAFE_MODES) {
-          dropdown.addOption(mode, mode);
-        }
-        dropdown
-          .setValue(claudeSettings.safeMode)
-          .onChange(async (value) => {
-            updateClaudeProviderSettings(
-              settingsBag,
-              { safeMode: value as ClaudeSafeMode },
-            );
-            await context.plugin.saveSettings();
-          });
-      });
+    new Setting(container).setName(t('settings.claude.configuration')).setHeading();
 
     new Setting(container)
       .setName(t('settings.loadUserSettings.name'))

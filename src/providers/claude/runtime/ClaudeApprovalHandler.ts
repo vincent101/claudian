@@ -19,7 +19,7 @@ import type {
   ExitPlanModeCallback,
   ExitPlanModeDecision,
 } from '../../../core/types';
-import type { PermissionMode } from '../../../core/types/settings';
+import type { ClaudeRuntimePermissionMode } from '../permissionModes';
 import { buildPermissionUpdates } from '../security/ClaudePermissionUpdates';
 
 export interface ClaudeApprovalHandlerDeps {
@@ -27,9 +27,10 @@ export interface ClaudeApprovalHandlerDeps {
   getApprovalCallback: () => ApprovalCallback | null;
   getAskUserQuestionCallback: () => AskUserQuestionCallback | null;
   getExitPlanModeCallback: () => ExitPlanModeCallback | null;
-  getPermissionMode: () => PermissionMode;
-  resolveSDKPermissionMode: (mode: PermissionMode) => SDKPermissionMode;
-  syncPermissionMode: (mode: PermissionMode, sdkMode: SDKPermissionMode) => void;
+  /** Scoped provider permission mode (four modes or the transient plan). */
+  getPermissionMode: () => ClaudeRuntimePermissionMode;
+  resolveSDKPermissionMode: (mode: ClaudeRuntimePermissionMode) => SDKPermissionMode;
+  syncPermissionMode: (mode: ClaudeRuntimePermissionMode, sdkMode: SDKPermissionMode) => void;
 }
 
 export function createClaudeApprovalCallback(
@@ -123,7 +124,11 @@ export function createClaudeApprovalCallback(
         return { behavior: 'deny', message: 'User interrupted.', interrupt: true };
       }
 
-      if (decision === 'allow' || decision === 'allow-always') {
+      if (decision === 'allow') {
+        return { behavior: 'allow', updatedInput: input };
+      }
+
+      if (decision === 'allow-always') {
         const updatedPermissions = buildPermissionUpdates(
           toolName,
           input,

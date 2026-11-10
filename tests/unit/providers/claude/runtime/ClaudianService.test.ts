@@ -9,6 +9,7 @@ import type ClaudianPlugin from '@/main';
 import { ClaudianService } from '@/providers/claude/runtime/ClaudeChatRuntime';
 import { MessageChannel } from '@/providers/claude/runtime/ClaudeMessageChannel';
 import { createResponseHandler, createRuntimeTurn } from '@/providers/claude/runtime/types';
+import * as permissionUpdates from '@/providers/claude/security/ClaudePermissionUpdates';
 import { adaptTranscriptFacts } from '@/providers/claude/transcript/ClaudeTranscriptFactAdapter';
 import { ClaudeTranscriptTurnObserver } from '@/providers/claude/transcript/ClaudeTranscriptTurnObserver';
 import * as envUtils from '@/utils/env';
@@ -555,20 +556,37 @@ describe('ClaudianService', () => {
         );
       });
 
-      it('should return updatedPermissions with session destination for allow decisions', async () => {
+      it.each([
+        ['without suggestions', {}],
+        ['with empty suggestions', { suggestions: [] }],
+        ['with suggestions', {
+          suggestions: [
+            {
+              type: 'addRules',
+              behavior: 'allow',
+              rules: [{ toolName: 'Bash', ruleContent: 'git *' }],
+              destination: 'session',
+            },
+            { type: 'addDirectories', directories: ['/external'], destination: 'session' },
+          ],
+        }],
+      ])('should allow once without permission updates %s', async (_label, extraOptions) => {
         const callback = jest.fn().mockResolvedValue('allow');
+        const buildUpdates = jest.spyOn(permissionUpdates, 'buildPermissionUpdates');
         service.setApprovalCallback(callback);
 
-        const canUseTool = (service as any).createApprovalCallback();
-        const result = await canUseTool('Bash', { command: 'git status' }, canUseToolOptions);
+        try {
+          const canUseTool = (service as any).createApprovalCallback();
+          const input = { command: 'git status' };
+          const result = await canUseTool('Bash', input, { ...canUseToolOptions, ...extraOptions });
 
-        expect(result.behavior).toBe('allow');
-        expect(result.updatedPermissions).toBeDefined();
-        expect(result.updatedPermissions[0]).toMatchObject({
-          type: 'addRules',
-          behavior: 'allow',
-          destination: 'session',
-        });
+          expect(result).toEqual({ behavior: 'allow', updatedInput: input });
+          expect(result.updatedInput).toBe(input);
+          expect(result).not.toHaveProperty('updatedPermissions');
+          expect(buildUpdates).not.toHaveBeenCalled();
+        } finally {
+          buildUpdates.mockRestore();
+        }
       });
 
       it('should return updatedPermissions for allow-always decisions', async () => {
@@ -585,6 +603,41 @@ describe('ClaudianService', () => {
           behavior: 'allow',
           destination: 'projectSettings',
         });
+      });
+
+      it('should preserve suggestions for allow-always decisions', async () => {
+        service.setApprovalCallback(jest.fn().mockResolvedValue('allow-always'));
+        const buildUpdates = jest.spyOn(permissionUpdates, 'buildPermissionUpdates');
+        const suggestions = [
+          {
+            type: 'addRules',
+            behavior: 'allow',
+            rules: [{ toolName: 'Bash', ruleContent: 'git *' }],
+            destination: 'session',
+          },
+          { type: 'addDirectories', directories: ['/external'], destination: 'session' },
+          { type: 'setMode', mode: 'default', destination: 'session' },
+        ];
+        const input = { command: 'git status' };
+
+        try {
+          const canUseTool = (service as any).createApprovalCallback();
+          const result = await canUseTool('Bash', input, { ...canUseToolOptions, suggestions });
+
+          expect(buildUpdates).toHaveBeenCalledWith('Bash', input, 'allow-always', suggestions);
+          expect(result).toEqual({
+            behavior: 'allow',
+            updatedInput: input,
+            updatedPermissions: [
+              { ...suggestions[0], destination: 'projectSettings' },
+              suggestions[1],
+              suggestions[2],
+            ],
+          });
+          expect(result.updatedInput).toBe(input);
+        } finally {
+          buildUpdates.mockRestore();
+        }
       });
     });
   });
@@ -1732,28 +1785,31 @@ describe('ClaudianService', () => {
       expect(mockPersistentQuery.setPermissionMode).toHaveBeenCalledWith('bypassPermissions');
     });
 
-    it('should update permission mode when claudeSafeMode changes within normal mode', async () => {
-      (mockPlugin as any).settings.permissionMode = 'normal';
-      (mockPlugin as any).settings.claudeSafeMode = 'acceptEdits';
+    it.each([
+      ['manual', 'default'],
+      ['acceptEdits', 'acceptEdits'],
+      ['auto', 'auto'],
+    ])('maps the durable mode %s onto the SDK setter value %s', async (appMode, sdkMode) => {
+      // Seed the live query under yolo first, then switch to the durable mode:
+      // the switch must reach the setter with the mapped SDK value.
+      (mockPlugin as any).settings.permissionMode = 'yolo';
       (service as any).currentConfig = (service as any).buildPersistentQueryConfig(
         '/mock/vault/path',
         '/usr/local/bin/claude',
         [],
       );
-
+      (mockPlugin as any).settings.permissionMode = appMode;
       mockPersistentQuery.setPermissionMode.mockClear();
-      (mockPlugin as any).settings.claudeSafeMode = 'default';
 
       await (service as any).applyDynamicUpdates({});
 
-      expect(mockPersistentQuery.setPermissionMode).toHaveBeenCalledWith('default');
-      expect((service as any).currentConfig.permissionMode).toBe('normal');
-      expect((service as any).currentConfig.sdkPermissionMode).toBe('default');
+      expect(mockPersistentQuery.setPermissionMode).toHaveBeenCalledWith(sdkMode);
+      expect((service as any).currentConfig.permissionMode).toBe(appMode);
+      expect((service as any).currentConfig.sdkPermissionMode).toBe(sdkMode);
     });
 
-    it('should update permission mode when claudeSafeMode switches back to acceptEdits', async () => {
-      (mockPlugin as any).settings.permissionMode = 'normal';
-      (mockPlugin as any).settings.claudeSafeMode = 'default';
+    it('switches manual→acceptEdits as a live setter with no restart', async () => {
+      (mockPlugin as any).settings.permissionMode = 'manual';
       (service as any).currentConfig = (service as any).buildPersistentQueryConfig(
         '/mock/vault/path',
         '/usr/local/bin/claude',
@@ -1761,55 +1817,35 @@ describe('ClaudianService', () => {
       );
 
       mockPersistentQuery.setPermissionMode.mockClear();
-      (mockPlugin as any).settings.claudeSafeMode = 'acceptEdits';
+      (service as any).startPersistentQuery.mockClear();
+      (mockPlugin as any).settings.permissionMode = 'acceptEdits';
 
       await (service as any).applyDynamicUpdates({});
 
       expect(mockPersistentQuery.setPermissionMode).toHaveBeenCalledWith('acceptEdits');
-      expect((service as any).currentConfig.permissionMode).toBe('normal');
+      expect((service as any).startPersistentQuery).not.toHaveBeenCalled();
+      expect((service as any).currentConfig.permissionMode).toBe('acceptEdits');
       expect((service as any).currentConfig.sdkPermissionMode).toBe('acceptEdits');
     });
 
-    it('should restart before applying auto mode when auto opt-in was not enabled', async () => {
-      (mockPlugin as any).settings.permissionMode = 'normal';
-      (mockPlugin as any).settings.claudeSafeMode = 'acceptEdits';
-      (service as any).currentConfig = (service as any).buildPersistentQueryConfig(
-        '/mock/vault/path',
-        '/usr/local/bin/claude',
-        [],
-      );
-
-      mockPersistentQuery.setPermissionMode.mockClear();
-      (service as any).startPersistentQuery.mockClear();
-      (mockPlugin as any).settings.claudeSafeMode = 'auto';
-
-      await (service as any).applyDynamicUpdates({});
-
-      expect(mockPersistentQuery.setPermissionMode).not.toHaveBeenCalled();
-      expect((service as any).startPersistentQuery).toHaveBeenCalledTimes(1);
-      expect((service as any).currentConfig.permissionMode).toBe('normal');
-      expect((service as any).currentConfig.sdkPermissionMode).toBe('auto');
-      expect((service as any).currentConfig.enableAutoMode).toBe(true);
-    });
-
-    it('should update permission mode to auto dynamically when auto opt-in is already enabled', async () => {
+    it('switches to auto as a live setter because every launch carries the auto capability', async () => {
       (mockPlugin as any).settings.permissionMode = 'yolo';
-      (mockPlugin as any).settings.claudeSafeMode = 'auto';
       (service as any).currentConfig = (service as any).buildPersistentQueryConfig(
         '/mock/vault/path',
         '/usr/local/bin/claude',
         [],
       );
+      expect((service as any).currentConfig.enableAutoMode).toBe(true);
 
       mockPersistentQuery.setPermissionMode.mockClear();
       (service as any).startPersistentQuery.mockClear();
-      (mockPlugin as any).settings.permissionMode = 'normal';
+      (mockPlugin as any).settings.permissionMode = 'auto';
 
       await (service as any).applyDynamicUpdates({});
 
       expect(mockPersistentQuery.setPermissionMode).toHaveBeenCalledWith('auto');
       expect((service as any).startPersistentQuery).not.toHaveBeenCalled();
-      expect((service as any).currentConfig.permissionMode).toBe('normal');
+      expect((service as any).currentConfig.permissionMode).toBe('auto');
       expect((service as any).currentConfig.sdkPermissionMode).toBe('auto');
       expect((service as any).currentConfig.enableAutoMode).toBe(true);
     });
@@ -1867,11 +1903,21 @@ describe('ClaudianService', () => {
       await expect((service as any).applyDynamicUpdates({})).resolves.toBeUndefined();
     });
 
-    it('should silently handle permission mode update error', async () => {
+    it('aborts this send when the permission mode setter fails instead of continuing silently', async () => {
       (mockPlugin as any).settings.permissionMode = 'yolo';
+      (service as any).currentConfig = (service as any).buildPersistentQueryConfig(
+        '/mock/vault/path',
+        '/usr/local/bin/claude',
+        [],
+      );
+      (mockPlugin as any).settings.permissionMode = 'manual';
       mockPersistentQuery.setPermissionMode.mockRejectedValueOnce(new Error('Permission error'));
 
-      await expect((service as any).applyDynamicUpdates({})).resolves.toBeUndefined();
+      // The rejection must surface: a failed switch must never send the next
+      // message under the previous mode (design §5.1).
+      await expect((service as any).applyDynamicUpdates({})).rejects.toThrow('Permission error');
+      expect((service as any).currentConfig.permissionMode).toBe('yolo');
+      expect((service as any).currentConfig.sdkPermissionMode).toBe('bypassPermissions');
     });
 
     it('should silently handle effort level update error', async () => {

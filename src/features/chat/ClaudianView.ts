@@ -2,6 +2,7 @@ import type { EventRef, WorkspaceLeaf } from 'obsidian';
 import { ItemView, Notice, Scope, setIcon } from 'obsidian';
 
 import { getHiddenProviderCommandSet } from '../../core/providers/commands/hiddenCommands';
+import { resolveProviderPermissionMode } from '../../core/providers/permissionModes';
 import { ProviderRegistry } from '../../core/providers/ProviderRegistry';
 import { ProviderSettingsCoordinator } from '../../core/providers/ProviderSettingsCoordinator';
 import { DEFAULT_CHAT_PROVIDER_ID, type ProviderId } from '../../core/providers/types';
@@ -600,7 +601,13 @@ export class ClaudianView extends ItemView {
           providerId,
         ).permissionMode as string;
         if (current === 'plan') {
-          const restoreMode = activeTab.state.prePlanPermissionMode ?? 'normal';
+          // Shift+Tab fallback (§5.3): a lost restore value falls back to the
+          // provider's fail-closed mode (Manual for Claude), never YOLO/Auto.
+          const policy = ProviderRegistry.getChatUIConfig(providerId).permissionModes;
+          const prePlan = activeTab.state.prePlanPermissionMode;
+          const restoreMode = policy && prePlan
+            ? resolveProviderPermissionMode(policy, prePlan, {}) ?? policy.fallbackValue
+            : policy?.fallbackValue ?? 'normal';
           activeTab.state.prePlanPermissionMode = null;
           updatePlanModeUI(activeTab, this.plugin, restoreMode);
         } else {

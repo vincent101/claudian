@@ -189,6 +189,24 @@
       "noConversations": "No conversations to resume",
       "openFailed": "Failed to open conversation: {error}"
     },
+    "claude": {
+      "permission": {
+        "auto": "Авто",
+        "autoDesc": "Claude решает, какие запросы требуют подтверждения",
+        "manual": "Вручную",
+        "manualDesc": "Спрашивать перед каждым изменением",
+        "acceptEdits": "Принимать правки",
+        "acceptEditsDesc": "Автоматически принимать правки файлов",
+        "yolo": "YOLO",
+        "yoloDesc": "Пропускать все запросы разрешений",
+        "plan": "Plan",
+        "updateFailed": "Не удалось обновить режим разрешений. Сообщение не отправлено."
+      }
+    },
+    "permission": {
+      "ariaLabel": "Режим разрешений: {mode}",
+      "unavailable": "Недоступно"
+    },
     "codex": {
       "effort": {
         "low": "Low",
@@ -359,11 +377,7 @@
     "safety": "Безопасность",
     "loadUserSettings": {
       "name": "Загружать пользовательские настройки Claude",
-      "desc": "Загружает ~/.claude/settings.json. При включении пользовательские правила разрешений Claude Code могут обходить безопасный режим."
-    },
-    "claudeSafeMode": {
-      "name": "Safe mode",
-      "desc": "Permission mode used when the Safe toggle is active."
+      "desc": "Загружает ~/.claude/settings.json. Если включено, существующие правила разрешений пользователя могут пропускать подтверждения."
     },
     "codexSafeMode": {
       "name": "Safe mode",
@@ -472,6 +486,9 @@
       "desc": "Изменить язык интерфейса плагина"
     },
     "environmentReview": "Review environment ownership for: {keys}",
+    "claude": {
+      "configuration": "Конфигурация"
+    },
     "codex": {
       "enable": {
         "name": "Enable Codex provider",

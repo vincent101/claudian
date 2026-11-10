@@ -19,8 +19,6 @@ export {
   validateModelPresetDrafts as validateClaudeModelPresetDrafts,
 } from '../../core/providers/modelPresets';
 
-export const CLAUDE_SAFE_MODES = ['acceptEdits', 'auto', 'default'] as const;
-export type ClaudeSafeMode = typeof CLAUDE_SAFE_MODES[number];
 export type ClaudeSettingSource = 'user' | 'project' | 'local';
 
 export type ClaudeModelPreset = ModelPreset;
@@ -34,7 +32,6 @@ export const DEFAULT_CLAUDE_MODEL_PRESETS: readonly ClaudeModelPreset[] = Object
 ]);
 
 export interface ClaudeProviderSettings {
-  safeMode: ClaudeSafeMode;
   cliPath: string;
   cliPathsByHost: HostnameCliPaths;
   loadUserSettings: boolean;
@@ -47,7 +44,6 @@ export interface ClaudeProviderSettings {
 }
 
 export const DEFAULT_CLAUDE_PROVIDER_SETTINGS: Readonly<ClaudeProviderSettings> = Object.freeze({
-  safeMode: 'acceptEdits',
   cliPath: '',
   cliPathsByHost: {},
   loadUserSettings: true,
@@ -71,12 +67,6 @@ function normalizeHostnameCliPaths(value: unknown): HostnameCliPaths {
     }
   }
   return result;
-}
-
-function normalizeClaudeSafeMode(value: unknown): ClaudeSafeMode | undefined {
-  return (CLAUDE_SAFE_MODES as readonly unknown[]).includes(value)
-    ? value as ClaudeSafeMode
-    : undefined;
 }
 
 function readLegacyToggle(
@@ -131,9 +121,6 @@ export function getClaudeProviderSettings(
     ?? migrateClaudeModelPresets(config, settings);
 
   return {
-    safeMode: normalizeClaudeSafeMode(config.safeMode)
-      ?? normalizeClaudeSafeMode(settings.claudeSafeMode)
-      ?? DEFAULT_CLAUDE_PROVIDER_SETTINGS.safeMode,
     cliPath: (config.cliPath as string | undefined)
       ?? (settings.claudeCliPath as string | undefined)
       ?? DEFAULT_CLAUDE_PROVIDER_SETTINGS.cliPath,
@@ -176,9 +163,6 @@ export function updateClaudeProviderSettings(
   const next = {
     ...current,
     ...updates,
-    safeMode: 'safeMode' in updates
-      ? normalizeClaudeSafeMode(updates.safeMode) ?? current.safeMode
-      : current.safeMode,
   };
   setProviderConfig(settings, 'claude', next);
   if ('modelPresets' in updates) {

@@ -189,6 +189,24 @@
       "noConversations": "재개할 대화가 없습니다",
       "openFailed": "대화를 열지 못했습니다: {error}"
     },
+    "claude": {
+      "permission": {
+        "auto": "자동",
+        "autoDesc": "Claude가 승인이 필요한 요청을 결정합니다",
+        "manual": "수동",
+        "manualDesc": "모든 변경 전에 확인합니다",
+        "acceptEdits": "편집 허용",
+        "acceptEditsDesc": "파일 편집을 자동으로 허용합니다",
+        "yolo": "YOLO",
+        "yoloDesc": "모든 권한 프롬프트를 건너뜁니다",
+        "plan": "Plan",
+        "updateFailed": "권한 모드를 업데이트하지 못했습니다. 메시지가 전송되지 않았습니다."
+      }
+    },
+    "permission": {
+      "ariaLabel": "권한 모드: {mode}",
+      "unavailable": "사용할 수 없음"
+    },
     "codex": {
       "effort": {
         "low": "낮음",
@@ -359,11 +377,7 @@
     "safety": "보안",
     "loadUserSettings": {
       "name": "사용자 Claude 설정 로드",
-      "desc": "~/.claude/settings.json을 로드합니다. 활성화하면 사용자의 Claude Code 허용 규칙이 보안 모드를 우회할 수 있습니다."
-    },
-    "claudeSafeMode": {
-      "name": "Safe mode",
-      "desc": "Permission mode used when the Safe toggle is active."
+      "desc": "~/.claude/settings.json을 로드합니다. 활성화하면 기존 사용자 권한 규칙이 승인을 건너뛸 수 있습니다."
     },
     "codexSafeMode": {
       "name": "Safe mode",
@@ -472,6 +486,9 @@
       "desc": "플러그인 인터페이스의 표시 언어 변경"
     },
     "environmentReview": "Review environment ownership for: {keys}",
+    "claude": {
+      "configuration": "구성"
+    },
     "codex": {
       "enable": {
         "name": "Enable Codex provider",

@@ -2,13 +2,17 @@ import { Notice, setIcon } from 'obsidian';
 import * as path from 'path';
 
 import type { McpServerManager } from '../../../core/mcp/McpServerManager';
+import {
+  isTransientProviderPermissionModeValue,
+} from '../../../core/providers/permissionModes';
 import type {
   ProviderCapabilities,
   ProviderChatUIConfig,
   ProviderModelOption,
   ProviderModelSelection,
   ProviderModeSelectorConfig,
-  ProviderPermissionModeToggleConfig,
+  ProviderPermissionModeOption,
+  ProviderPermissionModePolicy,
   ProviderReasoningOption,
   ProviderServiceTierToggleConfig,
   ProviderUIOption,
@@ -17,6 +21,7 @@ import type {
   ManagedMcpServer,
   UsageInfo,
 } from '../../../core/types';
+import { t } from '../../../i18n/i18n';
 import { CHECK_ICON_SVG, createProviderIconSvg, MCP_ICON_SVG } from '../../../shared/icons';
 import { filterValidPaths, findConflictingPath, isDuplicatePath, isValidDirectoryPath, validateDirectoryPath } from '../../../utils/externalContext';
 import { expandHomePath, normalizePathForFilesystem } from '../../../utils/path';
@@ -353,12 +358,26 @@ export class ThinkingBudgetSelector {
   }
 }
 
+/**
+ * Permission-mode menu driven by the provider's policy options (four modes for
+ * Claude, two for Safe/YOLO providers). Plan is a read-only transient display
+ * state, never a fifth option; unknown values render as unavailable and wait
+ * for the projection instead of masquerading as the first option.
+ */
 export class PermissionToggle {
   private container: HTMLElement;
-  private toggleEl: HTMLElement | null = null;
+  private buttonEl: HTMLElement | null = null;
   private labelEl: HTMLElement | null = null;
+  private iconEl: HTMLElement | null = null;
+  private chevronEl: HTMLElement | null = null;
+  private menuEl: HTMLElement | null = null;
+  private itemEls: HTMLElement[] = [];
   private callbacks: ToolbarCallbacks;
   private visible = true;
+  private menuOpen = false;
+  private focusedIndex: number | null = null;
+  private documentClickListener: ((e: Event) => void) | null = null;
+  private destroyed = false;
 
   constructor(parentEl: HTMLElement, callbacks: ToolbarCallbacks) {
     this.callbacks = callbacks;
@@ -374,62 +393,262 @@ export class PermissionToggle {
   private render() {
     this.container.empty();
 
-    this.labelEl = this.container.createSpan({ cls: 'claudian-permission-label' });
-    this.toggleEl = this.container.createDiv({ cls: 'claudian-toggle-switch' });
+    this.buttonEl = this.container.createEl('button', { cls: 'claudian-permission-button' });
+    this.iconEl = this.buttonEl.createSpan({ cls: 'claudian-permission-icon' });
+    this.labelEl = this.buttonEl.createSpan({ cls: 'claudian-permission-label' });
+    this.chevronEl = this.buttonEl.createSpan({ cls: 'claudian-permission-chevron' });
+    this.menuEl = this.container.createDiv({ cls: 'claudian-permission-menu' });
+
+    this.buttonEl.setAttribute('aria-haspopup', 'menu');
+    this.buttonEl.setAttribute('aria-expanded', 'false');
+    this.menuEl.setAttribute('role', 'menu');
+    this.menuEl.setAttribute('aria-label', t('chat.permission.ariaLabel', { mode: '' }));
+    this.menuEl.style.display = 'none';
+
+    this.buttonEl.addEventListener('click', () => {
+      if (this.menuOpen) {
+        this.closeMenu();
+      } else {
+        this.openMenu();
+      }
+    });
+
+    // Button + menu item keys share one bubbled handler.
+    this.container.addEventListener('keydown', (e: KeyboardEvent) => {
+      this.handleKeydown(e);
+    });
 
     this.updateDisplay();
-
-    this.toggleEl.addEventListener('click', () => this.toggle());
   }
 
-  private getToggleConfig(): ProviderPermissionModeToggleConfig | null {
-    const uiConfig = this.callbacks.getUIConfig();
-    return uiConfig.getPermissionModeToggle?.() ?? null;
+  private getOptions(): readonly ProviderPermissionModeOption[] {
+    return this.callbacks.getUIConfig().getPermissionModeOptions?.(this.callbacks.getSettings()) ?? [];
+  }
+
+  private getPolicy(): ProviderPermissionModePolicy | null {
+    return this.callbacks.getUIConfig().permissionModes ?? null;
+  }
+
+  isMenuOpen(): boolean {
+    return this.menuOpen;
+  }
+
+  /** Closes the menu; returns whether it was open (Escape arbitration). */
+  closeMenu(): boolean {
+    if (!this.menuOpen) {
+      return false;
+    }
+    this.menuOpen = false;
+    this.focusedIndex = null;
+    if (this.menuEl) this.menuEl.style.display = 'none';
+    this.buttonEl?.setAttribute('aria-expanded', 'false');
+    this.chevronEl?.removeClass('claudian-permission-chevron-open');
+    this.detachDocumentClickListener();
+    return true;
+  }
+
+  private openMenu(): void {
+    if (this.destroyed || this.menuOpen || !this.menuEl) {
+      return;
+    }
+    this.menuOpen = true;
+    this.menuEl.style.display = '';
+    this.buttonEl?.setAttribute('aria-expanded', 'true');
+    this.chevronEl?.addClass('claudian-permission-chevron-open');
+    this.attachDocumentClickListener();
+    this.focusItemAt(0);
+  }
+
+  /**
+   * Consumed-key report for the three Escape paths (view scope, input keydown,
+   * navigation controller): a menu-open Escape closes the menu instead of
+   * cancelling streaming; a closed menu never swallows keys.
+   */
+  handleKeydown(e: KeyboardEvent): boolean {
+    if (this.destroyed) {
+      return false;
+    }
+    if (this.menuOpen) {
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        this.closeMenu();
+        this.buttonEl?.focus();
+        return true;
+      }
+      if (e.key === 'ArrowDown') {
+        e.preventDefault();
+        this.focusItemAt((this.focusedIndex ?? -1) + 1);
+        return true;
+      }
+      if (e.key === 'ArrowUp') {
+        e.preventDefault();
+        this.focusItemAt((this.focusedIndex ?? this.itemEls.length) - 1);
+        return true;
+      }
+      if (e.key === 'Enter' || e.key === ' ') {
+        e.preventDefault();
+        if (this.focusedIndex !== null) {
+          this.itemEls[this.focusedIndex]?.click();
+        }
+        return true;
+      }
+      return false;
+    }
+
+    // Closed menu: only the button itself opens via keyboard.
+    if (e.target !== this.buttonEl) {
+      return false;
+    }
+    if (e.key === 'ArrowDown' || e.key === 'Enter' || e.key === ' ') {
+      e.preventDefault();
+      this.openMenu();
+      return true;
+    }
+    if (e.key === 'ArrowUp') {
+      e.preventDefault();
+      this.openMenu();
+      this.focusItemAt(this.itemEls.length - 1);
+      return true;
+    }
+    return false;
+  }
+
+  /** Idempotent teardown: clears the menu and every document listener. */
+  destroy(): void {
+    if (this.destroyed) {
+      return;
+    }
+    this.closeMenu();
+    this.destroyed = true;
+    this.container.empty();
+    this.buttonEl = null;
+    this.labelEl = null;
+    this.iconEl = null;
+    this.chevronEl = null;
+    this.menuEl = null;
+    this.itemEls = [];
+  }
+
+  private focusItemAt(index: number): void {
+    if (this.itemEls.length === 0) {
+      return;
+    }
+    const wrapped = ((index % this.itemEls.length) + this.itemEls.length) % this.itemEls.length;
+    this.focusedIndex = wrapped;
+    this.itemEls[wrapped]?.focus();
+  }
+
+  private attachDocumentClickListener(): void {
+    if (typeof document === 'undefined') {
+      return;
+    }
+    this.detachDocumentClickListener();
+    this.documentClickListener = (e: Event) => {
+      const target = e.target as Node | null;
+      if (target && this.container.contains(target)) {
+        return;
+      }
+      this.closeMenu();
+    };
+    document.addEventListener('click', this.documentClickListener);
+  }
+
+  private detachDocumentClickListener(): void {
+    if (this.documentClickListener && typeof document !== 'undefined') {
+      document.removeEventListener('click', this.documentClickListener);
+    }
+    this.documentClickListener = null;
   }
 
   updateDisplay() {
-    if (!this.toggleEl || !this.labelEl) return;
+    if (this.destroyed || !this.buttonEl || !this.labelEl || !this.iconEl) return;
 
-    const toggleConfig = this.getToggleConfig();
-    const capabilities = this.callbacks.getCapabilities();
-    if (!this.visible || !toggleConfig) {
+    const options = this.getOptions();
+    const policy = this.getPolicy();
+    if (!this.visible || options.length === 0) {
+      this.closeMenu();
       this.container.style.display = 'none';
       return;
     }
 
     this.container.style.display = '';
     const mode = this.callbacks.getSettings().permissionMode;
-    const planValue = toggleConfig.planValue;
-    const planLabel = toggleConfig.planLabel ?? 'PLAN';
-    const canShowPlan = Boolean(planValue) && capabilities.supportsPlanMode;
+    const current = options.find(option => option.value === mode) ?? null;
+    const isTransientPlan = policy !== null
+      && isTransientProviderPermissionModeValue(policy, mode);
+    const transientLabel = isTransientPlan
+      ? this.callbacks.getUIConfig().getPermissionTransientModeLabel?.(mode as string) ?? null
+      : null;
+    const bypasses = current?.bypassesApprovals === true;
 
-    if (canShowPlan && planValue && mode === planValue) {
-      this.toggleEl.style.display = 'none';
-      this.labelEl.setText(planLabel);
-      this.labelEl.addClass('plan-active');
-    } else {
-      this.toggleEl.style.display = '';
-      this.labelEl.removeClass('plan-active');
-      if (mode === toggleConfig.activeValue) {
-        this.toggleEl.addClass('active');
-        this.labelEl.setText(toggleConfig.activeLabel);
-      } else {
-        this.toggleEl.removeClass('active');
-        this.labelEl.setText(toggleConfig.inactiveLabel);
+    // Plan and unknown states never fall back to options[0] — plan renders its
+    // own read-only label; anything else waits for the projection to recover.
+    const displayLabel = current?.label
+      ?? transientLabel
+      ?? t('chat.permission.unavailable');
+
+    this.labelEl.setText(displayLabel);
+    this.labelEl.toggleClass('plan-active', isTransientPlan);
+    this.iconEl.empty();
+    setIcon(this.iconEl, bypasses ? 'shield-alert' : 'shield');
+    this.buttonEl.toggleClass('claudian-permission-warning', bypasses);
+    this.buttonEl.setAttribute('aria-label', t('chat.permission.ariaLabel', { mode: displayLabel }));
+
+    // Provider switch / selection: rebuild from current options and drop the
+    // old menu so it can never commit against a stale provider.
+    this.closeMenu();
+    this.renderMenuItems(options, mode);
+  }
+
+  private renderMenuItems(
+    options: readonly ProviderPermissionModeOption[],
+    currentMode: string,
+  ): void {
+    if (!this.menuEl) return;
+    this.menuEl.empty();
+    this.itemEls = [];
+
+    for (const option of options) {
+      const item = this.menuEl.createDiv({ cls: 'claudian-permission-option' });
+      item.setAttribute('role', 'menuitemradio');
+      // Programmatically focusable for arrow-key navigation.
+      item.setAttribute('tabindex', '-1');
+      const selected = option.value === currentMode;
+      item.setAttribute('aria-checked', selected ? 'true' : 'false');
+      if (selected) {
+        item.addClass('selected');
+        const checkEl = item.createSpan({ cls: 'claudian-permission-check' });
+        checkEl.innerHTML = CHECK_ICON_SVG;
       }
+
+      item.createSpan({ cls: 'claudian-permission-option-label' }).setText(option.label);
+      if (option.description) {
+        item.createDiv({ cls: 'claudian-permission-option-desc' }).setText(option.description);
+      }
+
+      item.addEventListener('click', (e) => {
+        e.stopPropagation();
+        void this.selectOption(option.value);
+      });
+      this.itemEls.push(item);
     }
   }
 
-  private async toggle() {
-    const toggleConfig = this.getToggleConfig();
-    if (!toggleConfig) return;
-
-    const current = this.callbacks.getSettings().permissionMode;
-    const newMode = current === toggleConfig.activeValue
-      ? toggleConfig.inactiveValue
-      : toggleConfig.activeValue;
-    await this.callbacks.onPermissionModeChange(newMode);
-    this.updateDisplay();
+  private async selectOption(value: string): Promise<void> {
+    // Same-value selections never commit; plan exits only through an explicit
+    // durable choice, which the Tab writer resolves + persists.
+    if (value === this.callbacks.getSettings().permissionMode) {
+      this.closeMenu();
+      this.buttonEl?.focus();
+      return;
+    }
+    try {
+      await this.callbacks.onPermissionModeChange(value);
+    } finally {
+      this.closeMenu();
+      this.buttonEl?.focus();
+      this.updateDisplay();
+    }
   }
 }
 
@@ -532,6 +751,30 @@ export class ExternalContextSelector {
     this.onPersistenceChangeCallback = callback;
   }
 
+  /**
+   * Single commit point for every effective external-context directory
+   * mutation. The new list is assigned before the effective-directory
+   * listener runs, the listener receives a defensive copy, and unchanged
+   * lists do not notify (no command revocation for no-op commits). A→B→A
+   * still notifies on each transition: freshness rides on the commit itself,
+   * never on remembered path strings.
+   */
+  private commitExternalContextPaths(nextPaths: string[]): boolean {
+    const changed = !ExternalContextSelector.sameEffectivePaths(nextPaths, this.externalContextPaths);
+    this.externalContextPaths = nextPaths;
+    if (changed) {
+      this.onChangeCallback?.([...nextPaths]);
+    }
+    this.updateDisplay();
+    return changed;
+  }
+
+  private static sameEffectivePaths(next: string[], current: string[]): boolean {
+    if (next.length !== current.length) return false;
+    const currentSet = new Set(current);
+    return next.every(p => currentSet.has(p));
+  }
+
   getExternalContexts(): string[] {
     return [...this.externalContextPaths];
   }
@@ -548,7 +791,6 @@ export class ExternalContextSelector {
     this.persistentPaths = new Set(validPaths);
     // Merge persistent paths into external context paths
     this.mergePersistentPaths();
-    this.updateDisplay();
     this.renderDropdown();
 
     // If invalid paths were removed, notify user and save updated list
@@ -579,7 +821,7 @@ export class ExternalContextSelector {
     for (const path of this.persistentPaths) {
       pathSet.add(path);
     }
-    this.externalContextPaths = [...pathSet];
+    this.commitExternalContextPaths([...pathSet]);
   }
 
   /**
@@ -588,8 +830,7 @@ export class ExternalContextSelector {
    * Use clearExternalContexts() for new sessions to start with current persistent paths.
    */
   setExternalContexts(paths: string[]): void {
-    this.externalContextPaths = [...paths];
-    this.updateDisplay();
+    this.commitExternalContextPaths([...paths]);
     this.renderDropdown();
   }
 
@@ -598,14 +839,17 @@ export class ExternalContextSelector {
    * Exposed for testing the remove button behavior.
    */
   removePath(pathStr: string): void {
-    this.externalContextPaths = this.externalContextPaths.filter(p => p !== pathStr);
-    // Also remove from persistent paths if it was persistent
-    if (this.persistentPaths.has(pathStr)) {
+    const nextActive = this.externalContextPaths.filter(p => p !== pathStr);
+    // Update both in-memory slots before notifying so the effective-directory
+    // listener observes a consistent selector state.
+    const wasPersistent = this.persistentPaths.has(pathStr);
+    if (wasPersistent) {
       this.persistentPaths.delete(pathStr);
+    }
+    this.commitExternalContextPaths(nextActive);
+    if (wasPersistent) {
       this.onPersistenceChangeCallback?.([...this.persistentPaths]);
     }
-    this.onChangeCallback?.(this.externalContextPaths);
-    this.updateDisplay();
     this.renderDropdown();
   }
 
@@ -653,10 +897,8 @@ export class ExternalContextSelector {
       return { success: false, error: this.formatConflictMessage(normalizedPath, conflict) };
     }
 
-    // Add the path
-    this.externalContextPaths = [...this.externalContextPaths, normalizedPath];
-    this.onChangeCallback?.(this.externalContextPaths);
-    this.updateDisplay();
+    // Add the path through the effective-directory commit point
+    this.commitExternalContextPaths([...this.externalContextPaths, normalizedPath]);
     this.renderDropdown();
 
     return { success: true, normalizedPath };
@@ -674,8 +916,7 @@ export class ExternalContextSelector {
       const validPaths = filterValidPaths(persistentPathsFromSettings);
       this.persistentPaths = new Set(validPaths);
     }
-    this.externalContextPaths = [...this.persistentPaths];
-    this.updateDisplay();
+    this.commitExternalContextPaths([...this.persistentPaths]);
     this.renderDropdown();
   }
 
@@ -727,9 +968,7 @@ export class ExternalContextSelector {
           return;
         }
 
-        this.externalContextPaths = [...this.externalContextPaths, selectedPath];
-        this.onChangeCallback?.(this.externalContextPaths);
-        this.updateDisplay();
+        this.commitExternalContextPaths([...this.externalContextPaths, selectedPath]);
         this.renderDropdown();
       }
     } catch {

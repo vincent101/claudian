@@ -189,6 +189,24 @@
       "noConversations": "沒有可恢復的對話",
       "openFailed": "開啟對話失敗：{error}"
     },
+    "claude": {
+      "permission": {
+        "auto": "自動",
+        "autoDesc": "由 Claude 決定哪些請求需要核准",
+        "manual": "手動",
+        "manualDesc": "每次變更前詢問",
+        "acceptEdits": "接受編輯",
+        "acceptEditsDesc": "自動接受檔案編輯",
+        "yolo": "YOLO",
+        "yoloDesc": "略過所有權限提示",
+        "plan": "Plan",
+        "updateFailed": "更新權限模式失敗。訊息未送出。"
+      }
+    },
+    "permission": {
+      "ariaLabel": "權限模式：{mode}",
+      "unavailable": "無法使用"
+    },
     "codex": {
       "effort": {
         "low": "低",
@@ -359,11 +377,7 @@
     "safety": "安全",
     "loadUserSettings": {
       "name": "載入使用者 Claude 設定",
-      "desc": "載入 ~/.claude/settings.json。啟用後，使用者的 Claude Code 權限規則可能繞過安全模式。"
-    },
-    "claudeSafeMode": {
-      "name": "安全模式",
-      "desc": "啟用 Safe 開關時使用的權限模式。"
+      "desc": "載入 ~/.claude/settings.json。啟用後，既有的使用者權限規則可能略過核准。"
     },
     "codexSafeMode": {
       "name": "安全模式",
@@ -472,6 +486,9 @@
       "desc": "更改插件介面的顯示語言"
     },
     "environmentReview": "請檢查以下環境變數的歸屬：{keys}",
+    "claude": {
+      "configuration": "組態"
+    },
     "codex": {
       "enable": {
         "name": "啟用 Codex 提供商",

@@ -1,11 +1,47 @@
-/* Permission Mode Toggle */
+/* Permission Mode Menu (array-driven dropdown, fork-local chrome only) */
 .claudian-permission-toggle {
   display: flex;
   align-items: center;
-  gap: 6px;
   margin-left: auto;
   padding-left: 12px;
   padding-right: 8px;
+  position: relative;
+}
+
+.claudian-permission-button {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 8px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: var(--radius-s);
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  font-size: 11px;
+  line-height: 1.4;
+}
+
+.claudian-permission-button:hover {
+  background: var(--background-modifier-hover);
+  color: var(--text-normal);
+}
+
+.claudian-permission-button:focus-visible,
+.claudian-permission-option:focus-visible {
+  outline: 2px solid var(--claudian-brand, var(--interactive-accent));
+  outline-offset: 1px;
+}
+
+/* Bypassing (YOLO) selection warning: shield-alert + error tint. */
+.claudian-permission-button.claudian-permission-warning {
+  color: var(--text-error);
+  border-color: var(--text-error);
+}
+
+.claudian-permission-icon {
+  display: inline-flex;
+  align-items: center;
 }
 
 .claudian-permission-label {
@@ -19,38 +55,55 @@
   font-weight: 600;
 }
 
-.claudian-toggle-switch {
-  width: 32px;
-  height: 18px;
-  border-radius: 9px;
-  background: var(--background-modifier-border);
-  cursor: pointer;
-  position: relative;
-  transition: background 0.2s ease;
-  flex-shrink: 0;
+.claudian-permission-chevron {
+  display: inline-flex;
+  transition: transform 0.15s ease;
 }
 
-.claudian-toggle-switch::after {
-  content: '';
+.claudian-permission-chevron-open {
+  transform: rotate(180deg);
+}
+
+.claudian-permission-menu {
   position: absolute;
-  width: 14px;
-  height: 14px;
-  border-radius: 50%;
-  background: var(--text-muted);
-  top: 2px;
-  left: 2px;
-  transition: transform 0.2s ease, background 0.2s ease;
+  top: calc(100% + 6px);
+  right: 0;
+  z-index: var(--layer-menu, 20);
+  min-width: 220px;
+  padding: 4px;
+  border-radius: var(--radius-m);
+  border: 1px solid var(--background-modifier-border);
+  background: var(--background-primary);
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.25);
 }
 
-.claudian-toggle-switch:hover {
+.claudian-permission-option {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  padding: 6px 8px;
+  border-radius: var(--radius-s);
+  cursor: pointer;
+}
+
+.claudian-permission-option:hover {
   background: var(--background-modifier-hover);
 }
 
-.claudian-toggle-switch.active {
-  background: rgba(var(--claudian-brand-rgb), 0.3);
+.claudian-permission-check {
+  color: var(--claudian-brand, var(--interactive-accent));
+  flex-shrink: 0;
+  margin-top: 2px;
 }
 
-.claudian-toggle-switch.active::after {
-  transform: translateX(14px);
-  background: var(--claudian-brand);
+.claudian-permission-option-label {
+  font-size: 12px;
+  color: var(--text-normal);
+  flex-shrink: 0;
+}
+
+.claudian-permission-option-desc {
+  font-size: 11px;
+  color: var(--text-muted);
+  padding-left: 12px;
 }

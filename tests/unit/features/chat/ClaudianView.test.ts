@@ -251,3 +251,105 @@ describe('ClaudianView tab rename wiring', () => {
     expect(updateHistoryDropdown).not.toHaveBeenCalled();
   });
 });
+
+describe('ClaudianView Escape and Shift+Tab permission arbitration', () => {
+  function createScopeView(activeTab: unknown) {
+    const view = Object.create(ClaudianView.prototype) as unknown as Record<string, unknown>;
+    view.plugin = {
+      app: {
+        scope: {},
+        vault: { on: jest.fn() },
+        workspace: { on: jest.fn() },
+      },
+      settings: { providerConfigs: { claude: {} }, permissionMode: 'acceptEdits' },
+      registerDomEvent: jest.fn(),
+      registerEvent: jest.fn(),
+      // Component base: registerDomEvent lives on the view itself in the app.
+    };
+    (view as { registerDomEvent: unknown }).registerDomEvent = jest.fn();
+    (view as { registerEvent: unknown }).registerEvent = jest.fn();
+    (view as { app: unknown }).app = (view.plugin as { app: unknown }).app;
+    view.containerEl = createMockEl();
+    view.tabManager = { getActiveTab: () => activeTab };
+    view.eventRefs = [];
+    view.assemblyGeneration = {};
+    view.tabManager = {
+      getActiveTab: () => activeTab,
+      getAllTabs: () => [activeTab],
+    };
+    view.isCurrentManager = () => true;
+    (view as { wireEventHandlers: () => void }).wireEventHandlers();
+    return view;
+  }
+
+  function mockTabWithMenu(open: boolean, streaming: boolean) {
+    const closeMenu = jest.fn().mockReturnValue(open);
+    const cancelStreaming = jest.fn();
+    return {
+      state: { isStreaming: streaming },
+      ui: { permissionToggle: { isMenuOpen: () => open, closeMenu } },
+      controllers: { inputController: { cancelStreaming } },
+      dom: { inputWrapper: { toggleClass: jest.fn() } },
+    };
+  }
+
+  it('closes an open permission menu on the first view-scope Escape without cancelling streaming', () => {
+    const tab = mockTabWithMenu(true, true);
+    const view = createScopeView(tab);
+    const scope = view.scope as unknown as { invoke: (keyId: string) => unknown };
+
+    const result = scope.invoke(':Escape');
+
+    expect(result).toBe(false);
+    expect((tab.ui.permissionToggle as { closeMenu: jest.Mock }).closeMenu).toHaveBeenCalledTimes(1);
+    expect((tab.controllers.inputController as { cancelStreaming: jest.Mock }).cancelStreaming)
+      .not.toHaveBeenCalled();
+  });
+
+  it('resumes the streaming-cancel behavior when no menu is open', () => {
+    const tab = mockTabWithMenu(false, true);
+    const view = createScopeView(tab);
+    const scope = view.scope as unknown as { invoke: (keyId: string) => unknown };
+
+    scope.invoke(':Escape');
+
+    expect((tab.controllers.inputController as { cancelStreaming: jest.Mock }).cancelStreaming)
+      .toHaveBeenCalledTimes(1);
+  });
+
+  it('Shift+Tab out of plan restores through the provider fail-closed fallback', () => {
+    const updatePlanModeUI = jest.requireMock('@/features/chat/tabs/Tab').updatePlanModeUI as jest.Mock;
+    const capabilitiesSpy = jest
+      .spyOn(ProviderRegistry, 'getCapabilities')
+      .mockReturnValue({ supportsPlanMode: true } as never);
+    try {
+      const tab = {
+        state: { prePlanPermissionMode: null },
+        ui: {},
+        dom: { inputWrapper: { toggleClass: jest.fn() } },
+      };
+      const view = createScopeView(tab);
+      const registerDomEvent = (view as { registerDomEvent: jest.Mock }).registerDomEvent;
+      const shiftTabCall = registerDomEvent.mock.calls.find(
+        ([, event]: [unknown, string]) => event === 'keydown',
+      );
+      expect(shiftTabCall).toBeDefined();
+
+      // current permissionMode is plan (snapshot mock below) → Shift+Tab exits.
+      mockGetProviderSettingsSnapshot.mockReturnValue({ permissionMode: 'plan' });
+      const shiftTabEvent = { key: 'Tab', shiftKey: true, isComposing: false, preventDefault: jest.fn() };
+      (shiftTabCall![2] as (e: unknown) => void)(shiftTabEvent);
+
+      expect(shiftTabEvent.preventDefault).toHaveBeenCalled();
+      expect(updatePlanModeUI).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.anything(),
+        // Provider fallback for Claude is manual, never yolo/auto.
+        'manual',
+      );
+    } finally {
+      capabilitiesSpy.mockRestore();
+    }
+  });
+});
+

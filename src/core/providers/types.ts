@@ -212,14 +212,30 @@ export interface ProviderReasoningOption extends ProviderUIOption {
   tokens?: number;
 }
 
-/** Compact permission-mode toggle descriptor for providers that expose the current toolbar control. */
-export interface ProviderPermissionModeToggleConfig {
-  inactiveValue: string;
-  inactiveLabel: string;
-  activeValue: string;
-  activeLabel: string;
-  planValue?: string;
-  planLabel?: string;
+/**
+ * Permission-mode values a provider accepts in the shared `permissionMode`
+ * setting. The policy owns validity, migration, and fail-closed behavior;
+ * the UI options own only presentation.
+ */
+export interface ProviderPermissionModePolicy {
+  readonly values: readonly string[];
+  /** Fail-closed value for unknown stored values. */
+  readonly fallbackValue: string;
+  /** Value used when the provider has no stored choice (e.g. fresh install). */
+  readonly defaultValue?: string;
+  /** Maps a retired stored value to a current one; unmapped values fail closed. */
+  migrateValue?(value: string, settings: Record<string, unknown>): string | undefined;
+  /**
+   * Runtime-only values (fork plan mode) accepted by in-memory projection but
+   * never persisted by storage serialization.
+   */
+  readonly transientValues?: readonly string[];
+}
+
+/** One toolbar permission-mode choice, in menu order. */
+export interface ProviderPermissionModeOption extends ProviderUIOption {
+  /** Skips approval prompts; the toolbar marks the selection as a warning. */
+  bypassesApprovals?: boolean;
 }
 
 /** Compact service-tier toggle descriptor for providers that expose a fast/standard toolbar control. */
@@ -273,8 +289,16 @@ export interface ProviderChatUIConfig {
   /** Extract custom model IDs from parsed environment variables. Used for per-model context limit UI. */
   getCustomModelIds(envVars: Record<string, string>): Set<string>;
 
-  /** Optional permission-mode toggle descriptor. Return null when the provider exposes no permission toggle UI. */
-  getPermissionModeToggle?(): ProviderPermissionModeToggleConfig | null;
+  /** Permission-mode values this provider accepts, with migration and fail-closed rules. */
+  readonly permissionModes?: ProviderPermissionModePolicy;
+
+  /** Permission-mode menu choices in menu order. Null when the provider exposes no permission UI. */
+  getPermissionModeOptions?(
+    settings: Record<string, unknown>,
+  ): readonly ProviderPermissionModeOption[] | null;
+
+  /** Display label for a runtime-only transient state (e.g. plan); null when unknown. */
+  getPermissionTransientModeLabel?(value: string): string | null;
 
   /** Optional provider-owned mapping back into the shared permission-mode contract. */
   resolvePermissionMode?(settings: Record<string, unknown>): string | null;

@@ -189,6 +189,24 @@
       "noConversations": "再開する会話がありません",
       "openFailed": "会話を開けませんでした：{error}"
     },
+    "claude": {
+      "permission": {
+        "auto": "自動",
+        "autoDesc": "Claude が承認が必要なリクエストを判断します",
+        "manual": "手動",
+        "manualDesc": "すべての変更前に確認します",
+        "acceptEdits": "編集を許可",
+        "acceptEditsDesc": "ファイル編集を自動的に許可します",
+        "yolo": "YOLO",
+        "yoloDesc": "すべての権限プロンプトをスキップします",
+        "plan": "Plan",
+        "updateFailed": "権限モードの更新に失敗しました。メッセージは送信されませんでした。"
+      }
+    },
+    "permission": {
+      "ariaLabel": "権限モード: {mode}",
+      "unavailable": "利用不可"
+    },
     "codex": {
       "effort": {
         "low": "低",
@@ -359,11 +377,7 @@
     "safety": "セキュリティ",
     "loadUserSettings": {
       "name": "ユーザーClaude設定を読み込む",
-      "desc": "~/.claude/settings.json を読み込みます。有効にすると、ユーザーの Claude Code 許可ルールがセキュリティモードをバイパスする可能性があります。"
-    },
-    "claudeSafeMode": {
-      "name": "Safe mode",
-      "desc": "Permission mode used when the Safe toggle is active."
+      "desc": "~/.claude/settings.json を読み込みます。有効にすると、既存のユーザー権限ルールが承認を省略する場合があります。"
     },
     "codexSafeMode": {
       "name": "Safe mode",
@@ -472,6 +486,9 @@
       "desc": "プラグインインターフェースの表示言語を変更"
     },
     "environmentReview": "Review environment ownership for: {keys}",
+    "claude": {
+      "configuration": "構成"
+    },
     "codex": {
       "enable": {
         "name": "Enable Codex provider",

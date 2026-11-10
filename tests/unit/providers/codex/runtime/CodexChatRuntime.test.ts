@@ -122,6 +122,8 @@ function createMockPlugin(overrides: Record<string, unknown> = {}): any {
       model: DEFAULT_CODEX_PRIMARY_MODEL,
       // Codex model identity is provider-scoped: the top-level fields are
       // settingsProvider-denominated and never inherited cross-provider.
+      settingsProvider: 'codex',
+      providerConfigs: { codex: { enabled: true } },
       savedProviderModel: { codex: DEFAULT_CODEX_PRIMARY_MODEL },
       effortLevel: 'medium',
       systemPrompt: '',

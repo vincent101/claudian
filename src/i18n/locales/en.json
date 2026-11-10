@@ -189,6 +189,24 @@
       "noConversations": "No conversations to resume",
       "openFailed": "Failed to open conversation: {error}"
     },
+    "claude": {
+      "permission": {
+        "auto": "Auto",
+        "autoDesc": "Claude handles permission decisions",
+        "manual": "Manual",
+        "manualDesc": "Always ask before making changes",
+        "acceptEdits": "Accept edits",
+        "acceptEditsDesc": "Automatically accept all file edits",
+        "yolo": "YOLO",
+        "yoloDesc": "Accept all permissions without asking",
+        "plan": "Plan",
+        "updateFailed": "Failed to update permission mode. The message was not sent."
+      }
+    },
+    "permission": {
+      "ariaLabel": "Permission mode: {mode}",
+      "unavailable": "Unavailable"
+    },
     "codex": {
       "effort": {
         "low": "Low",
@@ -359,11 +377,7 @@
     "safety": "Safety",
     "loadUserSettings": {
       "name": "Load user Claude settings",
-      "desc": "Load ~/.claude/settings.json. When enabled, user's Claude Code permission rules may bypass Safe mode."
-    },
-    "claudeSafeMode": {
-      "name": "Safe mode",
-      "desc": "Permission mode used when the Safe toggle is active."
+      "desc": "Load ~/.claude/settings.json. When enabled, existing user permission rules may skip approval prompts."
     },
     "codexSafeMode": {
       "name": "Safe mode",
@@ -472,6 +486,9 @@
       "desc": "Change the display language of the plugin interface"
     },
     "environmentReview": "Review environment ownership for: {keys}",
+    "claude": {
+      "configuration": "Configuration"
+    },
     "codex": {
       "enable": {
         "name": "Enable Codex provider",

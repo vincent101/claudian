@@ -5,6 +5,7 @@ import { getHiddenProviderCommandSet } from '../../../core/providers/commands/hi
 import type { ProviderCommandDropdownConfig } from '../../../core/providers/commands/ProviderCommandCatalog';
 import type { ProviderCommandEntry } from '../../../core/providers/commands/ProviderCommandEntry';
 import { getDefaultProviderModelSelection, getProviderModelOptions, isValidProviderModelSelection, restoreDraftModelSelection } from '../../../core/providers/modelRouting';
+import { resolveProviderPermissionMode } from '../../../core/providers/permissionModes';
 import { ProviderRegistry } from '../../../core/providers/ProviderRegistry';
 import { ProviderSettingsCoordinator } from '../../../core/providers/ProviderSettingsCoordinator';
 import { ProviderWorkspaceRegistry } from '../../../core/providers/ProviderWorkspaceRegistry';
@@ -148,14 +149,45 @@ function getTabSettingsSnapshot(
   return snapshot;
 }
 
+function getTabPermissionPolicy(
+  tab: TabProviderContext,
+  plugin: ClaudianPlugin,
+) {
+  return getTabChatUIConfig(tab, plugin).permissionModes ?? null;
+}
+
+/**
+ * Restores the pre-plan permission choice; a lost restore value falls back to
+ * the provider's fail-closed value (Manual for Claude, never YOLO/Auto).
+ */
+function resolvePlanRestoreMode(
+  tab: TabData,
+  plugin: ClaudianPlugin,
+): string {
+  const policy = getTabPermissionPolicy(tab, plugin);
+  const prePlan = tab.state.prePlanPermissionMode;
+  if (policy && prePlan !== null && prePlan !== undefined) {
+    const restored = resolveProviderPermissionMode(policy, prePlan, {});
+    if (restored !== undefined) {
+      return restored;
+    }
+  }
+  return policy?.fallbackValue ?? 'normal';
+}
+
 function getTabPermissionMode(
   tab: TabProviderContext,
   plugin: ClaudianPlugin,
 ): string {
   const permissionMode = getTabSettingsSnapshot(tab, plugin).permissionMode;
-  return typeof permissionMode === 'string' && permissionMode
-    ? permissionMode
-    : 'normal';
+  const policy = getTabPermissionPolicy(tab, plugin);
+  if (typeof permissionMode === 'string' && permissionMode) {
+    const normalized = policy
+      ? resolveProviderPermissionMode(policy, permissionMode, {})
+      : undefined;
+    return normalized ?? permissionMode;
+  }
+  return policy?.fallbackValue ?? 'normal';
 }
 
 function getTabHiddenCommands(
@@ -328,7 +360,7 @@ function applyProviderUIGating(tab: TabData, plugin: ClaudianPlugin): void {
   const mcpManager = capabilities.supportsMcpTools
     ? getProviderMcpManager(capabilities.providerId)
     : null;
-  const hasPermissionToggle = Boolean(uiConfig.getPermissionModeToggle?.());
+  const hasPermissionToggle = Boolean(uiConfig.getPermissionModeOptions?.(plugin.settings as unknown as Record<string, unknown>)?.length);
 
   if (!capabilities.supportsMcpTools) {
     tab.ui.mcpServerSelector?.clearEnabled();
@@ -1014,6 +1046,7 @@ function initializeInputToolbar(
       tab.ui.serviceTierToggle?.updateDisplay();
     },
     onPermissionModeChange: async (mode: string) => {
+      const wasPlan = getTabPermissionMode(tab, plugin) === 'plan';
       await updateTabProviderSettings(tab, plugin, (settings) => {
         const uiConfig = getTabChatUIConfig(tab, plugin);
         if (uiConfig.applyPermissionMode) {
@@ -1022,6 +1055,11 @@ function initializeInputToolbar(
           settings.permissionMode = mode;
         }
       });
+      if (wasPlan && mode !== 'plan') {
+        // Selecting a durable mode inside plan is an explicit exit: drop the
+        // pre-plan bookmark so the next restore never resurfaces a stale pick.
+        tab.state.prePlanPermissionMode = null;
+      }
       tab.ui.permissionToggle?.updateDisplay();
       dom.inputWrapper.toggleClass(
         'claudian-input-plan-mode',
@@ -1758,7 +1796,7 @@ export function initializeTabControllers(
       : undefined,
     restorePrePlanPermissionModeIfNeeded: () => {
       if (getTabPermissionMode(tab, plugin) === 'plan') {
-        const restoreMode = tab.state.prePlanPermissionMode ?? 'normal';
+        const restoreMode = resolvePlanRestoreMode(tab, plugin);
         tab.state.prePlanPermissionMode = null;
         updatePlanModeUI(tab, plugin, restoreMode);
       }
@@ -1777,6 +1815,8 @@ export function initializeTabControllers(
       if (ui.slashCommandDropdown?.isVisible()) return true;
       if (ui.fileContextManager?.isMentionDropdownVisible()) return true;
       if (tab.controllers.historySearchController?.isActive()) return true;
+      // Open permission menu consumes Escape (closes instead of blurring).
+      if (ui.permissionToggle?.isMenuOpen()) return true;
       return false;
     },
   });
@@ -1832,6 +1872,11 @@ export function wireTabInputEvents(tab: TabData, plugin: ClaudianPlugin): void {
     }
 
     if (ui.fileContextManager?.handleMentionKeydown(e)) {
+      return;
+    }
+
+    // Permission menu Escape/arrow keys outrank streaming-cancel (§5.3).
+    if (ui.permissionToggle?.handleKeydown(e)) {
       return;
     }
 
@@ -2049,6 +2094,8 @@ export async function destroyTab(tab: TabData): Promise<void> {
 
   tab.controllers.inputController?.destroyResumeDropdown();
   tab.ui.fileContextManager?.destroy();
+  tab.ui.permissionToggle?.destroy();
+  tab.ui.permissionToggle = null;
   tab.ui.slashCommandDropdown?.destroy();
   tab.ui.slashCommandDropdown = null;
   tab.ui.instructionModeManager?.destroy();
@@ -2156,7 +2203,7 @@ export function setupServiceCallbacks(tab: TabData, plugin: ClaudianPlugin): voi
         if (decision !== null && decision.type !== 'feedback') {
           // Only restore permission mode if still in plan mode — user may have toggled out via Shift+Tab
           if (getTabPermissionMode(tab, plugin) === 'plan') {
-            const restoreMode = tab.state.prePlanPermissionMode ?? 'normal';
+            const restoreMode = resolvePlanRestoreMode(tab, plugin);
             tab.state.prePlanPermissionMode = null;
             updatePlanModeUI(tab, plugin, restoreMode);
           }

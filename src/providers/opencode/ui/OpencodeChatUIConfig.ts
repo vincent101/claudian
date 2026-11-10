@@ -1,6 +1,9 @@
+import {
+  BINARY_PERMISSION_MODE_POLICY,
+  getBinaryPermissionModeOptions,
+} from '../../../core/providers/permissionModes';
 import type {
   ProviderChatUIConfig,
-  ProviderPermissionModeToggleConfig,
   ProviderReasoningOption,
   ProviderUIOption,
 } from '../../../core/providers/types';
@@ -33,20 +36,18 @@ function getOpencodeFallbackModels(): ProviderUIOption[] {
   ];
 }
 
-function getOpencodePermissionModeToggle(): ProviderPermissionModeToggleConfig {
-  return {
-    inactiveValue: 'normal',
-    inactiveLabel: t('chat.opencode.permission.safe'),
-    activeValue: 'yolo',
-    activeLabel: t('chat.opencode.permission.yolo'),
-    planValue: 'plan',
-    planLabel: t('chat.opencode.permission.plan'),
-  };
+function getOpencodePermissionModeOptions() {
+  return getBinaryPermissionModeOptions({
+    safe: t('chat.opencode.permission.safe'),
+    yolo: t('chat.opencode.permission.yolo'),
+  });
 }
 
 const DEFAULT_CONTEXT_WINDOW = 200_000;
 
 export const opencodeChatUIConfig: ProviderChatUIConfig = {
+  permissionModes: BINARY_PERMISSION_MODE_POLICY,
+
   getModelOptions(settings): ProviderUIOption[] {
     const opencodeSettings = getOpencodeProviderSettings(settings);
     const applyAlias = (rawId: string, option: ProviderUIOption): ProviderUIOption => {
@@ -240,8 +241,12 @@ export const opencodeChatUIConfig: ProviderChatUIConfig = {
     return null;
   },
 
-  getPermissionModeToggle(): ProviderPermissionModeToggleConfig {
-    return getOpencodePermissionModeToggle();
+  getPermissionModeOptions() {
+    return getOpencodePermissionModeOptions();
+  },
+
+  getPermissionTransientModeLabel(value) {
+    return value === 'plan' ? t('chat.opencode.permission.plan') : null;
   },
 
   resolvePermissionMode(settings: Record<string, unknown>): string | null {

@@ -401,24 +401,31 @@ describe('CodexChatUIConfig', () => {
     });
   });
 
-  describe('getPermissionModeToggle', () => {
-    it('should return yolo/safe toggle config with plan mode', () => {
-      const toggle = codexChatUIConfig.getPermissionModeToggle!();
-      expect(toggle).toEqual({
-        inactiveValue: 'normal',
-        inactiveLabel: 'Safe',
-        activeValue: 'yolo',
-        activeLabel: 'YOLO',
-        planValue: 'plan',
-        planLabel: 'Plan',
+  describe('getPermissionModeOptions', () => {
+    it('should return the two-option Safe/YOLO menu with YOLO marked as bypassing', () => {
+      const options = codexChatUIConfig.getPermissionModeOptions!({});
+      expect(options).toEqual([
+        { value: 'normal', label: 'Safe' },
+        { value: 'yolo', label: 'YOLO', bypassesApprovals: true },
+      ]);
+    });
+
+    it('exposes the shared binary policy accepting plan only as a transient', () => {
+      expect(codexChatUIConfig.permissionModes).toEqual({
+        values: ['normal', 'yolo'],
+        defaultValue: 'normal',
+        fallbackValue: 'normal',
+        transientValues: ['plan'],
       });
+      expect(codexChatUIConfig.getPermissionTransientModeLabel?.('plan')).toBe('Plan');
+      expect(codexChatUIConfig.getPermissionTransientModeLabel?.('weird')).toBeNull();
     });
 
     it('resolves labels at call time so a locale switch is reflected immediately', () => {
       try {
         expect(setLocale('zh-CN')).toBe(true);
-        expect(codexChatUIConfig.getPermissionModeToggle!()?.inactiveLabel).toBe('安全');
         expect(codexChatUIConfig.getReasoningOptions(DEFAULT_CODEX_PRIMARY_MODEL, {})[0].label).toBe('低');
+        expect(codexChatUIConfig.getPermissionModeOptions!({})?.[0].label).toBe('安全');
       } finally {
         setLocale('en');
       }

@@ -10,7 +10,7 @@ import type {
   ChatTurnMetadata,
 } from '../../../core/runtime/types';
 import type { ImageAttachment, StreamChunk } from '../../../core/types';
-import type { PermissionMode } from '../../../core/types/settings';
+import type { ClaudeRuntimePermissionMode } from '../permissionModes';
 import type { TransformStreamState } from '../stream/toolInputStreamState';
 import type { TransformUsageState } from '../stream/transformClaudeMessage';
 import { createTransformStreamState, createTransformUsageState } from '../stream/transformClaudeMessage';
@@ -304,7 +304,7 @@ export interface PersistentQueryConfig {
   model: string | null;
   thinkingTokens: number | null;
   effortLevel: EffortLevel | null;
-  permissionMode: PermissionMode | null;
+  permissionMode: ClaudeRuntimePermissionMode | null;
   sdkPermissionMode: SDKPermissionMode | null;
   systemPromptKey: string;
   disallowedToolsKey: string;

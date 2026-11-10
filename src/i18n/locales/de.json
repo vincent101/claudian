@@ -189,6 +189,24 @@
       "noConversations": "No conversations to resume",
       "openFailed": "Failed to open conversation: {error}"
     },
+    "claude": {
+      "permission": {
+        "auto": "Auto",
+        "autoDesc": "Claude entscheidet über Berechtigungsanfragen",
+        "manual": "Manuell",
+        "manualDesc": "Vor jeder Änderung nachfragen",
+        "acceptEdits": "Bearbeitungen akzeptieren",
+        "acceptEditsDesc": "Dateibearbeitungen automatisch akzeptieren",
+        "yolo": "YOLO",
+        "yoloDesc": "Alle Berechtigungsanfragen überspringen",
+        "plan": "Plan",
+        "updateFailed": "Berechtigungsmodus konnte nicht aktualisiert werden. Die Nachricht wurde nicht gesendet."
+      }
+    },
+    "permission": {
+      "ariaLabel": "Berechtigungsmodus: {mode}",
+      "unavailable": "Nicht verfügbar"
+    },
     "codex": {
       "effort": {
         "low": "Low",
@@ -359,11 +377,7 @@
     "safety": "Sicherheit",
     "loadUserSettings": {
       "name": "Benutzer-Claude-Einstellungen laden",
-      "desc": "Lädt ~/.claude/settings.json. Wenn aktiviert, können Benutzer-Claude-Code-Berechtigungsregeln den Sicherheitsmodus umgehen."
-    },
-    "claudeSafeMode": {
-      "name": "Safe mode",
-      "desc": "Permission mode used when the Safe toggle is active."
+      "desc": "~/.claude/settings.json laden. Wenn aktiviert, können bestehende Benutzer-Berechtigungsregeln Genehmigungen überspringen."
     },
     "codexSafeMode": {
       "name": "Safe mode",
@@ -472,6 +486,9 @@
       "desc": "Anzeigesprache der Plugin-Oberfläche ändern"
     },
     "environmentReview": "Review environment ownership for: {keys}",
+    "claude": {
+      "configuration": "Konfiguration"
+    },
     "codex": {
       "enable": {
         "name": "Enable Codex provider",

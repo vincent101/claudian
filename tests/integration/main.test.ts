@@ -1,4 +1,5 @@
 
+import { ProviderSettingsCoordinator } from '@/core/providers/ProviderSettingsCoordinator';
 import { VIEW_TYPE_CLAUDIAN } from '@/core/types';
 import { DEFAULT_SETTINGS } from '@/providers/claude/types/settings';
 import { claudeChatUIConfig } from '@/providers/claude/ui/ClaudeChatUIConfig';
@@ -150,8 +151,59 @@ describe('ClaudianPlugin', () => {
       await plugin.onload();
 
       expect(plugin.settings).toBeDefined();
-      expect(plugin.settings.permissionMode).toBe(DEFAULT_SETTINGS.permissionMode);
+      // Fresh installs start Claude on Auto (#1482 port).
+      expect(plugin.settings.permissionMode).toBe('auto');
       expect(plugin.settings.hiddenProviderCommands).toEqual(DEFAULT_SETTINGS.hiddenProviderCommands);
+    });
+
+    it('seeds an unsaved provider with Safe, not the Claude default', async () => {
+      await plugin.onload();
+
+      const codexSnapshot = ProviderSettingsCoordinator.getProviderSettingsSnapshot(
+        plugin.settings as unknown as Record<string, unknown>,
+        'codex',
+      );
+      expect(codexSnapshot.permissionMode).toBe('normal');
+      const claudeSnapshot = ProviderSettingsCoordinator.getProviderSettingsSnapshot(
+        plugin.settings as unknown as Record<string, unknown>,
+        'claude',
+      );
+      expect(claudeSnapshot.permissionMode).toBe('auto');
+    });
+
+    it.each([
+      [{ permissionMode: 'yolo' }, 'yolo'],
+      [{ permissionMode: 'auto' }, 'auto'],
+      [{ permissionMode: 'manual' }, 'manual'],
+      [{ permissionMode: 'acceptEdits' }, 'acceptEdits'],
+      [{ permissionMode: 'normal', providerConfigs: { claude: { safeMode: 'auto' } } }, 'auto'],
+      [{ permissionMode: 'normal', providerConfigs: { claude: { safeMode: 'default' } } }, 'manual'],
+      [{ permissionMode: 'normal' }, 'acceptEdits'],
+      [{ permissionMode: 'plan' }, 'manual'],
+      [{ permissionMode: 'bogus' }, 'manual'],
+    ])('migrates stored %j to a durable Claude mode %s without a safeMode residue', async (raw, expected) => {
+      mockApp.vault.adapter.exists.mockImplementation(async (path: string) => (
+        path === '.claudian/claudian-settings.json'
+      ));
+      mockApp.vault.adapter.read.mockImplementation(async (path: string) => {
+        if (path === '.claudian/claudian-settings.json') {
+          return JSON.stringify(raw);
+        }
+        return '';
+      });
+      (plugin.loadData as jest.Mock).mockResolvedValue({});
+      (plugin.saveData as jest.Mock).mockResolvedValue(undefined);
+
+      await plugin.onload();
+
+      expect(plugin.settings.permissionMode).toBe(expected);
+      expect(plugin.settings.savedProviderPermissionMode.claude).toBe(expected);
+      const savedRaw = (plugin.saveData as jest.Mock).mock.calls.length > 0
+        ? JSON.stringify((plugin.saveData as jest.Mock).mock.calls.map(c => c[0]))
+        : '';
+      // No legacy Claude Safe residue survives the write-back.
+      expect(savedRaw).not.toContain('"safeMode"');
+      expect(savedRaw).not.toContain('claudeSafeMode');
     });
 
     // Note: With multi-tab, agentService is per-tab via TabManager, not on plugin
