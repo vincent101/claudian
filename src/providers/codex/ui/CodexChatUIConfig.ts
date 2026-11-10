@@ -21,14 +21,15 @@ import {
 
 // Render-time factories instead of module-level constants: labels must be
 // resolved through t() at call time so a locale switch is reflected without
-// reloading the plugin.
+// reloading the plugin. Effort labels are intentionally fixed English to
+// match Claude's built-in reasoning levels in every locale.
 
 function getEffortLevels(): ProviderReasoningOption[] {
   return [
-    { value: 'low', label: t('chat.codex.effort.low') },
-    { value: 'medium', label: t('chat.codex.effort.medium') },
-    { value: 'high', label: t('chat.codex.effort.high') },
-    { value: 'xhigh', label: t('chat.codex.effort.xhigh') },
+    { value: 'low', label: 'Low' },
+    { value: 'medium', label: 'Medium' },
+    { value: 'high', label: 'High' },
+    { value: 'xhigh', label: 'XHigh' },
   ];
 }
 
