@@ -1,31 +1,20 @@
 import '@/providers';
 
+import { EditorState, StateEffect } from '@codemirror/state';
+import { EditorView, type WidgetType } from '@codemirror/view';
 import { createMockEl } from '@test/helpers/mockElement';
+import { installObsidianDom } from '@test/helpers/obsidianDom';
+import { JSDOM } from 'jsdom';
 import { Notice } from 'obsidian';
 
 import { ProviderRegistry } from '@/core/providers/ProviderRegistry';
+import { ProviderWorkspaceRegistry } from '@/core/providers/ProviderWorkspaceRegistry';
 import { type InlineEditContext, InlineEditModal } from '@/features/inline-edit/ui/InlineEditModal';
+import { ClaudeCommandCatalog } from '@/providers/claude/commands/ClaudeCommandCatalog';
+import { SlashCommandDropdown } from '@/shared/components/SlashCommandDropdown';
+import { MentionDropdownController } from '@/shared/mention/MentionDropdownController';
 import { VaultFolderCache } from '@/shared/mention/VaultMentionCache';
 import * as editorUtils from '@/utils/editor';
-
-const mentionDropdownCtor = jest.fn();
-jest.mock('@/shared/mention/MentionDropdownController', () => ({
-  MentionDropdownController: function MockMentionDropdownController(...args: any[]) {
-    mentionDropdownCtor(...args);
-    return {
-      handleInputChange: jest.fn(),
-      handleKeydown: jest.fn().mockReturnValue(false),
-      destroy: jest.fn(),
-    };
-  },
-}));
-
-jest.mock('@/shared/components/SlashCommandDropdown', () => ({
-  SlashCommandDropdown: jest.fn().mockImplementation(() => ({
-    handleKeydown: jest.fn().mockReturnValue(false),
-    destroy: jest.fn(),
-  })),
-}));
 
 jest.mock('@/utils/externalContextScanner', () => ({
   externalContextScanner: {
@@ -161,8 +150,8 @@ describe('InlineEditModal - openAndWait', () => {
       const modal = new InlineEditModal(app, plugin, editor, view, editContext, 'note.md');
       const resultPromise = modal.openAndWait();
 
-      expect(mentionDropdownCtor).toHaveBeenCalled();
-      const callbacks = mentionDropdownCtor.mock.calls[0]?.[2];
+      expect(widgetRef.mentionDropdown).toBeDefined();
+      const callbacks = widgetRef.mentionDropdown.callbacks;
       expect(callbacks).toBeDefined();
       expect(callbacks.getCachedVaultFolders()).toEqual([{ name: 'src', path: 'src' }]);
       expect(getFoldersSpy).toHaveBeenCalledTimes(1);
@@ -260,9 +249,7 @@ describe('InlineEditModal - openAndWait', () => {
       const modal = new InlineEditModal(app, plugin, editor, view, editContext, 'note.md');
       const resultPromise = modal.openAndWait();
 
-      const { SlashCommandDropdown } = jest.requireMock('@/shared/components/SlashCommandDropdown');
-      const constructorCall = SlashCommandDropdown.mock.calls[0];
-      expect(Array.from(constructorCall[3].hiddenCommands)).toEqual(['analyze']);
+      expect(Array.from(widgetRef.slashCommandDropdown.hiddenCommands)).toEqual(['analyze']);
 
       widgetRef?.reject();
       await expect(resultPromise).resolves.toEqual({ decision: 'reject' });
@@ -487,7 +474,7 @@ describe('InlineEditModal - openAndWait', () => {
       );
       const resultPromise = modal.openAndWait();
 
-      const callbacks = mentionDropdownCtor.mock.calls[0]?.[2];
+      const callbacks = widgetRef.mentionDropdown.callbacks;
       expect(callbacks.getCachedVaultFiles()).toEqual([]);
       expect(callbacks.getCachedVaultFiles()).toEqual([]);
 
@@ -989,5 +976,920 @@ describe('InlineEditModal - openAndWait', () => {
     } finally {
       (global as any).document = originalDocument;
     }
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+describe('InlineEditModal - input DOM ownership', () => {
+  let dom: JSDOM;
+  let editorView: EditorView;
+  let controller: any;
+  let resultPromise: Promise<any>;
+  let catalog: ClaudeCommandCatalog;
+  let service: {
+    cancel: jest.Mock;
+    continueConversation: jest.Mock;
+    editText: jest.Mock;
+    resetConversation: jest.Mock;
+    setModelOverride: jest.Mock;
+  };
+  let registryListeners: Array<() => void>;
+  let unsubscribes: jest.Mock[];
+  let unsubscribeHook: ((index: number) => void) | null;
+  let addEventSpy: jest.SpyInstance;
+  let removeEventSpy: jest.SpyInstance;
+  let timeoutSpy: jest.SpyInstance;
+  let savedGlobals: Map<string, PropertyDescriptor | undefined>;
+
+  function makeCatalog(name: string): ClaudeCommandCatalog {
+    return new ClaudeCommandCatalog(
+      { loadAll: async () => [{ id: `vault:${name}`, name, content: '', source: 'user' }] } as any,
+      { loadAll: async () => [] } as any,
+    );
+  }
+
+  function findInputWidget(): WidgetType {
+    let inputWidget: WidgetType | null = null;
+    for (const decorations of editorView.state.facet(EditorView.decorations)) {
+      if (typeof decorations === 'function') continue;
+      decorations.between(0, editorView.state.doc.length, (_from, _to, decoration) => {
+        const candidate = decoration.spec.widget as WidgetType | undefined;
+        if (candidate && (candidate as any).controller === controller) inputWidget = candidate;
+      });
+    }
+    if (!inputWidget) throw new Error('CodeMirror input widget was not found');
+    return inputWidget;
+  }
+
+  function changeSelection(): void {
+    editorView.dispatch({ selection: { anchor: 1, head: 6 } });
+    editorView.dom.dispatchEvent(new dom.window.MouseEvent('mouseup', { bubbles: true }));
+  }
+
+  function listenersFor(target: EventTarget, type: string): EventListener[] {
+    return addEventSpy.mock.calls.flatMap((args, index) => {
+      const listener = args[1];
+      return addEventSpy.mock.contexts[index] === target && args[0] === type && typeof listener === 'function'
+        ? [listener as EventListener]
+        : [];
+    });
+  }
+
+  function removalsFor(target: EventTarget, type: string): number {
+    return removeEventSpy.mock.calls.filter((args, index) =>
+      removeEventSpy.mock.contexts[index] === target && args[0] === type
+    ).length;
+  }
+
+  function focusCallbacks(): Array<() => void> {
+    return timeoutSpy.mock.calls.flatMap(([callback, delay]) =>
+      delay === 50 && typeof callback === 'function' ? [callback as () => void] : []
+    );
+  }
+
+  async function flushMicrotasks(): Promise<void> {
+    for (let i = 0; i < 30; i++) await Promise.resolve();
+  }
+
+  beforeEach(() => {
+    jest.useFakeTimers();
+    dom = new JSDOM('<!doctype html><html><body></body></html>', { pretendToBeVisual: true });
+    const browser = dom.window;
+    const globals: Record<string, unknown> = {
+      document: browser.document,
+      DOMRect: browser.DOMRect,
+      Element: browser.Element,
+      Event: browser.Event,
+      EventTarget: browser.EventTarget,
+      getComputedStyle: browser.getComputedStyle.bind(browser),
+      HTMLElement: browser.HTMLElement,
+      KeyboardEvent: browser.KeyboardEvent,
+      MouseEvent: browser.MouseEvent,
+      MutationObserver: browser.MutationObserver,
+      navigator: browser.navigator,
+      Node: browser.Node,
+      Range: browser.Range,
+      ResizeObserver: undefined,
+      window: browser,
+      Window: browser.Window,
+    };
+    savedGlobals = new Map();
+    for (const [key, value] of Object.entries(globals)) {
+      savedGlobals.set(key, Object.getOwnPropertyDescriptor(globalThis, key));
+      Object.defineProperty(globalThis, key, { configurable: true, writable: true, value });
+    }
+    installObsidianDom();
+    browser.requestAnimationFrame = () => 1;
+    browser.cancelAnimationFrame = () => {};
+
+    addEventSpy = jest.spyOn(browser.EventTarget.prototype, 'addEventListener');
+    removeEventSpy = jest.spyOn(browser.EventTarget.prototype, 'removeEventListener');
+    timeoutSpy = jest.spyOn(globalThis, 'setTimeout');
+    registryListeners = [];
+    unsubscribes = [];
+    unsubscribeHook = null;
+
+    service = {
+      cancel: jest.fn(),
+      continueConversation: jest.fn(),
+      editText: jest.fn(),
+      resetConversation: jest.fn(),
+      setModelOverride: jest.fn(),
+    };
+    jest.spyOn(ProviderRegistry, 'createInlineEditService').mockReturnValue(service as any);
+    catalog = makeCatalog('inline-owner');
+    ProviderWorkspaceRegistry.setServices('claude', { commandCatalog: catalog } as any);
+    editorView = new EditorView({
+      state: EditorState.create({ doc: 'alpha beta\ngamma', selection: { anchor: 0, head: 5 } }),
+      parent: browser.document.body,
+    });
+    const editor = {
+      cm: editorView,
+      getCursor: (side: 'from' | 'to') => {
+        const position = editorView.state.selection.main[side];
+        const line = editorView.state.doc.lineAt(position);
+        return { line: line.number - 1, ch: position - line.from };
+      },
+      getSelection: () => {
+        const { from, to } = editorView.state.selection.main;
+        return editorView.state.sliceDoc(from, to);
+      },
+      replaceRange: jest.fn(),
+    } as any;
+    const app = {
+      vault: { adapter: { basePath: '/vault' }, getFiles: () => [], getAllLoadedFiles: () => [] },
+      workspace: {},
+    } as any;
+    const plugin = { settings: { hiddenProviderCommands: { claude: [], codex: [] } } } as any;
+    const modal = new InlineEditModal(
+      app, plugin, editor, { editor } as any, { mode: 'selection', selectedText: 'alpha' }, 'note.md'
+    );
+    resultPromise = modal.openAndWait();
+    controller = (modal as any).controller;
+  });
+
+  afterEach(async () => {
+    unsubscribeHook = null;
+    try {
+      controller?.reject();
+      editorView?.destroy();
+      await resultPromise?.catch(() => undefined);
+      ProviderWorkspaceRegistry.clear();
+    } finally {
+      jest.restoreAllMocks();
+      dom?.window.close();
+      for (const [key, descriptor] of savedGlobals ?? []) {
+        if (descriptor) Object.defineProperty(globalThis, key, descriptor);
+        else delete (globalThis as any)[key];
+      }
+      jest.clearAllTimers();
+      jest.useRealTimers();
+    }
+  });
+
+  it('replaces a real CodeMirror widget without leaving old dropdowns, listeners, or sessions', async () => {
+    const oldWidget = findInputWidget();
+    const oldRoot = controller.containerEl as HTMLElement;
+    const oldInput = controller.inputEl as HTMLInputElement;
+    const oldSlash = controller.slashCommandDropdown as SlashCommandDropdown;
+    const oldMention = controller.mentionDropdown as MentionDropdownController;
+    const oldSession = (oldSlash as any).session;
+    const release = jest.spyOn(oldSession, 'release');
+    const slashDestroy = jest.spyOn(oldSlash, 'destroy');
+    const mentionDestroy = jest.spyOn(oldMention, 'destroy');
+    const oldInputHandlers = listenersFor(oldInput, 'input');
+    const oldKeyHandlers = listenersFor(oldInput, 'keydown');
+    expect(oldInputHandlers).toHaveLength(2);
+    expect(oldKeyHandlers).toHaveLength(1);
+
+    oldInput.value = '/';
+    oldInput.setSelectionRange(1, 1);
+    oldInput.dispatchEvent(new dom.window.Event('input', { bubbles: true }));
+    await flushMicrotasks();
+    const oldSlashNode = document.querySelector<HTMLElement>('.claudian-slash-dropdown');
+    const oldItem = oldSlashNode?.querySelector<HTMLElement>('.claudian-slash-item');
+    expect(oldItem).toBeTruthy();
+    oldInput.value = '@';
+    oldInput.setSelectionRange(1, 1);
+    oldInput.dispatchEvent(new dom.window.Event('input', { bubbles: true }));
+    jest.advanceTimersByTime(200);
+    const oldMentionNode = document.querySelector<HTMLElement>('.claudian-mention-dropdown');
+    expect(oldMentionNode).toBeTruthy();
+    expect((catalog as any).activeSessions.size).toBe(1);
+
+    changeSelection();
+    const newRoot = controller.containerEl as HTMLElement;
+    const newInput = controller.inputEl as HTMLInputElement;
+    const newSlash = controller.slashCommandDropdown as SlashCommandDropdown;
+    const newMention = controller.mentionDropdown as MentionDropdownController;
+    expect(newRoot).not.toBe(oldRoot);
+    expect(newInput.value).toBe('');
+    expect(newInput.placeholder).toBe('Edit instructions...');
+    expect(oldRoot.isConnected).toBe(false);
+    expect(oldSlashNode?.isConnected).toBe(false);
+    expect(oldMentionNode?.isConnected).toBe(false);
+    expect(slashDestroy).toHaveBeenCalledTimes(1);
+    expect(mentionDestroy).toHaveBeenCalledTimes(1);
+    expect(release).toHaveBeenCalledTimes(1);
+    expect((oldSession as any).listeners.size).toBe(0);
+    expect(unsubscribes[0]).toHaveBeenCalledTimes(1);
+    expect(removalsFor(oldInput, 'keydown')).toBe(1);
+    expect(removalsFor(oldInput, 'input')).toBe(2);
+    expect((catalog as any).activeSessions.size).toBe(1);
+
+    const newSlashDestroy = jest.spyOn(newSlash, 'destroy');
+    const rebindNew = jest.spyOn(newSlash, 'setProviderCatalog');
+    const newMentionInput = jest.spyOn(newMention, 'handleInputChange');
+    const newMentionKey = jest.spyOn(newMention, 'handleKeydown');
+    const newSlashKey = jest.spyOn(newSlash, 'handleKeydown');
+    newInput.value = 'keep this input';
+    oldWidget.destroy(oldRoot);
+    oldWidget.destroy(oldRoot);
+    oldWidget.destroy(document.createElement('div'));
+    registryListeners[0]();
+    for (const listener of oldInputHandlers) listener.call(oldInput, new dom.window.Event('input'));
+    for (const listener of oldKeyHandlers) {
+      listener.call(oldInput, new dom.window.KeyboardEvent('keydown', { key: 'Enter', cancelable: true }));
+    }
+    oldInput.dispatchEvent(new dom.window.Event('input'));
+    oldItem?.click();
+    expect(newSlashDestroy).not.toHaveBeenCalled();
+    expect(rebindNew).not.toHaveBeenCalled();
+    expect(newMentionInput).not.toHaveBeenCalled();
+    expect(newMentionKey).not.toHaveBeenCalled();
+    expect(newSlashKey).not.toHaveBeenCalled();
+    expect(service.editText).not.toHaveBeenCalled();
+    expect(newInput.value).toBe('keep this input');
+    expect(unsubscribes[1]).not.toHaveBeenCalled();
+
+    ProviderWorkspaceRegistry.setServices('claude', { commandCatalog: makeCatalog('replacement') } as any);
+    expect(rebindNew).toHaveBeenCalledTimes(1);
+    expect(service.cancel).not.toHaveBeenCalled();
+  });
+
+  it('does not let reentrant destruction of the old widget dispose a new owner', () => {
+    const oldWidget = findInputWidget();
+    const oldRoot = controller.containerEl as HTMLElement;
+    const oldSlash = controller.slashCommandDropdown as SlashCommandDropdown;
+    const oldMention = controller.mentionDropdown as MentionDropdownController;
+    const oldSlashDestroy = jest.spyOn(oldSlash, 'destroy');
+    const oldMentionDestroy = jest.spyOn(oldMention, 'destroy');
+    let newRoot: HTMLElement | null = null;
+    unsubscribeHook = (index) => {
+      if (index !== 0) return;
+      unsubscribeHook = null;
+      newRoot = controller.createInputDOM();
+    };
+
+    oldWidget.destroy(oldRoot);
+    expect(newRoot).not.toBeNull();
+    expect(editorView.dom.contains(oldRoot)).toBe(true);
+    expect(controller.containerEl).toBe(newRoot);
+    expect(oldSlashDestroy).toHaveBeenCalledTimes(1);
+    expect(oldMentionDestroy).toHaveBeenCalledTimes(1);
+    expect(unsubscribes[0]).toHaveBeenCalledTimes(1);
+    expect(unsubscribes[1]).not.toHaveBeenCalled();
+    const newSlash = controller.slashCommandDropdown as SlashCommandDropdown;
+    const newDestroy = jest.spyOn(newSlash, 'destroy');
+    const newSession = (newSlash as any).session;
+    expect((catalog as any).activeSessions.has(newSession)).toBe(true);
+    oldWidget.destroy(oldRoot);
+    expect(newDestroy).not.toHaveBeenCalled();
+    expect(controller.containerEl).toBe(newRoot);
+    expect(service.cancel).not.toHaveBeenCalled();
+  });
+
+  it('removes global listeners before disposing the owner and cleans up only once', async () => {
+    const oldWidget = findInputWidget();
+    const oldRoot = controller.containerEl as HTMLElement;
+    const oldInput = controller.inputEl as HTMLInputElement;
+    const slashDestroy = jest.spyOn(controller.slashCommandDropdown, 'destroy');
+    const mentionDestroy = jest.spyOn(controller.mentionDropdown, 'destroy');
+    const documentRemove = jest.spyOn(document, 'removeEventListener');
+    const viewRemove = jest.spyOn(editorView.dom, 'removeEventListener');
+    const dispatch = jest.spyOn(editorView, 'dispatch');
+
+    controller.reject();
+    await expect(resultPromise).resolves.toEqual({ decision: 'reject' });
+    const dispatchCount = dispatch.mock.calls.length;
+    controller.cleanup();
+    controller.reject();
+    oldWidget.destroy(oldRoot);
+    expect(dispatch).toHaveBeenCalledTimes(dispatchCount);
+    expect(service.cancel).toHaveBeenCalledTimes(1);
+    expect(service.resetConversation).toHaveBeenCalledTimes(1);
+    expect(unsubscribes[0]).toHaveBeenCalledTimes(1);
+    expect(slashDestroy).toHaveBeenCalledTimes(1);
+    expect(mentionDestroy).toHaveBeenCalledTimes(1);
+    expect(removalsFor(oldInput, 'keydown')).toBe(1);
+    expect(removalsFor(oldInput, 'input')).toBe(2);
+    expect(documentRemove.mock.invocationCallOrder[0]).toBeLessThan(unsubscribes[0].mock.invocationCallOrder[0]);
+    expect(viewRemove.mock.invocationCallOrder[0]).toBeLessThan(unsubscribes[0].mock.invocationCallOrder[0]);
+    expect(unsubscribes[0].mock.invocationCallOrder[0]).toBeLessThan(slashDestroy.mock.invocationCallOrder[0]);
+    expect(mentionDestroy.mock.invocationCallOrder[0]).toBeLessThan(service.cancel.mock.invocationCallOrder[0]);
+    expect(service.cancel.mock.invocationCallOrder[0]).toBeLessThan(service.resetConversation.mock.invocationCallOrder[0]);
+  });
+
+  it('releases the partial owner when catalog setup fails before subscription', () => {
+    const oldRoot = controller.containerEl as HTMLElement;
+    const slashDestroy = jest.spyOn(SlashCommandDropdown.prototype, 'destroy');
+    const mentionDestroy = jest.spyOn(MentionDropdownController.prototype, 'destroy');
+    const failure = new Error('catalog configuration failed');
+    jest.spyOn(catalog, 'getDropdownConfig').mockImplementationOnce(() => { throw failure; });
+
+    expect(() => controller.createInputDOM()).toThrow(failure);
+    expect(editorView.dom.contains(oldRoot)).toBe(true);
+    expect(unsubscribes).toHaveLength(1);
+    expect(unsubscribes[0]).toHaveBeenCalledTimes(1);
+    expect(slashDestroy).toHaveBeenCalledTimes(2);
+    expect(mentionDestroy).toHaveBeenCalledTimes(1);
+    expect((catalog as any).activeSessions.size).toBe(0);
+    expect(controller.containerEl).toBeNull();
+    expect(controller.inputEl).toBeNull();
+    expect(service.cancel).not.toHaveBeenCalled();
+  });
+
+  it('releases acquired resources and rethrows the original construction error', () => {
+    const oldRoot = controller.containerEl as HTMLElement;
+    const slashDestroy = jest.spyOn(SlashCommandDropdown.prototype, 'destroy');
+    const mentionDestroy = jest.spyOn(MentionDropdownController.prototype, 'destroy');
+    const failure = new Error('focus timer unavailable');
+    unsubscribeHook = (index) => {
+      if (index === 1) throw new Error('unsubscribe failed');
+    };
+    timeoutSpy.mockImplementationOnce(() => { throw failure; });
+
+    expect(() => controller.createInputDOM()).toThrow(failure);
+    expect(editorView.dom.contains(oldRoot)).toBe(true);
+    expect(unsubscribes).toHaveLength(2);
+    expect(unsubscribes[0]).toHaveBeenCalledTimes(1);
+    expect(unsubscribes[1]).toHaveBeenCalledTimes(1);
+    expect(slashDestroy).toHaveBeenCalledTimes(2);
+    expect(mentionDestroy).toHaveBeenCalledTimes(2);
+    expect((catalog as any).activeSessions.size).toBe(0);
+    expect(controller.containerEl).toBeNull();
+    expect(controller.inputEl).toBeNull();
+    const inputs = addEventSpy.mock.calls.flatMap((args, index) => {
+      const target = addEventSpy.mock.contexts[index];
+      return args[0] === 'keydown' && target instanceof dom.window.HTMLInputElement ? [target] : [];
+    });
+    expect(inputs).toHaveLength(2);
+    expect(removalsFor(inputs[1], 'keydown')).toBe(1);
+    expect(removalsFor(inputs[1], 'input')).toBe(2);
+    expect(service.cancel).not.toHaveBeenCalled();
+  });
+
+  it('focuses only the live input and suppresses canceled or stale focus callbacks', () => {
+    const oldInput = controller.inputEl as HTMLInputElement;
+    const oldFocus = jest.spyOn(oldInput, 'focus');
+    const oldCallback = focusCallbacks()[0];
+    jest.advanceTimersByTime(20);
+    changeSelection();
+    const newInput = controller.inputEl as HTMLInputElement;
+    const newFocus = jest.spyOn(newInput, 'focus');
+    jest.advanceTimersByTime(30);
+    expect(oldFocus).not.toHaveBeenCalled();
+    expect(newFocus).not.toHaveBeenCalled();
+    oldCallback();
+    expect(oldFocus).not.toHaveBeenCalled();
+    expect(newFocus).not.toHaveBeenCalled();
+    jest.advanceTimersByTime(20);
+    expect(newFocus).toHaveBeenCalledTimes(1);
+    expect(document.activeElement).toBe(newInput);
+
+    const replacement = controller.createInputDOM() as HTMLElement;
+    const replacementInput = replacement.querySelector('input') as HTMLInputElement;
+    const replacementFocus = jest.spyOn(replacementInput, 'focus');
+    const replacementCallback = focusCallbacks().at(-1)!;
+    controller.reject();
+    replacementCallback();
+    jest.advanceTimersByTime(50);
+    expect(replacementFocus).not.toHaveBeenCalled();
+  });
+
+  it('preserves the cursor placeholder and autofocus after a real widget redraw', async () => {
+    const previous = controller;
+    previous.reject();
+    await resultPromise;
+    const editor = previous.editor;
+    const modal = new InlineEditModal(
+      previous.app,
+      previous.plugin,
+      editor,
+      { editor } as any,
+      {
+        mode: 'cursor',
+        cursorContext: { beforeCursor: '', afterCursor: '', isInbetween: true, line: 1, column: 0 },
+      },
+      'note.md',
+    );
+    resultPromise = modal.openAndWait();
+    controller = (modal as any).controller;
+    const oldInput = controller.inputEl as HTMLInputElement;
+    controller.updateHighlight();
+    const newInput = controller.inputEl as HTMLInputElement;
+    expect(newInput).not.toBe(oldInput);
+    expect(newInput.value).toBe('');
+    expect(newInput.placeholder).toBe('Insert instructions...');
+    jest.advanceTimersByTime(50);
+    expect(document.activeElement).toBe(newInput);
+  });
+
+  it.each([
+    ['edit', { success: true, editedText: 'late edit' }],
+    ['insertion', { success: true, insertedText: 'late insertion' }],
+    ['clarification', { success: true, clarification: 'late clarification' }],
+    ['error', { success: false, error: 'late error' }],
+  ])('ignores a late %s result after terminal cleanup', async (_label, result) => {
+    let complete!: (value: any) => void;
+    service.editText.mockReturnValue(new Promise(resolve => { complete = resolve; }));
+    const oldInput = controller.inputEl as HTMLInputElement;
+    const oldSpinner = controller.spinnerEl as HTMLElement;
+    const dispatch = jest.spyOn(editorView, 'dispatch');
+    oldInput.value = 'edit this';
+    const generation = controller.generate() as Promise<void>;
+    expect(service.editText).toHaveBeenCalledTimes(1);
+    expect(oldSpinner.style.display).toBe('block');
+    controller.reject();
+    await expect(resultPromise).resolves.toEqual({ decision: 'reject' });
+    const dispatchCount = dispatch.mock.calls.length;
+
+    complete(result);
+    await expect(generation).resolves.toBeUndefined();
+    expect(dispatch).toHaveBeenCalledTimes(dispatchCount);
+    expect(oldInput.disabled).toBe(true);
+    expect(oldSpinner.style.display).toBe('block');
+    expect(editorView.dom.querySelector('.claudian-inline-input-container')).toBeNull();
+    expect(editorView.dom.querySelector('.claudian-inline-diff-replace')).toBeNull();
+    expect(service.cancel).toHaveBeenCalledTimes(1);
+    expect(service.resetConversation).toHaveBeenCalledTimes(1);
+  });
+
+  it('retains the existing fresh-input behavior after a live edit error', async () => {
+    service.editText.mockResolvedValue({ success: false, error: 'Try again' });
+    const oldRoot = controller.containerEl as HTMLElement;
+    (controller.inputEl as HTMLInputElement).value = 'failed instruction';
+
+    await controller.generate();
+    const newRoot = controller.containerEl as HTMLElement;
+    const newInput = controller.inputEl as HTMLInputElement;
+    expect(newRoot).not.toBe(oldRoot);
+    expect(oldRoot.isConnected).toBe(false);
+    expect(newInput.value).toBe('');
+    expect(newInput.placeholder).toBe('Edit instructions...');
+    expect(newInput.disabled).toBe(false);
+    expect(document.activeElement).toBe(newInput);
+    expect(service.cancel).not.toHaveBeenCalled();
+    expect(service.resetConversation).not.toHaveBeenCalled();
+    changeSelection();
+    expect(controller.inputEl).not.toBe(newInput);
+    expect((catalog as any).activeSessions.size).toBe(1);
+  });
+
+  it('keeps a live clarification and successful edit working after the input widget is destroyed', async () => {
+    service.editText.mockResolvedValue({ success: true, clarification: 'Need more detail' });
+    service.continueConversation.mockResolvedValue({ success: true, editedText: 'refined' });
+    const oldRoot = controller.containerEl as HTMLElement;
+    const input = controller.inputEl as HTMLInputElement;
+    input.value = 'edit this';
+
+    await controller.generate();
+    expect(input.disabled).toBe(false);
+    expect(input.value).toBe('');
+    expect(input.placeholder).toBe('Reply to continue...');
+    expect(oldRoot.querySelector('.claudian-inline-agent-reply')?.textContent).toBe('Need more detail');
+    input.value = 'add detail';
+    await controller.generate();
+
+    expect(service.continueConversation).toHaveBeenCalledWith('add detail', []);
+    expect(oldRoot.isConnected).toBe(false);
+    expect(editorView.dom.querySelector('.claudian-inline-diff-replace')).not.toBeNull();
+    expect((catalog as any).activeSessions.size).toBe(0);
+    expect(service.cancel).not.toHaveBeenCalled();
+    expect(service.resetConversation).not.toHaveBeenCalled();
+    controller.accept();
+    await expect(resultPromise).resolves.toEqual({ decision: 'accept', editedText: 'refined' });
+    expect(controller.editor.replaceRange).toHaveBeenCalledTimes(1);
+    expect(service.cancel).toHaveBeenCalledTimes(1);
+    expect(service.resetConversation).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not apply a late result to a replacement DOM or cancel the service', async () => {
+    let complete!: (value: any) => void;
+    service.editText.mockReturnValue(new Promise(resolve => { complete = resolve; }));
+    const oldWidget = findInputWidget();
+    const oldRoot = controller.containerEl as HTMLElement;
+    const oldInput = controller.inputEl as HTMLInputElement;
+    oldInput.value = 'edit this';
+    const generation = controller.generate() as Promise<void>;
+    const newRoot = oldWidget.toDOM(editorView);
+    const newInput = newRoot.querySelector('input') as HTMLInputElement;
+    const newReply = newRoot.querySelector<HTMLElement>('.claudian-inline-agent-reply')!;
+    newInput.value = 'keep the new draft';
+    oldWidget.destroy(oldRoot);
+
+    complete({ success: true, clarification: 'late clarification' });
+    await expect(generation).resolves.toBeUndefined();
+    expect(controller.containerEl).toBe(newRoot);
+    expect(newInput.value).toBe('keep the new draft');
+    expect(newInput.placeholder).toBe('Edit instructions...');
+    expect(newInput.disabled).toBe(false);
+    expect(newReply.style.display).toBe('none');
+    expect(service.cancel).not.toHaveBeenCalled();
+    expect(service.resetConversation).not.toHaveBeenCalled();
+  });
+
+  // ─────────────────────────────────────────────────────────────────────────────
+  // Owner lifetime: the controller is bound to the real CM editor/extension
+  // owner (a per-controller ViewPlugin), not to widget destruction. Direct
+  // editorView.destroy() must end the controller in every phase (input,
+  // pending, diff) with no editor write, while selection rebuilds and
+  // input→diff transitions must not terminate it.
+  // ─────────────────────────────────────────────────────────────────────────────
+  describe('owner lifetime', () => {
+    function documentKeydownRemovals(): number {
+      return removeEventSpy.mock.calls.filter((args, index) =>
+        removeEventSpy.mock.contexts[index] === document && args[0] === 'keydown'
+      ).length;
+    }
+
+    it('terminates the controller when the view is destroyed while the input is open', async () => {
+      const slashDestroy = jest.spyOn(controller.slashCommandDropdown, 'destroy');
+      const mentionDestroy = jest.spyOn(controller.mentionDropdown, 'destroy');
+      const dispatch = jest.spyOn(editorView, 'dispatch');
+      const removalsBefore = documentKeydownRemovals();
+
+      editorView.destroy();
+      // The shared afterEach destroys the view again; keep that second call inert.
+      editorView.destroy = () => {};
+
+      await expect(resultPromise).resolves.toEqual({ decision: 'reject' });
+      expect(service.cancel).toHaveBeenCalledTimes(1);
+      expect(service.resetConversation).toHaveBeenCalledTimes(1);
+      expect(unsubscribes[0]).toHaveBeenCalledTimes(1);
+      expect(slashDestroy).toHaveBeenCalledTimes(1);
+      expect(mentionDestroy).toHaveBeenCalledTimes(1);
+      // Escape listener released, no editor write past the destroyed view.
+      expect(documentKeydownRemovals()).toBe(removalsBefore + 1);
+      expect(dispatch).not.toHaveBeenCalled();
+    });
+
+    it('terminates a pending generation when the view is destroyed', async () => {
+      let complete!: (value: any) => void;
+      service.editText.mockReturnValue(new Promise(resolve => { complete = resolve; }));
+      const input = controller.inputEl as HTMLInputElement;
+      input.value = 'edit this';
+      const generation = controller.generate() as Promise<void>;
+
+      editorView.destroy();
+      // The shared afterEach destroys the view again; keep that second call inert.
+      editorView.destroy = () => {};
+
+      await expect(resultPromise).resolves.toEqual({ decision: 'reject' });
+      expect(service.cancel).toHaveBeenCalledTimes(1);
+      expect(service.resetConversation).toHaveBeenCalledTimes(1);
+
+      complete({ success: true, editedText: 'late edit' });
+      await expect(generation).resolves.toBeUndefined();
+      expect(service.resetConversation).toHaveBeenCalledTimes(1);
+    });
+
+    it('terminates a diff view when the view is destroyed without accepting', async () => {
+      service.editText.mockResolvedValue({ success: true, editedText: 'edited' });
+      const input = controller.inputEl as HTMLInputElement;
+      input.value = 'edit this';
+      await controller.generate();
+      expect(editorView.dom.querySelector('.claudian-inline-diff-replace')).not.toBeNull();
+      const replaceRange = controller.editor.replaceRange;
+
+      editorView.destroy();
+      // The shared afterEach destroys the view again; keep that second call inert.
+      editorView.destroy = () => {};
+
+      await expect(resultPromise).resolves.toEqual({ decision: 'reject' });
+      expect(replaceRange).not.toHaveBeenCalled();
+      expect(service.cancel).toHaveBeenCalledTimes(1);
+      expect(service.resetConversation).toHaveBeenCalledTimes(1);
+    });
+
+    it('does not terminate on selection rebuilds or input-to-diff transitions', async () => {
+      changeSelection();
+      expect(service.cancel).not.toHaveBeenCalled();
+      let settled = false;
+      resultPromise.then(() => { settled = true; });
+      await flushMicrotasks();
+      expect(settled).toBe(false);
+
+      service.editText.mockResolvedValue({ success: true, editedText: 'edited' });
+      const input = controller.inputEl as HTMLInputElement;
+      input.value = 'edit this';
+      await controller.generate();
+      expect(editorView.dom.querySelector('.claudian-inline-diff-replace')).not.toBeNull();
+      expect(service.cancel).not.toHaveBeenCalled();
+
+      controller.accept();
+      await expect(resultPromise).resolves.toEqual({ decision: 'accept', editedText: 'edited' });
+    });
+
+    it('clears the active controller so a fresh open is not auto-rejected after view destruction', async () => {
+      editorView.destroy();
+      await expect(resultPromise).resolves.toEqual({ decision: 'reject' });
+
+      const modal = new InlineEditModal(
+        controller.app, controller.plugin, controller.editor,
+        { editor: controller.editor } as any,
+        { mode: 'selection', selectedText: 'alpha' }, 'note.md',
+      );
+      const secondPromise = modal.openAndWait();
+      let settled = false;
+      secondPromise.then(() => { settled = true; });
+      await flushMicrotasks();
+      expect(settled).toBe(false);
+
+      (modal as any).controller.reject();
+      await expect(secondPromise).resolves.toEqual({ decision: 'reject' });
+    });
+
+    it('a view destroy terminates the newer controller via its live owner, leaving the stale owner inert', async () => {
+      const first = controller;
+      const firstCancel = service.cancel;
+      first.reject();
+      await resultPromise;
+      expect(firstCancel).toHaveBeenCalledTimes(1);
+
+      // The second session gets its own service stub so termination counts
+      // stay attributable per controller.
+      const secondService = {
+        cancel: jest.fn(),
+        continueConversation: jest.fn(),
+        editText: jest.fn(),
+        resetConversation: jest.fn(),
+        setModelOverride: jest.fn(),
+      };
+      jest.spyOn(ProviderRegistry, 'createInlineEditService').mockReturnValue(secondService as any);
+
+      const modal = new InlineEditModal(
+        first.app, first.plugin, first.editor,
+        { editor: first.editor } as any,
+        { mode: 'selection', selectedText: 'alpha' }, 'note.md',
+      );
+      const secondPromise = modal.openAndWait();
+      const second = (modal as any).controller;
+      const slashDestroy = jest.spyOn(second.slashCommandDropdown, 'destroy');
+      const mentionDestroy = jest.spyOn(second.mentionDropdown, 'destroy');
+
+      editorView.destroy();
+      // The shared afterEach destroys the view again; keep that second call inert.
+      editorView.destroy = () => {};
+
+      await expect(secondPromise).resolves.toEqual({ decision: 'reject' });
+      // The stale owner did not re-terminate the first controller.
+      expect(firstCancel).toHaveBeenCalledTimes(1);
+      expect(service.resetConversation).toHaveBeenCalledTimes(1);
+      // The live owner did terminate the newer controller exactly once.
+      expect(secondService.cancel).toHaveBeenCalledTimes(1);
+      expect(secondService.resetConversation).toHaveBeenCalledTimes(1);
+      expect(slashDestroy).toHaveBeenCalledTimes(1);
+      expect(mentionDestroy).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  // ─────────────────────────────────────────────────────────────────────────────
+  // Reinstall and bounded accumulation. A setState drops every extension the
+  // modal appended, so the next open on the same view must reinstall the
+  // field + owner from the live state and stay bounded: repeated open/reject
+  // cycles on one live view must never append further config.
+  // ─────────────────────────────────────────────────────────────────────────────
+  describe('owner reinstall and bounded accumulation', () => {
+    it('reinstalls the field and owner after a setState so the input reappears on the same view', async () => {
+      expect(editorView.dom.querySelector('.claudian-inline-input-container')).not.toBeNull();
+
+      // setState swaps the whole state: every appended extension (field and
+      // owner plugin) is dropped and the owner plugin's destroy fires.
+      editorView.setState(EditorState.create({ doc: 'alpha beta\ngamma', selection: { anchor: 0, head: 5 } }));
+
+      await expect(resultPromise).resolves.toEqual({ decision: 'reject' });
+      expect(service.cancel).toHaveBeenCalledTimes(1);
+      expect(service.resetConversation).toHaveBeenCalledTimes(1);
+      expect(editorView.dom.querySelector('.claudian-inline-input-container')).toBeNull();
+
+      const secondService = {
+        cancel: jest.fn(),
+        continueConversation: jest.fn(),
+        editText: jest.fn(),
+        resetConversation: jest.fn(),
+        setModelOverride: jest.fn(),
+      };
+      jest.spyOn(ProviderRegistry, 'createInlineEditService').mockReturnValue(secondService as any);
+
+      const modal = new InlineEditModal(
+        controller.app, controller.plugin, controller.editor,
+        { editor: controller.editor } as any,
+        { mode: 'selection', selectedText: 'alpha' }, 'note.md',
+      );
+      const secondPromise = modal.openAndWait();
+      const second = (modal as any).controller;
+
+      // The reopened session renders its input: the dropped field was
+      // reinstalled and consumed the show effect.
+      expect(editorView.dom.querySelector('.claudian-inline-input-container')).not.toBeNull();
+
+      // The reopened controller completes a full input → diff → accept cycle.
+      secondService.editText.mockResolvedValue({ success: true, editedText: 'edited' });
+      const input = second.inputEl as HTMLInputElement;
+      input.value = 'edit this';
+      await second.generate();
+      expect(editorView.dom.querySelector('.claudian-inline-diff-replace')).not.toBeNull();
+
+      second.accept();
+      await expect(secondPromise).resolves.toEqual({ decision: 'accept', editedText: 'edited' });
+      expect(controller.editor.replaceRange).toHaveBeenCalledWith('edited', { line: 0, ch: 0 }, { line: 0, ch: 5 });
+    });
+
+    it('keeps owner installation bounded across repeated open/reject cycles on one view', async () => {
+      controller.reject();
+      await resultPromise;
+
+      const dispatch = jest.spyOn(editorView, 'dispatch');
+      const appendConfigEffects = (): number => dispatch.mock.calls.reduce(
+        (sum: number, call: any) => {
+          const spec: any = call[0];
+          const effects = Array.isArray(spec?.effects)
+            ? spec.effects
+            : spec?.effects
+              ? [spec.effects]
+              : [];
+          return sum + effects.filter((effect: any) => effect?.is?.(StateEffect.appendConfig)).length;
+        },
+        0,
+      );
+
+      jest.spyOn(ProviderRegistry, 'createInlineEditService').mockImplementation(() => ({
+        cancel: jest.fn(),
+        continueConversation: jest.fn(),
+        editText: jest.fn(),
+        resetConversation: jest.fn(),
+        setModelOverride: jest.fn(),
+      } as any));
+
+      for (let cycle = 0; cycle < 3; cycle++) {
+        const modal = new InlineEditModal(
+          controller.app, controller.plugin, controller.editor,
+          { editor: controller.editor } as any,
+          { mode: 'selection', selectedText: 'alpha' }, 'note.md',
+        );
+        const cyclePromise = modal.openAndWait();
+
+        // Each reopen renders exactly one input: the field is not duplicated
+        // and the current controller is rebound through the live owner.
+        expect(editorView.dom.querySelectorAll('.claudian-inline-input-container')).toHaveLength(1);
+
+        (modal as any).controller.reject();
+        await cyclePromise;
+
+        // Bounded: repeated opens on a live view append no further config,
+        // so terminal owner closures cannot accumulate on the view.
+        expect(appendConfigEffects()).toBe(0);
+      }
+    });
+  });
+
+  // ─────────────────────────────────────────────────────────────────────────────
+  // Teardown fault isolation: cleanup revokes eligibility first, then runs
+  // each teardown responsibility independently. A throwing step must not
+  // abort the remaining ones, must surface through Notice, and the promise
+  // must still settle exactly once. Assertions target the responsibilities
+  // that run after the fault, not resource state before it.
+  // ─────────────────────────────────────────────────────────────────────────────
+  describe('teardown fault isolation', () => {
+    async function openSecondSession(): Promise<{ second: any; secondPromise: Promise<any> }> {
+      const modal = new InlineEditModal(
+        controller.app, controller.plugin, controller.editor,
+        { editor: controller.editor } as any,
+        { mode: 'selection', selectedText: 'alpha' }, 'note.md',
+      );
+      const secondPromise = modal.openAndWait();
+      return { second: (modal as any).controller, secondPromise };
+    }
+
+    it('continues teardown and settles when the registry unsubscribe throws', async () => {
+      const noticeMock = Notice as unknown as jest.Mock;
+      noticeMock.mockClear();
+      const slashDestroy = jest.spyOn(controller.slashCommandDropdown, 'destroy');
+      const mentionDestroy = jest.spyOn(controller.mentionDropdown, 'destroy');
+      const dispatch = jest.spyOn(editorView, 'dispatch');
+      unsubscribeHook = () => { throw new Error('unsubscribe failed'); };
+
+      controller.reject();
+
+      await expect(resultPromise).resolves.toEqual({ decision: 'reject' });
+      expect(noticeMock).toHaveBeenCalledWith(expect.stringContaining('unsubscribe failed'));
+      // Responsibilities after the fault still ran.
+      expect(slashDestroy.mock.invocationCallOrder[0]).toBeGreaterThan(unsubscribes[0].mock.invocationCallOrder[0]);
+      expect(mentionDestroy).toHaveBeenCalledTimes(1);
+      expect(service.cancel).toHaveBeenCalledTimes(1);
+      expect(service.resetConversation).toHaveBeenCalledTimes(1);
+      expect(dispatch).toHaveBeenCalled();
+      expect(document.querySelector('.claudian-inline-input-container')).toBeNull();
+
+      const { secondPromise } = await openSecondSession();
+      let settled = false;
+      secondPromise.then(() => { settled = true; });
+      await flushMicrotasks();
+      expect(settled).toBe(false);
+      controller.reject();
+    });
+
+    it('continues teardown and settles when the mention dropdown destroy throws', async () => {
+      const noticeMock = Notice as unknown as jest.Mock;
+      noticeMock.mockClear();
+      const slashDestroy = jest.spyOn(controller.slashCommandDropdown, 'destroy');
+      jest.spyOn(controller.mentionDropdown, 'destroy')
+        .mockImplementation(() => { throw new Error('mention destroy failed'); });
+      const dispatch = jest.spyOn(editorView, 'dispatch');
+
+      controller.reject();
+
+      await expect(resultPromise).resolves.toEqual({ decision: 'reject' });
+      expect(noticeMock).toHaveBeenCalledWith(expect.stringContaining('mention destroy failed'));
+      expect(slashDestroy).toHaveBeenCalledTimes(1);
+      expect(unsubscribes[0]).toHaveBeenCalledTimes(1);
+      expect(service.cancel).toHaveBeenCalledTimes(1);
+      expect(service.resetConversation).toHaveBeenCalledTimes(1);
+      expect(dispatch).toHaveBeenCalled();
+      expect(document.querySelector('.claudian-inline-input-container')).toBeNull();
+    });
+
+    it('continues teardown and settles when cancel throws', async () => {
+      const noticeMock = Notice as unknown as jest.Mock;
+      noticeMock.mockClear();
+      service.cancel.mockImplementationOnce(() => { throw new Error('cancel failed'); });
+      const dispatch = jest.spyOn(editorView, 'dispatch');
+
+      controller.reject();
+
+      await expect(resultPromise).resolves.toEqual({ decision: 'reject' });
+      expect(noticeMock).toHaveBeenCalledWith(expect.stringContaining('cancel failed'));
+      expect(service.resetConversation).toHaveBeenCalledTimes(1);
+      expect(unsubscribes[0]).toHaveBeenCalledTimes(1);
+      expect(dispatch).toHaveBeenCalled();
+      expect(document.querySelector('.claudian-inline-input-container')).toBeNull();
+    });
+
+    it('continues teardown and settles when resetConversation throws', async () => {
+      const noticeMock = Notice as unknown as jest.Mock;
+      noticeMock.mockClear();
+      service.resetConversation.mockImplementationOnce(() => { throw new Error('reset failed'); });
+      const dispatch = jest.spyOn(editorView, 'dispatch');
+
+      controller.reject();
+
+      await expect(resultPromise).resolves.toEqual({ decision: 'reject' });
+      expect(noticeMock).toHaveBeenCalledWith(expect.stringContaining('reset failed'));
+      expect(service.cancel).toHaveBeenCalledTimes(1);
+      expect(unsubscribes[0]).toHaveBeenCalledTimes(1);
+      expect(dispatch).toHaveBeenCalled();
+      expect(document.querySelector('.claudian-inline-input-container')).toBeNull();
+    });
+
+    it('keeps destroying subsequent owners when an owner teardown throws on rebuild', async () => {
+      const noticeMock = Notice as unknown as jest.Mock;
+      noticeMock.mockClear();
+      const input = controller.inputEl as HTMLInputElement;
+
+      const failingDestroy = jest.spyOn(controller.mentionDropdown, 'destroy')
+        .mockImplementation(() => { throw new Error('mention destroy failed'); });
+
+      changeSelection();
+
+      // The old owner's teardown fault must not take down the fresh owner.
+      expect(controller.containerEl).not.toBeNull();
+      expect(failingDestroy).toHaveBeenCalledTimes(1);
+      expect(noticeMock).toHaveBeenCalledWith(expect.stringContaining('mention destroy failed'));
+      const freshMention = controller.mentionDropdown as MentionDropdownController;
+      const freshDestroy = jest.spyOn(freshMention, 'destroy');
+
+      controller.reject();
+      await expect(resultPromise).resolves.toEqual({ decision: 'reject' });
+      expect(freshDestroy).toHaveBeenCalledTimes(1);
+      expect(service.cancel).toHaveBeenCalledTimes(1);
+      expect(service.resetConversation).toHaveBeenCalledTimes(1);
+      expect(input.isConnected).toBe(false);
+    });
+
+    it('does not report accept when editor replacement fails', async () => {
+      const noticeMock = Notice as unknown as jest.Mock;
+      noticeMock.mockClear();
+      service.editText.mockResolvedValue({ success: true, editedText: 'edited' });
+      const input = controller.inputEl as HTMLInputElement;
+      input.value = 'edit this';
+      await controller.generate();
+      controller.editor.replaceRange = jest.fn(() => { throw new Error('replace failed'); });
+
+      controller.accept();
+
+      await expect(resultPromise).resolves.toEqual({ decision: 'reject' });
+      expect(noticeMock).toHaveBeenCalledWith(expect.stringContaining('replace failed'));
+    });
   });
 });

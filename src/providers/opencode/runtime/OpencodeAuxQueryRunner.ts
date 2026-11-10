@@ -33,6 +33,17 @@ interface OpencodeAuxQueryRunnerOptions {
   allowReadTextFile?: boolean;
 }
 
+// A query's eligibility is pinned to the runner generation it started with.
+// Only an external reset() bumps the generation, so a stale query fails its
+// gate checks instead of publishing onto whatever resources replaced it.
+interface OpencodeAuxStartupCandidate {
+  process: AcpSubprocess;
+  transport: AcpJsonRpcTransport;
+  connection: AcpClientConnection;
+}
+
+const SUPERSEDED_MESSAGE = 'OpenCode aux query was superseded by a reset';
+
 const OPENCODE_AUX_AGENT_IDS: Record<OpencodeAuxAgentProfile, string> = {
   passive: 'claudian-aux-passive',
   readonly: 'claudian-aux-readonly',
@@ -50,6 +61,7 @@ export class OpencodeAuxQueryRunner implements AuxQueryRunner {
   private connection: AcpClientConnection | null = null;
   private currentModelId: string | null = null;
   private currentLaunchKey: string | null = null;
+  private generation = 0;
   private process: AcpSubprocess | null = null;
   private readonly sessionCwds = new Map<string, string>();
   private sessionId: string | null = null;
@@ -62,30 +74,40 @@ export class OpencodeAuxQueryRunner implements AuxQueryRunner {
   ) {}
 
   async query(config: AuxQueryConfig, prompt: string): Promise<string> {
+    const generation = this.generation;
+    const signal = config.abortController?.signal;
     const cwd = getVaultPath(this.plugin.app) ?? process.cwd();
-    await this.ensureReady(cwd, config.systemPrompt);
+    await this.ensureReady(cwd, config.systemPrompt, generation, signal);
+    this.assertCurrentGeneration(generation);
 
-    if (!this.connection) {
+    if (signal?.aborted) {
+      throw new Error('Cancelled');
+    }
+
+    const connection = this.connection;
+    const proc = this.process;
+    if (!connection || !proc) {
       throw new Error('OpenCode runtime is not ready.');
     }
 
-    if (!this.sessionId) {
-      const sessionId = await this.createSession(cwd);
+    let sessionId = this.sessionId;
+    if (!sessionId) {
+      sessionId = await this.createSession(connection, cwd, generation);
       if (!sessionId) {
         throw new Error('Failed to create an OpenCode session.');
       }
     }
 
-    const sessionId = this.sessionId!;
     const selectedModel = this.resolveSelectedRawModel(config.model);
     const nextModel = this.resolveApplicableModel(selectedModel);
     if (nextModel) {
-      const response = await this.connection.setConfigOption({
+      const response = await connection.setConfigOption({
         configId: 'model',
         sessionId,
         type: 'select',
         value: nextModel,
       });
+      this.assertCurrentGeneration(generation);
       this.syncSessionModelState({
         configOptions: response.configOptions,
       });
@@ -93,7 +115,7 @@ export class OpencodeAuxQueryRunner implements AuxQueryRunner {
 
     this.sessionUpdateNormalizer.reset();
     let accumulatedText = '';
-    const removeListener = this.connection.onSessionNotification((notification) => {
+    const removeListener = connection.onSessionNotification((notification) => {
       if (notification.sessionId !== sessionId) {
         return;
       }
@@ -113,59 +135,66 @@ export class OpencodeAuxQueryRunner implements AuxQueryRunner {
       }
     });
 
+    // Captured references only: a stale query's abort, error, and cleanup paths
+    // must never act on the session or process that replaced it.
     const abortHandler = () => {
-      if (this.connection && this.sessionId) {
-        this.connection.cancel({ sessionId: this.sessionId });
-      }
+      connection.cancel({ sessionId });
     };
-    config.abortController?.signal.addEventListener('abort', abortHandler, { once: true });
+    signal?.addEventListener('abort', abortHandler, { once: true });
 
     try {
-      if (config.abortController?.signal.aborted) {
+      if (signal?.aborted) {
         throw new Error('Cancelled');
       }
 
-      await this.connection.prompt({
+      await connection.prompt({
         prompt: [{ type: 'text', text: prompt }],
         sessionId,
       });
 
-      if (config.abortController?.signal.aborted) {
+      if (signal?.aborted) {
         throw new Error('Cancelled');
       }
 
       return accumulatedText;
     } catch (error) {
       const message = error instanceof Error ? error.message : 'OpenCode request failed';
-      const stderr = this.process?.getStderrSnapshot();
+      const stderr = proc.getStderrSnapshot();
       throw new Error(
         stderr ? `${message}\n\n${stderr}` : message,
         error instanceof Error ? { cause: error } : undefined,
       );
     } finally {
-      config.abortController?.signal.removeEventListener('abort', abortHandler);
+      signal?.removeEventListener('abort', abortHandler);
       removeListener();
     }
   }
 
   reset(): void {
+    // Eligibility is revoked first, then resources are detached and disposed,
+    // so completions that unblock during teardown read cleared slots and a
+    // dead generation instead of reaching whatever comes next.
+    this.generation += 1;
+    const detached = this.detachResources();
+    detached.connection?.dispose();
+    detached.transport?.dispose();
+    if (detached.process) {
+      void detached.process.shutdown().catch(() => {});
+    }
     this.availableModelIds.clear();
     this.sessionId = null;
     this.sessionCwds.clear();
     this.currentModelId = null;
     this.currentLaunchKey = null;
-    this.connection?.dispose();
-    this.connection = null;
-    this.transport?.dispose();
-    this.transport = null;
-    if (this.process) {
-      void this.process.shutdown().catch(() => {});
-    }
-    this.process = null;
     this.sessionUpdateNormalizer.reset();
   }
 
-  private async ensureReady(cwd: string, systemPrompt: string): Promise<void> {
+  private async ensureReady(
+    cwd: string,
+    systemPrompt: string,
+    generation: number,
+    signal: AbortSignal | undefined,
+  ): Promise<void> {
     const resolvedCliPath = this.plugin.getResolvedProviderCliPath('opencode') ?? 'opencode';
 
     const settings = this.plugin.settings as unknown as Record<string, unknown>;
@@ -181,6 +210,11 @@ export class OpencodeAuxQueryRunner implements AuxQueryRunner {
       userName: typeof settings.userName === 'string' ? settings.userName : undefined,
       workspaceRoot: cwd,
     });
+    if (signal?.aborted) {
+      // A cancellation landing while materials are pending must not spawn.
+      throw new Error('Cancelled');
+    }
+    this.assertCurrentGeneration(generation);
     const nextLaunchKey = JSON.stringify({
       artifactKey: artifacts.launchKey,
       command: resolvedCliPath,
@@ -198,52 +232,67 @@ export class OpencodeAuxQueryRunner implements AuxQueryRunner {
       return;
     }
 
-    this.reset();
-    await this.startProcess({
+    // An internal relaunch swaps resources without invalidating the calling
+    // query's eligibility; only an external reset() bumps the generation.
+    this.teardownResources();
+    const candidate = this.launchStartupCandidate({
       command: resolvedCliPath,
       configPath: artifacts.configPath,
       configContent: artifacts.configContent,
       cwd,
       runtimeEnv,
     });
+    this.process = candidate.process;
+    this.transport = candidate.transport;
+    this.connection = candidate.connection;
+    await candidate.connection.initialize();
+    if (signal?.aborted || !this.isCurrentGeneration(generation)) {
+      this.reclaimCandidate(candidate);
+      throw signal?.aborted ? new Error('Cancelled') : new Error(SUPERSEDED_MESSAGE);
+    }
     this.currentLaunchKey = nextLaunchKey;
   }
 
-  private async createSession(cwd: string): Promise<string | null> {
-    if (!this.connection) {
-      return null;
-    }
-
+  private async createSession(
+    connection: AcpClientConnection,
+    cwd: string,
+    generation: number,
+  ): Promise<string | null> {
     try {
-      const response = await this.connection.newSession({
+      const response = await connection.newSession({
         cwd,
         mcpServers: [],
       });
+      this.assertCurrentGeneration(generation);
       this.syncSessionModelState({
         configOptions: response.configOptions ?? null,
         models: response.models ?? null,
       });
-      await this.connection.setConfigOption({
+      await connection.setConfigOption({
         configId: 'mode',
         sessionId: response.sessionId,
         type: 'select',
         value: OPENCODE_AUX_AGENT_IDS[this.options.agentProfile],
       });
+      this.assertCurrentGeneration(generation);
       this.sessionId = response.sessionId;
       this.sessionCwds.set(response.sessionId, cwd);
       return response.sessionId;
-    } catch {
+    } catch (error) {
+      if (!this.isCurrentGeneration(generation)) {
+        throw new Error(SUPERSEDED_MESSAGE, { cause: error });
+      }
       return null;
     }
   }
 
-  private async startProcess(params: {
+  private launchStartupCandidate(params: {
     command: string;
     configPath: string;
     configContent: string;
     cwd: string;
     runtimeEnv: NodeJS.ProcessEnv;
-  }): Promise<void> {
+  }): OpencodeAuxStartupCandidate {
     const processEnv: NodeJS.ProcessEnv = {
       ...process.env,
       ...params.runtimeEnv,
@@ -252,21 +301,21 @@ export class OpencodeAuxQueryRunner implements AuxQueryRunner {
       PATH: params.runtimeEnv.PATH,
     };
 
-    this.process = new AcpSubprocess({
+    const proc = new AcpSubprocess({
       args: ['acp', `--cwd=${params.cwd}`],
       command: params.command,
       cwd: params.cwd,
       env: processEnv,
     });
-    this.process.start();
+    proc.start();
 
-    this.transport = new AcpJsonRpcTransport({
-      input: this.process.stdout,
-      onClose: (listener) => this.process!.onClose(listener),
-      output: this.process.stdin,
+    const transport = new AcpJsonRpcTransport({
+      input: proc.stdout,
+      onClose: (listener) => proc.onClose(listener),
+      output: proc.stdin,
     });
 
-    this.connection = new AcpClientConnection({
+    const connection = new AcpClientConnection({
       clientInfo: {
         name: 'claudian-aux',
         version: this.plugin.manifest?.version ?? '0.0.0',
@@ -279,11 +328,65 @@ export class OpencodeAuxQueryRunner implements AuxQueryRunner {
           : undefined,
         requestPermission: (request) => this.handlePermissionRequest(request),
       },
-      transport: this.transport,
+      transport,
     });
 
-    this.transport.start();
-    await this.connection.initialize();
+    transport.start();
+    return { connection, process: proc, transport };
+  }
+
+  private detachResources(): {
+    process: AcpSubprocess | null;
+    transport: AcpJsonRpcTransport | null;
+    connection: AcpClientConnection | null;
+  } {
+    const detached = {
+      process: this.process,
+      transport: this.transport,
+      connection: this.connection,
+    };
+    this.process = null;
+    this.transport = null;
+    this.connection = null;
+    return detached;
+  }
+
+  private teardownResources(): void {
+    const detached = this.detachResources();
+    detached.connection?.dispose();
+    detached.transport?.dispose();
+    if (detached.process) {
+      void detached.process.shutdown().catch(() => {});
+    }
+    this.currentLaunchKey = null;
+  }
+
+  // A candidate that lost its startup race is shut down on its own references;
+  // slots are only cleared when they still point at this candidate, so a
+  // replacement is never torn down by a stale reclaim.
+  private reclaimCandidate(candidate: OpencodeAuxStartupCandidate): void {
+    if (this.process === candidate.process) {
+      this.process = null;
+    }
+    if (this.transport === candidate.transport) {
+      this.transport = null;
+    }
+    if (this.connection === candidate.connection) {
+      this.connection = null;
+    }
+    candidate.connection.dispose();
+    candidate.transport.dispose();
+    void candidate.process.shutdown().catch(() => {});
+  }
+
+  private isCurrentGeneration(generation: number): boolean {
+    return generation === this.generation;
+  }
+
+  private assertCurrentGeneration(generation: number): void {
+    if (!this.isCurrentGeneration(generation)) {
+      throw new Error(SUPERSEDED_MESSAGE);
+    }
   }
 
   private async readTextFile(

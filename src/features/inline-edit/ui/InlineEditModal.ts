@@ -1,6 +1,6 @@
-import { RangeSetBuilder, StateEffect, StateField } from '@codemirror/state';
+import { type Extension, RangeSetBuilder, StateEffect, StateField } from '@codemirror/state';
 import type { DecorationSet } from '@codemirror/view';
-import { Decoration, EditorView, WidgetType } from '@codemirror/view';
+import { Decoration, EditorView, ViewPlugin, WidgetType } from '@codemirror/view';
 import type { App, Editor, MarkdownView } from 'obsidian';
 import { Notice } from 'obsidian';
 
@@ -98,6 +98,9 @@ class InputWidget extends WidgetType {
   toDOM(): HTMLElement {
     return this.controller.createInputDOM();
   }
+  destroy(dom: HTMLElement): void {
+    this.controller.disposeInputDOM(dom);
+  }
   eq(): boolean {
     return false;
   }
@@ -143,7 +146,11 @@ const inlineEditField = StateField.define<DecorationSet>({
   provide: (f) => EditorView.decorations.from(f),
 });
 
-const installedEditors = new WeakSet<EditorView>();
+// Per-view owner binding: the shared owner plugin's destroy terminates the
+// controller currently registered for the view. A terminal controller drops
+// out of this map, so a live view never accumulates stale controller
+// closures across repeated opens.
+const viewOwners = new WeakMap<EditorView, InlineEditController>();
 
 interface DiffOp { type: 'equal' | 'insert' | 'delete'; text: string; }
 
@@ -202,6 +209,10 @@ function diffToHtml(ops: DiffOp[]): string {
 
 export type InlineEditDecision = 'accept' | 'edit' | 'reject';
 
+function describeError(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
 export class InlineEditModal {
   private controller: InlineEditController | null = null;
 
@@ -254,7 +265,38 @@ export class InlineEditModal {
   }
 }
 
+interface InputDOMOwner {
+  root: HTMLElement;
+  input: HTMLInputElement;
+  spinner: HTMLElement;
+  reply: HTMLElement;
+  slashDropdown: SlashCommandDropdown | null;
+  mentionDropdown: MentionDropdownController | null;
+  unsubscribe: (() => void) | null;
+  onKeydown: ((event: KeyboardEvent) => void) | null;
+  onInput: (() => void) | null;
+  focusTimer: ReturnType<typeof setTimeout> | null;
+  disposed: boolean;
+}
+
 class InlineEditController {
+  // One shared owner plugin per view, not one per open: show() rebinds the
+  // registry entry instead of appending a fresh closure, so repeated opens on
+  // a live view accumulate no terminal controllers, and destroy terminates
+  // only the currently bound controller.
+  private static readonly ownerPlugin = ViewPlugin.define((view: EditorView) => ({
+    destroy: () => {
+      const controller = viewOwners.get(view);
+      if (!controller) return;
+      viewOwners.delete(view);
+      controller.terminate();
+      controller.settle({ decision: 'reject' });
+    },
+  }));
+
+  private currentInputOwner: InputDOMOwner | null = null;
+  private inputOwners = new WeakMap<HTMLElement, InputDOMOwner>();
+  private terminal = false;
   private inputEl: HTMLInputElement | null = null;
   private spinnerEl: HTMLElement | null = null;
   private agentReplyEl: HTMLElement | null = null;
@@ -271,6 +313,7 @@ class InlineEditController {
   private escHandler: ((e: KeyboardEvent) => void) | null = null;
   private selectionListener: ((e: Event) => void) | null = null;
   private isConversing = false;
+  private settled = false;
   private resolvedProviderId: ProviderId;
   private slashCommandDropdown: SlashCommandDropdown | null = null;
   private mentionDropdown: MentionDropdownController | null = null;
@@ -343,12 +386,29 @@ class InlineEditController {
   }
 
   show() {
-    if (!installedEditors.has(this.editorView)) {
-      this.editorView.dispatch({
-        effects: StateEffect.appendConfig.of(inlineEditField),
-      });
-      installedEditors.add(this.editorView);
+    // The controller's lifetime is bound to the real CM owner, not to widget
+    // destruction: the shared per-view owner plugin is destroyed by
+    // editorView.destroy(), setState, and extension retirement alike, and its
+    // destruction terminates exactly the controller currently bound to the
+    // view. Installation follows the live state, never a historical mark: a
+    // setState drops every appended extension, so stale install knowledge
+    // would leave the next open without the field and without a widget.
+    // Harness views without the real CM state API report nothing installed.
+    const extensions: Extension[] = [];
+    if (typeof this.editorView.state.field !== 'function'
+      || this.editorView.state.field(inlineEditField, false) === undefined) {
+      extensions.push(inlineEditField);
     }
+    if (typeof this.editorView.plugin !== 'function'
+      || this.editorView.plugin(InlineEditController.ownerPlugin) == null) {
+      extensions.push(InlineEditController.ownerPlugin);
+    }
+    if (extensions.length > 0) {
+      this.editorView.dispatch({
+        effects: StateEffect.appendConfig.of(extensions),
+      });
+    }
+    viewOwners.set(this.editorView, this);
 
     this.updateHighlight();
 
@@ -412,85 +472,197 @@ class InlineEditController {
   }
 
   createInputDOM(): HTMLElement {
+    if (this.currentInputOwner) this.disposeInputOwner(this.currentInputOwner);
+
     const container = document.createElement('div');
     container.className = 'claudian-inline-input-container';
-    this.containerEl = container;
 
-    this.agentReplyEl = document.createElement('div');
-    this.agentReplyEl.className = 'claudian-inline-agent-reply';
-    this.agentReplyEl.style.display = 'none';
-    container.appendChild(this.agentReplyEl);
+    const reply = document.createElement('div');
+    reply.className = 'claudian-inline-agent-reply';
+    reply.style.display = 'none';
+    container.appendChild(reply);
 
     const inputWrap = document.createElement('div');
     inputWrap.className = 'claudian-inline-input-wrap';
     container.appendChild(inputWrap);
 
-    this.inputEl = document.createElement('input');
-    this.inputEl.type = 'text';
-    this.inputEl.className = 'claudian-inline-input';
-    this.inputEl.placeholder = this.mode === 'cursor' ? 'Insert instructions...' : 'Edit instructions...';
-    this.inputEl.spellcheck = false;
-    inputWrap.appendChild(this.inputEl);
+    const input = document.createElement('input');
+    input.type = 'text';
+    input.className = 'claudian-inline-input';
+    input.placeholder = this.mode === 'cursor' ? 'Insert instructions...' : 'Edit instructions...';
+    input.spellcheck = false;
+    inputWrap.appendChild(input);
 
-    this.spinnerEl = document.createElement('div');
-    this.spinnerEl.className = 'claudian-inline-spinner';
-    this.spinnerEl.style.display = 'none';
-    inputWrap.appendChild(this.spinnerEl);
+    const spinner = document.createElement('div');
+    spinner.className = 'claudian-inline-spinner';
+    spinner.style.display = 'none';
+    inputWrap.appendChild(spinner);
 
-    const inlineCatalog = ProviderWorkspaceRegistry.getCommandCatalog(this.resolvedProviderId);
-    this.slashCommandDropdown = new SlashCommandDropdown(
-      document.body,
-      this.inputEl,
-      {
-        onSelect: () => {},
-        onHide: () => {},
-      },
-      {
-        fixed: true,
-        hiddenCommands: getHiddenProviderCommandSet(this.plugin.settings, this.resolvedProviderId),
-        ...(inlineCatalog ? {
-          providerConfig: inlineCatalog.getDropdownConfig(),
-          getProviderEntries: () => inlineCatalog.listDropdownEntries({ includeBuiltIns: false }),
-        } : {}),
+    const owner: InputDOMOwner = {
+      root: container,
+      input,
+      spinner,
+      reply,
+      slashDropdown: null,
+      mentionDropdown: null,
+      unsubscribe: null,
+      onKeydown: null,
+      onInput: null,
+      focusTimer: null,
+      disposed: false,
+    };
+    this.inputOwners.set(container, owner);
+    this.currentInputOwner = owner;
+    this.containerEl = container;
+    this.inputEl = input;
+    this.spinnerEl = spinner;
+    this.agentReplyEl = reply;
+
+    try {
+      const slashDropdown = new SlashCommandDropdown(
+        document.body,
+        input,
+        {
+          onSelect: () => {},
+          onHide: () => {},
+        },
+        {
+          fixed: true,
+          hiddenCommands: getHiddenProviderCommandSet(this.plugin.settings, this.resolvedProviderId),
+        }
+      );
+      owner.slashDropdown = slashDropdown;
+      this.slashCommandDropdown = slashDropdown;
+
+      const mentionDropdown = new MentionDropdownController(
+        document.body,
+        input,
+        {
+          // Inline-edit resolves @mentions at send time from input text.
+          onAttachFile: () => {},
+          onMcpMentionChange: () => {},
+          getMentionedMcpServers: () => new Set(),
+          setMentionedMcpServers: () => false,
+          addMentionedMcpServer: () => {},
+          getExternalContexts: this.getExternalContexts,
+          getCachedVaultFolders: () => this.mentionDataProvider.getCachedVaultFolders(),
+          getCachedVaultFiles: () => this.mentionDataProvider.getCachedVaultFiles(),
+          normalizePathForVault: (rawPath) => this.normalizePathForVault(rawPath),
+        },
+        { fixed: true }
+      );
+      owner.mentionDropdown = mentionDropdown;
+      this.mentionDropdown = mentionDropdown;
+
+      owner.onKeydown = (event) => {
+        if (this.isCurrentInputOwner(owner)) this.handleKeydown(event, owner);
+      };
+      owner.onInput = () => {
+        if (this.isCurrentInputOwner(owner)) mentionDropdown.handleInputChange();
+      };
+      input.addEventListener('keydown', owner.onKeydown);
+      input.addEventListener('input', owner.onInput);
+
+      owner.focusTimer = setTimeout(() => {
+        owner.focusTimer = null;
+        if (this.isCurrentInputOwner(owner)) input.focus();
+      }, 50);
+      return container;
+    } catch (error) {
+      try {
+        this.disposeInputOwner(owner, { rethrow: true });
+      } catch {
+        // Construction failure remains the primary error after attempted teardown.
       }
-    );
+      throw error;
+    }
+  }
 
-    this.mentionDropdown = new MentionDropdownController(
-      document.body,
-      this.inputEl,
-      {
-        // Inline-edit resolves @mentions at send time from input text.
-        onAttachFile: () => {},
-        onMcpMentionChange: () => {},
-        getMentionedMcpServers: () => new Set(),
-        setMentionedMcpServers: () => false,
-        addMentionedMcpServer: () => {},
-        getExternalContexts: this.getExternalContexts,
-        getCachedVaultFolders: () => this.mentionDataProvider.getCachedVaultFolders(),
-        getCachedVaultFiles: () => this.mentionDataProvider.getCachedVaultFiles(),
-        normalizePathForVault: (rawPath) => this.normalizePathForVault(rawPath),
-      },
-      { fixed: true }
-    );
+  disposeInputDOM(root: HTMLElement): void {
+    const owner = this.inputOwners.get(root);
+    if (!owner) return;
+    this.inputOwners.delete(root);
+    this.disposeInputOwner(owner);
+  }
 
-    this.inputEl.addEventListener('keydown', (e) => this.handleKeydown(e));
-    this.inputEl.addEventListener('input', () => this.mentionDropdown?.handleInputChange());
+  private isCurrentInputOwner(owner: InputDOMOwner): boolean {
+    return !this.terminal && !owner.disposed && this.currentInputOwner === owner;
+  }
 
-    setTimeout(() => this.inputEl?.focus(), 50);
-    return container;
+  private disposeInputOwner(owner: InputDOMOwner, options?: { rethrow?: boolean }): void {
+    if (owner.disposed) return;
+    owner.disposed = true;
+    if (this.currentInputOwner === owner) {
+      this.currentInputOwner = null;
+      this.containerEl = null;
+      this.inputEl = null;
+      this.spinnerEl = null;
+      this.agentReplyEl = null;
+      this.slashCommandDropdown = null;
+      this.mentionDropdown = null;
+    }
+
+    let failure: unknown;
+    let failed = false;
+    const attempt = (dispose: () => void) => {
+      try {
+        dispose();
+      } catch (error) {
+        if (!failed) failure = error;
+        failed = true;
+      }
+    };
+    if (owner.focusTimer !== null) {
+      const timer = owner.focusTimer;
+      owner.focusTimer = null;
+      attempt(() => clearTimeout(timer));
+    }
+    if (owner.unsubscribe) {
+      const unsubscribe = owner.unsubscribe;
+      owner.unsubscribe = null;
+      attempt(unsubscribe);
+    }
+    if (owner.onKeydown) {
+      const onKeydown = owner.onKeydown;
+      owner.onKeydown = null;
+      attempt(() => owner.input.removeEventListener('keydown', onKeydown));
+    }
+    if (owner.onInput) {
+      const onInput = owner.onInput;
+      owner.onInput = null;
+      attempt(() => owner.input.removeEventListener('input', onInput));
+    }
+    if (owner.slashDropdown) {
+      const dropdown = owner.slashDropdown;
+      owner.slashDropdown = null;
+      attempt(() => dropdown.destroy());
+    }
+    if (owner.mentionDropdown) {
+      const dropdown = owner.mentionDropdown;
+      owner.mentionDropdown = null;
+      attempt(() => dropdown.destroy());
+    }
+    if (failed) {
+      // Teardown faults stay observable via Notice even when the caller keeps
+      // the original error (construction failure rethrows it afterwards).
+      new Notice(`Inline edit cleanup failed: ${describeError(failure)}`);
+      if (options?.rethrow) throw failure;
+    }
   }
 
   private async generate() {
-    if (!this.inputEl || !this.spinnerEl) return;
-    const userMessage = this.inputEl.value.trim();
+    const owner = this.currentInputOwner;
+    if (!owner || !this.isCurrentInputOwner(owner)) return;
+    const { input, spinner } = owner;
+    const userMessage = input.value.trim();
     if (!userMessage) return;
 
     // Slash commands are passed directly to SDK for handling
 
     this.removeSelectionListeners();
 
-    this.inputEl.disabled = true;
-    this.spinnerEl.style.display = 'block';
+    input.disabled = true;
+    spinner.style.display = 'block';
 
     const contextFiles = this.resolveContextFilesFromMessage(userMessage);
 
@@ -520,7 +692,8 @@ class InlineEditController {
       }
     }
 
-    this.spinnerEl.style.display = 'none';
+    if (!this.isCurrentInputOwner(owner)) return;
+    spinner.style.display = 'none';
 
     if (result.success) {
       if (result.editedText !== undefined) {
@@ -532,10 +705,10 @@ class InlineEditController {
       } else if (result.clarification) {
         this.showAgentReply(result.clarification);
         this.isConversing = true;
-        this.inputEl.disabled = false;
-        this.inputEl.value = '';
-        this.inputEl.placeholder = 'Reply to continue...';
-        this.inputEl.focus();
+        input.disabled = false;
+        input.value = '';
+        input.placeholder = 'Reply to continue...';
+        input.focus();
       } else {
         this.handleError('No response from agent');
       }
@@ -558,7 +731,7 @@ class InlineEditController {
     this.updatePositionsFromEditor();
     this.updateHighlight();
     this.attachSelectionListeners();
-    this.inputEl.focus();
+    this.inputEl?.focus();
   }
 
   private showDiffInPlace() {
@@ -618,6 +791,7 @@ class InlineEditController {
   }
 
   accept() {
+    if (this.terminal) return;
     const textToInsert = this.editedText ?? this.insertedText;
     if (textToInsert !== null) {
       // Convert CM6 positions back to Obsidian Editor positions
@@ -628,18 +802,26 @@ class InlineEditController {
       const to = { line: toLine.number - 1, ch: this.selTo - toLine.from };
 
       this.cleanup();
-      this.editor.replaceRange(textToInsert, from, to);
-      this.resolve({ decision: 'accept', editedText: textToInsert });
+      try {
+        this.editor.replaceRange(textToInsert, from, to);
+      } catch (error) {
+        // A failed editor write must not be reported as an accepted edit.
+        new Notice(`Inline edit failed to apply the change: ${describeError(error)}`);
+        this.settle({ decision: 'reject' });
+        return;
+      }
+      this.settle({ decision: 'accept', editedText: textToInsert });
     } else {
       this.cleanup();
-      this.resolve({ decision: 'reject' });
+      this.settle({ decision: 'reject' });
     }
   }
 
   reject() {
+    if (this.terminal) return;
     this.cleanup({ keepSelectionHighlight: true });
-    this.restoreSelectionHighlight();
-    this.resolve({ decision: 'reject' });
+    this.attemptTeardownStep('restore selection highlight', () => this.restoreSelectionHighlight());
+    this.settle({ decision: 'reject' });
   }
 
   private removeSelectionListeners() {
@@ -650,29 +832,66 @@ class InlineEditController {
     }
   }
 
+
   private cleanup(options?: { keepSelectionHighlight?: boolean }) {
-    this.inlineEditService.cancel();
-    this.inlineEditService.resetConversation();
-    this.isConversing = false;
-    this.removeSelectionListeners();
-    if (this.escHandler) {
-      document.removeEventListener('keydown', this.escHandler);
+    if (this.terminal) return;
+    this.terminate();
+    this.attemptTeardownStep('hide inline edit decoration', () => {
+      this.editorView.dispatch({
+        effects: hideInlineEdit.of(null),
+      });
+    });
+    if (!options?.keepSelectionHighlight) {
+      this.attemptTeardownStep('hide selection highlight', () => {
+        hideSelectionHighlight(this.editorView);
+      });
     }
-    this.slashCommandDropdown?.destroy();
-    this.slashCommandDropdown = null;
+  }
 
-    this.mentionDropdown?.destroy();
-    this.mentionDropdown = null;
-
+  /**
+   * Revokes eligibility, then runs every teardown responsibility as an
+   * independent step: a throwing unsubscribe, dropdown destroy, cancel, or
+   * reset must not abort the remaining ones. The promise still settles via
+   * settle() and errors surface through Notice.
+   */
+  private terminate(): void {
+    if (this.terminal) return;
+    this.terminal = true;
+    if (viewOwners.get(this.editorView) === this) {
+      viewOwners.delete(this.editorView);
+    }
     if (activeController === this) {
       activeController = null;
     }
-    this.editorView.dispatch({
-      effects: hideInlineEdit.of(null),
-    });
-    if (!options?.keepSelectionHighlight) {
-      hideSelectionHighlight(this.editorView);
+    this.attemptTeardownStep('remove selection listeners', () => this.removeSelectionListeners());
+    if (this.escHandler) {
+      const escHandler = this.escHandler;
+      this.escHandler = null;
+      this.attemptTeardownStep('remove escape handler', () => {
+        document.removeEventListener('keydown', escHandler);
+      });
     }
+    if (this.currentInputOwner) {
+      const owner = this.currentInputOwner;
+      this.attemptTeardownStep('dispose input owner', () => this.disposeInputOwner(owner));
+    }
+    this.attemptTeardownStep('cancel inline edit service', () => this.inlineEditService.cancel());
+    this.attemptTeardownStep('reset inline edit service', () => this.inlineEditService.resetConversation());
+    this.isConversing = false;
+  }
+
+  private attemptTeardownStep(description: string, step: () => void): void {
+    try {
+      step();
+    } catch (error) {
+      new Notice(`Inline edit cleanup failed (${description}): ${describeError(error)}`);
+    }
+  }
+
+  private settle(result: { decision: InlineEditDecision; editedText?: string }): void {
+    if (this.settled) return;
+    this.settled = true;
+    this.resolve(result);
   }
 
   private restoreSelectionHighlight(): void {
@@ -682,15 +901,16 @@ class InlineEditController {
     showSelectionHighlight(this.editorView, this.selFrom, this.selTo);
   }
 
-  private handleKeydown(e: KeyboardEvent) {
-    if (this.mentionDropdown?.handleKeydown(e)) {
+  private handleKeydown(e: KeyboardEvent, owner: InputDOMOwner) {
+    if (!this.isCurrentInputOwner(owner) || owner.mentionDropdown?.handleKeydown(e)) {
       return;
     }
 
-    if (this.slashCommandDropdown?.handleKeydown(e)) {
+    if (!this.isCurrentInputOwner(owner) || owner.slashDropdown?.handleKeydown(e)) {
       return;
     }
 
+    if (!this.isCurrentInputOwner(owner)) return;
     if (e.key === 'Enter' && !e.isComposing) {
       e.preventDefault();
       this.generate();
