@@ -33,7 +33,7 @@ import { InputController } from '../controllers/InputController';
 import { NavigationController } from '../controllers/NavigationController';
 import { SelectionController } from '../controllers/SelectionController';
 import { StreamController } from '../controllers/StreamController';
-import { TurnCoordinator } from '../controllers/TurnCoordinator';
+import { TurnCoordinator, type TurnCoordinatorDeps } from '../controllers/TurnCoordinator';
 import { capturePageUiState, restorePageUiState } from '../history/HistoryPageUiState';
 import { HistoryWindowRenderer } from '../rendering/HistoryWindowRenderer';
 import { MessageRenderer } from '../rendering/MessageRenderer';
@@ -1372,6 +1372,28 @@ async function handleForkAll(
   });
 }
 
+/**
+ * Lease-stall watchdog wiring (2026-11-10): chunk-free silence is only
+ * suspicious while nothing legitimately explains it, and a force settle must
+ * abort the wedged turn's side effects before pumping the queue. Both probes
+ * resolve through the controllers lazily — they are constructed after the
+ * coordinator. Exported so the wiring itself is testable end to end.
+ */
+export function createTurnStallWatchdogDeps(
+  controllers: TabData['controllers'],
+): Pick<TurnCoordinatorDeps, 'hasBlockingWork' | 'onStallForceSettle'> {
+  return {
+    hasBlockingWork: turnId => (
+      (controllers.streamController?.hasRunningToolWork(turnId) ?? false)
+      || (controllers.inputController?.hasPendingInteractivePrompt() ?? false)
+    ),
+    onStallForceSettle: (turn) => {
+      controllers.inputController?.abandonStalledTurn(turn.turnId);
+      controllers.autoTurnProjectionController?.abandonStalledTurn(turn.turnId);
+    },
+  };
+}
+
 export function initializeTabControllers(
   tab: TabData,
   plugin: ClaudianPlugin,
@@ -1710,13 +1732,7 @@ export function initializeTabControllers(
     state,
     getConversationId: () => state.currentConversationId,
     processQueuedMessage: () => tab.controllers.inputController?.processQueuedMessage(),
-    // Stall watchdog false-kill guard (2026-11-10): chunk-free silence is only
-    // suspicious while nothing legitimately explains it. Both probes are
-    // resolved lazily — the controllers are constructed after this coordinator.
-    hasBlockingWork: turnId => (
-      (tab.controllers.streamController?.hasRunningToolWork(turnId) ?? false)
-      || (tab.controllers.inputController?.hasPendingInteractivePrompt() ?? false)
-    ),
+    ...createTurnStallWatchdogDeps(tab.controllers),
     recordDiagnostic: event => { tab.service?.recordAutoTurnDiagnostic?.(event); },
   });
 
@@ -2286,17 +2302,16 @@ export function setupServiceCallbacks(
     // read through the capture — a future tab-level replacement would surface
     // as a diagnostic instead of a silent hook false negative.
     const hookSubagentManager = tab.services.subagentManager;
+    // Both state reads are getters inside the manager's provider (hasRunning
+    // owns the stale cleanup; the snapshot must follow it) — see
+    // SubagentManager.createStopHookStateProvider.
+    const hookStateProvider = hookSubagentManager.createStopHookStateProvider();
     service.setSubagentHookProvider(
       () => {
         if (tab.services.subagentManager !== hookSubagentManager) {
           service.recordAutoTurnDiagnostic?.({ phase: 'subagent_state_source_mismatch', detail: 'hook_provider' });
         }
-        return {
-          // Stop reads this getter and retains its existing stale cleanup. The
-          // probe reads runningAgents only, without invoking that cleanup.
-          get hasRunning() { return hookSubagentManager.hasRunningSubagents(); },
-          runningAgents: hookSubagentManager.getRunningAsyncAgents(),
-        };
+        return hookStateProvider();
       }
     );
     // Fix 2 (通知直接销账) + 0823 工具明细修复: terminal task-notifications go

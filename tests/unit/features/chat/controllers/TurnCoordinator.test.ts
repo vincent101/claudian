@@ -1,4 +1,5 @@
 import {
+  TURN_LEASE_STALL_BLOCKED_MAX_MS,
   TURN_LEASE_STALL_MS,
   TURN_LEASE_STALL_POLL_MS,
   TurnCoordinator,
@@ -10,6 +11,7 @@ function createDeps(options: {
   processQueuedMessage?: () => void;
   hasBlockingWork?: () => boolean;
   recordDiagnostic?: (event: any) => void;
+  onStallForceSettle?: (turn: { turnId: string }) => void;
 } = {}) {
   const state = new ChatState();
   const getConversationId = jest.fn((): string | null => options.conversationId ?? 'conv-1');
@@ -20,6 +22,7 @@ function createDeps(options: {
     processQueuedMessage,
     hasBlockingWork: options.hasBlockingWork,
     recordDiagnostic: options.recordDiagnostic,
+    onStallForceSettle: options.onStallForceSettle,
   });
   return { coordinator, state, getConversationId, processQueuedMessage };
 }
@@ -262,7 +265,7 @@ describe('TurnCoordinator - feature turn lease (S2)', () => {
       state.isStreaming = true;
       coordinator.beginUserTurn('user-1', 1);
 
-      jest.advanceTimersByTime(3 * TURN_LEASE_STALL_MS);
+      jest.advanceTimersByTime(2 * TURN_LEASE_STALL_MS);
 
       // The probe is scoped to the lease's turn so stale controller state from
       // an older turn cannot mask a wedged one.
@@ -290,7 +293,7 @@ describe('TurnCoordinator - feature turn lease (S2)', () => {
       state.isStreaming = true;
       coordinator.beginUserTurn('user-1', 1);
 
-      jest.advanceTimersByTime(3 * TURN_LEASE_STALL_MS);
+      jest.advanceTimersByTime(2 * TURN_LEASE_STALL_MS);
 
       expect(coordinator.isBusy()).toBe(true);
       expect(recordDiagnostic).toHaveBeenCalledWith(expect.objectContaining({
@@ -299,6 +302,81 @@ describe('TurnCoordinator - feature turn lease (S2)', () => {
       }));
       // One shot per lease: repeated polls must not stamp the same error.
       expect(recordDiagnostic).toHaveBeenCalledTimes(1);
+    });
+
+    it('records one-shot evidence when blocking work suppresses the settle', () => {
+      const recordDiagnostic = jest.fn();
+      const { coordinator, state } = createDeps({
+        hasBlockingWork: () => true,
+        recordDiagnostic,
+      });
+      state.isStreaming = true;
+      coordinator.beginUserTurn('user-1', 1);
+
+      jest.advanceTimersByTime(2 * TURN_LEASE_STALL_MS);
+
+      expect(coordinator.isBusy()).toBe(true);
+      expect(recordDiagnostic).toHaveBeenCalledWith(expect.objectContaining({
+        phase: 'lease_stall_force_settle',
+        turnId: 'user-1',
+        detail: 'skipped_blocking_work',
+      }));
+      // Suppression is logged once per lease, not once per poll.
+      expect(recordDiagnostic).toHaveBeenCalledTimes(1);
+    });
+
+    it('force-settles once evidence-backed silence exceeds the absolute ceiling', () => {
+      const recordDiagnostic = jest.fn();
+      const { coordinator, state, processQueuedMessage } = createDeps({
+        // A running-tool record whose result was lost: the probe reports
+        // blocking forever, which must not disarm the watchdog permanently.
+        hasBlockingWork: () => true,
+        recordDiagnostic,
+      });
+      state.isStreaming = true;
+      coordinator.beginUserTurn('user-1', 1);
+
+      jest.advanceTimersByTime(TURN_LEASE_STALL_BLOCKED_MAX_MS - TURN_LEASE_STALL_POLL_MS);
+      expect(coordinator.isBusy()).toBe(true);
+
+      jest.advanceTimersByTime(TURN_LEASE_STALL_POLL_MS);
+
+      expect(coordinator.isBusy()).toBe(false);
+      expect(state.isStreaming).toBe(false);
+      expect(processQueuedMessage).toHaveBeenCalledTimes(1);
+      expect(recordDiagnostic).toHaveBeenCalledWith(expect.objectContaining({
+        phase: 'lease_stall_force_settle',
+        detail: 'settled_blocked_too_long',
+        elapsedMs: expect.any(Number),
+      }));
+    });
+
+    it('runs the side-effect hook before dropping the lease', () => {
+      const onStallForceSettle = jest.fn();
+      const { coordinator, state } = createDeps({ onStallForceSettle });
+      state.isStreaming = true;
+      const finishSpy = jest.spyOn(coordinator, 'finish');
+      coordinator.beginUserTurn('user-1', 1);
+
+      jest.advanceTimersByTime(TURN_LEASE_STALL_MS);
+
+      expect(onStallForceSettle).toHaveBeenCalledWith(expect.objectContaining({ turnId: 'user-1', kind: 'user' }));
+      expect(onStallForceSettle.mock.invocationCallOrder[0])
+        .toBeLessThan(finishSpy.mock.invocationCallOrder[0]);
+      finishSpy.mockRestore();
+    });
+
+    it('still settles when the side-effect hook throws', () => {
+      const { coordinator, state, processQueuedMessage } = createDeps({
+        onStallForceSettle: () => { throw new Error('cleanup failed'); },
+      });
+      state.isStreaming = true;
+      coordinator.beginUserTurn('user-1', 1);
+
+      jest.advanceTimersByTime(TURN_LEASE_STALL_MS + TURN_LEASE_STALL_POLL_MS);
+
+      expect(coordinator.isBusy()).toBe(false);
+      expect(processQueuedMessage).toHaveBeenCalledTimes(1);
     });
 
     it('records the fired settle with the idle elapsed time', () => {

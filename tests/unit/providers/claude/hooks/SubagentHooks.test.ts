@@ -111,27 +111,9 @@ describe('SubagentHooks', () => {
       });
     });
 
-    it('reads hasRunning before the running snapshot so stale cleanup is reflected', async () => {
-      const onEvaluate = jest.fn();
-      let running = [{ agentId: 'stale-agent', startedAt: 0 }];
-      const hook = createStopSubagentHook(
-        () => ({
-          get hasRunning() {
-            // Lazy getter owns the stale cleanup; the snapshot must follow it.
-            running = [];
-            return false;
-          },
-          get runningAgents() {
-            return running;
-          },
-        }),
-        { onEvaluate },
-      );
-
-      await hook.hooks[0](createHookInput(), undefined, opts);
-
-      expect(onEvaluate).toHaveBeenCalledWith({ hasRunning: false, runningAgentIds: [] });
-    });
+    // The hasRunning-before-snapshot ordering is covered end to end against the
+    // real SubagentManager provider in SubagentManager.test.ts
+    // ('Stop snapshot reads hasRunning before the running list').
 
     it('never blocks the stop when the diagnostic sink throws', async () => {
       const hook = createStopSubagentHook(

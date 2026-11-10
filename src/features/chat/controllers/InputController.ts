@@ -162,6 +162,10 @@ export class InputController {
   private activeLivePageMessages: ChatMessage[] = [];
   /** Turn projection context of the in-flight turn (v3 §5.1); cleared on turn end. */
   private activeTurnContext: TurnProjectionContext | null = null;
+  /** P2 live projection lease of the in-flight user turn; the stall watchdog
+   *  releases it when the parked generator can no longer run its finally. */
+  private activeProjectionLease: ProjectionWriteLease | null = null;
+  private activeProjectionLeaseTurnId: string | null = null;
   private pendingProviderUserMessages: Array<{
     displayContent: string;
     persistedContent?: string;
@@ -196,6 +200,29 @@ export class InputController {
       || this.pendingExitPlanModeInline
       || this.pendingPlanApproval
     );
+  }
+
+  /**
+   * Lease-stall watchdog side effects (2026-11-10): the turn never settles on
+   * its own, so the two things its finally/cancel path would otherwise do must
+   * happen here — abort the runtime turn (the Claude message channel keeps
+   * `activeTurnId` until settle, and only then delivers a queued message to
+   * the CLI) and release the live projection lease (a held lease parks every
+   * later acquireLive, so the pumped message never mounts).
+   */
+  abandonStalledTurn(turnId: string): void {
+    if (this.activeProjectionLeaseTurnId === turnId) {
+      this.activeProjectionLease?.release();
+      this.activeProjectionLease = null;
+      this.activeProjectionLeaseTurnId = null;
+      // The parked generator is about to be woken by the cancel: make it take
+      // the interrupted path instead of projecting a late result into a tab
+      // that may already belong to a newer turn.
+      this.deps.state.cancelRequested = true;
+      this.deps.streamController.invalidateRenderFlush?.();
+      this.deps.streamController.hideThinkingIndicator();
+    }
+    this.getAgentService()?.cancel();
   }
 
   private getAuxiliaryModel(): string | null {
@@ -392,6 +419,13 @@ export class InputController {
         // The turn was invalidated while queued behind the stored drain.
         projectionLease.release();
         projectionLease = null;
+      }
+      if (projectionLease) {
+        // Exposed for the lease-stall watchdog: a turn that never settles
+        // cannot run the finally below, so the lease must be releasable from
+        // outside or every later send waits forever on acquireLive.
+        this.activeProjectionLease = projectionLease;
+        this.activeProjectionLeaseTurnId = turnId;
       }
       if (!projectionLease) {
         // Queue instead of dropping — the cancelled wait lost the race, the
@@ -797,6 +831,10 @@ export class InputController {
       // stored transaction is queued; holding live while queueing stored
       // would self-deadlock the FIFO.
       projectionLease?.release();
+      if (this.activeProjectionLeaseTurnId === turnId) {
+        this.activeProjectionLease = null;
+        this.activeProjectionLeaseTurnId = null;
+      }
       const historyWindowRenderer = this.deps.getHistoryWindowRenderer?.();
       historyWindowRenderer?.freezeLivePage(this.activeLivePageMessages);
       this.activeLivePageMessages = [];

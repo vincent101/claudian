@@ -554,6 +554,28 @@ export class AutoTurnProjectionController {
     this.active = null;
   }
 
+  /**
+   * Lease-stall watchdog side effect (2026-11-10): the auto turn never
+   * settled, so its live projection lease must be released here — the parked
+   * runtime turn cannot run this controller's finalize path, and a held live
+   * lease parks every later acquireLive. Mirrors `cancelled` minus the lease
+   * bookkeeping the coordinator now owns.
+   */
+  abandonStalledTurn(turnId: string): void {
+    const active = this.active;
+    if (!active || active.turnId !== turnId) return;
+    this.deps.streamController.invalidateRenderFlush();
+    this.deps.streamController.hideThinkingIndicator();
+    if (!active.assistantMessage.content && (active.assistantMessage.toolCalls?.length ?? 0) === 0) {
+      this.deps.state.messages = this.deps.state.messages.filter(
+        message => message.id !== active.assistantMessage.id,
+      );
+      this.deps.renderer.removeMessage(active.assistantMessage.id);
+    }
+    this.releaseLiveLease(active);
+    this.active = null;
+  }
+
   private releaseLiveLease(active: AutoProjection): void {
     // Idempotent: the coordinator tolerates double release.
     active.liveLease?.release();

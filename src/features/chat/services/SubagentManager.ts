@@ -4,6 +4,7 @@ import { isAbsolute, sep } from 'path';
 
 import { ProviderRegistry } from '../../../core/providers/ProviderRegistry';
 import type { ProviderTaskResultInterpreter } from '../../../core/providers/types';
+import type { SubagentRuntimeState } from '../../../core/runtime/types';
 import { TOOL_TASK } from '../../../core/tools/toolNames';
 import { extractToolResultContent } from '../../../core/tools/toolResultContent';
 import { clampToolResultForProjection } from '../../../core/tools/toolResultProjection';
@@ -32,12 +33,12 @@ import type { PendingToolCall } from '../state/types';
 export type SubagentStateChangeCallback = (subagent: SubagentInfo) => void;
 
 /**
- * Default liveness TTL for "running" async bookkeeping (2026-11-10 hardening:
- * lowered from 2h). A background agent whose process died silently can never
- * deliver a terminal notification, so a shorter TTL bounds how long a ghost
- * record keeps the Stop hook / recovery probe believing work is in flight.
- * Injectable via `setStaleTimeoutMs` (settings or tests); 15–30 min is the
- * design band, the ceiling only needs to exceed real long-running agents.
+ * Liveness TTL for "running" async bookkeeping (2026-11-10 hardening: lowered
+ * from 2h). A background agent whose process died silently can never deliver a
+ * terminal notification, so a shorter TTL bounds how long a ghost record keeps
+ * the Stop hook / recovery probe believing work is in flight. A fixed constant
+ * on purpose: no settings surface exists for it, and 20 min sits inside the
+ * design band (15–30 min) while exceeding real long-running agents.
  */
 export const DEFAULT_SUBAGENT_STALE_MS = 20 * 60 * 1000;
 
@@ -75,7 +76,6 @@ export class SubagentManager {
 
   private onStateChange: SubagentStateChangeCallback;
   private taskResultInterpreter: ProviderTaskResultInterpreter;
-  private staleTimeoutMs = DEFAULT_SUBAGENT_STALE_MS;
   /**
    * Render-pipeline sub-item 3 write point 7 gate: bounds agent results
    * leaving extractAgentResult. Optional and evaluated per call so a provider
@@ -104,14 +104,21 @@ export class SubagentManager {
     this.projectionClampEnabled = enabled;
   }
 
-  /** Liveness TTL for running async records; invalid values are ignored. */
-  public setStaleTimeoutMs(ms: number): void {
-    if (!Number.isFinite(ms) || ms <= 0) return;
-    this.staleTimeoutMs = ms;
-  }
-
-  public getStaleTimeoutMs(): number {
-    return this.staleTimeoutMs;
+  /**
+   * Stop-hook snapshot provider (2026-11-10): handed to the Claude hook
+   * provider so the Stop event always reads THIS manager. Both properties must
+   * be getters — the hook reads `hasRunning` first because that read owns the
+   * stale cleanup, and an eagerly evaluated `runningAgents` would freeze the
+   * pre-cleanup list (idle-with-live-ids, the very false negative the snapshot
+   * exists to expose).
+   */
+  public createStopHookStateProvider(): () => SubagentRuntimeState {
+    const hasRunning = (): boolean => this.hasRunningSubagents();
+    const runningAgents = (): SubagentRuntimeState['runningAgents'] => this.getRunningAsyncAgents();
+    return () => ({
+      get hasRunning() { return hasRunning(); },
+      get runningAgents() { return runningAgents(); },
+    });
   }
 
   // ============================================
@@ -664,11 +671,10 @@ export class SubagentManager {
 
   public hasRunningSubagents(): boolean {
     // 每次读取时清理过期追踪状态：进程退出丢失状态的 agent 会永远留在 Map 里，
-    // 超过 staleTimeoutMs 无生命的 "running" 条目经统一终态链（markOrphaned）标记后移除，
+    // 超过 DEFAULT_SUBAGENT_STALE_MS 无生命的 "running" 条目经统一终态链（markOrphaned）标记后移除，
     // 不再参与存活判定；真实活跃 agent（startedAt 距今 < TTL）保持原状态检查语义。
-    const staleMs = this.staleTimeoutMs;
     const now = Date.now();
-    const isLive = (s?: SubagentInfo): boolean => now - (s?.startedAt ?? 0) < staleMs;
+    const isLive = (s?: SubagentInfo): boolean => now - (s?.startedAt ?? 0) < DEFAULT_SUBAGENT_STALE_MS;
     for (const [id, s] of this.pendingAsyncSubagents) {
       if (!isLive(s)) this.pendingAsyncSubagents.delete(id);
     }
