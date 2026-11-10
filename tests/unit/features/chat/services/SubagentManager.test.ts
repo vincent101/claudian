@@ -1651,6 +1651,54 @@ Only this is the final result.
         expect(manager.getByTaskId('task-stale')).toBeUndefined();
       });
 
+      it('defaults the stale TTL to 20 minutes (2026-11-10 hardening: was 2h)', () => {
+        const { manager } = createManager();
+        expect(manager.getStaleTimeoutMs()).toBe(20 * 60 * 1000);
+      });
+
+      it('orphans a running agent past the default 20-minute TTL', () => {
+        const { manager } = createManager();
+        const parentEl = createMockEl();
+        manager.handleTaskToolUse('task-ttl', { description: 'Background', run_in_background: true }, parentEl);
+        manager.handleTaskToolResult('task-ttl', JSON.stringify({ agent_id: 'agent-ttl' }));
+        const record = manager.getByTaskId('task-ttl')!;
+        record.startedAt = Date.now() - 21 * 60 * 1000;
+
+        expect(manager.hasRunningSubagents()).toBe(false);
+        expect(record.asyncStatus).toBe('orphaned');
+        expect(manager.getRunningAsyncAgents()).toEqual([]);
+      });
+
+      it('keeps a running agent inside the default TTL', () => {
+        const { manager } = createManager();
+        const parentEl = createMockEl();
+        manager.handleTaskToolUse('task-live', { description: 'Background', run_in_background: true }, parentEl);
+        manager.handleTaskToolResult('task-live', JSON.stringify({ agent_id: 'agent-live' }));
+        manager.getByTaskId('task-live')!.startedAt = Date.now() - 19 * 60 * 1000;
+
+        expect(manager.hasRunningSubagents()).toBe(true);
+        expect(manager.getRunningAsyncAgents()).toHaveLength(1);
+      });
+
+      it('honors a configured TTL and ignores invalid values', () => {
+        const { manager } = createManager();
+        const parentEl = createMockEl();
+        manager.setStaleTimeoutMs(15 * 60 * 1000);
+        expect(manager.getStaleTimeoutMs()).toBe(15 * 60 * 1000);
+
+        manager.handleTaskToolUse('task-cfg', { description: 'Background', run_in_background: true }, parentEl);
+        manager.handleTaskToolResult('task-cfg', JSON.stringify({ agent_id: 'agent-cfg' }));
+        const record = manager.getByTaskId('task-cfg')!;
+        record.startedAt = Date.now() - 16 * 60 * 1000;
+
+        expect(manager.hasRunningSubagents()).toBe(false);
+        expect(record.asyncStatus).toBe('orphaned');
+
+        manager.setStaleTimeoutMs(0);
+        manager.setStaleTimeoutMs(Number.NaN);
+        expect(manager.getStaleTimeoutMs()).toBe(15 * 60 * 1000);
+      });
+
       it('returns false when all subagents have completed', () => {
         const { manager } = createManager();
         const parentEl = createMockEl();
@@ -1957,6 +2005,33 @@ Only this is the final result.
 
       expect(() => manager.handleTaskNotification('agent-unknown', 'completed', 'x')).not.toThrow();
       expect(manager.handleTaskNotification('agent-unknown', 'completed', 'x')).toBeUndefined();
+    });
+
+    it('settles a running agent when the CLI notification carries the launch task id (2026-11-10 reconciliation)', () => {
+      const { manager } = createManager();
+      const parentEl = createMockEl();
+      setupRunning(manager, parentEl, 'task-launch', 'agent-real');
+
+      expect(manager.hasRunningSubagents()).toBe(true);
+
+      const settled = manager.handleTaskNotification('task-launch', 'completed', 'done');
+
+      expect(settled?.agentId).toBe('agent-real');
+      expect(settled?.asyncStatus).toBe('completed');
+      expect(manager.hasRunningSubagents()).toBe(false);
+      // Both index spaces are consumed by the same settlement.
+      expect(manager.getRunningAsyncAgents()).toEqual([]);
+      expect(manager.getByTaskId('task-launch')).toBeUndefined();
+    });
+
+    it('does not settle a task id whose mapped agent already settled', () => {
+      const { manager } = createManager();
+      const parentEl = createMockEl();
+      setupRunning(manager, parentEl, 'task-done', 'agent-done');
+
+      manager.handleTaskNotification('agent-done', 'completed');
+      expect(manager.handleTaskNotification('task-done', 'completed')).toBeUndefined();
+      expect(manager.getRunningAsyncAgents()).toEqual([]);
     });
 
     it('ignores non-terminal notification statuses', () => {

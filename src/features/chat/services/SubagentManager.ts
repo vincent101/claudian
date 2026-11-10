@@ -31,6 +31,16 @@ import type { PendingToolCall } from '../state/types';
 
 export type SubagentStateChangeCallback = (subagent: SubagentInfo) => void;
 
+/**
+ * Default liveness TTL for "running" async bookkeeping (2026-11-10 hardening:
+ * lowered from 2h). A background agent whose process died silently can never
+ * deliver a terminal notification, so a shorter TTL bounds how long a ghost
+ * record keeps the Stop hook / recovery probe believing work is in flight.
+ * Injectable via `setStaleTimeoutMs` (settings or tests); 15–30 min is the
+ * design band, the ceiling only needs to exceed real long-running agents.
+ */
+export const DEFAULT_SUBAGENT_STALE_MS = 20 * 60 * 1000;
+
 export type HandleTaskResult =
   | { action: 'buffered' }
   | { action: 'created_sync'; info: SubagentInfo; domState?: SubagentState }
@@ -65,6 +75,7 @@ export class SubagentManager {
 
   private onStateChange: SubagentStateChangeCallback;
   private taskResultInterpreter: ProviderTaskResultInterpreter;
+  private staleTimeoutMs = DEFAULT_SUBAGENT_STALE_MS;
   /**
    * Render-pipeline sub-item 3 write point 7 gate: bounds agent results
    * leaving extractAgentResult. Optional and evaluated per call so a provider
@@ -91,6 +102,16 @@ export class SubagentManager {
 
   public setProjectionClampEnabled(enabled?: () => boolean): void {
     this.projectionClampEnabled = enabled;
+  }
+
+  /** Liveness TTL for running async records; invalid values are ignored. */
+  public setStaleTimeoutMs(ms: number): void {
+    if (!Number.isFinite(ms) || ms <= 0) return;
+    this.staleTimeoutMs = ms;
+  }
+
+  public getStaleTimeoutMs(): number {
+    return this.staleTimeoutMs;
   }
 
   // ============================================
@@ -402,8 +423,11 @@ export class SubagentManager {
    * TaskOutput round-trip.
    *
    * Terminal statuses: completed / killed / failed (+ 'stopped', the structured
-   * SDK spelling of killed). Only active entries (key = agentId = task-id) are
-   * settled; pending entries (launch in flight) are recorded in the
+   * SDK spelling of killed). Active entries are keyed by agentId, but a CLI
+   * task-status notification may carry the launch task id — the recorded
+   * task-id → agent-id index is the reconciliation fallback (2026-11-10), so a
+   * real terminal always clears the running booking instead of leaving a ghost
+   * running entry. Pending entries (launch in flight) are recorded in the
    * seen-terminal short table and settled at promotion time.
    * Idempotent: unknown task-ids are tolerated silently.
    * Returns the settled SubagentInfo, or undefined when nothing was settled.
@@ -419,15 +443,26 @@ export class SubagentManager {
       return undefined; // non-terminal notification — ignore
     }
 
-    const subagent = this.activeAsyncSubagents.get(taskId);
+    let agentId = taskId;
+    let subagent = this.activeAsyncSubagents.get(taskId);
+    if (!subagent) {
+      const mappedAgentId = this.taskIdToAgentId.get(taskId);
+      if (mappedAgentId) {
+        const mapped = this.activeAsyncSubagents.get(mappedAgentId);
+        if (mapped) {
+          agentId = mappedAgentId;
+          subagent = mapped;
+        }
+      }
+    }
     if (!subagent) {
       // Notification arrived before promotion (or unknown task) — record for
       // the promotion-time check. Unknown ids age out via the LRU bound.
-      this.rememberTerminalNotification(taskId, normalized, result);
+      this.rememberTerminalNotification(agentId, normalized, result);
       return undefined;
     }
 
-    this.settleActiveSubagent(subagent, taskId, normalized, result);
+    this.settleActiveSubagent(subagent, agentId, normalized, result);
     return subagent;
   }
 
@@ -629,11 +664,11 @@ export class SubagentManager {
 
   public hasRunningSubagents(): boolean {
     // 每次读取时清理过期追踪状态：进程退出丢失状态的 agent 会永远留在 Map 里，
-    // 超过 STALE_MS 无生命的 "running" 条目经统一终态链（markOrphaned）标记后移除，
-    // 不再参与存活判定；真实活跃 agent（startedAt 距今 < 2h）保持原状态检查语义。
-    const STALE_MS = 2 * 60 * 60 * 1000;
+    // 超过 staleTimeoutMs 无生命的 "running" 条目经统一终态链（markOrphaned）标记后移除，
+    // 不再参与存活判定；真实活跃 agent（startedAt 距今 < TTL）保持原状态检查语义。
+    const staleMs = this.staleTimeoutMs;
     const now = Date.now();
-    const isLive = (s?: SubagentInfo): boolean => now - (s?.startedAt ?? 0) < STALE_MS;
+    const isLive = (s?: SubagentInfo): boolean => now - (s?.startedAt ?? 0) < staleMs;
     for (const [id, s] of this.pendingAsyncSubagents) {
       if (!isLive(s)) this.pendingAsyncSubagents.delete(id);
     }

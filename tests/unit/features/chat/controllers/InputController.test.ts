@@ -955,6 +955,24 @@ describe('InputController - Message Queue', () => {
         jest.useRealTimers();
       }
     });
+
+    it('settles subagent bookkeeping at the cancel request (2026-11-10 interrupt accounting)', () => {
+      const subagentManager = {
+        resetSpawnedCount: jest.fn(),
+        resetStreamingState: jest.fn(),
+        interruptAllActive: jest.fn(),
+      };
+      const localDeps = createMockDeps({ getSubagentManager: () => subagentManager as any });
+      const localController = new InputController(localDeps);
+      localDeps.state.isStreaming = true;
+
+      localController.cancelStreaming();
+
+      // Reachable without any stream chunk: the parked for-await loop is
+      // exactly the state the old settleInterruptedTurn entry could not reach.
+      expect(subagentManager.interruptAllActive).toHaveBeenCalledTimes(1);
+      expect(subagentManager.interruptAllActive).toHaveBeenCalledWith(t('chat.cancel.toolInterrupted'));
+    });
   });
 
   describe('Sending messages', () => {

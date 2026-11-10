@@ -1464,6 +1464,13 @@ export class InputController {
     // Restore queued message to input instead of discarding
     this.restorePendingMessagesToInput();
     this.getAgentService()?.cancel();
+    // Interrupt accounting must not wait for the stream loop (2026-11-10): a
+    // CLI wedged before the next chunk parks the for-await consumer, so the
+    // settleInterruptedTurn entry (which owns interruptAllActive) never runs
+    // and every live subagent stays booked running. The cancel request is the
+    // terminal signal for this turn's subagents — settle them now. Idempotent
+    // with the later settleInterruptedTurn call (its maps are already clear).
+    this.deps.getSubagentManager().interruptAllActive(t('chat.cancel.toolInterrupted'));
     streamController.hideThinkingIndicator();
     this.armCancelWatchdog();
   }
