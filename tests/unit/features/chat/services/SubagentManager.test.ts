@@ -1713,6 +1713,58 @@ Only this is the final result.
         expect(manager.hasRunningSubagents()).toBe(false);
       });
 
+      it('preserves active and pending cleanup when the Stop hook reads the lazy getter', async () => {
+        const now = 1_800_000_000_000;
+        const clock = jest.spyOn(Date, 'now').mockReturnValue(now);
+        try {
+          const { manager, updates } = createManager();
+          const launch = (id: string, promote: boolean) => {
+            manager.handleTaskToolUse(id, { run_in_background: true }, null);
+            if (promote) manager.handleTaskToolResult(id, JSON.stringify({ agent_id: `agent-${id}` }));
+            return manager.getByTaskId(id)!;
+          };
+          const live = launch('live', true);
+          const stale = launch('stale', true);
+          stale.startedAt = now - 2 * 60 * 60 * 1000;
+          const pendingLive = launch('pending-live', false);
+          pendingLive.startedAt = now;
+          const pendingStale = launch('pending-stale', false);
+          pendingStale.startedAt = now - 2 * 60 * 60 * 1000;
+          const pendingWithoutStart = launch('pending-without-start', false);
+          expect(pendingWithoutStart.startedAt).toBeUndefined();
+          const beforeSweep = updates.length;
+          const getState = jest.fn(() => ({
+            get hasRunning() { return manager.hasRunningSubagents(); },
+            runningAgents: manager.getRunningAsyncAgents(),
+          }));
+          const hook = createStopSubagentHook(getState);
+          expect(getState).not.toHaveBeenCalled();
+          expect(manager.getByTaskId('stale')).toBe(stale);
+          expect(manager.getByTaskId('pending-stale')).toBe(pendingStale);
+
+          expect(await hook.hooks[0]({
+            hook_event_name: 'Stop', session_id: 'test-session',
+            transcript_path: join(tmpdir(), 'transcript'), cwd: tmpdir(), stop_hook_active: true,
+          }, undefined, { signal: new AbortController().signal })).toEqual({});
+
+          expect(getState).toHaveBeenCalledTimes(1);
+          expect(manager.getByTaskId('live')).toBe(live);
+          expect(live.asyncStatus).toBe('running');
+          expect(manager.getByTaskId('pending-live')).toBe(pendingLive);
+          expect(manager.getByTaskId('pending-stale')).toBeUndefined();
+          expect(manager.getByTaskId('pending-without-start')).toBeUndefined();
+          expect(manager.getByTaskId('stale')).toBeUndefined();
+          expect(stale.asyncStatus).toBe('orphaned');
+          expect(stale.status).toBe('error');
+          expect(stale.result).toBe('Conversation ended before task completed');
+          expect(stale.completedAt).toBe(now);
+          expect(updates.slice(beforeSweep).map(u => u.asyncStatus)).toEqual(['orphaned']);
+          expect((manager as any).taskIdToAgentId.has('stale')).toBe(false);
+        } finally {
+          clock.mockRestore();
+        }
+      });
+
       it('allows the Stop hook after a foreground task resolves from completed task metadata', async () => {
         const { manager } = createManager();
         const parentEl = createMockEl();

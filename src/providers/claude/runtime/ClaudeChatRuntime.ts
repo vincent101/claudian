@@ -79,7 +79,6 @@ import { extractXmlTag } from '../history/sdkMessageParsing';
 import { getSDKSessionPath } from '../history/sdkSessionPaths';
 import {
   createStopSubagentHook,
-  type StopHookCircuitBreaker,
   type SubagentHookState,
 } from '../hooks/SubagentHooks';
 import { encodeClaudeTurn } from '../prompt/ClaudeTurnEncoder';
@@ -299,10 +298,6 @@ export class ClaudianService implements ChatRuntime {
 
   // Subagent hook state provider (set from feature layer to avoid core→feature dependency)
   private _subagentStateProvider: (() => SubagentHookState) | null = null;
-
-  // Fix 1 (熔断): consecutive Stop-hook blocks since the last allow / user message.
-  private _stopHookConsecutiveBlocks = 0;
-  private static readonly STOP_HOOK_MAX_CONSECUTIVE_BLOCKS = 3;
 
   // Fix 2 (通知直接销账): live task-notification sink (set from feature layer).
   private _subagentNotificationHandler: SubagentTaskNotificationHandler | null = null;
@@ -1098,31 +1093,10 @@ export class ClaudianService implements ChatRuntime {
   private buildHooks() {
     const hooks: Options['hooks'] = {};
 
-    // Fix 1 (熔断): the hook is a stateless closure, so the consecutive-block
-    // counter lives on this runtime instance. Reset on every allow and on every
-    // user-initiated turn (see query()).
-    const breaker: StopHookCircuitBreaker = {
-      registerBlock: () => {
-        this._stopHookConsecutiveBlocks += 1;
-        if (this._stopHookConsecutiveBlocks > ClaudianService.STOP_HOOK_MAX_CONSECUTIVE_BLOCKS) {
-          this._stopHookConsecutiveBlocks = 0;
-          new Notice(
-            `Claudian: Stop hook blocked ${ClaudianService.STOP_HOOK_MAX_CONSECUTIVE_BLOCKS} times while background tasks were still marked running. Allowing stop (circuit breaker) — please verify your background tasks.`
-          );
-          return true;
-        }
-        return false;
-      },
-      reset: () => {
-        this._stopHookConsecutiveBlocks = 0;
-      },
-    };
-
     // Always register subagent hooks — closures resolve provider at execution time
     // so hooks work even when provider is set after the persistent query starts.
     hooks.Stop = [createStopSubagentHook(
       () => this._subagentStateProvider?.() ?? { hasRunning: false },
-      breaker
     )];
 
     return hooks;
@@ -2279,10 +2253,6 @@ export class ClaudianService implements ChatRuntime {
       yield { type: 'error', content: `Protocol error: turnId '${turnId}' is already in flight` };
       return;
     }
-
-    // Fix 1 (熔断): a user-initiated turn resets the consecutive Stop-hook
-    // block count — the breaker scope is "since last user message / last allow".
-    this._stopHookConsecutiveBlocks = 0;
 
     const vaultPath = getVaultPath(this.plugin.app);
     if (!vaultPath) {

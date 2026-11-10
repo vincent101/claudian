@@ -1,6 +1,8 @@
+import { tmpdir } from 'os';
+import { join } from 'path';
+
 import {
   createStopSubagentHook,
-  type StopHookCircuitBreaker,
   type SubagentHookState,
 } from '@/providers/claude/hooks/SubagentHooks';
 
@@ -9,8 +11,8 @@ describe('SubagentHooks', () => {
     const createHookInput = () => ({
       hook_event_name: 'Stop' as const,
       session_id: 'test-session',
-      transcript_path: '/tmp/transcript',
-      cwd: '/vault',
+      transcript_path: join(tmpdir(), 'transcript'),
+      cwd: tmpdir(),
       stop_hook_active: true,
     });
 
@@ -27,19 +29,31 @@ describe('SubagentHooks', () => {
       expect(result).toEqual({});
     });
 
-    it('blocks stop when subagents are still running', async () => {
-      const state: SubagentHookState = {
-        hasRunning: true,
-      };
+    it('allows stop with a running subagent (Stop minimal fix red case)', async () => {
+      const hook = createStopSubagentHook(() => ({ hasRunning: true }));
+      const input = { ...createHookInput(), cwd: process.env.TMPDIR!, transcript_path: `${process.env.TMPDIR!}/transcript` };
 
-      const hook = createStopSubagentHook(() => state);
-      const result = await hook.hooks[0](createHookInput(), undefined, opts);
+      expect(await hook.hooks[0](input, undefined, opts)).toEqual({});
+    });
 
-      expect(result).toEqual({
-        decision: 'block',
-        reason: expect.stringContaining('still running'),
-      });
-      expect((result as any).reason).toContain('TaskOutput');
+    it('reads the provider and live lazy getter exactly once per execution', async () => {
+      let running = true;
+      const getter = jest.fn(() => running);
+      const getState = jest.fn(() => ({ get hasRunning() { return getter(); } }));
+      const hook = createStopSubagentHook(getState);
+
+      expect(getState).not.toHaveBeenCalled();
+      expect(getter).not.toHaveBeenCalled();
+      expect(await hook.hooks[0](createHookInput(), undefined, opts)).toEqual({});
+      expect(getState).toHaveBeenCalledTimes(1);
+      expect(getter).toHaveBeenCalledTimes(1);
+      expect(getter.mock.results[0].value).toBe(true);
+
+      running = false;
+      expect(await hook.hooks[0](createHookInput(), undefined, opts)).toEqual({});
+      expect(getState).toHaveBeenCalledTimes(2);
+      expect(getter).toHaveBeenCalledTimes(2);
+      expect(getter.mock.results[1].value).toBe(false);
     });
 
     it('resolves state dynamically at execution time', async () => {
@@ -51,83 +65,37 @@ describe('SubagentHooks', () => {
       const hook = createStopSubagentHook(getState);
 
       const result1 = await hook.hooks[0](createHookInput(), undefined, opts);
-      expect((result1 as any).decision).toBe('block');
+      expect(result1).toEqual({});
 
       running = false;
       const result2 = await hook.hooks[0](createHookInput(), undefined, opts);
       expect(result2).toEqual({});
     });
 
-    it('fails open when reading subagent state throws (fix 1)', async () => {
+    it.each(['provider', 'getter'])('warns and fails open when the %s throws', async (source) => {
+      const error = new Error(`${source} failed`);
+      const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
       const hook = createStopSubagentHook(() => {
-        throw new Error('tab already torn down');
+        if (source === 'provider') throw error;
+        return { get hasRunning(): boolean { throw error; } };
       });
-
-      const result = await hook.hooks[0](createHookInput(), undefined, opts);
-
-      expect(result).toEqual({});
-    });
-
-    it('allows stop after the breaker trips on too many consecutive blocks (fix 1)', async () => {
-      const state: SubagentHookState = { hasRunning: true };
-      let blocks = 0;
-      const breaker: StopHookCircuitBreaker = {
-        registerBlock: () => {
-          blocks += 1;
-          return blocks > 3;
-        },
-        reset: () => {},
-      };
-
-      const hook = createStopSubagentHook(() => state, breaker);
-
-      // First three blocks pass through as blocks
-      for (let i = 0; i < 3; i++) {
-        const result = await hook.hooks[0](createHookInput(), undefined, opts);
-        expect((result as any).decision).toBe('block');
+      try {
+        expect(await hook.hooks[0](createHookInput(), undefined, opts)).toEqual({});
+        expect(warn).toHaveBeenCalledWith('[Claudian] Stop hook state provider failed; failing open', error);
+      } finally {
+        warn.mockRestore();
       }
-
-      // Fourth attempt: breaker trips -> allow
-      const tripped = await hook.hooks[0](createHookInput(), undefined, opts);
-      expect(tripped).toEqual({});
-      expect(blocks).toBe(4);
     });
 
-    it('resets the breaker when the hook allows (fix 1)', async () => {
-      let running = true;
-      const resets: number[] = [];
-      const breaker: StopHookCircuitBreaker = {
-        registerBlock: () => false,
-        reset: () => {
-          resets.push(1);
-        },
-      };
+    it('still allows on repeated calls with stop_hook_active set', async () => {
+      const getState = jest.fn(() => ({ hasRunning: true }));
+      const hook = createStopSubagentHook(getState);
+      const input = { ...createHookInput(), stop_hook_active: true };
 
-      const hook = createStopSubagentHook(() => ({ hasRunning: running }), breaker);
-
-      await hook.hooks[0](createHookInput(), undefined, opts); // block
-      running = false;
-      await hook.hooks[0](createHookInput(), undefined, opts); // allow -> reset
-
-      expect(resets.length).toBe(1);
-    });
-
-    it('resets the breaker when the state provider throws (fix 1 fail-open)', async () => {
-      const resets: number[] = [];
-      const breaker: StopHookCircuitBreaker = {
-        registerBlock: () => false,
-        reset: () => {
-          resets.push(1);
-        },
-      };
-
-      const hook = createStopSubagentHook(() => {
-        throw new Error('provider gone');
-      }, breaker);
-
-      await hook.hooks[0](createHookInput(), undefined, opts);
-
-      expect(resets.length).toBe(1);
+      for (let i = 0; i < 4; i++) {
+        expect(await hook.hooks[0](input, undefined, opts)).toEqual({});
+      }
+      expect(getState).toHaveBeenCalledTimes(4);
     });
 
     it('has no matcher (applies to all stop events)', () => {

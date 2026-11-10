@@ -628,9 +628,9 @@ export class SubagentManager {
   }
 
   public hasRunningSubagents(): boolean {
-    // stale-hook patch（2026-08-09，自运行中 main.js 移植）：进程退出丢失状态的 agent 会永远卡在 Map 里，
-    // 导致 stop hook 永久 block。超过 STALE_MS 无生命的 "running" 条目视为僵尸清理放行；
-    // 真实活跃 agent（startedAt 距今 < 2h）仍正常拦截，保护语义保留。
+    // 每次读取时清理过期追踪状态：进程退出丢失状态的 agent 会永远留在 Map 里，
+    // 超过 STALE_MS 无生命的 "running" 条目经统一终态链（markOrphaned）标记后移除，
+    // 不再参与存活判定；真实活跃 agent（startedAt 距今 < 2h）保持原状态检查语义。
     const STALE_MS = 2 * 60 * 60 * 1000;
     const now = Date.now();
     const isLive = (s?: SubagentInfo): boolean => now - (s?.startedAt ?? 0) < STALE_MS;
