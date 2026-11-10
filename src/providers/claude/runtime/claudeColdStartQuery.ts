@@ -5,6 +5,10 @@ import { ProviderSettingsCoordinator } from '../../../core/providers/ProviderSet
 import type ClaudianPlugin from '../../../main';
 import { getEnhancedPath, getMissingNodeError, parseEnvironmentVariables } from '../../../utils/env';
 import { getVaultPath } from '../../../utils/path';
+import {
+  createClaudeNativeMcpCutoverService,
+  resolveClaudeLaunchScopeInput,
+} from '../app/ClaudeNativeMcpCutover';
 import { extractAssistantText } from '../auxiliary/extractAssistantText';
 import {
   getClaudeProviderSettings,
@@ -14,6 +18,7 @@ import {
   resolveAdaptiveEffortLevel,
   resolveThinkingTokens,
 } from '../types/models';
+import { CutoverLaunchBlockedError } from '../types/nativeMcpCutover';
 import { createCustomSpawnFunction } from './customSpawn';
 
 export interface ColdStartQueryConfig {
@@ -132,7 +137,24 @@ export async function runColdStartQuery(
     }
   }
 
+  // Cutover admission (design §4.2): auxiliary queries (inline/title/refine)
+  // spawn real CLIs, so they pass the same scope gate as the main chat —
+  // previously this entry bypassed any main-chat-only gating.
+  const cutover = createClaudeNativeMcpCutoverService(config.plugin);
+  const admission = await cutover.resolveLaunchAdmission(
+    resolveClaudeLaunchScopeInput(
+      config.plugin,
+      vaultPath,
+      resolvedClaudePath,
+      resolveClaudeSettingSources(claudeSettings.loadUserSettings),
+    ),
+  );
+  if (!admission.allowed) {
+    throw new CutoverLaunchBlockedError();
+  }
+
   const response = agentQuery({ prompt, options });
+  cutover.markNativeRunning(admission.scopeKey);
   let responseText = '';
   let sessionId: string | null = null;
 

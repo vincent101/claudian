@@ -79,3 +79,21 @@ export interface CutoverServiceDeps {
 export interface CutoverConfirmResult {
   ok: boolean;
 }
+
+/**
+ * Stable, non-secret error raised when a launch is blocked by the cutover
+ * gate. Carries no configuration values — only the fixed action the user
+ * must take.
+ */
+export class CutoverLaunchBlockedError extends Error {
+  constructor() {
+    super(
+      'Claude cannot start yet: in-app MCP management was removed and this '
+      + 'workspace still has legacy MCP traces. Review your native MCP '
+      + 'configuration (same-name servers, tool restrictions) in Claudian '
+      + 'settings → Claude → MCP Servers and confirm to switch to native '
+      + 'management. History remains readable.',
+    );
+    this.name = 'CutoverLaunchBlockedError';
+  }
+}

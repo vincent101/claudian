@@ -6,6 +6,9 @@ import {
   resetMockMessages,
   setMockMessages,
 } from '@test/__mocks__/claude-agent-sdk';
+import * as fs from 'fs';
+import * as os from 'os';
+import * as path from 'path';
 
 import { type TitleGenerationResult, TitleGenerationService } from '@/providers/claude/auxiliary/ClaudeTitleGenerationService';
 function createMockPlugin(settings = {}) {
@@ -19,7 +22,10 @@ function createMockPlugin(settings = {}) {
     app: {
       vault: {
         adapter: {
-          basePath: '/test/vault/path',
+          // Fresh temp dir per suite run: the cutover admission probes the
+          // real fs at the vault root, so a machine-local /test/vault could
+          // otherwise flip every title query to review-required.
+          basePath: fs.mkdtempSync(path.join(os.tmpdir(), 'claudian-title-')),
         },
       },
     },

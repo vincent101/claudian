@@ -41,7 +41,10 @@ export type TranscriptDiagnosticPhase =
   // credentials' source. source_changed = replacement detected; missing =
   // the vanished source is unverifiable; stale/identity_missing = the
   // recovery-prime handshake variants.
-  | 'prime_rejected';
+  | 'prime_rejected'
+  // Native MCP cutover (design 2026-11-09): a launch was blocked before
+  // spawn by the scope admission gate.
+  | 'native_mcp_cutover_block';
 
 export interface TranscriptDiagnosticEvent {
   phase: TranscriptDiagnosticPhase;

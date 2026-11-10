@@ -1,4 +1,4 @@
-import * as fs from 'fs';
+import * as fs from 'fs/promises';
 import * as os from 'os';
 import * as path from 'path';
 
@@ -136,17 +136,23 @@ export function createClaudeNativeMcpCutoverService(
     saveRecord: async record => {
       // Persisted through the standard provider-settings channel so the
       // record survives load/save normalization (design §6.1 settings row).
-      updateClaudeProviderSettings(
-        plugin.settings as unknown as Record<string, unknown>,
-        { nativeMcpCutover: record },
-      );
-      await plugin.saveSettings();
+      // A failed persist rolls the in-memory mutation back — a failed write
+      // must never leave an in-memory pass behind (design §5.2).
+      const settingsBag = plugin.settings as unknown as Record<string, unknown>;
+      const previous = getClaudeProviderSettings(settingsBag).nativeMcpCutover;
+      updateClaudeProviderSettings(settingsBag, { nativeMcpCutover: record });
+      try {
+        await plugin.saveSettings();
+      } catch (error) {
+        updateClaudeProviderSettings(settingsBag, { nativeMcpCutover: previous });
+        throw error;
+      }
     },
     legacyFileProbe: createLegacyMcpFileProbe(async legacyPath => {
       try {
         // lstat: presence only — presence of the link itself counts, and the
         // file content is never opened here.
-        await fs.promises.lstat(legacyPath);
+        await fs.lstat(legacyPath);
         return true;
       } catch (error) {
         const code = (error as { code?: string }).code;
@@ -157,7 +163,22 @@ export function createClaudeNativeMcpCutoverService(
         return 'unknown';
       }
     }),
-    hasLoadedLegacyMetadata: () => plugin.hasLoadedLegacyMcpMetadata(),
+    hasLoadedLegacyMetadata: () => {
+      // The production plugin exposes a boolean-only signal; older plugin
+      // shapes (test seams, isolated construction) fall back to inspecting
+      // the conversations array existence — a missing signal is "no loaded
+      // legacy traces", never a fabrication of traces.
+      const candidate = plugin as unknown as {
+        hasLoadedLegacyMcpMetadata?: () => boolean;
+        conversations?: Array<{ enabledMcpServers?: string[] }>;
+      };
+      if (typeof candidate.hasLoadedLegacyMcpMetadata === 'function') {
+        return candidate.hasLoadedLegacyMcpMetadata();
+      }
+      return (candidate.conversations ?? []).some(
+        conversation => (conversation.enabledMcpServers?.length ?? 0) > 0,
+      );
+    },
     legacyFilePath: cwd => path.join(cwd, '.claude', 'mcp.json'),
   });
 }

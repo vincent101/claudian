@@ -1,4 +1,9 @@
 import * as fs from 'fs';
+// The module-level `jest.mock('fs')` swaps fs for the automock; the cutover
+// notice test needs the REAL fs for its temp-dir fixtures, restored via
+// requireActual inside that test.
+import type * as os from 'os';
+import type * as path from 'path';
 
 import { DEFAULT_CLAUDE_PROVIDER_SETTINGS } from '@/providers/claude/settings';
 import { claudeSettingsTabRenderer } from '@/providers/claude/ui/ClaudeSettingsTab';
@@ -32,6 +37,7 @@ jest.mock('obsidian', () => {
     public textAreaComponents: MockTextAreaComponent[] = [];
     public dropdownComponents: MockDropdownComponent[] = [];
     public toggleComponents: MockToggleComponent[] = [];
+    public buttonComponents: MockButtonComponent[] = [];
     public infoEl = createInfoElement();
 
     constructor(_container: unknown) {
@@ -80,10 +86,41 @@ jest.mock('obsidian', () => {
       callback(component);
       return this;
     }
+
+    addButton(callback: (button: MockButtonComponent) => void) {
+      const component = createButtonComponent();
+      this.buttonComponents.push(component);
+      callback(component);
+      return this;
+    }
   }
 
   return {
     Setting: MockSetting,
+    Modal: class MockModal {
+      app: any;
+      modalEl: any;
+      contentEl: any;
+
+      constructor(app: any) {
+        this.app = app;
+        this.modalEl = { addClass: jest.fn() };
+        this.contentEl = {
+          createDiv: jest.fn().mockReturnValue({ createEl: jest.fn(), createDiv: jest.fn() }),
+          createEl: jest.fn().mockReturnValue({ setAttribute: jest.fn() }),
+          empty: jest.fn(),
+        };
+      }
+
+      setTitle = jest.fn();
+      open = jest.fn();
+      close = jest.fn();
+      onOpen(): void {}
+      onClose(): void {}
+    },
+    Notice: class MockNotice {
+      constructor(public message: string) {}
+    },
   };
 });
 
@@ -167,6 +204,15 @@ interface MockToggleComponent {
   onChange: jest.MockedFunction<(callback: (value: boolean) => Promise<void> | void) => MockToggleComponent>;
 }
 
+interface MockButtonComponent {
+  buttonText: string;
+  cta: boolean;
+  onClickCallback: (() => void) | null;
+  setButtonText: jest.MockedFunction<(text: string) => MockButtonComponent>;
+  setCta: jest.MockedFunction<() => MockButtonComponent>;
+  onClick: jest.MockedFunction<(callback: () => void) => MockButtonComponent>;
+}
+
 const createdSettings: Array<{
   name: string;
   desc: string;
@@ -175,6 +221,7 @@ const createdSettings: Array<{
   textAreaComponents: MockTextAreaComponent[];
   dropdownComponents: MockDropdownComponent[];
   toggleComponents: MockToggleComponent[];
+  buttonComponents: MockButtonComponent[];
 }> = [];
 
 function createInputEl(): MockInputEl & { _listeners: Map<string, Array<() => void>> } {
@@ -267,6 +314,27 @@ function createToggleComponent(): MockToggleComponent {
   return component;
 }
 
+function createButtonComponent(): MockButtonComponent {
+  const component = {} as MockButtonComponent;
+  component.buttonText = '';
+  component.cta = false;
+  component.onClickCallback = null;
+  component.setButtonText = jest.fn((text: string) => {
+    component.buttonText = text;
+    return component;
+  });
+  component.setCta = jest.fn(() => {
+    component.cta = true;
+    return component;
+  });
+  component.onClick = jest.fn((callback: () => void) => {
+    component.onClickCallback = callback;
+    return component;
+  });
+
+  return component;
+}
+
 function createElement(): any {
   const listeners: Record<string, Array<() => void>> = {};
   const element: any = {
@@ -335,6 +403,10 @@ function createPlugin(overrides: Record<string, unknown> = {}): any {
         },
       },
     },
+    // Cutover notice resolution surface (vault + CLI + legacy metadata).
+    getResolvedProviderCliPath: jest.fn().mockReturnValue(null),
+    hasLoadedLegacyMcpMetadata: jest.fn().mockReturnValue(false),
+    conversations: [],
   };
 }
 
@@ -406,5 +478,104 @@ describe('ClaudeSettingsTab', () => {
     expect(createdSettings.map(setting => setting.name)).not.toContain('settings.claudeSafeMode.name');
     const allDropdowns = createdSettings.flatMap(setting => setting.dropdownComponents);
     expect(allDropdowns.length).toBe(0);
+  });
+
+  describe('native MCP cutover notice', () => {
+    it('renders no management CRUD anywhere (only native pointer/cutover notice)', () => {
+      const plugin = createPlugin();
+      const context = createContext(plugin);
+
+      claudeSettingsTabRenderer.render(createContainer(), context);
+
+      const names = createdSettings.map(setting => setting.name);
+      expect(names).not.toContain('settings.mcpServers.name');
+    });
+
+    /**
+     * Real fs for fixtures (the module-level fs mock never touches disk):
+     * the cutover admission probe stats the legacy file with real I/O, so
+     * the async notice only settles after a real event-loop round.
+     */
+    function makeTrackedContainer(): { container: any; created: any[] } {
+      const created: any[] = [];
+      const createTrackedDiv = (opts: { cls?: string } | undefined): any => {
+        const element = createElement();
+        if (opts?.cls) element._cls = opts.cls;
+        created.push(element);
+        // Nested divs keep cls tracking so the notice subtree is observable.
+        element.createDiv = jest.fn((nestedOpts: { cls?: string } | undefined) =>
+          createTrackedDiv(nestedOpts));
+        return element;
+      };
+      const container = createContainer();
+      container.createDiv = jest.fn((opts: { cls?: string } | undefined) => createTrackedDiv(opts));
+      return { container, created };
+    }
+
+    async function settleAsyncRender(): Promise<void> {
+      for (let i = 0; i < 50; i++) {
+        await new Promise(resolve => setTimeout(resolve, 1));
+      }
+    }
+
+    it('shows the review-required notice with the confirm entry for a legacy workspace', async () => {
+      const realFs = jest.requireActual('fs') as typeof fs;
+      const realOs = jest.requireActual('os') as typeof os;
+      const realPath = jest.requireActual('path') as typeof path;
+      const vaultRoot = realFs.mkdtempSync(realPath.join(realOs.tmpdir(), 'claudian-tab-cutover-'));
+      try {
+        realFs.mkdirSync(realPath.join(vaultRoot, '.claude'), { recursive: true });
+        realFs.writeFileSync(realPath.join(vaultRoot, '.claude', 'mcp.json'), '{}', 'utf8');
+
+        const plugin = createPlugin();
+        plugin.app.vault.adapter.basePath = vaultRoot;
+        plugin.getResolvedProviderCliPath = jest.fn().mockReturnValue('/mock/claude');
+
+        const { container, created } = makeTrackedContainer();
+
+        claudeSettingsTabRenderer.render(container, createContext(plugin));
+        await settleAsyncRender();
+
+        const clsList = created.map(el => el._cls).filter(Boolean);
+        expect(clsList).toContain('claudian-mcp-cutover-container');
+        expect(clsList).toContain('claudian-mcp-cutover-notice');
+
+        // Exactly one action entry: the explicit confirm button. No CRUD,
+        // no import/test/manage controls anywhere in the tab.
+        const buttons = createdSettings.flatMap(setting => setting.buttonComponents);
+        expect(buttons.length).toBe(1);
+        expect(buttons[0].buttonText).toBe('Review native MCP configuration');
+        expect(buttons[0].cta).toBe(true);
+        expect(buttons[0].onClickCallback).toBeInstanceOf(Function);
+      } finally {
+        realFs.rmSync(vaultRoot, { recursive: true, force: true });
+      }
+    });
+
+    it('renders the neutral native-management pointer without any action entry for a clean workspace', async () => {
+      const realFs = jest.requireActual('fs') as typeof fs;
+      const realOs = jest.requireActual('os') as typeof os;
+      const realPath = jest.requireActual('path') as typeof path;
+      const vaultRoot = realFs.mkdtempSync(realPath.join(realOs.tmpdir(), 'claudian-tab-cutover-'));
+      try {
+        const plugin = createPlugin();
+        plugin.app.vault.adapter.basePath = vaultRoot;
+        plugin.getResolvedProviderCliPath = jest.fn().mockReturnValue('/mock/claude');
+
+        const { container, created } = makeTrackedContainer();
+
+        claudeSettingsTabRenderer.render(container, createContext(plugin));
+        await settleAsyncRender();
+
+        const clsList = created.map(el => el._cls).filter(Boolean);
+        expect(clsList).toContain('claudian-mcp-cutover-container');
+        expect(clsList).toContain('claudian-mcp-settings-desc');
+        expect(clsList).not.toContain('claudian-mcp-cutover-notice');
+        // Fresh install: no confirmation entry is offered anywhere.
+        expect(createdSettings.flatMap(setting => setting.buttonComponents).length).toBe(0);
+      } finally {
+        realFs.rmSync(vaultRoot, { recursive: true, force: true });
+      }
+    });
   });
 });
