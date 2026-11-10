@@ -4,6 +4,8 @@ import { Notice } from 'obsidian';
 import { ProviderRegistry } from '@/core/providers/ProviderRegistry';
 import type { UsageInfo } from '@/core/types';
 import { ClaudianView } from '@/features/chat/ClaudianView';
+import type { MarkdownRenderSummary } from '@/features/chat/history/HistoryDiagnostics';
+import { MarkdownRenderDiagnostics } from '@/features/chat/rendering/MarkdownRenderDiagnostics';
 import { t } from '@/i18n/i18n';
 import { claudeChatUIConfig } from '@/providers/claude/ui/ClaudeChatUIConfig';
 import { InputModal } from '@/shared/modals/InputModal';
@@ -131,6 +133,161 @@ describe('ClaudianView.refreshModelSelector usage refresh', () => {
   });
 });
 
+describe('ClaudianView markdown diagnostics lifecycle', () => {
+  it('cleans up the captured manager and tab bar when persistence fails', async () => {
+    const failure = new Error('tab persistence failed');
+    const manager = {
+      beginClose: jest.fn(),
+      stopMarkdownDiagnostics: jest.fn(),
+      getAllTabs: () => [],
+      getActiveTab: () => null,
+      getPersistedState: () => ({ openTabs: [] }),
+      destroy: jest.fn().mockResolvedValue(undefined),
+    };
+    const tabBar = { destroy: jest.fn() };
+    const view = Object.create(ClaudianView.prototype) as ClaudianView;
+    const raw = view as unknown as Record<string, unknown>;
+    raw.plugin = {
+      app: { vault: { offref: jest.fn() } },
+      persistTabManagerState: jest.fn().mockRejectedValue(failure),
+    };
+    raw.tabManager = manager;
+    raw.tabBar = tabBar;
+    raw.pendingTabBarUpdate = null;
+    raw.pendingPersist = null;
+    raw.eventRefs = [];
+
+    await expect(view.onClose()).rejects.toBe(failure);
+    expect(manager.destroy).toHaveBeenCalledTimes(1);
+    expect(tabBar.destroy).toHaveBeenCalledTimes(1);
+    expect(manager.beginClose).toHaveBeenCalledTimes(1);
+  });
+
+  it('retires synchronously and shares concurrent close work', async () => {
+    let releasePersistence!: () => void;
+    const persistence = new Promise<void>(resolve => { releasePersistence = resolve; });
+    const manager = {
+      beginClose: jest.fn(),
+      stopMarkdownDiagnostics: jest.fn(),
+      getAllTabs: () => [],
+      getActiveTab: () => null,
+      getPersistedState: jest.fn(() => ({ openTabs: [] })),
+      destroy: jest.fn().mockResolvedValue(undefined),
+    };
+    const tabBar = { destroy: jest.fn() };
+    const persistTabManagerState = jest.fn(() => persistence);
+    const view = Object.create(ClaudianView.prototype) as ClaudianView;
+    const raw = view as unknown as Record<string, unknown>;
+    raw.plugin = { app: { vault: { offref: jest.fn() } }, persistTabManagerState };
+    raw.tabManager = manager;
+    raw.tabBar = tabBar;
+    raw.pendingTabBarUpdate = null;
+    raw.pendingPersist = null;
+    raw.eventRefs = [];
+
+    const first = view.onClose();
+    const second = view.onClose();
+    try {
+      expect(manager.beginClose).toHaveBeenCalledTimes(1);
+      expect(persistTabManagerState).toHaveBeenCalledTimes(1);
+      expect(manager.destroy).not.toHaveBeenCalled();
+      releasePersistence();
+      await Promise.all([first, second]);
+      expect(manager.destroy).toHaveBeenCalledTimes(1);
+      expect(tabBar.destroy).toHaveBeenCalledTimes(1);
+    } finally {
+      releasePersistence();
+      await Promise.allSettled([first, second]);
+    }
+  });
+
+  it('cleans the captured tab bar when manager destruction rejects', async () => {
+    const failure = new Error('manager cleanup failed');
+    const manager = {
+      beginClose: jest.fn(),
+      stopMarkdownDiagnostics: jest.fn(),
+      getAllTabs: () => [],
+      getActiveTab: () => null,
+      getPersistedState: () => ({ openTabs: [] }),
+      destroy: jest.fn().mockRejectedValue(failure),
+    };
+    const tabBar = { destroy: jest.fn() };
+    const view = Object.create(ClaudianView.prototype) as ClaudianView;
+    const raw = view as unknown as Record<string, unknown>;
+    raw.plugin = {
+      app: { vault: { offref: jest.fn() } },
+      persistTabManagerState: jest.fn().mockResolvedValue(undefined),
+    };
+    raw.tabManager = manager;
+    raw.tabBar = tabBar;
+    raw.pendingTabBarUpdate = null;
+    raw.pendingPersist = null;
+    raw.eventRefs = [];
+
+    await expect(view.onClose()).rejects.toBe(failure);
+    expect(tabBar.destroy).toHaveBeenCalledTimes(1);
+    expect(raw.tabManager).toBeNull();
+    expect(raw.tabBar).toBeNull();
+  });
+
+  it('flushes only its own collectors before persistence and ignores late completions', async () => {
+    const order: string[] = [];
+    const events: MarkdownRenderSummary[] = [];
+    const createCollector = (id: string) => new MarkdownRenderDiagnostics(id, event => {
+      events.push(event);
+      if (event.flushScope === 'window') order.push(id);
+    });
+    const first = createCollector('aaaaaaaaaaaa');
+    const second = createCollector('bbbbbbbbbbbb');
+    const otherView = createCollector('cccccccccccc');
+    const element = { isConnected: true, ownerDocument: { visibilityState: 'visible' } } as unknown as HTMLElement;
+    const token = first.start(element, 1);
+    second.start(element, 2);
+    const otherToken = otherView.start(element, 3);
+    const view = Object.create(ClaudianView.prototype) as ClaudianView;
+    const raw = view as unknown as Record<string, unknown>;
+    raw.plugin = {
+      app: { vault: { offref: jest.fn() } },
+      persistTabManagerState: jest.fn(async () => { order.push('persist'); }),
+    };
+    raw.tabManager = {
+      beginClose: jest.fn(),
+      stopMarkdownDiagnostics: jest.fn(() => { order.push('stop'); }),
+      getAllTabs: () => [first, second].map(collector => ({
+        markdownRenderDiagnostics: { collector, dispose: () => collector.dispose() },
+      })),
+      getActiveTab: () => null,
+      getPersistedState: () => ({ openTabs: [] }),
+      destroy: jest.fn(async () => { order.push('destroy'); }),
+    };
+    raw.pendingTabBarUpdate = null;
+    raw.pendingPersist = null;
+    raw.eventRefs = [];
+    raw.tabBar = null;
+
+    try {
+      await view.onClose();
+      expect(order).toEqual(['stop', 'aaaaaaaaaaaa', 'bbbbbbbbbbbb', 'persist', 'destroy']);
+      expect(events.filter(event => event.flushScope === 'window')).toEqual(expect.arrayContaining([
+        expect.objectContaining({ collectorIdHash: 'aaaaaaaaaaaa', flushReason: 'dispose', abandonedCalls: 1 }),
+        expect.objectContaining({ collectorIdHash: 'bbbbbbbbbbbb', flushReason: 'dispose', abandonedCalls: 1 }),
+      ]));
+      const count = events.length;
+      first.end(token, true);
+      await view.onClose();
+      expect(events).toHaveLength(count);
+      otherView.end(otherToken, true);
+      otherView.dispose();
+      expect(events.find(event => event.collectorIdHash === 'cccccccccccc' && event.flushScope === 'window'))
+        .toMatchObject({ successCalls: 1, abandonedCalls: 0 });
+    } finally {
+      first.dispose();
+      second.dispose();
+      otherView.dispose();
+    }
+  });
+});
+
 describe('ClaudianView tab rename wiring', () => {
   const open = jest.fn();
   let plugin: {
@@ -140,7 +297,7 @@ describe('ClaudianView tab rename wiring', () => {
   let view: ClaudianView;
   let updateTabBar: jest.Mock;
   let updateHistoryDropdown: jest.Mock;
-  let tabBarCallbacks: { onTabRename: (tabId: string) => void };
+  let tabBarCallbacks: { onTabRename: (tabId: string) => void; onNewTab: () => Promise<void> };
 
   function submittedModalOptions(): { value: string; onSubmit: (raw: string) => Promise<void> } {
     const calls = (InputModal as unknown as jest.Mock).mock.calls;
@@ -172,11 +329,13 @@ describe('ClaudianView tab rename wiring', () => {
     const raw = view as unknown as Record<string, unknown>;
     raw.app = {};
     raw.plugin = plugin;
+    const tabs: Record<string, unknown> = {
+      'tab-bound': { id: 'tab-bound', conversationId: 'conv-1' },
+      'tab-empty': { id: 'tab-empty', conversationId: null },
+    };
     raw.tabManager = {
-      getTab: (tabId: string) => ({
-        'tab-bound': { id: 'tab-bound', conversationId: 'conv-1' },
-        'tab-empty': { id: 'tab-empty', conversationId: null },
-      } as Record<string, unknown>)[tabId],
+      isOpen: jest.fn().mockReturnValue(true),
+      getTab: (tabId: string) => tabs[tabId],
     };
     raw.updateTabBar = updateTabBar;
     raw.updateHistoryDropdown = updateHistoryDropdown;
@@ -217,6 +376,55 @@ describe('ClaudianView tab rename wiring', () => {
     expect(plugin.renameConversationManually).toHaveBeenCalledWith('conv-1', 'New title');
     expect(order).toEqual(['rename', 'tabBar', 'history']);
     expect(Notice).not.toHaveBeenCalled();
+  });
+
+  it('does not publish a completed old rename into a replacement manager', async () => {
+    let resolveRename!: () => void;
+    plugin.renameConversationManually.mockImplementationOnce(() => new Promise<void>(resolve => {
+      resolveRename = resolve;
+    }));
+    tabBarCallbacks.onTabRename('tab-bound');
+    const submitted = submittedModalOptions().onSubmit('New title');
+    (view as unknown as Record<string, unknown>).tabManager = {
+      getTab: () => null,
+    };
+    resolveRename();
+    await submitted;
+
+    expect(plugin.renameConversationManually).toHaveBeenCalledWith('conv-1', 'New title');
+    expect(updateTabBar).not.toHaveBeenCalled();
+    expect(updateHistoryDropdown).not.toHaveBeenCalled();
+  });
+
+  it('does not route callbacks from an old tab bar into a reopened manager', async () => {
+    const createTab = jest.fn().mockResolvedValue({ id: 'replacement-tab' });
+    const raw = view as unknown as Record<string, unknown>;
+    raw.tabManager = {
+      isOpen: () => true,
+      getTab: () => ({ id: 'tab-bound', conversationId: 'conv-1' }),
+      createTab,
+    };
+    raw.assemblyGeneration = {};
+    raw.updateTabBarVisibility = jest.fn();
+
+    tabBarCallbacks.onTabRename('tab-bound');
+    await tabBarCallbacks.onNewTab();
+
+    expect(InputModal).not.toHaveBeenCalled();
+    expect(createTab).not.toHaveBeenCalled();
+  });
+
+  it('does not start a rename submitted after its original manager retires', async () => {
+    tabBarCallbacks.onTabRename('tab-bound');
+    const { onSubmit } = submittedModalOptions();
+    const manager = (view as unknown as { tabManager: { isOpen: jest.Mock } }).tabManager;
+    manager.isOpen.mockReturnValue(false);
+
+    await onSubmit('New title');
+
+    expect(plugin.renameConversationManually).not.toHaveBeenCalled();
+    expect(updateTabBar).not.toHaveBeenCalled();
+    expect(updateHistoryDropdown).not.toHaveBeenCalled();
   });
 
   it('trims the confirmed value before renaming', async () => {
@@ -353,3 +561,159 @@ describe('ClaudianView Escape and Shift+Tab permission arbitration', () => {
   });
 });
 
+describe('ClaudianView retired asynchronous callbacks', () => {
+  beforeEach(() => { jest.clearAllMocks(); });
+
+  it('does not report a closing cancellation as a tab limit', async () => {
+    let release!: (value: null) => void;
+    let active = true;
+    const manager = {
+      isOpen: () => active,
+      createTab: jest.fn(() => new Promise<null>(resolve => { release = resolve; })),
+    };
+    const view = Object.create(ClaudianView.prototype) as ClaudianView;
+    const raw = view as unknown as Record<string, unknown>;
+    raw.plugin = { settings: { maxTabs: 3 } };
+    raw.tabManager = manager;
+    raw.assemblyGeneration = {};
+    raw.updateTabBarVisibility = jest.fn();
+
+    const creating = view.createNewTab();
+    active = false;
+    release(null);
+    await creating;
+
+    expect(Notice).not.toHaveBeenCalled();
+    expect(raw.updateTabBarVisibility).not.toHaveBeenCalled();
+  });
+
+  it('does not refresh a replacement view after the original tab close', async () => {
+    let release!: () => void;
+    const manager = {
+      isOpen: () => true,
+      getTab: () => ({ state: { isStreaming: false } }),
+      closeTab: jest.fn(() => new Promise<void>(resolve => { release = resolve; })),
+    };
+    const view = Object.create(ClaudianView.prototype) as ClaudianView;
+    const raw = view as unknown as Record<string, unknown>;
+    raw.tabManager = manager;
+    raw.assemblyGeneration = {};
+    raw.updateTabBarVisibility = jest.fn();
+    const closing = (view as unknown as { handleTabClose: (id: string) => Promise<void> })
+      .handleTabClose('tab-1');
+    raw.tabManager = { isOpen: () => true };
+    raw.assemblyGeneration = {};
+    release();
+    await closing;
+
+    expect(raw.updateTabBarVisibility).not.toHaveBeenCalled();
+  });
+
+  it('does not route an old history menu callback into a reopened manager', async () => {
+    const renderHistoryDropdown = jest.fn((_container: unknown, _options: unknown) => {});
+    const controller = { renderHistoryDropdown };
+    const manager = {
+      isOpen: () => true,
+      getActiveTab: () => ({ controllers: { conversationController: controller } }),
+    };
+    const view = Object.create(ClaudianView.prototype) as ClaudianView;
+    const raw = view as unknown as Record<string, unknown>;
+    raw.tabManager = manager;
+    raw.assemblyGeneration = {};
+    raw.historyDropdown = createMockEl();
+    raw.historyDropdownOwner = null;
+    (view as unknown as { updateHistoryDropdown: () => void }).updateHistoryDropdown();
+    const callbacks = renderHistoryDropdown.mock.calls[0][1] as {
+      onSelectConversation: (id: string) => Promise<void>;
+    };
+    const openConversation = jest.fn().mockResolvedValue(undefined);
+    raw.tabManager = { isOpen: () => true, openConversation };
+    raw.assemblyGeneration = {};
+    raw.hideHistoryDropdown = jest.fn();
+
+    await callbacks.onSelectConversation('conv-1');
+
+    expect(openConversation).not.toHaveBeenCalled();
+    expect(raw.hideHistoryDropdown).not.toHaveBeenCalled();
+  });
+
+  it('does not repaint a replacement tab bar from an old animation frame', () => {
+    let frame!: FrameRequestCallback;
+    const originalRequestFrame = globalThis.requestAnimationFrame;
+    globalThis.requestAnimationFrame = jest.fn(callback => { frame = callback; return 1; });
+    try {
+      const oldManager = { isOpen: () => true, getTabBarItems: jest.fn(() => []) };
+      const oldTabBar = { update: jest.fn() };
+      const newManager = { isOpen: () => true, getTabBarItems: jest.fn(() => []) };
+      const newTabBar = { update: jest.fn() };
+      const view = Object.create(ClaudianView.prototype) as ClaudianView;
+      const raw = view as unknown as Record<string, unknown>;
+      raw.tabManager = oldManager;
+      raw.tabBar = oldTabBar;
+      raw.assemblyGeneration = {};
+      raw.pendingTabBarUpdate = null;
+      raw.updateTabBarVisibility = jest.fn();
+      (view as unknown as { updateTabBar: () => void }).updateTabBar();
+      raw.tabManager = newManager;
+      raw.tabBar = newTabBar;
+      raw.assemblyGeneration = {};
+      raw.pendingTabBarUpdate = 2;
+
+      frame(0);
+
+      expect(newManager.getTabBarItems).not.toHaveBeenCalled();
+      expect(newTabBar.update).not.toHaveBeenCalled();
+      expect(raw.pendingTabBarUpdate).toBe(2);
+    } finally {
+      globalThis.requestAnimationFrame = originalRequestFrame;
+    }
+  });
+
+  it('does not persist a replacement manager from an old debounce callback', () => {
+    jest.useFakeTimers();
+    try {
+      const persistTabManagerState = jest.fn().mockResolvedValue(undefined);
+      const oldManager = { isOpen: () => true, getPersistedState: jest.fn(() => ({ openTabs: [] })) };
+      const newManager = { isOpen: () => true, getPersistedState: jest.fn(() => ({ openTabs: [] })) };
+      const view = Object.create(ClaudianView.prototype) as ClaudianView;
+      const raw = view as unknown as Record<string, unknown>;
+      raw.plugin = { persistTabManagerState };
+      raw.pendingPersist = null;
+      raw.tabManager = oldManager;
+      raw.assemblyGeneration = {};
+      (view as unknown as { persistTabState: () => void }).persistTabState();
+      raw.tabManager = newManager;
+      raw.assemblyGeneration = {};
+
+      jest.advanceTimersByTime(300);
+
+      expect(oldManager.getPersistedState).not.toHaveBeenCalled();
+      expect(newManager.getPersistedState).not.toHaveBeenCalled();
+      expect(persistTabManagerState).not.toHaveBeenCalled();
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  it.each(['openHistoryConversation', 'openHistoryConversationInNewTab'] as const)(
+    'does not hide a replacement view history dropdown after %s', async method => {
+      let release!: () => void;
+      const manager = {
+        isOpen: () => true,
+        openConversation: jest.fn(() => new Promise<void>(resolve => { release = resolve; })),
+      };
+      const view = Object.create(ClaudianView.prototype) as ClaudianView;
+      const raw = view as unknown as Record<string, unknown>;
+      raw.tabManager = manager;
+      raw.assemblyGeneration = {};
+      raw.hideHistoryDropdown = jest.fn();
+      const opening = (view as unknown as Record<string, (id: string) => Promise<void>>)[method]('conv-1');
+      raw.tabManager = { isOpen: () => true };
+      raw.assemblyGeneration = {};
+      release();
+      await opening;
+
+      expect(raw.hideHistoryDropdown).not.toHaveBeenCalled();
+    },
+  );
+});

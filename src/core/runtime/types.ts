@@ -205,6 +205,8 @@ export interface AutoTurnCancelledEvent {
   interrupted?: boolean;
 }
 
+export type { CapturedSessionPersistence } from '../providers/types';
+
 export type {
   ApprovalDecision,
   ExitPlanModeCallback,

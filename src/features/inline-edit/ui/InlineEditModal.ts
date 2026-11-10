@@ -529,10 +529,20 @@ class InlineEditController {
         {
           fixed: true,
           hiddenCommands: getHiddenProviderCommandSet(this.plugin.settings, this.resolvedProviderId),
+          // Without a published catalog the resolved provider still gates
+          // capability-bound built-ins (an undefined identity would ungate them).
+          builtInProviderId: this.resolvedProviderId,
         }
       );
       owner.slashDropdown = slashDropdown;
       this.slashCommandDropdown = slashDropdown;
+      this.rebindCommandCatalog(owner);
+      owner.unsubscribe = ProviderWorkspaceRegistry.subscribeCommandCatalog(
+        this.resolvedProviderId,
+        () => {
+          if (this.isCurrentInputOwner(owner)) this.rebindCommandCatalog(owner);
+        },
+      );
 
       const mentionDropdown = new MentionDropdownController(
         document.body,
@@ -832,6 +842,22 @@ class InlineEditController {
     }
   }
 
+  /**
+   * Rebinds the inline dropdown to the currently published command catalog
+   * for the resolved provider. The inline entry stays unbound: the default
+   * typed factory is used and the active chat runtime is never injected into
+   * command capture.
+   */
+  private rebindCommandCatalog(owner: InputDOMOwner): void {
+    const dropdown = owner.slashDropdown;
+    if (!dropdown || !this.isCurrentInputOwner(owner)) return;
+    const catalog = ProviderWorkspaceRegistry.getCommandCatalog(this.resolvedProviderId);
+    dropdown.setProviderCatalog(
+      catalog ? catalog.getDropdownConfig() : null,
+      catalog ? () => catalog.listDropdownEntries({ includeBuiltIns: false }) : null,
+      this.resolvedProviderId,
+    );
+  }
 
   private cleanup(options?: { keepSelectionHighlight?: boolean }) {
     if (this.terminal) return;

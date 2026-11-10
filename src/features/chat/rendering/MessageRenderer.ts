@@ -31,6 +31,11 @@ export interface RenderContentOptions {
   deferMath?: boolean;
 }
 
+export interface MarkdownRenderMeasurement {
+  start(element: HTMLElement, chars: number): unknown;
+  end(token: unknown, success: boolean): void;
+}
+
 export type RenderContentFn = (
   el: HTMLElement,
   markdown: string,
@@ -72,6 +77,7 @@ export class MessageRenderer {
     forkCallback?: (messageId: string) => Promise<void>,
     getCapabilities?: () => ProviderCapabilities,
     onMessageContentRendered?: (projectionKey: string, projectionLevel: HistoryProjectionLevel) => void,
+    private readonly markdownMeasurement?: MarkdownRenderMeasurement,
   ) {
     this.app = plugin.app;
     this.plugin = plugin;
@@ -984,12 +990,30 @@ export class MessageRenderer {
         this.app,
         this.plugin.settings.mediaFolder
       );
-      await MarkdownRenderer.renderMarkdown(
-        processedMarkdown,
-        el,
-        '',
-        this.component
-      );
+      let token: unknown;
+      let started = false;
+      try {
+        if (this.markdownMeasurement) {
+          token = this.markdownMeasurement.start(el, processedMarkdown.length);
+          started = true;
+        }
+      } catch {
+        // Diagnostics are a bypass, including at registration and settlement.
+      }
+      let success = false;
+      try {
+        await MarkdownRenderer.renderMarkdown(
+          processedMarkdown,
+          el,
+          '',
+          this.component
+        );
+        success = true;
+      } finally {
+        if (started) {
+          try { this.markdownMeasurement?.end(token, success); } catch { /* diagnostic failure is isolated */ }
+        }
+      }
 
       // Wrap pre elements and move buttons outside scroll area
       el.querySelectorAll('pre').forEach((pre) => {

@@ -13,6 +13,7 @@ import {
   type HistoryDiagnosticEvent,
   setHistoryDiagnosticsSink,
 } from '@/features/chat/history/HistoryDiagnostics';
+import { MarkdownRenderDiagnostics } from '@/features/chat/rendering/MarkdownRenderDiagnostics';
 import { MessageRenderer } from '@/features/chat/rendering/MessageRenderer';
 import { renderStoredAsyncSubagent, renderStoredSubagent } from '@/features/chat/rendering/SubagentRenderer';
 import { renderStoredThinkingBlock } from '@/features/chat/rendering/ThinkingBlockRenderer';
@@ -91,6 +92,228 @@ function createRenderer(messagesEl?: any, providerId: 'claude' | 'codex' = 'clau
 describe('MessageRenderer', () => {
   beforeEach(() => {
     jest.clearAllMocks();
+  });
+
+  it('measures the actual Markdown call and releases its registrar', async () => {
+    const { MarkdownRenderer } = await import('obsidian');
+    const start = jest.fn().mockReturnValue('token');
+    const end = jest.fn();
+    const release = jest.fn();
+    const component = createMockComponent();
+    const el = createMockEl();
+    const plugin = { app: {}, settings: { mediaFolder: '' } };
+    const Renderer = MessageRenderer as any;
+    const renderer = new Renderer(plugin, component, createMockEl(), undefined, undefined, undefined, undefined, { start, end });
+    renderer.setPageRenderWorkRegistrar(() => release);
+
+    await renderer.renderContent(el, 'A😀');
+
+    expect(MarkdownRenderer.renderMarkdown).toHaveBeenCalledWith('A😀', el, '', component);
+    expect(start).toHaveBeenCalledWith(el, 3);
+    expect(end).toHaveBeenCalledWith('token', true);
+    expect(release).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(['disabled', 'enabled', 'start throws', 'end throws'])(
+    'preserves Markdown failure and release with diagnostics %s',
+    async mode => {
+      const { MarkdownRenderer } = await import('obsidian');
+      (MarkdownRenderer.renderMarkdown as jest.Mock).mockRejectedValueOnce(new Error('private error'));
+      const start = jest.fn(() => {
+        if (mode === 'start throws') throw new Error('private diagnostic error');
+        return 'token';
+      });
+      const end = jest.fn(() => {
+        if (mode === 'end throws') throw new Error('private diagnostic error');
+      });
+      const release = jest.fn();
+      const el = createMockEl();
+      const component = createMockComponent();
+      const Renderer = MessageRenderer as any;
+      const renderer = new Renderer(
+        { app: {}, settings: { mediaFolder: '' } }, component, createMockEl(),
+        undefined, undefined, undefined, undefined,
+        mode === 'disabled' ? undefined : { start, end },
+      );
+      renderer.setPageRenderWorkRegistrar(() => release);
+
+      await expect(renderer.renderContent(el, 'broken')).resolves.toBeUndefined();
+
+      expect(MarkdownRenderer.renderMarkdown).toHaveBeenCalledTimes(1);
+      expect(MarkdownRenderer.renderMarkdown).toHaveBeenCalledWith('broken', el, '', component);
+      expect(el.querySelector('.claudian-render-error')).not.toBeNull();
+      expect(release).toHaveBeenCalledTimes(1);
+      expect(end.mock.calls).toEqual(mode === 'enabled' || mode === 'end throws' ? [['token', false]] : []);
+    },
+  );
+
+  it('excludes diagnostic setup time from the real Markdown Promise timing', async () => {
+    const { MarkdownRenderer } = await import('obsidian');
+    let now = 0;
+    const clock = jest.spyOn(performance, 'now').mockImplementation(() => now);
+    const events: any[] = [];
+    const collector = new MarkdownRenderDiagnostics('cccccccccccc', event => events.push(event));
+    const release = jest.fn();
+    const component = createMockComponent();
+    const el = createMockEl();
+    const renderer = new MessageRenderer({ app: {}, settings: { mediaFolder: '' } } as any, component as any,
+      createMockEl(), undefined, undefined, undefined, undefined, collector);
+    collector.setContext({ getTabActive: () => { now += 100; return true; } });
+    renderer.setPageRenderWorkRegistrar(() => release);
+    (MarkdownRenderer.renderMarkdown as jest.Mock).mockImplementationOnce(async () => { now += 1; });
+
+    try {
+      await expect(renderer.renderContent(el, 'payload')).resolves.toBeUndefined();
+      collector.dispose();
+      expect(MarkdownRenderer.renderMarkdown).toHaveBeenCalledTimes(1);
+      expect(MarkdownRenderer.renderMarkdown).toHaveBeenCalledWith('payload', el, '', component);
+      expect(release).toHaveBeenCalledTimes(1);
+      expect(events.find(event => event.flushScope === 'window')).toMatchObject({
+        elapsedMsSum: 1, elapsedMsMax: 1, elapsedMsHistogram: [0, 1, 0, 0, 0, 0, 0, 0],
+        settledCalls: 1, successCalls: 1,
+      });
+    } finally {
+      collector.dispose();
+      clock.mockRestore();
+    }
+  });
+
+  it.each(['throws', 'NaN', 'negative', 'infinite'])('isolates a %s start clock from actual Markdown rendering', async mode => {
+    const { MarkdownRenderer } = await import('obsidian');
+    let invalid = false;
+    const clock = jest.spyOn(performance, 'now').mockImplementation(() => {
+      if (!invalid) return 0;
+      if (mode === 'throws') throw new Error('private clock error');
+      return mode === 'NaN' ? NaN : mode === 'negative' ? -1 : Infinity;
+    });
+    const events: any[] = [];
+    const collector = new MarkdownRenderDiagnostics('cccccccccccc', event => events.push(event));
+    const release = jest.fn();
+    const component = createMockComponent();
+    const el = createMockEl();
+    const renderer = new MessageRenderer({ app: {}, settings: { mediaFolder: '' } } as any, component as any,
+      createMockEl(), undefined, undefined, undefined, undefined, collector);
+    renderer.setPageRenderWorkRegistrar(() => release);
+    invalid = true;
+    try {
+      await expect(renderer.renderContent(el, 'payload')).resolves.toBeUndefined();
+      collector.dispose();
+      expect(MarkdownRenderer.renderMarkdown).toHaveBeenCalledTimes(1);
+      expect(MarkdownRenderer.renderMarkdown).toHaveBeenCalledWith('payload', el, '', component);
+      expect(el.querySelector('.claudian-render-error')).toBeNull();
+      expect(release).toHaveBeenCalledTimes(1);
+      expect(events).toEqual([]);
+    } finally {
+      collector.dispose();
+      clock.mockRestore();
+    }
+  });
+
+  it.each([
+    ['throws', false], ['throws', true], ['NaN', false], ['NaN', true],
+  ] as const)('isolates a %s end clock on Markdown failure=%s', async (mode, markdownFails) => {
+    const { MarkdownRenderer } = await import('obsidian');
+    let invalid = false;
+    const clock = jest.spyOn(performance, 'now').mockImplementation(() => {
+      if (!invalid) return 0;
+      if (mode === 'throws') throw new Error('private clock error');
+      return NaN;
+    });
+    const events: any[] = [];
+    const collector = new MarkdownRenderDiagnostics('cccccccccccc', event => events.push(event));
+    const release = jest.fn();
+    const component = createMockComponent();
+    const el = createMockEl();
+    const renderer = new MessageRenderer({ app: {}, settings: { mediaFolder: '' } } as any, component as any,
+      createMockEl(), undefined, undefined, undefined, undefined, collector);
+    renderer.setPageRenderWorkRegistrar(() => release);
+    (MarkdownRenderer.renderMarkdown as jest.Mock).mockImplementationOnce(async () => {
+      invalid = true;
+      if (markdownFails) throw new Error('private markdown error');
+    });
+    try {
+      await expect(renderer.renderContent(el, 'payload')).resolves.toBeUndefined();
+      await expect(renderer.renderContent(createMockEl(), 'second')).resolves.toBeUndefined();
+      collector.dispose();
+      expect(MarkdownRenderer.renderMarkdown).toHaveBeenCalledTimes(2);
+      expect(MarkdownRenderer.renderMarkdown).toHaveBeenNthCalledWith(1, 'payload', el, '', component);
+      expect(el.querySelector('.claudian-render-error') !== null).toBe(markdownFails);
+      expect(release).toHaveBeenCalledTimes(2);
+      expect(events).toEqual([]);
+    } finally {
+      collector.dispose();
+      clock.mockRestore();
+    }
+  });
+
+  it('feeds the real collector the processed Markdown UTF-16 length', async () => {
+    const { MarkdownRenderer } = await import('obsidian');
+    const { replaceImageEmbedsWithHtml } = await import('@/utils/imageEmbed');
+    const events: any[] = [];
+    const collector = new MarkdownRenderDiagnostics('cccccccccccc', event => events.push(event));
+    collector.setContext({ tabIdHash: 'aaaaaaaaaaaa', conversationIdHash: 'bbbbbbbbbbbb', getTabActive: () => true });
+    const component = createMockComponent();
+    const el = createMockEl();
+    const release = jest.fn();
+    const renderer = new MessageRenderer({ app: {}, settings: { mediaFolder: '' } } as any, component as any,
+      createMockEl(), undefined, undefined, undefined, undefined, collector);
+    renderer.setPageRenderWorkRegistrar(() => release);
+    (replaceImageEmbedsWithHtml as jest.Mock).mockReturnValueOnce('A😀');
+
+    await renderer.renderContent(el, 'x');
+    collector.dispose();
+
+    expect(MarkdownRenderer.renderMarkdown).toHaveBeenCalledWith('A😀', el, '', component);
+    expect(release).toHaveBeenCalledTimes(1);
+    expect(events.find(event => event.flushScope === 'window')).toMatchObject({ callsSum: 1, charsSum: 3, settledCalls: 1, successCalls: 1 });
+    expect(JSON.stringify(events)).not.toContain('A😀');
+  });
+
+  it('records real Markdown failure but does not count a preprocessing failure', async () => {
+    const { MarkdownRenderer } = await import('obsidian');
+    const { replaceImageEmbedsWithHtml } = await import('@/utils/imageEmbed');
+    const events: any[] = [];
+    const collector = new MarkdownRenderDiagnostics('cccccccccccc', event => events.push(event));
+    const release = jest.fn();
+    const renderer = new MessageRenderer({ app: {}, settings: { mediaFolder: '' } } as any, createMockComponent() as any,
+      createMockEl(), undefined, undefined, undefined, undefined, collector);
+    renderer.setPageRenderWorkRegistrar(() => release);
+    const preprocessError = createMockEl();
+    (replaceImageEmbedsWithHtml as jest.Mock).mockImplementationOnce(() => { throw new Error('private'); });
+    await renderer.renderContent(preprocessError, 'preprocess fails');
+    expect(MarkdownRenderer.renderMarkdown).not.toHaveBeenCalled();
+    expect(preprocessError.querySelector('.claudian-render-error')).not.toBeNull();
+    const markdownError = createMockEl();
+    (MarkdownRenderer.renderMarkdown as jest.Mock).mockRejectedValueOnce(new Error('private'));
+    await renderer.renderContent(markdownError, 'fail');
+    collector.dispose();
+    expect(markdownError.querySelector('.claudian-render-error')).not.toBeNull();
+    expect(release).toHaveBeenCalledTimes(2);
+    expect(events.find(event => event.flushScope === 'window')).toMatchObject({ callsSum: 1, charsSum: 4, settledCalls: 1, successCalls: 0, failureCalls: 1 });
+    expect(JSON.stringify(events)).not.toContain('private');
+  });
+
+  it.each(['start throws', 'end throws'])('preserves successful rendering when diagnostics %s', async mode => {
+    const { MarkdownRenderer } = await import('obsidian');
+    const release = jest.fn();
+    const el = createMockEl();
+    const component = createMockComponent();
+    const measurement = {
+      start: jest.fn(() => {
+        if (mode === 'start throws') throw new Error('private');
+        return 'token';
+      }),
+      end: jest.fn(() => { if (mode === 'end throws') throw new Error('private'); }),
+    };
+    const renderer = new MessageRenderer({ app: {}, settings: { mediaFolder: '' } } as any, component as any,
+      createMockEl(), undefined, undefined, undefined, undefined, measurement);
+    renderer.setPageRenderWorkRegistrar(() => release);
+    await expect(renderer.renderContent(el, 'success')).resolves.toBeUndefined();
+    expect(MarkdownRenderer.renderMarkdown).toHaveBeenCalledTimes(1);
+    expect(MarkdownRenderer.renderMarkdown).toHaveBeenCalledWith('success', el, '', component);
+    expect(el.querySelector('.claudian-render-error')).toBeNull();
+    expect(release).toHaveBeenCalledTimes(1);
+    expect(measurement.end.mock.calls).toEqual(mode === 'end throws' ? [['token', true]] : []);
   });
 
   it('registers page render work for every markdown render', async () => {

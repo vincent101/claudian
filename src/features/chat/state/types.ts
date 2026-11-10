@@ -1,6 +1,11 @@
 import type { EditorView } from '@codemirror/view';
 
-import type { HistoryIndexLease, LoadedTurnRange } from '../../../core/providers/types';
+import type {
+  AttemptToken, BindingToken, CaptureAcknowledgement, CloseToken, HistoryIndexLease, HistoryTailStart, LoadedTurnRange, MetadataPatch,
+  OwnerToken, ProviderId, RecordHandle, RecordVersions, RegisteredSaveRequest, RuntimeAdoptionToken, SaveAdmission,
+  SaveAdmissionPending, SaveReceipt, SaveRejectionReason, SaveTicket, SaveToken, SessionBindingPatch,
+} from '../../../core/providers/types';
+import type { CapturedSessionPersistence } from '../../../core/runtime/types';
 import type { ChatRuntimeQueryOptions } from '../../../core/runtime/types';
 import type { TodoItem } from '../../../core/tools/todo';
 import type {
@@ -54,6 +59,8 @@ export interface ChatStateData {
   historyLoading: boolean;
   historyError: string | null;
   historySnapshotOffset: number | null;
+  /** Opaque tail-start credentials riding with the snapshot offset (H/P8). */
+  historyTailStart: HistoryTailStart | null;
   historyPageStore: HistoryPageStore;
 
   // Streaming control
@@ -134,6 +141,65 @@ export interface ChatStateCallbacks {
 
 /** Options for query execution. */
 export type QueryOptions = ChatRuntimeQueryOptions;
+
+export interface PersistableBindingState {
+  readonly metadata: MetadataPatch;
+  readonly sessionSeed: SessionBindingPatch;
+}
+export interface ReservationWitness { readonly claim: object; readonly owns: () => boolean }
+export interface BindingAttempt {
+  readonly token: AttemptToken;
+  readonly owner: OwnerToken;
+  readonly record: RecordHandle;
+  readonly expectedRecordVersions: RecordVersions;
+  readonly outgoing: BindingToken | null;
+}
+export interface CommittedTabBinding {
+  readonly token: BindingToken;
+  readonly owner: OwnerToken;
+  readonly record: RecordHandle;
+  readonly recordVersions: RecordVersions;
+  readonly dirtyRevision: number;
+  readonly state: PersistableBindingState;
+}
+export interface CommitReceipt {
+  readonly token: BindingToken;
+  readonly attempt: AttemptToken;
+  readonly owner: OwnerToken;
+  readonly record: RecordHandle;
+  readonly recordVersions: RecordVersions;
+}
+export interface RuntimePersistencePort {
+  readonly identity: object;
+  readonly providerId: ProviderId;
+  captureSessionPersistence(): CapturedSessionPersistence;
+  acknowledgeSessionPersistenceCapture(capture: CapturedSessionPersistence): void;
+}
+export interface RuntimeAdoptionReceipt {
+  readonly token: RuntimeAdoptionToken;
+  readonly owner: OwnerToken;
+  readonly binding: BindingToken;
+}
+export type CoreRejectReason = SaveRejectionReason | 'outgoing-not-written';
+export type CoreResult<T> = { readonly status: 'ok'; readonly value: T }
+  | { readonly status: 'rejected'; readonly reason: CoreRejectReason; readonly error?: unknown };
+export interface CloseSavePlan {
+  readonly token: CloseToken;
+  readonly owner: OwnerToken;
+  readonly acceptedAtSeal: readonly SaveTicket[];
+  readonly pendingAtSeal: readonly SaveAdmissionPending[];
+  readonly finalAdmissions: readonly RegisteredSaveRequest[];
+  readonly completion: Promise<readonly CloseSaveOutcome[]>;
+}
+export type CloseSaveOutcome =
+  | { readonly status: 'not-admitted'; readonly token: SaveToken; readonly rejection: Extract<SaveAdmission, { status: 'rejected' }> }
+  | { readonly status: 'settled'; readonly receipt: SaveReceipt; readonly captureAcknowledgement: CaptureAcknowledgement };
+export type SaveReceiptState = { readonly status: 'pending' } | { readonly status: 'settled'; readonly receipt: SaveReceipt };
+export interface BindingPersistenceStatus {
+  readonly dirtyRevision: number;
+  readonly confirmedDirtyRevision: number;
+  readonly dirty: boolean;
+}
 
 // Re-export types that are used across the chat feature
 export type {

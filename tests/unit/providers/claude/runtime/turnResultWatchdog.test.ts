@@ -1,7 +1,7 @@
 import '@/providers';
 
 import * as sdkModule from '@anthropic-ai/claude-agent-sdk';
-import { appendFile, mkdtemp, readFile, rm, writeFile } from 'fs/promises';
+import { appendFile, mkdtemp, readFile, rm, stat, writeFile } from 'fs/promises';
 import { Notice } from 'obsidian';
 import { tmpdir } from 'os';
 import { join } from 'path';
@@ -26,6 +26,7 @@ const RESULT_WATCHDOG_GRACE_MS = 15_000;
 const STOP_TASK_GRACE_MS = 15_000;
 const STOP_TASK_TURN_SILENCE_MS = 30 * 60_000;
 const STOP_TASK_AGENT_MIN_AGE_MS = 2 * 60 * 60 * 1000;
+const realSetImmediate = setImmediate;
 
 function makeMockPlugin(): ClaudianPlugin {
   const storageMock = {
@@ -126,9 +127,16 @@ describe('ClaudianService - P0-1 result-late watchdog', () => {
   let transcriptFile: string;
   let diagDir: string;
   let service: ClaudianService;
-  let sessionPathSpy: jest.SpyInstance;
+  let fixtureActive: boolean;
+  let releaseOwnedTasks: Array<() => void>;
+  let replacedChannels: MessageChannel[];
+  let ownedConsumers: Promise<void>[];
 
   beforeEach(async () => {
+    fixtureActive = true;
+    releaseOwnedTasks = [];
+    replacedChannels = [];
+    ownedConsumers = [];
     jest.useFakeTimers();
     dir = await mkdtemp(join(tmpdir(), 'claudian-watchdog-'));
     transcriptFile = join(dir, 'session.jsonl');
@@ -144,22 +152,87 @@ describe('ClaudianService - P0-1 result-late watchdog', () => {
     service.setOnAutoTurnStarted(() => true);
     service.setOnAutoTurnChunk(async () => {});
     service.setOnAutoTurnFinished(async () => {});
-    sessionPathSpy = jest.spyOn(sdkSessionPaths, 'getSDKSessionPath').mockReturnValue(transcriptFile);
+    jest.spyOn(sdkSessionPaths, 'getSDKSessionPath').mockReturnValue(transcriptFile);
   });
 
   afterEach(async () => {
-    jest.useRealTimers();
-    sessionPathSpy.mockRestore();
-    service.cleanup();
-    sdkMock.resetMockMessages();
-    await rm(dir, { recursive: true, force: true });
+    fixtureActive = false;
+    const runtime = service as any;
+    const observer = runtime.transcriptObserver;
+    const reader = observer?.reader;
+    const retirement = runtime.queryRetirementChain as Promise<void> | null;
+    const startup = runtime.persistentQueryStart as Promise<void> | null;
+    retainReplacedQuery(service);
+    try {
+      for (const release of releaseOwnedTasks) release();
+      service.cleanup();
+      for (const channel of replacedChannels) channel.close();
+      if (retirement) await jest.advanceTimersByTimeAsync(15_000);
+      await Promise.allSettled([retirement, startup].filter((task): task is Promise<void> => task !== null));
+      retainReplacedQuery(service);
+      const lateObserver = runtime.transcriptObserver;
+      const lateReader = lateObserver?.reader;
+      service.cleanup();
+      for (const channel of replacedChannels) channel.close();
+      await runtime.transcriptObserverRestartChain;
+      await Promise.all([reader?.ioChain, observer?.consumeChain, lateReader?.ioChain, lateObserver?.consumeChain]);
+      await jest.runAllTimersAsync();
+      await Promise.allSettled(ownedConsumers);
+    } finally {
+      jest.restoreAllMocks();
+      jest.useRealTimers();
+      sdkMock.resetMockMessages();
+      await rm(dir, { recursive: true, force: true });
+    }
   });
 
-  async function driveObserverTick(): Promise<void> {
-    const observer = (service as any).transcriptObserver;
+  function retainReplacedQuery(target: ClaudianService): void {
+    const channel = (target as any).messageChannel as MessageChannel | null;
+    const consumer = (target as any).responseConsumerPromise as Promise<void> | null;
+    if (channel) replacedChannels.push(channel);
+    if (consumer) ownedConsumers.push(consumer);
+  }
+
+  async function awaitObserverStart(target: ClaudianService = service): Promise<any> {
+    await (target as any).transcriptObserverRestartChain;
+    const observer = (target as any).transcriptObserver;
+    expect(observer?.reader).toBeTruthy();
+    expect(observer.stopped).toBe(false);
+    expect(observer.reader.stopped).toBe(false);
+    return observer;
+  }
+
+  async function awaitScheduledPoll(target: ClaudianService, observer: any): Promise<{ callAt: number }> {
     const reader = observer.reader;
-    const batch = await reader.readAvailable();
-    await observer.consumeBatch(batch, observer.generation);
+    const clock = (setTimeout as unknown as { clock?: { timers?: Map<number, { callAt: number }> } }).clock;
+    if (!clock?.timers) throw new Error('Fake timer state is unavailable');
+    // The reader only schedules its next poll after real I/O and onBatch finish.
+    while (fixtureActive && (target as any).transcriptObserver === observer && !reader.stopped
+      && !clock.timers.has(Number(reader.timer))) {
+      await new Promise<void>(resolve => { realSetImmediate(resolve); });
+    }
+    if (!fixtureActive || (target as any).transcriptObserver !== observer || reader.stopped) {
+      throw new Error('Transcript observer stopped before its poll completed');
+    }
+    const timer = clock.timers.get(Number(reader.timer));
+    if (!timer) throw new Error('Transcript poll timer is unavailable');
+    return timer;
+  }
+
+  async function driveObserverTick(target: ClaudianService = service): Promise<void> {
+    const observer = await awaitObserverStart(target);
+    const reader = observer.reader;
+    const targetOffset = (await stat(transcriptFile)).size;
+    const timer = await awaitScheduledPoll(target, observer);
+    if (reader.getOffset() < targetOffset) {
+      await jest.advanceTimersByTimeAsync(Math.max(0, timer.callAt - Date.now()));
+      await awaitScheduledPoll(target, observer);
+    }
+    expect(reader.getOffset()).toBe(targetOffset);
+    await observer.consumeChain;
+    const phases = await readDiagnosticPhases(diagDir);
+    expect(phases.some(entry => entry.phase === 'tick_end' && entry.generation === observer.generation)).toBe(true);
+    expect(phases.some(entry => entry.phase === 'callback_error')).toBe(false);
   }
 
   it('T1: transcript terminal + silent SDK stream force-settles, releases and pumps the queue', async () => {
@@ -176,7 +249,7 @@ describe('ClaudianService - P0-1 result-late watchdog', () => {
 
     // Host turn projection begins after the observer exists (restored-session flow).
     service.beginUserTurnProjection('turn-t1');
-    await flushMicrotasks();
+    await awaitObserverStart();
 
     // The dispatched message's user row lands on the transcript (the
     // generator registered it only if the observer already existed; the
@@ -266,7 +339,7 @@ describe('ClaudianService - P0-1 result-late watchdog', () => {
     const gen = service.query(turn);
     await gen.next();
     service.beginUserTurnProjection('turn-t4');
-    await flushMicrotasks();
+    await awaitObserverStart();
     let settled = false;
     void gen.next().then(() => { settled = true; });
     await flushMicrotasks();
@@ -297,7 +370,7 @@ describe('ClaudianService - P0-1 result-late watchdog', () => {
     const first = await gen.next();
     expect(first.value).toEqual(expect.objectContaining({ type: 'text' }));
     service.beginUserTurnProjection('turn-t5b');
-    await flushMicrotasks();
+    await awaitObserverStart();
     const t5bUuid = (service as any).lastSentMessage.uuid as string;
     (service as any).transcriptObserver.registerHostUserTranscriptId(t5bUuid);
     await appendFile(transcriptFile, hostUserRowLine(t5bUuid));
@@ -349,7 +422,7 @@ describe('ClaudianService - P0-1 result-late watchdog', () => {
     const gen = service.query(turn);
     await gen.next();
     service.beginUserTurnProjection('turn-t5');
-    await flushMicrotasks();
+    await awaitObserverStart();
     const t5Uuid = (service as any).lastSentMessage.uuid as string;
     (service as any).transcriptObserver.registerHostUserTranscriptId(t5Uuid);
     await appendFile(transcriptFile, hostUserRowLine(t5Uuid));
@@ -363,6 +436,7 @@ describe('ClaudianService - P0-1 result-late watchdog', () => {
 
     await appendFile(transcriptFile, hostTerminalRows());
     await driveObserverTick();
+    expect((service as any).runtimeTurns.get('turn-t5').transcriptTerminalSeenAt).not.toBeNull();
 
     await jest.advanceTimersByTimeAsync(RESULT_WATCHDOG_MS);
     await jest.advanceTimersByTimeAsync(RESULT_WATCHDOG_GRACE_MS);
@@ -436,7 +510,7 @@ describe('ClaudianService - P0-1 result-late watchdog', () => {
     const genA = service.query(turnA);
     await genA.next();
     service.beginUserTurnProjection('turn-t7a');
-    await flushMicrotasks();
+    await awaitObserverStart();
     const t7aUuid = (service as any).lastSentMessage.uuid as string;
     (service as any).transcriptObserver.registerHostUserTranscriptId(t7aUuid);
     await appendFile(transcriptFile, hostUserRowLine(t7aUuid));
@@ -490,7 +564,7 @@ describe('ClaudianService - P0-1 result-late watchdog', () => {
     const gen = service.query(turn);
     await gen.next();
     service.beginUserTurnProjection('turn-t8');
-    await flushMicrotasks();
+    await awaitObserverStart();
     const t8Uuid = (service as any).lastSentMessage.uuid as string;
     (service as any).transcriptObserver.registerHostUserTranscriptId(t8Uuid);
     await appendFile(transcriptFile, hostUserRowLine(t8Uuid));
@@ -540,7 +614,7 @@ describe('ClaudianService - P0-1 result-late watchdog', () => {
     expect(first.value).toEqual(expect.objectContaining({ type: 'text', content: 'model reply' }));
 
     service.beginUserTurnProjection('turn-t1c');
-    await flushMicrotasks();
+    await awaitObserverStart();
     const t1cUuid = (service as any).lastSentMessage.uuid as string;
     (service as any).transcriptObserver.registerHostUserTranscriptId(t1cUuid);
 
@@ -647,7 +721,7 @@ describe('ClaudianService - P0-1 result-late watchdog', () => {
     const gen = service.query(turn);
     await gen.next();
     service.beginUserTurnProjection('turn-t4c');
-    await flushMicrotasks();
+    await awaitObserverStart();
     const t4cUuid = (service as any).lastSentMessage.uuid as string;
     (service as any).transcriptObserver.registerHostUserTranscriptId(t4cUuid);
     await appendFile(transcriptFile, hostUserRowLine(t4cUuid));
@@ -676,11 +750,14 @@ describe('ClaudianService - P0-1 result-late watchdog', () => {
 
   async function armTerminalEvidence(target: ClaudianService, turnId: string): Promise<void> {
     target.beginUserTurnProjection(turnId);
-    await flushMicrotasks();
+    const observer = await awaitObserverStart(target);
     const uuid = (target as any).lastSentMessage.uuid as string;
-    (target as any).transcriptObserver.registerHostUserTranscriptId(uuid);
+    expect(observer.currentDispatch()).toEqual(expect.objectContaining({ leaseTurnId: turnId, canonicalUuid: uuid }));
+    observer.registerHostUserTranscriptId(uuid);
     await appendFile(transcriptFile, hostUserRowLine(uuid) + hostTerminalRows());
-    await driveObserverTick();
+    await driveObserverTick(target);
+    expect(observer.hostUserRowObserved).toBe(true);
+    expect((target as any).runtimeTurns.get(turnId).transcriptTerminalSeenAt).not.toBeNull();
   }
 
   describe('query boundary isolation (2026-11-05 fix 2: old results must never settle new-query turns)', () => {
@@ -688,6 +765,7 @@ describe('ClaudianService - P0-1 result-late watchdog', () => {
      * effects (the terminal state after a retirement/rebuild: new channel,
      * new scope, old scope still holding its own state). */
     function installReplacementQuery(service: ClaudianService): MessageChannel {
+      retainReplacedQuery(service);
       const messageChannel = new MessageChannel(() => {}, (info) => (service as any).handleTurnDequeued(info));
       (service as any).messageChannel = messageChannel;
       (service as any).persistentQuery = sdkMock.query({ prompt: messageChannel, options: {} as any });
@@ -731,7 +809,10 @@ describe('ClaudianService - P0-1 result-late watchdog', () => {
     it.each(['result', 'reject'] as const)('a retired consumer drops its late %s while the rebuilt next lease settles only on its own result', async (lateKind) => {
       const delivered: unknown[] = [];
       let deliverOldResult!: () => void;
-      const bufferedStdout = new Promise<void>(resolve => { deliverOldResult = resolve; });
+      const bufferedStdout = new Promise<void>(resolve => {
+        deliverOldResult = resolve;
+        releaseOwnedTasks.push(resolve);
+      });
       const transportSpy = jest.spyOn(sdkMock, 'query');
       const createTransport = transportSpy.getMockImplementation()!;
       transportSpy.mockImplementationOnce((args) => {
@@ -766,6 +847,7 @@ describe('ClaudianService - P0-1 result-late watchdog', () => {
       const nextFirst = nextGenerator.next();
       await flushMicrotasks();
       const oldConsumer = (service as any).responseConsumerPromise as Promise<void>;
+      ownedConsumers.push(oldConsumer);
       // Only SDK transport timing is mocked: old stdout stays buffered until
       // the next query has really dispatched. Production retirement closes
       // the channel and confirms exit through the injected process event.
@@ -1563,7 +1645,7 @@ describe('ClaudianService - P0-1 result-late watchdog', () => {
       await flushMicrotasks();
       const query = sdkMock.getLastResponse()!;
       query.stopTask.mockImplementation((agentId: string) => {
-        if (agentId === 'blocked-control') return new Promise<void>(() => {});
+        if (agentId === 'blocked-control') return new Promise<void>(resolve => { releaseOwnedTasks.push(resolve); });
         if (agentId === 'refused-control') return Promise.reject(new Error('stop_task_refused'));
         return Promise.resolve();
       });
@@ -1689,7 +1771,7 @@ describe('ClaudianService - P0-1 result-late watchdog', () => {
       const gen = service.query(turn);
       await gen.next();
       service.beginUserTurnProjection('turn-retract');
-      await flushMicrotasks();
+      await awaitObserverStart();
       const uuid = (service as any).lastSentMessage.uuid as string;
       (service as any).transcriptObserver.registerHostUserTranscriptId(uuid);
       await appendFile(transcriptFile, hostUserRowLine(uuid));
@@ -1738,7 +1820,10 @@ describe('ClaudianService - P0-1 result-late watchdog', () => {
 
       const query = sdkMock.getLastResponse()!;
       let rejectStop!: (error: Error) => void;
-      query.stopTask.mockImplementationOnce(() => new Promise<void>((_, reject) => { rejectStop = reject; }));
+      query.stopTask.mockImplementationOnce(() => new Promise<void>((resolve, reject) => {
+        rejectStop = reject;
+        releaseOwnedTasks.push(resolve);
+      }));
 
       await jest.advanceTimersByTimeAsync(RESULT_WATCHDOG_MS);
       const attemptEpoch = (service as any).currentQueryScope.epoch;
@@ -1779,7 +1864,7 @@ describe('ClaudianService - P0-1 result-late watchdog', () => {
       const gen = service.query(turn);
       await gen.next();
       service.beginUserTurnProjection('turn-probe-fire');
-      await flushMicrotasks();
+      await awaitObserverStart();
       void gen.next();
       await flushMicrotasks();
 
@@ -1794,6 +1879,7 @@ describe('ClaudianService - P0-1 result-late watchdog', () => {
       (service as any).transcriptObserver.registerHostUserTranscriptId(uuid);
       await appendFile(transcriptFile, hostUserRowLine(uuid) + hostTerminalRows());
       await driveObserverTick();
+      expect((service as any).runtimeTurns.get('turn-probe-fire').transcriptTerminalSeenAt).not.toBeNull();
       await jest.advanceTimersByTimeAsync(RESULT_WATCHDOG_MS);
       await flushMicrotasks();
 
@@ -1856,7 +1942,7 @@ describe('ClaudianService - P0-1 result-late watchdog', () => {
       const gen = service.query(turn);
       await gen.next();
       service.beginUserTurnProjection('turn-tb4');
-      await flushMicrotasks();
+      await awaitObserverStart();
       let settled = false;
       void gen.next().then(() => { settled = true; });
       await flushMicrotasks();
@@ -1897,7 +1983,7 @@ describe('ClaudianService - P0-1 result-late watchdog', () => {
       const gen = service.query(turn);
       await gen.next();
       service.beginUserTurnProjection('turn-tb5');
-      await flushMicrotasks();
+      await awaitObserverStart();
       void gen.next();
       await flushMicrotasks();
 
@@ -1927,7 +2013,7 @@ describe('ClaudianService - P0-1 result-late watchdog', () => {
       const gen = service.query(turn);
       await gen.next();
       service.beginUserTurnProjection('turn-tb3');
-      await flushMicrotasks();
+      await awaitObserverStart();
       let settled = false;
       void gen.next().then(() => { settled = true; });
       await flushMicrotasks();
@@ -1955,14 +2041,17 @@ describe('ClaudianService - P0-1 result-late watchdog', () => {
       ], { appendResult: false });
       await startPersistentQuery(service);
       let resolveApproval!: (decision: 'allow') => void;
-      service.setApprovalCallback(() => new Promise(resolve => { resolveApproval = resolve; }));
+      service.setApprovalCallback(() => new Promise(resolve => {
+        resolveApproval = resolve;
+        releaseOwnedTasks.push(() => resolve('allow'));
+      }));
       const approvalWait = (service as any).createApprovalCallback()('Bash', { command: 'pwd' }, { signal: new AbortController().signal, toolUseID: 'guard-tool' });
 
       const turn = service.prepareTurn({ turnId: 'turn-approval-guard', text: 'hello' });
       const gen = service.query(turn);
       await gen.next();
       service.beginUserTurnProjection('turn-approval-guard');
-      await flushMicrotasks();
+      await awaitObserverStart();
       void gen.next();
       await flushMicrotasks();
 
@@ -1994,7 +2083,7 @@ describe('ClaudianService - P0-1 result-late watchdog', () => {
       const gen = service.query(turn);
       await gen.next();
       service.beginUserTurnProjection('turn-young-agent');
-      await flushMicrotasks();
+      await awaitObserverStart();
       void gen.next();
       await flushMicrotasks();
 
@@ -2137,6 +2226,7 @@ describe('ClaudianService - P0-1 result-late watchdog', () => {
 
       // Replace the query incarnation; a fresh turn takes the new lease.
       const channelB = (() => {
+        retainReplacedQuery(service);
         const messageChannel = new MessageChannel(() => {}, (info) => (service as any).handleTurnDequeued(info));
         (service as any).messageChannel = messageChannel;
         (service as any).persistentQuery = sdkMock.query({ prompt: messageChannel, options: {} as any });
@@ -2179,7 +2269,7 @@ describe('ClaudianService - P0-1 result-late watchdog', () => {
       await gen.next();
       await flushMicrotasks();
       service.beginUserTurnProjection('turn-anch-a');
-      await flushMicrotasks();
+      await awaitObserverStart();
       const descriptor = (service as any).currentDispatchDescriptor;
       expect(descriptor?.leaseTurnId).toBe('turn-anch-a');
       const realDispatchedAt = descriptor.dispatchedAt as number;
@@ -2278,7 +2368,10 @@ describe('ClaudianService - P0-1 result-late watchdog', () => {
       // delivered after the query incarnation is replaced.
       let rejectStop!: (error: Error) => void;
       sdkMock.getLastResponse()!.stopTask.mockImplementationOnce(
-        () => new Promise<void>((_, reject) => { rejectStop = reject; }),
+        () => new Promise<void>((resolve, reject) => {
+          rejectStop = reject;
+          releaseOwnedTasks.push(resolve);
+        }),
       );
 
       await jest.advanceTimersByTimeAsync(RESULT_WATCHDOG_MS);

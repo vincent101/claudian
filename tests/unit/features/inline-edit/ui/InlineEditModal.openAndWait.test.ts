@@ -980,6 +980,323 @@ describe('InlineEditModal - openAndWait', () => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Command discovery wiring (§6 W4d): the inline entry must consume the typed
+// catalog unbound — the active chat's SDK commands never leak in — and must
+// rebind/unsubscribe across registry catalog replacement and cleanup.
+// ─────────────────────────────────────────────────────────────────────────────
+describe('InlineEditModal - command discovery wiring', () => {
+  let originalDocument: any;
+  let originalWindow: any;
+  let bodyEl: any;
+
+  function installDom() {
+    originalDocument = (global as any).document;
+    originalWindow = (global as any).window;
+    bodyEl = createMockEl('body');
+    (global as any).document = {
+      body: bodyEl,
+      createElement: (tagName: string) => createMockEl(tagName),
+      addEventListener: jest.fn(),
+      removeEventListener: jest.fn(),
+    };
+    (global as any).window = { innerHeight: 600, innerWidth: 800 };
+  }
+
+  function restoreDom() {
+    (global as any).document = originalDocument;
+    (global as any).window = originalWindow;
+  }
+
+  function vaultCommand(name: string) {
+    return {
+      id: `vault:${name}`,
+      name,
+      description: `${name} command`,
+      content: '',
+      source: 'user',
+    };
+  }
+
+  function createVaultCatalog(names: string[]) {
+    const commands = names.map(vaultCommand);
+    const probe = jest.fn(() => {
+      throw new Error('owned probe must not fire from the inline entry');
+    });
+    const catalog = new ClaudeCommandCatalog(
+      { loadAll: async () => commands } as any,
+      { loadAll: async () => [] } as any,
+      probe as any,
+    );
+    return { catalog, probe };
+  }
+
+  function getRenderedCommandNames(): string[] {
+    const dropdownEl = bodyEl.children.find((c: any) => c.hasClass('claudian-slash-dropdown'));
+    if (!dropdownEl) return [];
+    const items = dropdownEl.querySelectorAll('.claudian-slash-item');
+    return items.map((item: any) => {
+      const nameSpan = item.children.find((c: any) => c.hasClass('claudian-slash-name'));
+      return nameSpan?.textContent ?? '';
+    });
+  }
+
+  function wiringPluginFixture() {
+    return {
+      settings: {
+        hiddenProviderCommands: { claude: [], codex: [] },
+      },
+      getConversationSync: jest.fn().mockReturnValue({ providerId: 'claude' }),
+      getView: jest.fn().mockReturnValue({
+        getActiveTab: jest.fn().mockReturnValue({
+          providerId: 'claude',
+          service: null,
+          conversationId: 'active-conversation',
+        }),
+      }),
+    } as any;
+  }
+
+  async function flushAsync(ticks = 20): Promise<void> {
+    for (let i = 0; i < ticks; i++) await Promise.resolve();
+  }
+
+  /** Creates the modal, drives openAndWait until createInputDOM ran. */
+  async function openInlineModal(plugin: any): Promise<{ modal: InlineEditModal; widget: any; resultPromise: Promise<any> }> {
+    const editor = {} as any;
+    const view = { editor } as any;
+    const editContext: InlineEditContext = {
+      mode: 'cursor',
+      cursorContext: {
+        beforeCursor: '',
+        afterCursor: '',
+        isInbetween: true,
+        line: 0,
+        column: 0,
+      },
+    };
+    let widget: any = null;
+    const dispatch = jest.fn((transaction: any) => {
+      const effects = Array.isArray(transaction?.effects)
+        ? transaction.effects
+        : transaction?.effects
+          ? [transaction.effects]
+          : [];
+      for (const effect of effects) {
+        const candidate = effect?.value?.widget;
+        if (candidate && typeof candidate.createInputDOM === 'function') {
+          widget = candidate;
+          widget.createInputDOM();
+        }
+      }
+    });
+    const editorView = {
+      state: {
+        doc: {
+          line: jest.fn(() => ({ from: 0 })),
+          lineAt: jest.fn(() => ({ from: 0 })),
+        },
+      },
+      dispatch,
+      dom: {
+        addEventListener: jest.fn(),
+        removeEventListener: jest.fn(),
+      },
+    } as any;
+    jest
+      .spyOn(editorUtils, 'getEditorView')
+      .mockReturnValue(editorView);
+
+    const modal = new InlineEditModal(
+      { vault: { getFiles: jest.fn().mockReturnValue([]), getAllLoadedFiles: jest.fn().mockReturnValue([]) }, workspace: {} } as any,
+      plugin,
+      editor,
+      view,
+      editContext,
+      'note.md',
+      () => [],
+    );
+    const resultPromise = modal.openAndWait();
+    await flushAsync(5);
+    expect(widget).not.toBeNull();
+    return { modal, widget, resultPromise };
+  }
+
+  function getRealDropdown(widget: any): any {
+    const instance = widget.slashCommandDropdown;
+    expect(instance).toBeDefined();
+    return instance;
+  }
+
+  function typeSlash(widget: any): void {
+    const inputEl = (widget as any).inputEl;
+    inputEl.value = '/';
+    inputEl.selectionStart = 1;
+    getRealDropdown(widget).handleInputChange();
+  }
+
+  afterEach(() => {
+    ProviderWorkspaceRegistry.clear();
+    jest.restoreAllMocks();
+  });
+
+  it('keeps inline discovery unbound even when an active chat has SDK commands', async () => {
+    installDom();
+    try {
+      const { catalog, probe } = createVaultCatalog(['inline-vault']);
+      // The active chat pushed its SDK commands into the catalog's legacy
+      // global slot; the unbound typed factory must never surface them.
+      catalog.setRuntimeCommands([{ id: 'sdk:foreign', name: 'foreign', content: '', source: 'sdk' } as any]);
+      const listLegacy = jest.spyOn(catalog, 'listDropdownEntries');
+      ProviderWorkspaceRegistry.setServices('claude', { commandCatalog: catalog } as any);
+
+      const plugin = wiringPluginFixture();
+      const { widget, resultPromise } = await openInlineModal(plugin);
+
+      // The real production config's typed factory reaches the real dropdown.
+      const dropdown = getRealDropdown(widget);
+      expect(typeof dropdown.providerConfig?.createDiscoverySession).toBe('function');
+
+      typeSlash(widget);
+      await flushAsync();
+
+      const names = getRenderedCommandNames();
+      expect(names).toContain('/inline-vault');
+      expect(names).toContain('/clear');
+      expect(names).not.toContain('/foreign');
+
+      // The active chat getter and the owned probe never fire.
+      expect(listLegacy).not.toHaveBeenCalled();
+      expect(probe).not.toHaveBeenCalled();
+
+      widget.reject();
+      await expect(resultPromise).resolves.toEqual({ decision: 'reject' });
+    } finally {
+      restoreDom();
+    }
+  });
+
+  it('rebinds inline catalog replacement and unsubscribes on cleanup', async () => {
+    installDom();
+    const realSubscribeCommandCatalog =
+      ProviderWorkspaceRegistry.subscribeCommandCatalog.bind(ProviderWorkspaceRegistry);
+    const unsubscribeSpy = jest.fn();
+    const subscribeSpy = jest
+      .spyOn(ProviderWorkspaceRegistry, 'subscribeCommandCatalog')
+      .mockImplementation((providerId, listener) => {
+        const unsubscribe = realSubscribeCommandCatalog(providerId, listener);
+        return () => {
+          unsubscribeSpy();
+          unsubscribe();
+        };
+      });
+    try {
+      const { catalog: catalog1 } = createVaultCatalog(['inline-one']);
+      const { catalog: catalog2 } = createVaultCatalog(['inline-two']);
+      ProviderWorkspaceRegistry.setServices('claude', { commandCatalog: catalog1 } as any);
+
+      const plugin = wiringPluginFixture();
+      const { widget, resultPromise } = await openInlineModal(plugin);
+      typeSlash(widget);
+      await flushAsync();
+      expect(getRenderedCommandNames()).toContain('/inline-one');
+
+      const dropdown = getRealDropdown(widget);
+      const setProviderCatalogSpy = jest.spyOn(dropdown, 'setProviderCatalog');
+      const inputEl = (widget as any).inputEl;
+      const oldItemEl = (bodyEl.children.find((c: any) => c.hasClass('claudian-slash-dropdown')) || { querySelectorAll: () => [] })
+        .querySelectorAll('.claudian-slash-item')[0];
+
+      // Registry replacement synchronously withdraws the old options; the
+      // next input evaluation renders the replacement catalog's vault entries.
+      ProviderWorkspaceRegistry.setServices('claude', { commandCatalog: catalog2 } as any);
+      expect(setProviderCatalogSpy).toHaveBeenCalledTimes(1);
+      const [replacementConfig] = setProviderCatalogSpy.mock.calls[0] as [{ createDiscoverySession?: unknown }, unknown];
+      expect(typeof replacementConfig.createDiscoverySession).toBe('function');
+      expect(getRenderedCommandNames()).toEqual([]);
+      typeSlash(widget);
+      await flushAsync();
+      expect(getRenderedCommandNames()).toContain('/inline-two');
+
+      // A stale detached option from the replaced catalog cannot insert.
+      inputEl.value = '/';
+      oldItemEl?.click();
+      expect(inputEl.value).toBe('/');
+
+      // Registry clear rebinds to null: old options are gone, builtins remain.
+      ProviderWorkspaceRegistry.setServices('claude', undefined);
+      expect(setProviderCatalogSpy).toHaveBeenCalledTimes(2);
+      // The provider identity is passed through even for a null catalog so
+      // capability-gated built-ins stay gated.
+      expect(setProviderCatalogSpy.mock.calls[1]).toEqual([null, null, 'claude']);
+      typeSlash(widget);
+      await flushAsync();
+      const afterClear = getRenderedCommandNames();
+      expect(afterClear).not.toContain('/inline-one');
+      expect(afterClear).not.toContain('/inline-two');
+      expect(afterClear).toContain('/clear');
+
+      // cleanup() unsubscribes first: later registry notifications never call
+      // back into the destroyed UI.
+      widget.reject();
+      await expect(resultPromise).resolves.toEqual({ decision: 'reject' });
+      expect(unsubscribeSpy).toHaveBeenCalledTimes(1);
+      const { catalog: catalog3 } = createVaultCatalog(['inline-three']);
+      ProviderWorkspaceRegistry.setServices('claude', { commandCatalog: catalog3 } as any);
+      expect(setProviderCatalogSpy).toHaveBeenCalledTimes(2);
+    } finally {
+      subscribeSpy.mockRestore();
+      restoreDom();
+    }
+  });
+
+  it('scopes inline built-in commands to the resolved provider when no catalog is published', async () => {
+    installDom();
+    try {
+      // OpenCode publishes no workspace services here: the inline dropdown must
+      // not fall back to an undefined provider identity, because an undefined
+      // context ungates capability-gated built-ins such as /fork.
+      const plugin = {
+        settings: {
+          hiddenProviderCommands: { claude: [], codex: [] },
+        },
+        getConversationSync: jest.fn().mockReturnValue(null),
+        getView: jest.fn().mockReturnValue({
+          getActiveTab: jest.fn().mockReturnValue({
+            providerId: 'opencode',
+            service: null,
+            conversationId: null,
+          }),
+        }),
+      } as any;
+      jest.spyOn(ProviderRegistry, 'createInlineEditService').mockReturnValue({
+        cancel: jest.fn(),
+        continueConversation: jest.fn(),
+        editText: jest.fn(),
+        resetConversation: jest.fn(),
+        setModelOverride: jest.fn(),
+      } as any);
+
+      const { widget, resultPromise } = await openInlineModal(plugin);
+      try {
+        expect((widget as any).resolvedProviderId).toBe('opencode');
+        typeSlash(widget);
+        await flushAsync();
+
+        const names = getRenderedCommandNames();
+        expect(names).toContain('/clear');
+        expect(names).not.toContain('/fork');
+      } finally {
+        // Even a failing red assertion must not leak the module-level
+        // activeController into later suites.
+        widget?.reject();
+        await resultPromise?.catch(() => undefined);
+      }
+    } finally {
+      restoreDom();
+    }
+  });
+});
+
 describe('InlineEditModal - input DOM ownership', () => {
   let dom: JSDOM;
   let editorView: EditorView;
@@ -1088,6 +1405,17 @@ describe('InlineEditModal - input DOM ownership', () => {
     registryListeners = [];
     unsubscribes = [];
     unsubscribeHook = null;
+    const subscribe = ProviderWorkspaceRegistry.subscribeCommandCatalog.bind(ProviderWorkspaceRegistry);
+    jest.spyOn(ProviderWorkspaceRegistry, 'subscribeCommandCatalog').mockImplementation((providerId, listener) => {
+      const index = registryListeners.push(listener) - 1;
+      const unsubscribe = subscribe(providerId, listener);
+      const trackedUnsubscribe = jest.fn(() => {
+        unsubscribe();
+        unsubscribeHook?.(index);
+      });
+      unsubscribes.push(trackedUnsubscribe);
+      return trackedUnsubscribe;
+    });
 
     service = {
       cancel: jest.fn(),

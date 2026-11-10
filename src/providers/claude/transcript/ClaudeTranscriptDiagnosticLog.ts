@@ -33,7 +33,15 @@ export type TranscriptDiagnosticPhase =
   | 'query_start_prohibited'
   // Terminal-evidence retraction (fix 1): strong continuation proof un-arms
   // a stamped terminal so the watchdog can re-arm on the new terminal.
-  | 'host_terminal_retracted';
+  | 'host_terminal_retracted'
+  | 'save_adoption_target_mismatch'
+  | 'save_materialization_rejected'
+  | 'markdown_render_summary'
+  // H/P8 tail-start handoff: the prime rejected (or silently declined) the
+  // credentials' source. source_changed = replacement detected; missing =
+  // the vanished source is unverifiable; stale/identity_missing = the
+  // recovery-prime handshake variants.
+  | 'prime_rejected';
 
 export interface TranscriptDiagnosticEvent {
   phase: TranscriptDiagnosticPhase;
@@ -53,7 +61,7 @@ export interface TranscriptDiagnosticEvent {
   errorName?: string;
   buildId?: string;
   mode?: 'worker' | 'direct';
-  reason?: 'oversized' | 'malformed' | 'no_conversation' | 'no_lease' | 'provider_without_index' | 'stale' | 'grant_timeout' | 'identity_missing' | 'alias_remap' | 'canonical_rebind' | 'range_mismatch' | 'rekey_conflict';
+  reason?: 'oversized' | 'malformed' | 'no_conversation' | 'no_lease' | 'provider_without_index' | 'stale' | 'grant_timeout' | 'identity_missing' | 'alias_remap' | 'canonical_rebind' | 'range_mismatch' | 'rekey_conflict' | 'source_changed' | 'missing';
   outcome?: 'rebuilt' | 'cache_hit' | 'not_applicable' | 'failed' | 'settled_by_result' | 'error' | 'no_candidates' | 'sent';
   /** Which surface forced a search snapshot refresh (search panel default). */
   trigger?: 'search' | 'rewind' | 'fork';
@@ -94,6 +102,44 @@ export interface TranscriptDiagnosticEvent {
   attemptId?: number;
   /** Free-form short context: query-close reason, run_phase state value, force-settle outcome. */
   detail?: string;
+  metricVersion?: 1;
+  collectorIdHash?: string;
+  flushId?: number;
+  flushReason?: 'timer' | 'dispose';
+  flushScope?: 'window' | 'attribution';
+  windowMs?: number;
+  callsSum?: number;
+  callsMax?: number;
+  callsSampleCount?: number;
+  callsHistogram?: number[];
+  charsSum?: number;
+  charsMax?: number;
+  charsHistogram?: number[];
+  elapsedMsSum?: number;
+  elapsedMsMax?: number;
+  elapsedMsHistogram?: number[];
+  settledCalls?: number;
+  successCalls?: number;
+  failureCalls?: number;
+  inFlightAtStart?: number;
+  inFlightAtEnd?: number;
+  abandonedCalls?: number;
+  startVisibilityHistogram?: number[];
+  attributionRows?: number;
+  attributionSlot?: number;
+  attributionKind?: 'known' | 'overflow';
+  tabIdState?: 'known' | 'unknown';
+  conversationIdState?: 'known' | 'unknown';
+  conversationIdHash?: string;
+  tabGeneration?: number;
+  conversationGeneration?: number;
+  tabActive?: 'yes' | 'no' | 'unknown';
+  documentVisible?: 'yes' | 'no' | 'unknown';
+  domConnected?: 'yes' | 'no' | 'unknown';
+  viewport?: 'unknown';
+  domPageNodes?: number;
+  domMessageNodes?: number;
+  domTextBlockNodes?: number;
 }
 
 const SEGMENT_BYTES = 128 * 1024;
@@ -140,6 +186,7 @@ export class ClaudeTranscriptDiagnosticLog {
   }
 
   private serialize(event: TranscriptDiagnosticEvent): string {
+    if (event.phase === 'markdown_render_summary') return this.serializeMarkdown(event);
     const clean: Record<string, unknown> = { ts: Date.now(), seq: ++this.seq, phase: event.phase };
     for (const key of ['tabIdHash', 'turnIdHash', 'pageKeyHash', 'previousPageKeyHash', 'rangeStart', 'rangeEnd', 'generation', 'renderTicket', 'projectedWeight', 'leaseKind', 'batchBytes', 'batchLines', 'elapsedMs', 'errorName', 'buildId', 'mode', 'reason', 'outcome', 'trigger', 'identityRecovery', 'recoveredIdentityFields', 'offset', 'queueMs', 'bytes', 'totalBytes', 'entries', 'turns', 'turnCount', 'sourceBytes', 'projectedChars', 'oversizedTurns', 'hostAliases', 'sourceKind', 'queueLength', 'isStreaming', 'terminalSeenAgeMs', 'lastChunkAgeMs', 'evidenceKind', 'cliVersion', 'agentIdHash', 'agentCandidateCount', 'queryEpoch', 'attemptId', 'detail'] as const) {
       const value = event[key];
@@ -151,5 +198,72 @@ export class ClaudeTranscriptDiagnosticLog {
       line = `${JSON.stringify(clean)}\n`;
     }
     return line;
+  }
+
+  private serializeMarkdown(event: TranscriptDiagnosticEvent): string {
+    const clean: Record<string, unknown> = { ts: Date.now(), seq: ++this.seq, phase: 'markdown_render_summary' };
+    const integerKeys = [
+      'flushId', 'callsSum', 'charsSum', 'charsMax', 'settledCalls', 'successCalls', 'failureCalls',
+      'inFlightAtStart', 'inFlightAtEnd', 'abandonedCalls',
+    ] as const;
+    const windowIntegerKeys = ['callsMax', 'callsSampleCount', 'attributionRows', 'domPageNodes', 'domMessageNodes', 'domTextBlockNodes'] as const;
+    const attributionIntegerKeys = ['tabGeneration', 'conversationGeneration'] as const;
+    const addIntegers = (keys: readonly (keyof TranscriptDiagnosticEvent)[]): void => {
+      for (const key of keys) {
+        const value = event[key];
+        if (typeof value === 'number' && Number.isSafeInteger(value) && value >= 0) clean[key] = value;
+      }
+    };
+    if (event.metricVersion === 1) clean.metricVersion = 1;
+    for (const key of ['collectorIdHash'] as const) {
+      const value = event[key];
+      if (typeof value === 'string' && /^[a-f0-9]{12}$/.test(value)) clean[key] = value;
+    }
+    if (event.flushReason === 'timer' || event.flushReason === 'dispose') clean.flushReason = event.flushReason;
+    if (event.flushScope === 'window' || event.flushScope === 'attribution') clean.flushScope = event.flushScope;
+    addIntegers(integerKeys);
+    for (const key of ['windowMs', 'elapsedMsSum', 'elapsedMsMax'] as const) {
+      const value = event[key];
+      if (typeof value === 'number' && Number.isFinite(value) && value >= 0) clean[key] = value;
+    }
+    const addHistogram = (key: 'charsHistogram' | 'elapsedMsHistogram' | 'startVisibilityHistogram' | 'callsHistogram', length: number): void => {
+      const value = event[key];
+      if (!Array.isArray(value) || value.length !== length) return;
+      const histogram: number[] = [];
+      for (let index = 0; index < length; index++) {
+        if (!Object.prototype.hasOwnProperty.call(value, index)) return;
+        const count: unknown = value[index];
+        if (typeof count !== 'number' || !Number.isSafeInteger(count) || count < 0) return;
+        histogram.push(count);
+      }
+      clean[key] = histogram;
+    };
+    addHistogram('charsHistogram', 7);
+    addHistogram('elapsedMsHistogram', 8);
+    addHistogram('startVisibilityHistogram', 27);
+    if (event.flushScope === 'window') {
+      addIntegers(windowIntegerKeys);
+      addHistogram('callsHistogram', 8);
+    } else if (event.flushScope === 'attribution') {
+      if (event.attributionKind === 'known' || event.attributionKind === 'overflow') clean.attributionKind = event.attributionKind;
+      if (event.attributionKind === 'known') {
+        if (Number.isInteger(event.attributionSlot) && event.attributionSlot! >= 1 && event.attributionSlot! <= 31) clean.attributionSlot = event.attributionSlot;
+        addIntegers(attributionIntegerKeys);
+        for (const key of ['tabIdHash', 'conversationIdHash'] as const) {
+          const value = event[key];
+          if (typeof value === 'string' && /^[a-f0-9]{12}$/.test(value)) clean[key] = value;
+        }
+        for (const key of ['tabIdState', 'conversationIdState'] as const) {
+          if (event[key] === 'known' || event[key] === 'unknown') clean[key] = event[key];
+        }
+        for (const key of ['tabActive', 'documentVisible', 'domConnected'] as const) {
+          if (event[key] === 'yes' || event[key] === 'no' || event[key] === 'unknown') clean[key] = event[key];
+        }
+        if (event.viewport === 'unknown') clean.viewport = 'unknown';
+      } else if (event.attributionKind === 'overflow' && event.attributionSlot === 0) {
+        clean.attributionSlot = 0;
+      }
+    }
+    return `${JSON.stringify(clean)}\n`;
   }
 }

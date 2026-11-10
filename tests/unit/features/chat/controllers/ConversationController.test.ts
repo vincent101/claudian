@@ -8,6 +8,7 @@ import * as historySearchModule from '@/features/chat/controllers/HistorySearchC
 import { type HistoryDiagnosticEvent, setHistoryDiagnosticsSink } from '@/features/chat/history/HistoryDiagnostics';
 import { ProjectionWriteCoordinator } from '@/features/chat/rendering/ProjectionWriteCoordinator';
 import { ChatState } from '@/features/chat/state/ChatState';
+import { loadActiveSessionNames } from '@/features/chat/utils/sessionIdentity';
 import { t } from '@/i18n/i18n';
 import { claudeChatUIConfig } from '@/providers/claude/ui/ClaudeChatUIConfig';
 import { confirm } from '@/shared/modals/ConfirmModal';
@@ -26,6 +27,16 @@ ProviderRegistry.register('claude', {
 jest.mock('@/shared/modals/ConfirmModal', () => ({
   confirm: jest.fn().mockResolvedValue(true),
 }));
+// The controller owns the registry-scan wiring; unit tests never touch the real
+// ~/.claude/sessions. Default to an empty registry so unrelated renders see no
+// suffix, matching a missing/unmatched registry.
+jest.mock('@/features/chat/utils/sessionIdentity', () => {
+  const actual = jest.requireActual('@/features/chat/utils/sessionIdentity');
+  return {
+    ...actual,
+    loadActiveSessionNames: jest.fn().mockResolvedValue(new Map<string, string>()),
+  };
+});
 jest.mock('@/utils/path', () => ({ getVaultPath: jest.fn().mockReturnValue('/vault') }));
 
 const mockNotice = Notice as jest.Mock;
@@ -136,6 +147,69 @@ describe('ConversationController', () => {
     controller = new ConversationController(deps);
   });
 
+  describe('manager-local retirement', () => {
+    it('does not restore or render a conversation read that completes after retirement', async () => {
+      let active = true;
+      (deps as ConversationControllerDeps & { isManagerActive: () => boolean }).isManagerActive = () => active;
+      let resolveRead!: (conversation: any) => void;
+      (deps.plugin.getConversationById as jest.Mock).mockImplementationOnce(() => new Promise(resolve => {
+        resolveRead = resolve;
+      }));
+      const ensureService = jest.fn().mockResolvedValue(undefined);
+      deps.ensureServiceForConversation = ensureService;
+      deps.state.currentConversationId = 'late';
+      const loading = controller.loadActive();
+      active = false;
+      resolveRead({ id: 'late', providerId: 'claude', title: 'Late', messages: [
+        { id: 'message', role: 'user', content: 'late', timestamp: 1 },
+      ], createdAt: 1, updatedAt: 1 });
+
+      await expect(loading).resolves.toBeUndefined();
+      expect(ensureService).not.toHaveBeenCalled();
+      expect(deps.state.messages).toEqual([]);
+      expect(deps.renderer.renderMessages).not.toHaveBeenCalled();
+    });
+
+    it('releases an uninstalled lease without reading its window after retirement', async () => {
+      let active = true;
+      (deps as ConversationControllerDeps & { isManagerActive: () => boolean }).isManagerActive = () => active;
+      let resolveReady!: () => void;
+      const ready = new Promise<void>(resolve => { resolveReady = resolve; });
+      const lease = {
+        conversationId: 'late', totalTurns: 1, ready, release: jest.fn(),
+        planWindow: jest.fn().mockReturnValue({ start: 0, end: 1 }),
+        loadWindow: jest.fn().mockResolvedValue({
+          messages: [], range: { start: 0, end: 1 }, hasMoreBefore: false,
+          hasMoreAfter: false, pageKey: 'late', sourceBytes: 0, projectedChars: 0,
+          oversizedTurnCount: 0, snapshotOffset: 0,
+        }),
+      };
+      deps.state.currentConversationId = 'late';
+      (deps.plugin.getConversationById as jest.Mock).mockResolvedValue({
+        id: 'late', providerId: 'claude', title: 'Late', messages: [], sessionId: 'session', createdAt: 1, updatedAt: 1,
+      });
+      deps.getHistoryIndexCapableService = () => ({ acquireHistoryIndex: () => lease } as any);
+      const loading = controller.loadActive();
+      for (let i = 0; i < 4; i++) await Promise.resolve();
+      active = false;
+      resolveReady();
+
+      await expect(loading).resolves.toBeUndefined();
+      expect(lease.loadWindow).not.toHaveBeenCalled();
+      expect(lease.release).toHaveBeenCalledTimes(1);
+      expect(deps.state.historyLease).toBeNull();
+    });
+
+    it('does not use manager retirement as a reason to reject a save', async () => {
+      (deps as ConversationControllerDeps & { isManagerActive: () => boolean }).isManagerActive = () => false;
+      deps.state.currentConversationId = 'saved';
+      deps.state.messages = [{ id: 'message', role: 'user', content: 'save', timestamp: 1 }];
+
+      await controller.save();
+      expect(deps.plugin.updateConversation).toHaveBeenCalledWith('saved', expect.any(Object));
+    });
+  });
+
   describe('paged history', () => {
     const makeLease = (totalTurns = 120) => ({
       conversationId: 'large', totalTurns, ready: Promise.resolve(), release: jest.fn(), search: jest.fn(),
@@ -147,6 +221,197 @@ describe('ConversationController', () => {
         const turns = Math.min(budget.maxTurns, anchorTurn);
         return { start: direction === 'older' ? anchorTurn - turns : anchorTurn, end: direction === 'older' ? anchorTurn : anchorTurn + turns };
       }),
+    });
+
+    const configureIndexedLoad = (lease: ReturnType<typeof makeLease>) => {
+      const conversation = {
+        id: 'large', providerId: 'claude', title: 'Large', messages: [], sessionId: 'session',
+        hasHistory: true, createdAt: 1, updatedAt: 1,
+      } as any;
+      deps.state.currentConversationId = conversation.id;
+      (deps.plugin.getConversationById as jest.Mock).mockResolvedValue(conversation);
+      (deps.plugin.getConversationSync as jest.Mock).mockReturnValue(conversation);
+      deps.getHistoryIndexCapableService = () => ({ acquireHistoryIndex: () => lease } as any);
+      return conversation;
+    };
+    const firstScreen = {
+      messages: [{ id: 'first', role: 'user', content: 'fixture history', timestamp: 1 }],
+      range: { start: 0, end: 1 }, snapshotOffset: 1, sourceBytes: 1, projectedChars: 15,
+      oversizedTurnCount: 0, pageKey: 'fixture-first-screen', hasMoreBefore: false, hasMoreAfter: false,
+    };
+    const bodyFailures: Array<[string, () => unknown, boolean]> = [
+      ['Error', () => new Error('body failure'), false],
+      ['undefined', () => undefined, false],
+      ['null', () => null, false],
+      ['false', () => false, false],
+      ['AggregateError', () => new AggregateError([new Error('nested')], 'body aggregate'), false],
+      ['the same object', () => new Error('shared failure'), true],
+      ['the same AggregateError', () => new AggregateError([new Error('nested')], 'shared aggregate'), true],
+    ];
+    const releaseFailures: Array<[string, () => unknown]> = [
+      ['Error', () => new Error('release failure')],
+      ['undefined', () => undefined],
+      ['null', () => null],
+      ['false', () => false],
+      ['AggregateError', () => new AggregateError([new Error('nested release')], 'release aggregate')],
+    ];
+
+    it.each([false, true])('loadActive keeps a successful body outcome when uninstalled release throws = %s', async releaseFails => {
+      const lease = makeLease(1);
+      lease.loadWindow.mockResolvedValue(firstScreen);
+      const releaseFailure = new Error('uninstalled release failure');
+      lease.release.mockImplementation(() => { if (releaseFails) throw releaseFailure; });
+      configureIndexedLoad(lease);
+
+      const outcome = await controller.loadActive(() => false).then(
+        () => ({ status: 'fulfilled', error: undefined }),
+        error => ({ status: 'rejected', error }),
+      );
+
+      expect(outcome.status).toBe(releaseFails ? 'rejected' : 'fulfilled');
+      expect(outcome.error).toBe(releaseFails ? releaseFailure : undefined);
+      expect(lease.release).toHaveBeenCalledTimes(1);
+      expect(deps.state.historyLease).toBeNull();
+      expect(deps.state.historyLoading).toBe(releaseFails);
+    });
+
+    it.each(bodyFailures)('loadActive preserves a %s body failure when release succeeds', async (_label, makeBodyFailure) => {
+      const bodyFailure = makeBodyFailure();
+      const lease = makeLease(1);
+      lease.ready = Promise.reject(bodyFailure);
+      configureIndexedLoad(lease);
+
+      const outcome = await controller.loadActive().then(
+        () => ({ status: 'fulfilled', error: undefined }),
+        error => ({ status: 'rejected', error }),
+      );
+
+      expect(outcome.status).toBe('rejected');
+      expect(outcome.error).toBe(bodyFailure);
+      expect(lease.release).toHaveBeenCalledTimes(1);
+      expect(lease.loadWindow).not.toHaveBeenCalled();
+      expect(deps.state.historyLease).toBeNull();
+      expect(deps.state.historyLoading).toBe(false);
+    });
+
+    it.each(bodyFailures)('loadActive preserves ordered %s and uninstalled release failures', async (_label, makeBodyFailure, sameObject) => {
+      const bodyFailure = makeBodyFailure();
+      const releaseFailure = sameObject ? bodyFailure : new Error('uninstalled release failure');
+      const lease = makeLease(1);
+      lease.ready = Promise.reject(bodyFailure);
+      lease.release.mockImplementation(() => { throw releaseFailure; });
+      configureIndexedLoad(lease);
+
+      const outcome = await controller.loadActive().then(
+        () => ({ status: 'fulfilled', error: undefined }),
+        error => ({ status: 'rejected', error }),
+      );
+
+      expect(outcome.status).toBe('rejected');
+      const failure = outcome.error as AggregateError;
+      expect(failure).toBeInstanceOf(AggregateError);
+      expect(failure.message).toBe('History lease release failed');
+      expect(failure.errors).toHaveLength(2);
+      expect(failure.errors[0]).toBe(bodyFailure);
+      expect(failure.errors[1]).toBe(releaseFailure);
+      expect(lease.release).toHaveBeenCalledTimes(1);
+      expect(deps.state.historyLease).toBeNull();
+      expect(deps.state.historyLoading).toBe(true);
+    });
+
+    it.each(releaseFailures)('loadActive preserves a thrown %s release failure after a successful body', async (_label, makeReleaseFailure) => {
+      const releaseFailure = makeReleaseFailure();
+      const lease = makeLease(1);
+      lease.loadWindow.mockResolvedValue(firstScreen);
+      lease.release.mockImplementation(() => { throw releaseFailure; });
+      configureIndexedLoad(lease);
+
+      const outcome = await controller.loadActive(() => false).then(
+        () => ({ status: 'fulfilled', error: undefined }),
+        error => ({ status: 'rejected', error }),
+      );
+
+      expect(outcome.status).toBe('rejected');
+      expect(outcome.error).toBe(releaseFailure);
+      expect(lease.release).toHaveBeenCalledTimes(1);
+      expect(deps.state.historyLease).toBeNull();
+      expect(deps.state.historyLoading).toBe(true);
+    });
+
+    it.each(releaseFailures)('loadActive preserves a body failure before a thrown %s release failure', async (_label, makeReleaseFailure) => {
+      const bodyFailure = new Error('body failure');
+      const releaseFailure = makeReleaseFailure();
+      const lease = makeLease(1);
+      lease.ready = Promise.reject(bodyFailure);
+      lease.release.mockImplementation(() => { throw releaseFailure; });
+      configureIndexedLoad(lease);
+
+      const outcome = await controller.loadActive().then(
+        () => ({ status: 'fulfilled', error: undefined }),
+        error => ({ status: 'rejected', error }),
+      );
+
+      expect(outcome.status).toBe('rejected');
+      const failure = outcome.error as AggregateError;
+      expect(failure).toBeInstanceOf(AggregateError);
+      expect(failure.message).toBe('History lease release failed');
+      expect(failure.errors).toHaveLength(2);
+      expect(failure.errors[0]).toBe(bodyFailure);
+      expect(failure.errors[1]).toBe(releaseFailure);
+      expect(lease.release).toHaveBeenCalledTimes(1);
+      expect(deps.state.historyLease).toBeNull();
+      expect(deps.state.historyLoading).toBe(true);
+    });
+
+    it.each([false, true])('loadActive does not release a transferred lease when backfill fails = %s', async backfillFails => {
+      const lease = makeLease(1);
+      lease.loadWindow.mockResolvedValue(firstScreen);
+      lease.release.mockImplementation(() => { throw new Error('transferred lease must not be released'); });
+      const conversation = configureIndexedLoad(lease);
+      conversation.hasHistory = false;
+      const failure = new Error('backfill failure after transfer');
+      (deps.plugin.updateConversation as jest.Mock).mockImplementation(async () => {
+        if (backfillFails) throw failure;
+      });
+
+      const outcome = await controller.loadActive().then(
+        () => ({ status: 'fulfilled', error: undefined }),
+        error => ({ status: 'rejected', error }),
+      );
+
+      expect(outcome.status).toBe(backfillFails ? 'rejected' : 'fulfilled');
+      expect(outcome.error).toBe(backfillFails ? failure : undefined);
+      expect(deps.state.historyLease).toBe(lease);
+      expect(lease.release).not.toHaveBeenCalled();
+      expect(deps.state.historyLoading).toBe(false);
+    });
+
+    it('loadActive preserves old and new lease release failures without transferring the new lease', async () => {
+      const oldFailure = new Error('old lease release failure');
+      const newFailure = new Error('new lease release failure');
+      const oldLease = { release: jest.fn(() => { throw oldFailure; }) };
+      const lease = makeLease(1);
+      lease.loadWindow.mockResolvedValue(firstScreen);
+      lease.release.mockImplementation(() => { throw newFailure; });
+      configureIndexedLoad(lease);
+      deps.state.historyLease = oldLease as any;
+
+      const outcome = await controller.loadActive().then(
+        () => ({ status: 'fulfilled', error: undefined }),
+        error => ({ status: 'rejected', error }),
+      );
+
+      expect(outcome.status).toBe('rejected');
+      const failure = outcome.error as AggregateError;
+      expect(failure).toBeInstanceOf(AggregateError);
+      expect(failure.message).toBe('History lease release failed');
+      expect(failure.errors).toHaveLength(2);
+      expect(failure.errors[0]).toBe(oldFailure);
+      expect(failure.errors[1]).toBe(newFailure);
+      expect(oldLease.release).toHaveBeenCalledTimes(1);
+      expect(lease.release).toHaveBeenCalledTimes(1);
+      expect(deps.state.historyLease).toBe(oldLease);
+      expect(deps.state.historyLoading).toBe(true);
     });
 
     it('restores a Claude draft without transcript identity instead of indexing it', async () => {
@@ -180,9 +445,12 @@ describe('ConversationController', () => {
       lease.loadWindow.mockResolvedValue({ messages: [{ id: 'latest', role: 'user', content: 'latest', timestamp: 1 }], range: { start: 110, end: 120 }, snapshotOffset: 123, sourceBytes: 1024, projectedChars: 7, oversizedTurnCount: 0, pageKey: 'w:110:120', hasMoreBefore: true, hasMoreAfter: false });
       const service = { acquireHistoryIndex: jest.fn().mockReturnValue(lease) };
       deps.getHistoryIndexCapableService = () => service as any;
+      const refresh = jest.fn();
+      (deps.plugin as any).conversationSizes = { refresh };
 
       await controller.loadActive();
 
+      expect(refresh).not.toHaveBeenCalled();
       expect(lease.loadWindow).toHaveBeenCalledWith(expect.objectContaining({
         anchorTurn: 120,
         direction: 'older',
@@ -491,9 +759,13 @@ describe('ConversationController', () => {
       const next = makeLease(100);
       const service = { acquireHistoryIndex: jest.fn().mockReturnValue(next) };
       deps.getHistoryIndexCapableService = () => service as any;
+      const refresh = jest.fn();
+      (deps.plugin as any).conversationSizes = { refresh };
 
       await controller.refreshHistorySearchSnapshot();
 
+      expect(refresh).not.toHaveBeenCalled();
+      expect(deps.state.historyLease).toBe(next);
       expect(service.acquireHistoryIndex).toHaveBeenCalledWith(conversation, '/vault', undefined, true);
       expect(previous.release).toHaveBeenCalled();
     });
@@ -2628,6 +2900,187 @@ describe('ConversationController', () => {
         await clickHandlers![0]({ stopPropagation: jest.fn() });
 
         expect(deps.plugin.deleteConversation).not.toHaveBeenCalled();
+      });
+    });
+
+    describe('conversation size display', () => {
+      it('should render only the published snapshot with the fork-source notice', () => {
+        (deps.plugin.getConversationList as jest.Mock).mockReturnValue([
+          {
+            id: 'conv-1', title: 'Big', createdAt: 1000, lastResponseAt: 1000, messageCount: 1234,
+            sizeSnapshot: {
+              conversationId: 'conv-1', revision: 1,
+              files: { status: 'known', bytes: 13_002_342, },
+            },
+          },
+        ]);
+
+        controller.updateHistoryDropdown();
+
+        const item = dropdown.children[1].children[0];
+        const metaEls = item.querySelectorAll('.claudian-history-item-date');
+        expect(metaEls.length).toBe(2);
+        expect(metaEls[1].textContent).toBe('Current session file 12.4 MiB');
+      });
+
+      it('ignores a late result after the menu closes and reopens', async () => {
+        const resolvers: Array<(value: any) => void> = [];
+        const refresh = jest.fn().mockImplementation(() => new Promise(resolve => { resolvers.push(resolve); }));
+        const getSnapshot = jest.fn();
+        (deps.plugin as any).conversationSizes = { refresh, getSnapshot };
+        const currentConversation = { id: 'conv-1' };
+        (deps.plugin.getConversationSync as jest.Mock).mockReturnValue(currentConversation);
+        (deps.plugin.getConversationList as jest.Mock).mockReturnValue([
+          { id: 'conv-1', title: 'Bare', createdAt: 1000, lastResponseAt: 1000 },
+        ]);
+        dropdown.addClass('visible');
+        controller.updateHistoryDropdown(true);
+        const oldLine = dropdown.children[1].children[0].querySelectorAll('.claudian-history-item-date')[1];
+        dropdown.removeClass('visible');
+        dropdown.addClass('visible');
+        controller.updateHistoryDropdown(true);
+        const newLine = dropdown.children[1].children[0].querySelectorAll('.claudian-history-item-date')[1];
+        const oldSnapshot = {
+          conversationId: 'conv-1', revision: 1,
+          files: { status: 'known', bytes: 10, },
+        };
+        // A reopened menu starts a fresh generation; the size service rejects the old read.
+        getSnapshot.mockReturnValue(undefined);
+        resolvers[0](undefined);
+        await Promise.resolve();
+        expect(oldLine.textContent).not.toContain('10 B');
+        expect(newLine.textContent).not.toContain('10 B');
+        const currentSnapshot = {
+          ...oldSnapshot, revision: 2, files: { status: 'known', bytes: 20, },
+        };
+        getSnapshot.mockReturnValue(currentSnapshot);
+        resolvers[1](currentSnapshot);
+        await Promise.resolve();
+        expect(newLine.textContent).toContain('20 B');
+        expect(oldLine.textContent).not.toContain('20 B');
+      });
+
+      it('should request an unknown conversation when its row is rendered', () => {
+        const requestConversationSize = jest.fn().mockResolvedValue(undefined);
+        (deps.plugin as any).conversationSizes = { refresh: requestConversationSize };
+        (deps.plugin.getConversationList as jest.Mock).mockReturnValue([
+          { id: 'conv-1', title: 'Bare', createdAt: 1000, lastResponseAt: 1000 },
+        ]);
+
+        controller.updateHistoryDropdown(true);
+
+        const item = dropdown.children[1].children[0];
+        const lines = item.querySelectorAll('.claudian-history-item-date');
+        expect(lines.length).toBe(2);
+        expect(lines[1].textContent).toBe('Current session file unknown');
+        expect(requestConversationSize).toHaveBeenCalledWith('conv-1', true);
+      });
+    });
+
+    describe('active session identity suffix', () => {
+      const sessionId = '02a240bd-1111-2222-3333-444444444444';
+      const registry = () => new Map([[sessionId, 'notevault-8b']]);
+      const currentConversation = { id: 'conv-1', title: 'Current', sessionId, messages: [] };
+      const historyConversation = { id: 'conv-2', title: 'History', sessionId: '99999999-8888-7777-6666-555555555555', messages: [] };
+      const flushAsync = () => new Promise<void>((resolve) => { setImmediate(resolve); });
+
+      const findCurrentItem = () => {
+        const list = dropdown.children[1];
+        return list.children.find((item: any) => item.hasClass('active'));
+      };
+      const findHistoryItem = () => {
+        const list = dropdown.children[1];
+        return list.children.find((item: any) => !item.hasClass('active'));
+      };
+
+      beforeEach(() => {
+        deps.state.currentConversationId = 'conv-1';
+        (deps.plugin.getConversationSync as jest.Mock).mockReturnValue(currentConversation);
+        (deps.plugin.getConversationList as jest.Mock).mockReturnValue([
+          { ...currentConversation, createdAt: 1000, lastResponseAt: 2000 },
+          { ...historyConversation, createdAt: 500, lastResponseAt: 1000 },
+        ]);
+        dropdown.addClass('visible');
+      });
+
+      it('renders the identity suffix and synced tooltip on the current row once the registry scan resolves', async () => {
+        (loadActiveSessionNames as jest.Mock).mockResolvedValue(registry());
+
+        controller.updateHistoryDropdown();
+        await flushAsync();
+
+        const currentItem = findCurrentItem();
+        const identityEl = currentItem.querySelector('.claudian-history-item-identity');
+        expect(identityEl?.textContent).toBe(' · notevault-8b · 02a240bd');
+        const titleEl = currentItem.querySelector('.claudian-history-item-title');
+        expect(titleEl.getAttribute('title')).toBe('Current · notevault-8b · 02a240bd');
+      });
+
+      it('renders the suffix synchronously on the next render using the last resolved registry', async () => {
+        (loadActiveSessionNames as jest.Mock).mockResolvedValue(registry());
+        controller.updateHistoryDropdown();
+        await flushAsync();
+
+        controller.updateHistoryDropdown();
+
+        const identityEl = findCurrentItem().querySelector('.claudian-history-item-identity');
+        expect(identityEl?.textContent).toBe(' · notevault-8b · 02a240bd');
+      });
+
+      it('never renders the suffix on a history row even when the registry is loaded', async () => {
+        (loadActiveSessionNames as jest.Mock).mockResolvedValue(registry());
+
+        controller.updateHistoryDropdown();
+        await flushAsync();
+
+        const historyItem = findHistoryItem();
+        expect(historyItem.querySelector('.claudian-history-item-identity')).toBeNull();
+        const titleEl = historyItem.querySelector('.claudian-history-item-title');
+        expect(titleEl.getAttribute('title')).toBe('History');
+      });
+
+      it('renders no suffix and no dangling separator on the current row when the registry misses it', async () => {
+        (loadActiveSessionNames as jest.Mock).mockResolvedValue(new Map());
+
+        controller.updateHistoryDropdown();
+        await flushAsync();
+
+        const currentItem = findCurrentItem();
+        expect(currentItem.querySelector('.claudian-history-item-identity')).toBeNull();
+        const titleEl = currentItem.querySelector('.claudian-history-item-title');
+        expect(titleEl.getAttribute('title')).toBe('Current');
+        expect(titleEl.getAttribute('title')).not.toContain(' · ');
+      });
+
+      it('keeps the size row in place alongside the identity suffix', async () => {
+        (loadActiveSessionNames as jest.Mock).mockResolvedValue(registry());
+
+        controller.updateHistoryDropdown();
+        await flushAsync();
+
+        const currentItem = findCurrentItem();
+        expect(currentItem.querySelector('.claudian-history-item-identity')).toBeTruthy();
+        // title row + date row + size row — the suffix lives inside the title, not as a fourth line
+        const content = currentItem.querySelector('.claudian-history-item-content');
+        expect(content.children.length).toBe(3);
+        expect(currentItem.querySelectorAll('.claudian-history-item-date').length).toBe(2);
+      });
+
+      it('does not write the suffix when the conversation switches before the scan resolves', async () => {
+        let resolveScan!: (names: Map<string, string>) => void;
+        (loadActiveSessionNames as jest.Mock).mockImplementationOnce(
+          () => new Promise<Map<string, string>>((resolve) => { resolveScan = resolve; }),
+        );
+
+        controller.updateHistoryDropdown();
+        deps.state.currentConversationId = 'conv-2';
+        resolveScan(registry());
+        await flushAsync();
+
+        const currentItem = findCurrentItem();
+        expect(currentItem.querySelector('.claudian-history-item-identity')).toBeNull();
+        const titleEl = currentItem.querySelector('.claudian-history-item-title');
+        expect(titleEl.getAttribute('title')).toBe('Current');
       });
     });
 

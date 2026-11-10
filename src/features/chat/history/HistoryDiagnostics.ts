@@ -9,7 +9,53 @@ export type HistorySearchSnapshotRefreshOutcome =
   | 'not_applicable'
   | 'failed';
 
+export type MarkdownVisibility = 'yes' | 'no' | 'unknown';
+
+export interface MarkdownRenderSummary {
+  kind: 'markdown_render_summary';
+  metricVersion: 1;
+  collectorIdHash: string;
+  flushId: number;
+  flushReason: 'timer' | 'dispose';
+  flushScope: 'window' | 'attribution';
+  windowMs: number;
+  callsSum: number;
+  charsSum: number;
+  charsMax: number;
+  charsHistogram: number[];
+  elapsedMsSum: number;
+  elapsedMsMax: number;
+  elapsedMsHistogram: number[];
+  settledCalls: number;
+  successCalls: number;
+  failureCalls: number;
+  inFlightAtStart: number;
+  inFlightAtEnd: number;
+  abandonedCalls: number;
+  startVisibilityHistogram: number[];
+  attributionRows?: number;
+  callsMax?: number;
+  callsHistogram?: number[];
+  callsSampleCount?: number;
+  attributionSlot?: number;
+  attributionKind?: 'known' | 'overflow';
+  tabIdState?: 'known' | 'unknown';
+  conversationIdState?: 'known' | 'unknown';
+  tabIdHash?: string;
+  conversationIdHash?: string;
+  tabGeneration?: number;
+  conversationGeneration?: number;
+  tabActive?: MarkdownVisibility;
+  documentVisible?: MarkdownVisibility;
+  domConnected?: MarkdownVisibility;
+  viewport?: 'unknown';
+  domPageNodes?: number;
+  domMessageNodes?: number;
+  domTextBlockNodes?: number;
+}
+
 export type HistoryDiagnosticEvent =
+  | MarkdownRenderSummary
   | { kind: 'render_batch'; mounted: number; total: number; elapsedMs: number }
   | { kind: 'render_complete'; messages: number; batches: number; elapsedMs: number }
   | { kind: 'page_render_timeout'; pageKey: string; ticket: number; timeoutMs: number }
@@ -50,7 +96,22 @@ export type HistoryDiagnosticEvent =
     /** Attribution: which surface forced the refresh (search panel default). */
     trigger?: 'search' | 'rewind' | 'fork';
     elapsedMs: number;
-  };
+  }
+  /**
+   * R2 save admission: a runtime sync targeted a conversation outside the
+   * committed binding's record (e.g. an environment reconcile that still saw
+   * the outgoing conversationId inside the commit→rebind window). The sync
+   * ran but the adoption was failed — the binding's saves fall back to its
+   * seed. The event traces the protocol bypass, never the session values.
+   */
+  | { kind: 'save_adoption_target_mismatch' }
+  /**
+   * R2 save admission: the record's materialization snapshot could not be
+   * detached honestly (a non-plain-JSON message, or a throwing source), so the
+   * messages axis was dropped for that save instead of persisting an
+   * untrustworthy payload.
+   */
+  | { kind: 'save_materialization_rejected'; reason: 'not_plain_json' | 'source_error' };
 
 type HistoryDiagnosticSink = (event: HistoryDiagnosticEvent) => void;
 

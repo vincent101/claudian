@@ -1,13 +1,34 @@
-import { appendFile, mkdtemp, readFile, rm, stat, writeFile } from 'fs/promises';
+import type * as FsPromisesModule from 'fs/promises';
+import { appendFile, mkdtemp, readFile, rename, rm, stat, unlink, writeFile } from 'fs/promises';
 import { tmpdir } from 'os';
 import { join } from 'path';
 
+import type { HistoryTailStart } from '@/core/providers/types';
 import type { Conversation } from '@/core/types';
 import { ClaudeConversationHistoryService } from '@/providers/claude/history/ClaudeConversationHistoryService';
 import { buildTranscriptIndex } from '@/providers/claude/history/ClaudeTranscriptHistoryIndex';
 import * as sdkSessionPaths from '@/providers/claude/history/sdkSessionPaths';
 import { ClaudeTranscriptTailReader } from '@/providers/claude/transcript/ClaudeTranscriptTailReader';
 import { ClaudeTranscriptTurnObserver } from '@/providers/claude/transcript/ClaudeTranscriptTurnObserver';
+
+function deferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((yes, no) => { resolve = yes; reject = no; });
+  return { promise, resolve, reject };
+}
+
+async function within<T>(promise: Promise<T>, message: string, timeoutMs = 1_500): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error(message)), timeoutMs); }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
 
 function peerTurn(id: string, text: string, complete = true): string[] {
   const lines = [
@@ -28,6 +49,18 @@ function notificationTurn(id: string, text: string): string[] {
     JSON.stringify({ type: 'user', uuid: id, origin: { kind: 'task-notification' }, message: { role: 'user', content: text } }),
     JSON.stringify({ type: 'assistant', uuid: `${id}-a1`, message: { id: `${id}-m1`, role: 'assistant', content: [{ type: 'text', text: 'working' }], stop_reason: 'tool_use' } }),
   ];
+}
+
+/** Index-shaped tail-start descriptor for the CURRENT file state: the
+ * credential semantics a real page handoff carries, with the caller's
+ * committed boundary (0 = consume every existing row on first read). */
+async function tailStartDescriptor(path: string, committedOffset = 0): Promise<HistoryTailStart> {
+  const info = await stat(path);
+  return {
+    provider: 'claude',
+    protocol: 1,
+    payload: { path, dev: info.dev, ino: info.ino, snapshotSize: info.size, committedOffset },
+  };
 }
 
 describe('ClaudeTranscriptTurnObserver', () => {
@@ -58,6 +91,1384 @@ describe('ClaudeTranscriptTurnObserver', () => {
     return { observer, callbacks, order };
   }
 
+  it('does not replay a valid JSON user row before its newline arrives', async () => {
+    const user = peerTurn('peer-unclosed', '中文', false)[0];
+    await writeFile(file, user);
+    const { observer, callbacks } = setup();
+    try {
+      await observer.start(file);
+      expect(callbacks.started).not.toHaveBeenCalled();
+      await appendFile(file, '\n');
+      observer.beginUserTurnProjection('host');
+      await observer.completeUserTurnProjection('host');
+      expect(callbacks.projectEmbeddedExternal).toHaveBeenCalledTimes(1);
+      expect(callbacks.projectEmbeddedExternal).toHaveBeenCalledWith(
+        expect.objectContaining({ turnId: 'peer-unclosed' }),
+      );
+      expect(callbacks.started).not.toHaveBeenCalled();
+    } finally {
+      observer.stop();
+    }
+  });
+
+  it('rejects an index tail-start handoff whose source was replaced before priming (H/P8)', async () => {
+    // The second source-replacement seam: the index snapshot produced the
+    // committed boundary, and the observer must prime there only against the
+    // file identity that snapshot observed. The takeover counterexample: a
+    // same-size replacement landing before the prime used to pair the old
+    // offset with the new file, read 0 bytes with no reset, and silently
+    // miss every later row of the new source.
+    const original = `${peerTurn('old', 'old').join('\n')}\n`;
+    await writeFile(file, original);
+    const indexResult = await buildTranscriptIndex(file, { useWorker: false });
+    expect(indexResult.status).toBe('complete');
+    if (indexResult.status !== 'complete') return;
+    const { dev, ino, snapshotSize, committedSize, filePath } = indexResult.index;
+    const tailStart = {
+      provider: 'claude' as const,
+      protocol: 1 as const,
+      payload: { path: filePath, dev, ino, snapshotSize, committedOffset: committedSize },
+    };
+    const replacement = join(dir, 'replacement.jsonl');
+    await writeFile(replacement, original);
+    await rename(replacement, file);
+    const { observer, callbacks } = setup();
+    try {
+      await expect(observer.start(file, tailStart)).rejects.toThrow(/source.*changed/i);
+      const reader = (observer as any).reader as ClaudeTranscriptTailReader;
+      expect(reader.sourceIdentity()).toBeNull();
+      expect(reader.getOffset()).toBe(0);
+      expect(callbacks.started).not.toHaveBeenCalled();
+    } finally {
+      observer.stop();
+    }
+  });
+
+  it('records a diagnostic when the tail-start handshake rejects a replaced source (H/P8)', async () => {
+    const original = `${peerTurn('old', 'old').join('\n')}\n`;
+    await writeFile(file, original);
+    const indexResult = await buildTranscriptIndex(file, { useWorker: false });
+    expect(indexResult.status).toBe('complete');
+    if (indexResult.status !== 'complete') return;
+    const { dev, ino, snapshotSize, committedSize, filePath } = indexResult.index;
+    const tailStart = {
+      provider: 'claude' as const,
+      protocol: 1 as const,
+      payload: { path: filePath, dev, ino, snapshotSize, committedOffset: committedSize },
+    };
+    const replacement = join(dir, 'replacement.jsonl');
+    await writeFile(replacement, original);
+    await rename(replacement, file);
+    const diagnostics = { record: jest.fn(), hashId: jest.fn(() => 'hash') };
+    const { callbacks } = setup();
+    const observer = new ClaudeTranscriptTurnObserver(callbacks, () => true, diagnostics as any);
+    try {
+      await expect(observer.start(file, tailStart)).rejects.toThrow(/source.*changed/i);
+      expect(diagnostics.record).toHaveBeenCalledWith(expect.objectContaining({
+        phase: 'prime_rejected', reason: 'source_changed',
+      }));
+    } finally {
+      observer.stop();
+    }
+  });
+
+  it('stays silent without polling when the tail-start source vanished before priming (H/P8)', async () => {
+    const original = `${peerTurn('old', 'old').join('\n')}\n`;
+    await writeFile(file, original);
+    const indexResult = await buildTranscriptIndex(file, { useWorker: false });
+    expect(indexResult.status).toBe('complete');
+    if (indexResult.status !== 'complete') return;
+    const { dev, ino, snapshotSize, committedSize, filePath } = indexResult.index;
+    const tailStart = {
+      provider: 'claude' as const,
+      protocol: 1 as const,
+      payload: { path: filePath, dev, ino, snapshotSize, committedOffset: committedSize },
+    };
+    await unlink(file);
+    const diagnostics = { record: jest.fn(), hashId: jest.fn(() => 'hash') };
+    const { callbacks } = setup();
+    const observer = new ClaudeTranscriptTurnObserver(callbacks, () => true, diagnostics as any);
+    try {
+      await observer.start(file, tailStart);
+      const reader = (observer as any).reader as ClaudeTranscriptTailReader;
+      const start = jest.spyOn(reader, 'start');
+      expect(reader.getOffset()).toBe(0);
+      expect(reader.sourceIdentity()).toBeNull();
+      expect(start).not.toHaveBeenCalled();
+      // Polling never began, so a recreated file at the same path stays unread.
+      await writeFile(file, original);
+      await new Promise<void>(resolve => { setTimeout(resolve, 50); });
+      expect(callbacks.started).not.toHaveBeenCalled();
+      expect(diagnostics.record).toHaveBeenCalledWith(expect.objectContaining({
+        phase: 'prime_rejected', reason: 'missing',
+      }));
+    } finally {
+      observer.stop();
+    }
+  });
+
+  it('rejects a replacement between recovery scanning and priming without replaying the old source', async () => {
+    const old = `${peerTurn('old', 'old', false).join('\n')}\n`;
+    const replacement = `${peerTurn('new', 'new', false).join('\n')}\n`;
+    expect(Buffer.byteLength(replacement)).toBe(Buffer.byteLength(old));
+    await writeFile(file, old);
+    const nextFile = join(dir, 'replacement.jsonl');
+    await writeFile(nextFile, replacement);
+    const fsPromises = jest.requireActual<typeof FsPromisesModule>('fs/promises');
+    const open = fsPromises.open;
+    const openSpy = jest.spyOn(fsPromises, 'open').mockImplementationOnce(async (...args) => {
+      const handle = await open(...args);
+      const read = handle.read.bind(handle);
+      handle.read = (async (...readArgs: Parameters<typeof read>) => {
+        const result = await read(...readArgs);
+        await fsPromises.rename(nextFile, file);
+        return result;
+      }) as typeof handle.read;
+      return handle;
+    });
+    const { observer, callbacks } = setup();
+    try {
+      await expect(observer.start(file)).rejects.toThrow(/source.*changed/i);
+      expect(callbacks.started).not.toHaveBeenCalled();
+      expect(callbacks.chunk).not.toHaveBeenCalled();
+    } finally {
+      openSpy.mockRestore();
+      observer.stop();
+    }
+  });
+
+  it('keeps a new same-id host token when the old host completion resets the source', async () => {
+    await writeFile(file, `${peerTurn('old', 'old', false).join('\n')}\n`);
+    const { observer, callbacks } = setup();
+    try {
+      await observer.start(file);
+      observer.beginUserTurnProjection('host');
+      callbacks.cancelled.mockImplementationOnce(() => observer.beginUserTurnProjection('host'));
+      await writeFile(file, '');
+      await observer.completeUserTurnProjection('host');
+      expect((observer as any).hostUserTurnId).toBe('host');
+      expect(callbacks.projectEmbeddedExternal).not.toHaveBeenCalled();
+    } finally {
+      observer.stop();
+    }
+  });
+
+  it('keeps a reentrant same-id host and drops embedded work from the reset source', async () => {
+    await writeFile(file, '');
+    const { observer, callbacks } = setup();
+    const polled = deferred<void>();
+    let nextToken: object | null = null;
+    callbacks.chunk.mockImplementation(async event => {
+      if (event.turnId === 'active') polled.resolve();
+    });
+    try {
+      await observer.start(file);
+      observer.beginUserTurnProjection('host');
+      const oldToken = (observer as any).hostProjection;
+      await appendFile(file, `${[...peerTurn('stale-embedded', 'old'), ...notificationTurn('active', 'active')].join('\n')}\n`);
+      await within(polled.promise, 'poll did not consume the old source', 3_500);
+      await new Promise<void>(resolve => setImmediate(resolve));
+      expect((observer as any).embeddedQueue.map((event: { turnId: string }) => event.turnId)).toEqual(['stale-embedded']);
+      expect((observer as any).active?.started.turnId).toBe('active');
+      callbacks.cancelled.mockImplementationOnce(() => {
+        observer.beginUserTurnProjection('host');
+        nextToken = (observer as any).hostProjection;
+      });
+      await writeFile(file, '');
+      await observer.completeUserTurnProjection('host');
+      expect(callbacks.cancelled).toHaveBeenCalledTimes(1);
+      expect(nextToken).not.toBeNull();
+      expect(nextToken).not.toBe(oldToken);
+      expect((observer as any).hostProjection).toBe(nextToken);
+      expect((observer as any).hostUserTurnId).toBe('host');
+      expect(callbacks.projectEmbeddedExternal).not.toHaveBeenCalled();
+      await appendFile(file, `${peerTurn('fresh', 'new').join('\n')}\n`);
+      await observer.completeUserTurnProjection('host');
+      expect(callbacks.projectEmbeddedExternal.mock.calls.map(([event]) => event.turnId)).toEqual(['fresh']);
+      expect((observer as any).hostUserTurnId).toBeNull();
+    } finally {
+      observer.stop();
+    }
+  }, 8_000);
+
+  it('keeps a reentrant new source when an old host completion resets', async () => {
+    await writeFile(file, `${peerTurn('old', 'old', false).join('\n')}\n`);
+    const nextFile = join(dir, 'next.jsonl');
+    await writeFile(nextFile, '');
+    const { observer, callbacks } = setup();
+    let restarted: Promise<void> | undefined;
+    try {
+      await observer.start(file);
+      observer.beginUserTurnProjection('host');
+      const nextStart = await tailStartDescriptor(nextFile);
+      callbacks.cancelled.mockImplementationOnce(() => {
+        restarted = observer.start(nextFile, nextStart);
+        observer.beginUserTurnProjection('host');
+      });
+      await writeFile(file, '');
+      await observer.completeUserTurnProjection('host');
+      await restarted;
+      expect((observer as any).reader?.filePath).toBe(nextFile);
+      expect((observer as any).hostUserTurnId).toBe('host');
+      expect(callbacks.projectEmbeddedExternal).not.toHaveBeenCalled();
+    } finally {
+      observer.stop();
+    }
+  });
+
+  describe('lifecycle ownership', () => {
+    it.each(['stop', 'restart', 'running'] as const)(
+      'keeps an accepted embedded callback and gates the remaining batch: %s',
+      async mode => {
+        await writeFile(file, '');
+        const { observer, callbacks } = setup();
+        const entered = deferred<void>();
+        const gate = deferred<void>();
+        callbacks.projectEmbeddedExternal.mockImplementationOnce(async () => {
+          entered.resolve();
+          await gate.promise;
+        });
+        try {
+          await observer.start(file);
+          observer.beginUserTurnProjection('host');
+          await appendFile(file, `${[...peerTurn('e1', 'one'), ...peerTurn('e2', 'two')].join('\n')}\n`);
+          const completing = observer.completeUserTurnProjection('host');
+          await entered.promise;
+          if (mode !== 'running') observer.stop();
+          if (mode === 'restart') {
+            await observer.start(file, await tailStartDescriptor(file, (await stat(file)).size));
+            observer.beginUserTurnProjection('host');
+          }
+          const reader = (observer as any).reader;
+          const mapper = (observer as any).mapper;
+          gate.resolve();
+          await expect(completing).resolves.toBeUndefined();
+          expect(callbacks.projectEmbeddedExternal.mock.calls.map(([event]) => event.turnId))
+            .toEqual(mode === 'running' ? ['e1', 'e2'] : ['e1']);
+          expect((observer as any).reader).toBe(reader);
+          expect((observer as any).mapper).toBe(mapper);
+          expect((observer as any).hostUserTurnId).toBe(mode === 'restart' ? 'host' : null);
+        } finally {
+          gate.resolve();
+          observer.stop();
+        }
+      },
+    );
+
+    it('keeps new consume work behind the unresolved old callback', async () => {
+      await writeFile(file, '');
+      const nextFile = join(dir, 'next.jsonl');
+      await writeFile(nextFile, '');
+      const { observer, callbacks } = setup();
+      const entered = deferred<void>();
+      const gate = deferred<void>();
+      callbacks.projectEmbeddedExternal.mockImplementationOnce(async () => { entered.resolve(); await gate.promise; });
+      try {
+        await observer.start(file);
+        observer.beginUserTurnProjection('old-host');
+        await appendFile(file, `${peerTurn('old', 'old').join('\n')}\n`);
+        const oldCompletion = observer.completeUserTurnProjection('old-host');
+        await entered.promise;
+        observer.stop();
+        await observer.start(nextFile, await tailStartDescriptor(nextFile));
+        observer.beginUserTurnProjection('new-host');
+        await appendFile(nextFile, `${peerTurn('new', 'new').join('\n')}\n`);
+        const newCompletion = observer.completeUserTurnProjection('new-host');
+        await Promise.resolve();
+        expect(callbacks.projectEmbeddedExternal).toHaveBeenCalledTimes(1);
+        gate.resolve();
+        await Promise.all([oldCompletion, newCompletion]);
+        expect(callbacks.projectEmbeddedExternal.mock.calls.map(([event]) => event.turnId)).toEqual(['old', 'new']);
+      } finally {
+        gate.resolve();
+        observer.stop();
+      }
+    });
+
+    it('preserves rejection of an already accepted embedded callback after stop', async () => {
+      await writeFile(file, '');
+      const { observer, callbacks } = setup();
+      const entered = deferred<void>();
+      const gate = deferred<void>();
+      callbacks.projectEmbeddedExternal.mockImplementationOnce(async () => { entered.resolve(); await gate.promise; });
+      try {
+        await observer.start(file);
+        observer.beginUserTurnProjection('host');
+        await appendFile(file, `${[...peerTurn('e1', 'one'), ...peerTurn('e2', 'two')].join('\n')}\n`);
+        const completing = observer.completeUserTurnProjection('host');
+        const settlement = completing.then(() => null, error => error);
+        const failure = new Error('accepted failure');
+        await entered.promise;
+        observer.stop();
+        gate.reject(failure);
+        expect(await settlement).toBe(failure);
+        expect(callbacks.projectEmbeddedExternal).toHaveBeenCalledTimes(1);
+      } finally {
+        gate.resolve();
+        observer.stop();
+      }
+    });
+
+    it.each([
+      ['chunk', 'resolve'], ['chunk', 'reject'], ['finished', 'resolve'], ['finished', 'reject'],
+    ] as const)(
+      'does not clear a new pending turn when an old %s callback %ss',
+      async (callback, settlement) => {
+        await writeFile(file, '');
+        const nextFile = join(dir, 'next.jsonl');
+        await writeFile(nextFile, `${peerTurn('new', 'new', false).join('\n')}\n`);
+        const { observer, callbacks } = setup();
+        const entered = deferred<void>();
+        const gate = deferred<void>();
+        callbacks[callback].mockImplementationOnce(async () => { entered.resolve(); await gate.promise; });
+        try {
+          await observer.start(file);
+          observer.beginUserTurnProjection('host');
+          const result = JSON.stringify({ type: 'result', subtype: 'success', turn_uuid: 'old' });
+          await appendFile(file, `${[...notificationTurn('old', 'old'), result].join('\n')}\n`);
+          const completing = observer.completeUserTurnProjection('host');
+          const settlementOf = completing.then(() => null, error => error);
+          const failure = new Error('old callback failure');
+          await entered.promise;
+          observer.stop();
+          await observer.start(nextFile);
+          const reader = (observer as any).reader;
+          const active = (observer as any).active;
+          const queue = (observer as any).queue;
+          expect(active?.started.turnId).toBe('new');
+          if (settlement === 'reject') gate.reject(failure);
+          else gate.resolve();
+          expect(await settlementOf).toBe(settlement === 'reject' ? failure : null);
+          expect((observer as any).reader).toBe(reader);
+          expect((observer as any).active).toBe(active);
+          expect((observer as any).queue).toBe(queue);
+          expect(callbacks.released).not.toHaveBeenCalledWith('new');
+          expect(callbacks.released).not.toHaveBeenCalledWith('old');
+        } finally {
+          gate.resolve();
+          observer.stop();
+        }
+      },
+    );
+
+    it.each([
+      ['chunk', 'cancelled', 'stop'], ['chunk', 'cancelled', 'restart'],
+      ['chunk', 'released', 'stop'], ['chunk', 'released', 'restart'],
+      ['finished', 'cancelled', 'stop'], ['finished', 'cancelled', 'restart'],
+      ['finished', 'released', 'stop'], ['finished', 'released', 'restart'],
+    ] as const)(
+      'rejects the accepted %s failure when %s reenters with %s',
+      async (failing, reentry, action) => {
+        await writeFile(file, '');
+        const nextFile = join(dir, 'next.jsonl');
+        await writeFile(nextFile, '');
+        const { observer, callbacks } = setup();
+        const failure = new Error('original accepted callback failure');
+        if (failing === 'chunk') callbacks.chunk.mockRejectedValueOnce(failure);
+        else callbacks.finished.mockRejectedValueOnce(failure);
+        const next: {
+          restart?: Promise<void>;
+          reader?: ClaudeTranscriptTailReader;
+          mapper?: unknown;
+          queue?: unknown;
+          token?: object | null;
+          offset?: number;
+        } = {};
+        const result = (turnId: string) => JSON.stringify({ type: 'result', subtype: 'success', turn_uuid: turnId });
+        try {
+          await observer.start(file, await tailStartDescriptor(file));
+          const oldReader = (observer as any).reader as ClaudeTranscriptTailReader;
+          const nextStart = await tailStartDescriptor(nextFile);
+          const reenter = () => {
+            next.offset = oldReader.getOffset();
+            if (action === 'stop') {
+              observer.stop();
+              return;
+            }
+            next.restart = observer.start(nextFile, nextStart);
+            void next.restart.catch(() => {});
+            observer.beginUserTurnProjection('host');
+            next.reader = (observer as any).reader;
+            next.mapper = (observer as any).mapper;
+            next.queue = (observer as any).queue;
+            next.token = (observer as any).hostProjection;
+          };
+          if (reentry === 'cancelled') callbacks.cancelled.mockImplementationOnce(reenter);
+          else callbacks.released.mockImplementationOnce(reenter);
+          observer.beginUserTurnProjection('host');
+          await appendFile(file, `${[...notificationTurn('old', 'old'), result('old')].join('\n')}\n`);
+          const expectedOffset = (await stat(file)).size;
+          const completion = observer.completeUserTurnProjection('host');
+          const outcome = await within(completion.then(() => null, error => error), 'old completion did not settle');
+          expect(outcome).toBe(failure);
+          expect(next.offset).toBe(expectedOffset);
+          expect(oldReader.getOffset()).toBe(expectedOffset);
+          expect(callbacks[failing].mock.calls.filter(([event]) => event.turnId === 'old')).toHaveLength(1);
+          expect(callbacks.cancelled).toHaveBeenCalledTimes(1);
+          expect(callbacks.cancelled).toHaveBeenCalledWith(expect.objectContaining({
+            turnId: 'old', reason: failure.message, interrupted: true,
+          }));
+          expect(callbacks.released).toHaveBeenCalledTimes(reentry === 'cancelled' ? 0 : 1);
+          expect((observer as any).reader).toBe(action === 'stop' ? null : next.reader);
+          expect((observer as any).hostUserTurnId).toBe(action === 'stop' ? null : 'host');
+          if (action === 'stop') return;
+          expect(next.restart).toBeDefined();
+          await within(next.restart!, 'new reader did not start');
+          expect(next.reader).toBeDefined();
+          expect((observer as any).reader).toBe(next.reader);
+          expect((observer as any).mapper).toBe(next.mapper);
+          expect((observer as any).queue).toBe(next.queue);
+          expect((observer as any).hostProjection).toBe(next.token);
+          expect((observer as any).hostUserTurnId).toBe('host');
+          expect(next.reader?.getOffset()).toBe(0);
+          expect(callbacks.started.mock.calls.map(([event]) => event.turnId)).toEqual(['old']);
+          await appendFile(nextFile, `${[...notificationTurn('new', 'new'), result('new')].join('\n')}\n`);
+          await within(observer.completeUserTurnProjection('host'), 'new completion did not settle');
+          expect(callbacks.started.mock.calls.map(([event]) => event.turnId)).toEqual(['old', 'new']);
+          expect(callbacks.finished).toHaveBeenCalledWith(expect.objectContaining({ turnId: 'new' }));
+          expect(callbacks.released.mock.calls.map(([turnId]) => turnId))
+            .toEqual(reentry === 'cancelled' ? ['new'] : ['old', 'new']);
+        } finally {
+          observer.stop();
+          if (next.restart) await Promise.allSettled([next.restart]);
+        }
+      },
+    );
+
+    it.each([
+      ['chunk', 'reject'], ['chunk', 'throw'], ['finished', 'reject'], ['finished', 'throw'],
+    ] as const)(
+      'rejects a same-owner %s %s while preserving cancellation, release and continuation',
+      async (failing, mode) => {
+        await writeFile(file, '');
+        const { observer, callbacks, order } = setup();
+        const failure = new Error('same-owner callback failure');
+        if (mode === 'throw') callbacks[failing].mockImplementationOnce(() => { throw failure; });
+        else callbacks[failing].mockRejectedValueOnce(failure);
+        const result = (turnId: string) => JSON.stringify({ type: 'result', subtype: 'success', turn_uuid: turnId });
+        try {
+          await observer.start(file, await tailStartDescriptor(file));
+          const reader = (observer as any).reader as ClaudeTranscriptTailReader;
+          observer.beginUserTurnProjection('host');
+          await appendFile(file, `${[
+            ...notificationTurn('old', 'old'), result('old'),
+            ...notificationTurn('next', 'next'), result('next'),
+          ].join('\n')}\n`);
+          const expectedOffset = (await stat(file)).size;
+          const completion = observer.completeUserTurnProjection('host');
+          const outcome = await within(completion.then(() => null, error => error), 'same-owner completion did not settle');
+          expect(outcome).toBe(failure);
+          expect(reader.getOffset()).toBe(expectedOffset);
+          expect(callbacks.cancelled).toHaveBeenCalledTimes(1);
+          expect(callbacks.cancelled).toHaveBeenCalledWith(expect.objectContaining({
+            turnId: 'old', reason: failure.message, interrupted: true,
+          }));
+          expect(callbacks.released.mock.calls.map(([turnId]) => turnId)).toEqual(['old', 'next']);
+          expect(callbacks.started.mock.calls.map(([event]) => event.turnId)).toEqual(['old', 'next']);
+          expect(order.indexOf('release:old')).toBeLessThan(order.indexOf('start:next'));
+          expect(callbacks.finished).toHaveBeenCalledWith(expect.objectContaining({ turnId: 'next' }));
+          observer.beginUserTurnProjection('empty');
+          await within(observer.completeUserTurnProjection('empty'), 'empty completion did not settle');
+          expect(callbacks.started.mock.calls.map(([event]) => event.turnId)).toEqual(['old', 'next']);
+        } finally {
+          observer.stop();
+        }
+      },
+    );
+
+    it.each([
+      ['chunk', 'reject'], ['chunk', 'throw'], ['finished', 'reject'], ['finished', 'throw'],
+    ] as const)(
+      'reports a same-owner poll %s %s without replaying the accepted batch',
+      async (failing, mode) => {
+        await writeFile(file, '');
+        const { callbacks, order } = setup();
+        const failure = new Error('same-owner poll callback failure');
+        failure.name = 'SameOwnerPollFailure';
+        if (mode === 'throw') callbacks[failing].mockImplementationOnce(() => { throw failure; });
+        else callbacks[failing].mockRejectedValueOnce(failure);
+        const reported = deferred<void>();
+        const diagnostics = {
+          record: jest.fn((event: { phase: string; errorName?: string; turnIdHash?: string }) => {
+            if (event.phase === 'callback_error' && event.errorName === failure.name && !('turnIdHash' in event)) {
+              reported.resolve();
+            }
+          }),
+          hashId: jest.fn(() => 'hash'),
+        };
+        const observer = new ClaudeTranscriptTurnObserver(callbacks, () => true, diagnostics as any);
+        const result = (turnId: string) => JSON.stringify({ type: 'result', subtype: 'success', turn_uuid: turnId });
+        try {
+          await observer.start(file, await tailStartDescriptor(file));
+          const generation = (observer as any).generation;
+          const reader = (observer as any).reader as ClaudeTranscriptTailReader;
+          await appendFile(file, `${[
+            ...notificationTurn('old', 'old'), result('old'),
+            ...notificationTurn('next', 'next'), result('next'),
+          ].join('\n')}\n`);
+          const expectedOffset = (await stat(file)).size;
+          await within(reported.promise, 'same-owner poll did not reject its accepted completion', 4_000);
+          expect((reader as any).lastPollFailure.error).toBe(failure);
+          expect(diagnostics.record).toHaveBeenCalledWith({
+            phase: 'callback_error', generation, errorName: failure.name,
+          });
+          expect(reader.getOffset()).toBe(expectedOffset);
+          expect(callbacks.cancelled).toHaveBeenCalledTimes(1);
+          expect(callbacks.cancelled).toHaveBeenCalledWith(expect.objectContaining({
+            turnId: 'old', reason: failure.message, interrupted: true,
+          }));
+          expect(callbacks.released.mock.calls.map(([turnId]) => turnId)).toEqual(['old', 'next']);
+          expect(callbacks.started.mock.calls.map(([event]) => event.turnId)).toEqual(['old', 'next']);
+          expect(order.indexOf('release:old')).toBeLessThan(order.indexOf('start:next'));
+          expect(callbacks.finished).toHaveBeenCalledWith(expect.objectContaining({ turnId: 'next' }));
+          observer.beginUserTurnProjection('empty');
+          await within(observer.completeUserTurnProjection('empty'), 'post-failure catch-up did not settle');
+          expect(callbacks.started.mock.calls.map(([event]) => event.turnId)).toEqual(['old', 'next']);
+          expect(reader.getOffset()).toBe(expectedOffset);
+          await appendFile(file, `${[...notificationTurn('fresh', 'fresh'), result('fresh')].join('\n')}\n`);
+          observer.beginUserTurnProjection('host');
+          await within(observer.completeUserTurnProjection('host'), 'fresh catch-up did not settle');
+          expect(callbacks.released.mock.calls.map(([turnId]) => turnId)).toEqual(['old', 'next', 'fresh']);
+          expect(reader.getOffset()).toBe((await stat(file)).size);
+        } finally {
+          observer.stop();
+        }
+      },
+      8_000,
+    );
+
+    it.each(['chunk', 'finished'] as const)(
+      'rejects the original %s failure when continuation promotion restarts the observer',
+      async failing => {
+        await writeFile(file, '');
+        const nextFile = join(dir, 'next.jsonl');
+        await writeFile(nextFile, '');
+        const { observer, callbacks } = setup();
+        const failure = new Error('original callback failure before promotion');
+        if (failing === 'chunk') callbacks.chunk.mockRejectedValueOnce(failure);
+        else callbacks.finished.mockRejectedValueOnce(failure);
+        const next: {
+          restart?: Promise<void>;
+          reader?: ClaudeTranscriptTailReader;
+          token?: object | null;
+          offset?: number;
+        } = {};
+        const result = (turnId: string) => JSON.stringify({ type: 'result', subtype: 'success', turn_uuid: turnId });
+        try {
+          await observer.start(file, await tailStartDescriptor(file));
+          const oldReader = (observer as any).reader as ClaudeTranscriptTailReader;
+          const nextStart = await tailStartDescriptor(nextFile);
+          callbacks.started.mockImplementation(event => {
+            if (event.turnId === 'old-next') {
+              next.offset = oldReader.getOffset();
+              next.restart = observer.start(nextFile, nextStart);
+              void next.restart.catch(() => {});
+              observer.beginUserTurnProjection('host');
+              next.reader = (observer as any).reader;
+              next.token = (observer as any).hostProjection;
+            }
+            return true;
+          });
+          observer.beginUserTurnProjection('host');
+          await appendFile(file, `${[
+            ...notificationTurn('old', 'old'), result('old'),
+            ...notificationTurn('old-next', 'next'), result('old-next'),
+          ].join('\n')}\n`);
+          const expectedOffset = (await stat(file)).size;
+          const completion = observer.completeUserTurnProjection('host');
+          const outcome = await within(completion.then(() => null, error => error), 'old completion did not settle');
+          expect(outcome).toBe(failure);
+          expect(next.offset).toBe(expectedOffset);
+          expect(oldReader.getOffset()).toBe(expectedOffset);
+          expect(callbacks.cancelled.mock.calls.map(([event]) => event.turnId)).toEqual(['old', 'old-next']);
+          expect(callbacks.released.mock.calls.map(([turnId]) => turnId)).toEqual(['old']);
+          expect(next.restart).toBeDefined();
+          await within(next.restart!, 'new reader did not start');
+          expect((observer as any).reader).toBe(next.reader);
+          expect((observer as any).hostProjection).toBe(next.token);
+          expect((observer as any).hostUserTurnId).toBe('host');
+          expect(next.reader?.getOffset()).toBe(0);
+          await appendFile(nextFile, `${[...notificationTurn('new', 'new'), result('new')].join('\n')}\n`);
+          await within(observer.completeUserTurnProjection('host'), 'new completion did not settle');
+          expect(callbacks.started.mock.calls.map(([event]) => event.turnId)).toEqual(['old', 'old-next', 'new']);
+          expect(callbacks.released.mock.calls.map(([turnId]) => turnId)).toEqual(['old', 'new']);
+        } finally {
+          observer.stop();
+          if (next.restart) await Promise.allSettled([next.restart]);
+        }
+      },
+    );
+
+    it.each([
+      ['chunk', 'cancelled'], ['finished', 'released'],
+    ] as const)(
+      'reports an accepted poll %s failure to its old owner when %s restarts',
+      async (failing, reentry) => {
+        await writeFile(file, '');
+        const nextFile = join(dir, 'next.jsonl');
+        await writeFile(nextFile, '');
+        const { callbacks } = setup();
+        const failure = new Error('accepted poll callback failure');
+        failure.name = 'AcceptedPollFailure';
+        if (failing === 'chunk') callbacks.chunk.mockRejectedValueOnce(failure);
+        else callbacks.finished.mockRejectedValueOnce(failure);
+        const reported = deferred<void>();
+        const diagnostics = {
+          record: jest.fn((event: { phase: string; generation?: number; errorName?: string; turnIdHash?: string }) => {
+            if (event.phase === 'callback_error' && event.errorName === failure.name && !('turnIdHash' in event)) {
+              reported.resolve();
+            }
+          }),
+          hashId: jest.fn(() => 'hash'),
+        };
+        const observer = new ClaudeTranscriptTurnObserver(callbacks, () => true, diagnostics as any);
+        const next: {
+          restart?: Promise<void>;
+          reader?: ClaudeTranscriptTailReader;
+          token?: object | null;
+          offset?: number;
+        } = {};
+        const result = (turnId: string) => JSON.stringify({ type: 'result', subtype: 'success', turn_uuid: turnId });
+        try {
+          await observer.start(file, await tailStartDescriptor(file));
+          const generation = (observer as any).generation;
+          const oldReader = (observer as any).reader as ClaudeTranscriptTailReader;
+          const nextStart = await tailStartDescriptor(nextFile);
+          const reenter = () => {
+            next.offset = oldReader.getOffset();
+            next.restart = observer.start(nextFile, nextStart);
+            void next.restart.catch(() => {});
+            observer.beginUserTurnProjection('host');
+            next.reader = (observer as any).reader;
+            next.token = (observer as any).hostProjection;
+          };
+          if (reentry === 'cancelled') callbacks.cancelled.mockImplementationOnce(reenter);
+          else callbacks.released.mockImplementationOnce(reenter);
+          observer.beginUserTurnProjection('host');
+          await appendFile(file, `${[...notificationTurn('old', 'old'), result('old')].join('\n')}\n`);
+          const expectedOffset = (await stat(file)).size;
+          await within(reported.promise, 'old poll completion did not report its failure', 4_000);
+          expect(diagnostics.record).toHaveBeenCalledWith({
+            phase: 'callback_error', generation, errorName: failure.name,
+          });
+          expect(next.offset).toBe(expectedOffset);
+          expect(oldReader.getOffset()).toBe(expectedOffset);
+          expect(callbacks.cancelled).toHaveBeenCalledTimes(1);
+          expect(callbacks.released).toHaveBeenCalledTimes(reentry === 'cancelled' ? 0 : 1);
+          expect(next.restart).toBeDefined();
+          await within(next.restart!, 'new reader did not start');
+          expect((observer as any).reader).toBe(next.reader);
+          expect((observer as any).hostProjection).toBe(next.token);
+          expect((observer as any).hostUserTurnId).toBe('host');
+          expect(next.reader?.getOffset()).toBe(0);
+          await appendFile(nextFile, `${[...notificationTurn('new', 'new'), result('new')].join('\n')}\n`);
+          await within(observer.completeUserTurnProjection('host'), 'new completion did not settle');
+          expect(callbacks.started.mock.calls.map(([event]) => event.turnId)).toEqual(['old', 'new']);
+          expect(callbacks.released.mock.calls.map(([turnId]) => turnId))
+            .toEqual(reentry === 'cancelled' ? ['new'] : ['old', 'new']);
+        } finally {
+          observer.stop();
+          if (next.restart) await Promise.allSettled([next.restart]);
+        }
+      },
+      8_000,
+    );
+
+    it('does not drain the new active pending turn when an old chunk returns', async () => {
+      await writeFile(file, '');
+      const nextFile = join(dir, 'next.jsonl');
+      const secondChunk = JSON.stringify({ type: 'assistant', uuid: 'new-a2', message: { id: 'new-m2', role: 'assistant', content: [{ type: 'text', text: 'second' }], stop_reason: 'tool_use' } });
+      await writeFile(nextFile, `${[...peerTurn('new', 'new', false), secondChunk].join('\n')}\n`);
+      const { observer, callbacks } = setup();
+      const oldEntered = deferred<void>();
+      const newEntered = deferred<void>();
+      const oldGate = deferred<void>();
+      const newGate = deferred<void>();
+      callbacks.chunk.mockImplementation(async event => {
+        if (event.turnId === 'old') { oldEntered.resolve(); await oldGate.promise; }
+        else if (callbacks.chunk.mock.calls.filter(([item]) => item.turnId === 'new').length === 1) {
+          newEntered.resolve();
+          await newGate.promise;
+        }
+      });
+      try {
+        await observer.start(file);
+        const reader = (observer as any).reader as ClaudeTranscriptTailReader;
+        await appendFile(file, `${peerTurn('old', 'old', false).join('\n')}\n`);
+        const batch = await reader.readAvailable();
+        const oldConsume = (observer as any).consumeBatch(batch, (observer as any).generation) as Promise<void>;
+        await oldEntered.promise;
+        observer.stop();
+        const newStart = observer.start(nextFile);
+        await newEntered.promise;
+        oldGate.resolve();
+        await oldConsume;
+        expect(callbacks.chunk.mock.calls.filter(([event]) => event.turnId === 'new')).toHaveLength(1);
+        newGate.resolve();
+        await newStart;
+        expect(callbacks.chunk.mock.calls.filter(([event]) => event.turnId === 'new')).toHaveLength(2);
+      } finally {
+        oldGate.resolve();
+        newGate.resolve();
+        observer.stop();
+      }
+    });
+
+    it('does not run an old queued completion against a same-id new host', async () => {
+      await writeFile(file, '');
+      const nextFile = join(dir, 'next.jsonl');
+      await writeFile(nextFile, '');
+      const { observer, callbacks } = setup();
+      const entered = deferred<void>();
+      const gate = deferred<void>();
+      const closing = deferred<void>();
+      const closeGate = deferred<void>();
+      const closed = deferred<void>();
+      const fsPromises = jest.requireActual<typeof FsPromisesModule>('fs/promises');
+      const open = fsPromises.open;
+      let restoreOpen = () => {};
+      let first: Promise<void> | undefined;
+      let queued: Promise<void> | undefined;
+      callbacks.projectEmbeddedExternal.mockImplementationOnce(async () => { entered.resolve(); await gate.promise; });
+      try {
+        await observer.start(file);
+        observer.beginUserTurnProjection('host');
+        await appendFile(file, `${peerTurn('old', 'old').join('\n')}\n`);
+        first = observer.completeUserTurnProjection('host');
+        void first.catch(() => {});
+        await within(entered.promise, 'first callback did not enter');
+        observer.beginUserTurnProjection('host');
+        await appendFile(file, `${peerTurn('queued-old', 'queued').join('\n')}\n`);
+        const oldReader = (observer as any).reader as ClaudeTranscriptTailReader;
+        const previousOffset = oldReader.getOffset();
+        const expectedOffset = (await stat(file)).size;
+        const openSpy = jest.spyOn(fsPromises, 'open').mockImplementationOnce(async (...args) => {
+          const handle = await open(...args);
+          const close = handle.close.bind(handle);
+          handle.close = async () => { closing.resolve(); await closeGate.promise; await close(); closed.resolve(); };
+          return handle;
+        });
+        restoreOpen = () => openSpy.mockRestore();
+        queued = observer.completeUserTurnProjection('host');
+        void queued.catch(() => {});
+        await within(closing.promise, 'queued catch-up did not reach physical close');
+        expect(oldReader.getOffset()).toBe(previousOffset);
+        closeGate.resolve();
+        await within(closed.promise, 'queued catch-up did not close');
+        await new Promise<void>(resolve => setImmediate(resolve));
+        expect(oldReader.getOffset()).toBe(expectedOffset);
+        openSpy.mockRestore();
+        observer.stop();
+        await observer.start(nextFile, await tailStartDescriptor(nextFile));
+        observer.beginUserTurnProjection('host');
+        const reader = (observer as any).reader as ClaudeTranscriptTailReader;
+        const mapper = (observer as any).mapper;
+        const queue = (observer as any).queue;
+        const hostProjection = (observer as any).hostProjection;
+        let newOpens = 0;
+        const newOpenSpy = jest.spyOn(fsPromises, 'open').mockImplementation(async (...args) => {
+          if (args[0] === nextFile) newOpens += 1;
+          return open(...args);
+        });
+        restoreOpen = () => newOpenSpy.mockRestore();
+        gate.resolve();
+        await within(Promise.all([first, queued]), 'old completions did not settle');
+        expect(newOpens).toBe(0);
+        expect((observer as any).reader).toBe(reader);
+        expect((observer as any).mapper).toBe(mapper);
+        expect((observer as any).queue).toBe(queue);
+        expect((observer as any).hostProjection).toBe(hostProjection);
+        expect((observer as any).hostUserTurnId).toBe('host');
+        expect(reader.getOffset()).toBe(0);
+        expect(callbacks.projectEmbeddedExternal.mock.calls.map(([event]) => event.turnId)).toEqual(['old']);
+      } finally {
+        closeGate.resolve();
+        gate.resolve();
+        observer.stop();
+        restoreOpen();
+        await Promise.allSettled([first, queued].filter((item): item is Promise<void> => item !== undefined));
+      }
+    });
+
+    it('drops a read that returns after stop and restart with the same host id', async () => {
+      await writeFile(file, '');
+      const nextFile = join(dir, 'next.jsonl');
+      await writeFile(nextFile, '');
+      const { observer, callbacks } = setup();
+      const closing = deferred<void>();
+      const gate = deferred<void>();
+      const fsPromises = jest.requireActual<typeof FsPromisesModule>('fs/promises');
+      const open = fsPromises.open;
+      let restoreOpen = () => {};
+      let completing: Promise<void> | undefined;
+      try {
+        await observer.start(file);
+        observer.beginUserTurnProjection('host');
+        const oldLines = peerTurn('old', 'old');
+        await appendFile(file, `${oldLines.join('\n')}\n`);
+        const oldReader = (observer as any).reader as ClaudeTranscriptTailReader;
+        const openSpy = jest.spyOn(fsPromises, 'open').mockImplementationOnce(async (...args) => {
+          const handle = await open(...args);
+          const close = handle.close.bind(handle);
+          handle.close = async () => { closing.resolve(); await gate.promise; await close(); };
+          return handle;
+        });
+        restoreOpen = () => openSpy.mockRestore();
+        completing = observer.completeUserTurnProjection('host');
+        void completing.catch(() => {});
+        await within(closing.promise, 'old read did not reach physical close');
+        expect(oldReader.getOffset()).toBe(0);
+        observer.stop();
+        await observer.start(nextFile, await tailStartDescriptor(nextFile));
+        observer.beginUserTurnProjection('host');
+        const reader = (observer as any).reader as ClaudeTranscriptTailReader;
+        const mapper = (observer as any).mapper;
+        const queue = (observer as any).queue;
+        const hostProjection = (observer as any).hostProjection;
+        gate.resolve();
+        await within(completing, 'old read did not settle after close');
+        expect(oldReader.getOffset()).toBe(0);
+        expect((observer as any).reader).toBe(reader);
+        expect((observer as any).mapper).toBe(mapper);
+        expect((observer as any).queue).toBe(queue);
+        expect((observer as any).hostProjection).toBe(hostProjection);
+        expect((observer as any).hostUserTurnId).toBe('host');
+        expect(reader.getOffset()).toBe(0);
+        expect(callbacks.projectEmbeddedExternal).not.toHaveBeenCalled();
+        openSpy.mockRestore();
+        expect((await oldReader.readAvailable()).lines).toEqual(oldLines);
+        await appendFile(nextFile, `${peerTurn('new', 'new').join('\n')}\n`);
+        await observer.completeUserTurnProjection('host');
+        expect(callbacks.projectEmbeddedExternal.mock.calls.map(([event]) => event.turnId)).toEqual(['new']);
+      } finally {
+        gate.resolve();
+        observer.stop();
+        restoreOpen();
+        if (completing) await Promise.allSettled([completing]);
+      }
+    });
+
+    it('reports a late poll close failure to its original generation after restart', async () => {
+      await writeFile(file, '');
+      const nextFile = join(dir, 'next.jsonl');
+      await writeFile(nextFile, '');
+      const { callbacks } = setup();
+      const reported = deferred<void>();
+      const closing = deferred<void>();
+      const gate = deferred<void>();
+      const closed = deferred<void>();
+      const failure = new Error('old poll close failure');
+      failure.name = 'OldPollCloseError';
+      const diagnostics = {
+        record: jest.fn((event: { phase: string; generation?: number; errorName?: string }) => {
+          if (event.phase === 'callback_error') reported.resolve();
+        }),
+        hashId: jest.fn(() => 'hash'),
+      };
+      const observer = new ClaudeTranscriptTurnObserver(callbacks, () => true, diagnostics as any);
+      const fsPromises = jest.requireActual<typeof FsPromisesModule>('fs/promises');
+      const open = fsPromises.open;
+      let restoreOpen = () => {};
+      let closeEntered = false;
+      try {
+        await observer.start(file);
+        const oldGeneration = (observer as any).generation;
+        const oldReader = (observer as any).reader as ClaudeTranscriptTailReader;
+        await appendFile(file, `${peerTurn('old', 'old').join('\n')}\n`);
+        const openSpy = jest.spyOn(fsPromises, 'open').mockImplementationOnce(async (...args) => {
+          const handle = await open(...args);
+          const close = handle.close.bind(handle);
+          handle.close = async () => {
+            closeEntered = true;
+            closing.resolve();
+            await gate.promise;
+            await close();
+            closed.resolve();
+            throw failure;
+          };
+          return handle;
+        });
+        restoreOpen = () => openSpy.mockRestore();
+        await within(closing.promise, 'old poll did not reach physical close', 3_500);
+        expect(oldReader.getOffset()).toBe(0);
+        observer.stop();
+        await observer.start(nextFile, await tailStartDescriptor(nextFile));
+        observer.beginUserTurnProjection('host');
+        const reader = (observer as any).reader;
+        const mapper = (observer as any).mapper;
+        const queue = (observer as any).queue;
+        const token = (observer as any).hostProjection;
+        gate.resolve();
+        await within(closed.promise, 'old poll handle did not close');
+        await within(reported.promise, 'old poll failure lost its error owner');
+        expect(diagnostics.record).toHaveBeenCalledWith(expect.objectContaining({
+          phase: 'callback_error', generation: oldGeneration, errorName: failure.name,
+        }));
+        expect((observer as any).reader).toBe(reader);
+        expect((observer as any).mapper).toBe(mapper);
+        expect((observer as any).queue).toBe(queue);
+        expect((observer as any).hostProjection).toBe(token);
+        expect(oldReader.getOffset()).toBe(0);
+        expect(callbacks.started).not.toHaveBeenCalled();
+      } finally {
+        gate.resolve();
+        observer.stop();
+        restoreOpen();
+        if (closeEntered) await within(closed.promise, 'old handle remained open during cleanup');
+      }
+    }, 8_000);
+
+    it('binds a post-reset poll failure to the new watcher generation', async () => {
+      await writeFile(file, 'old\n');
+      const { callbacks } = setup();
+      const reported = deferred<void>();
+      const closed = deferred<void>();
+      const failure = new Error('post-reset poll read failure');
+      failure.name = 'NewPollReadError';
+      const diagnostics = {
+        record: jest.fn((event: { phase: string; generation?: number; errorName?: string }) => {
+          if (event.phase === 'callback_error') reported.resolve();
+        }),
+        hashId: jest.fn(() => 'hash'),
+      };
+      const observer = new ClaudeTranscriptTurnObserver(callbacks, () => true, diagnostics as any);
+      const fsPromises = jest.requireActual<typeof FsPromisesModule>('fs/promises');
+      const open = fsPromises.open;
+      let restoreOpen = () => {};
+      try {
+        await observer.start(file);
+        const oldGeneration = (observer as any).generation;
+        observer.beginUserTurnProjection('host');
+        await writeFile(file, '');
+        await observer.completeUserTurnProjection('host');
+        const generation = (observer as any).generation;
+        const reader = (observer as any).reader as ClaudeTranscriptTailReader;
+        expect(generation).toBeGreaterThan(oldGeneration);
+        await appendFile(file, `${peerTurn('new', 'new').join('\n')}\n`);
+        const openSpy = jest.spyOn(fsPromises, 'open').mockImplementationOnce(async (...args) => {
+          const handle = await open(...args);
+          handle.read = (async () => { throw failure; }) as typeof handle.read;
+          const close = handle.close.bind(handle);
+          handle.close = async () => { await close(); closed.resolve(); };
+          return handle;
+        });
+        restoreOpen = () => openSpy.mockRestore();
+        await within(closed.promise, 'post-reset poll did not close its handle', 3_500);
+        await within(reported.promise, 'post-reset poll failure lost its error owner');
+        expect(diagnostics.record).toHaveBeenCalledWith(expect.objectContaining({
+          phase: 'callback_error', generation, errorName: failure.name,
+        }));
+        expect((reader as any).lastPollFailure.error).toBe(failure);
+        expect(reader.getOffset()).toBe(0);
+        expect(callbacks.projectEmbeddedExternal).not.toHaveBeenCalled();
+      } finally {
+        restoreOpen();
+        observer.stop();
+      }
+    }, 8_000);
+
+    it('does not start a new reader when an old prime completes after restart', async () => {
+      await writeFile(file, '');
+      const nextFile = join(dir, 'next.jsonl');
+      await writeFile(nextFile, '');
+      const { observer } = setup();
+      const entered = deferred<void>();
+      const gate = deferred<void>();
+      const originalPrime = ClaudeTranscriptTailReader.prototype.prime;
+      const prime = jest.spyOn(ClaudeTranscriptTailReader.prototype, 'prime')
+        .mockImplementationOnce(async function (this: ClaudeTranscriptTailReader, offset?: number) {
+          entered.resolve();
+          await gate.promise;
+          await originalPrime.call(this, offset);
+        });
+      try {
+        const oldStart = observer.start(file);
+        await entered.promise;
+        observer.stop();
+        await observer.start(nextFile, await tailStartDescriptor(nextFile));
+        const reader = (observer as any).reader as ClaudeTranscriptTailReader;
+        const start = jest.spyOn(reader, 'start');
+        gate.resolve();
+        await oldStart;
+        expect((observer as any).reader).toBe(reader);
+        expect(start).not.toHaveBeenCalled();
+      } finally {
+        gate.resolve();
+        prime.mockRestore();
+        observer.stop();
+      }
+    });
+
+    it('leaves a reentrant start authoritative over an outer start', async () => {
+      const nextFile = join(dir, 'next.jsonl');
+      const outerFile = join(dir, 'outer.jsonl');
+      await writeFile(file, `${peerTurn('old', 'old', false).join('\n')}\n`);
+      await writeFile(nextFile, '');
+      await writeFile(outerFile, '');
+      const { observer, callbacks } = setup();
+      let restarted: Promise<void> | undefined;
+      try {
+        await observer.start(file);
+        const nextStart = await tailStartDescriptor(nextFile);
+        callbacks.cancelled.mockImplementationOnce(() => { restarted = observer.start(nextFile, nextStart); });
+        await observer.start(outerFile, await tailStartDescriptor(outerFile));
+        await restarted;
+        expect((observer as any).reader?.filePath).toBe(nextFile);
+      } finally {
+        observer.stop();
+      }
+    });
+
+    it('does not poll after reset priming cannot stat the transcript', async () => {
+      await writeFile(file, '');
+      const { observer } = setup();
+      try {
+        await observer.start(file);
+        const reader = (observer as any).reader as ClaudeTranscriptTailReader;
+        const start = jest.spyOn(reader, 'start');
+        const prime = reader.prime.bind(reader);
+        jest.spyOn(reader, 'prime').mockImplementationOnce(async offset => {
+          await unlink(file);
+          await prime(offset);
+        });
+        await (observer as any).consumeBatch({ lines: [], reset: true }, (observer as any).generation);
+        expect(start).not.toHaveBeenCalled();
+      } finally {
+        observer.stop();
+      }
+    });
+
+    it('completes the host projection when its read observes a transcript reset', async () => {
+      await writeFile(file, `${peerTurn('old', 'old', false).join('\n')}\n`);
+      const { observer } = setup();
+      try {
+        await observer.start(file);
+        observer.beginUserTurnProjection('host');
+        await writeFile(file, '');
+        await observer.completeUserTurnProjection('host');
+        expect((observer as any).hostUserTurnId).toBeNull();
+      } finally {
+        observer.stop();
+      }
+    });
+
+    it('does not let transcript-reset cancellation overwrite a reentrant start', async () => {
+      const nextFile = join(dir, 'next.jsonl');
+      await writeFile(file, `${peerTurn('old', 'old', false).join('\n')}\n`);
+      await writeFile(nextFile, '');
+      const { observer, callbacks } = setup();
+      let restarted: Promise<void> | undefined;
+      try {
+        await observer.start(file);
+        const nextStart = await tailStartDescriptor(nextFile);
+        callbacks.cancelled.mockImplementationOnce(() => {
+          restarted = observer.start(nextFile, nextStart);
+          observer.beginUserTurnProjection('new-host');
+        });
+        const oldGeneration = (observer as any).generation;
+        await (observer as any).consumeBatch({ lines: [], reset: true }, oldGeneration);
+        await restarted;
+        expect((observer as any).reader?.filePath).toBe(nextFile);
+        expect((observer as any).hostUserTurnId).toBe('new-host');
+      } finally {
+        observer.stop();
+      }
+    });
+
+    it('does not release an old turn after interrupt cancellation starts a new generation', async () => {
+      const nextFile = join(dir, 'next.jsonl');
+      await writeFile(file, `${peerTurn('old', 'old', false).join('\n')}\n`);
+      await writeFile(nextFile, '');
+      const { observer, callbacks } = setup();
+      let restarted: Promise<void> | undefined;
+      try {
+        await observer.start(file);
+        const nextStart = await tailStartDescriptor(nextFile);
+        callbacks.cancelled.mockImplementationOnce(() => {
+          restarted = observer.start(nextFile, nextStart);
+          observer.beginUserTurnProjection('new-host');
+        });
+        observer.interruptActiveTurn('user_cancel');
+        await restarted;
+        expect((observer as any).reader?.filePath).toBe(nextFile);
+        expect((observer as any).hostUserTurnId).toBe('new-host');
+        expect(callbacks.released).not.toHaveBeenCalledWith('old');
+      } finally {
+        observer.stop();
+      }
+    });
+
+    it('does not requeue an old pending turn when started synchronously restarts', async () => {
+      const nextFile = join(dir, 'next.jsonl');
+      await writeFile(file, '');
+      await writeFile(nextFile, '');
+      const { observer, callbacks } = setup();
+      let restarted: Promise<void> | undefined;
+      try {
+        await observer.start(file);
+        const nextStart = await tailStartDescriptor(nextFile);
+        callbacks.started.mockImplementationOnce(() => {
+          restarted = observer.start(nextFile, nextStart);
+          return false;
+        });
+        const generation = (observer as any).generation;
+        await (observer as any).consumeBatch({ lines: peerTurn('old', 'old', false), reset: false }, generation);
+        await restarted;
+        expect((observer as any).reader?.filePath).toBe(nextFile);
+        expect((observer as any).active).toBeNull();
+        expect((observer as any).queue).toHaveLength(0);
+      } finally {
+        observer.stop();
+      }
+    });
+
+    it('does not clear a generation started synchronously from cancellation', async () => {
+      const nextFile = join(dir, 'next.jsonl');
+      await writeFile(file, `${peerTurn('old', 'old', false).join('\n')}\n`);
+      await writeFile(nextFile, '');
+      const { observer, callbacks } = setup();
+      let restarted: Promise<void> | undefined;
+      try {
+        await observer.start(file);
+        const nextStart = await tailStartDescriptor(nextFile);
+        callbacks.cancelled.mockImplementationOnce(() => {
+          restarted = observer.start(nextFile, nextStart);
+          observer.beginUserTurnProjection('new-host');
+          observer.registerHostUserTranscriptId('new-row');
+        });
+        observer.stop();
+        await restarted;
+        expect((observer as any).reader?.filePath).toBe(nextFile);
+        expect((observer as any).hostUserTurnId).toBe('new-host');
+        expect((observer as any).hostUserTranscriptIds.has('new-row')).toBe(true);
+      } finally {
+        observer.stop();
+      }
+    });
+  });
+
+  it('reads host catch-up and projects a mid-turn peer before settling the captured token', async () => {
+    await writeFile(file, '');
+    const { observer, callbacks } = setup();
+    try {
+      await observer.start(file);
+      observer.beginUserTurnProjection('host');
+      await appendFile(file, `${peerTurn('old', 'old').join('\n')}\n`);
+      await observer.completeUserTurnProjection('host');
+      expect((observer as any).hostUserTurnId).toBeNull();
+      expect((observer as any).hostProjection).toBeNull();
+      expect(callbacks.started).not.toHaveBeenCalled();
+      expect(callbacks.projectEmbeddedExternal).toHaveBeenCalledTimes(1);
+      expect(callbacks.projectEmbeddedExternal).toHaveBeenCalledWith(expect.objectContaining({ turnId: 'old' }));
+      const reader = (observer as any).reader as ClaudeTranscriptTailReader;
+      expect(reader.getOffset()).toBe((await stat(file)).size);
+    } finally {
+      observer.stop();
+    }
+  });
+
+  it('keeps host catch-up IO running while an accepted callback gates the FIFO', async () => {
+    await writeFile(file, '');
+    const { observer, callbacks, order } = setup();
+    const entered = deferred<void>();
+    const gate = deferred<void>();
+    const closing = deferred<void>();
+    const closeGate = deferred<void>();
+    const closed = deferred<void>();
+    const fsPromises = jest.requireActual<typeof FsPromisesModule>('fs/promises');
+    let restoreOpen = () => {};
+    let first: Promise<void> | undefined;
+    let second: Promise<void> | undefined;
+    let deadline: ReturnType<typeof setTimeout> | undefined;
+    let bytesRead = 0;
+    callbacks.projectEmbeddedExternal.mockImplementation(async event => {
+      order.push(`embedded:${event.turnId}`);
+      if (event.turnId === 'e1') { entered.resolve(); await gate.promise; }
+    });
+    try {
+      await observer.start(file);
+      const reader = (observer as any).reader as ClaudeTranscriptTailReader;
+      observer.beginUserTurnProjection('h1');
+      await appendFile(file, `${peerTurn('e1', 'one').join('\n')}\n`);
+      first = observer.completeUserTurnProjection('h1');
+      void first.catch(() => {});
+      await entered.promise;
+      const firstOffset = reader.getOffset();
+      observer.beginUserTurnProjection('h2');
+      const next = `${peerTurn('e2', 'two').join('\n')}\n`;
+      await appendFile(file, next);
+      const open = fsPromises.open;
+      const openSpy = jest.spyOn(fsPromises, 'open').mockImplementationOnce(async (...args) => {
+        const handle = await open(...args);
+        const read = handle.read.bind(handle);
+        handle.read = (async (...readArgs: Parameters<typeof read>) => {
+          const result = await read(...readArgs);
+          bytesRead += result.bytesRead;
+          return result;
+        }) as typeof handle.read;
+        const close = handle.close.bind(handle);
+        handle.close = async () => { closing.resolve(); await closeGate.promise; await close(); closed.resolve(); };
+        return handle;
+      });
+      restoreOpen = () => openSpy.mockRestore();
+      second = observer.completeUserTurnProjection('h2');
+      void second.catch(() => {});
+      await Promise.race([
+        closing.promise,
+        new Promise<never>((_, reject) => {
+          deadline = setTimeout(() => reject(new Error('host catch-up did not reach physical close while FIFO was gated')), 1_500);
+        }),
+      ]);
+      expect(bytesRead).toBe(Buffer.byteLength(next));
+      expect(reader.getOffset()).toBe(firstOffset);
+      expect(order).toEqual(['embedded:e1']);
+      closeGate.resolve();
+      await closed.promise;
+      await new Promise<void>(resolve => setImmediate(resolve));
+      expect(reader.getOffset()).toBe(firstOffset + Buffer.byteLength(next));
+      expect(order).toEqual(['embedded:e1']);
+      gate.resolve();
+      await Promise.all([first, second]);
+      expect(order).toEqual(['embedded:e1', 'embedded:e2']);
+      expect((observer as any).hostUserTurnId).toBeNull();
+    } finally {
+      if (deadline) clearTimeout(deadline);
+      closeGate.resolve();
+      gate.resolve();
+      observer.stop();
+      restoreOpen();
+      await Promise.allSettled([first, second].filter((item): item is Promise<void> => item !== undefined));
+    }
+  });
+
+  it('settles the captured host token even when the read observes a reset', async () => {
+    await writeFile(file, `${peerTurn('old', 'old', false).join('\n')}\n`);
+    const { observer, callbacks } = setup();
+    try {
+      await observer.start(file);
+      observer.beginUserTurnProjection('host');
+      await writeFile(file, '');
+      await observer.completeUserTurnProjection('host');
+      expect((observer as any).hostUserTurnId).toBeNull();
+      expect(callbacks.projectEmbeddedExternal).not.toHaveBeenCalled();
+    } finally {
+      observer.stop();
+    }
+  });
+
+  it('settles the captured host token on an empty catch-up batch', async () => {
+    await writeFile(file, '');
+    const { observer } = setup();
+    try {
+      await observer.start(file);
+      observer.beginUserTurnProjection('host');
+      await observer.completeUserTurnProjection('host');
+      expect((observer as any).hostUserTurnId).toBeNull();
+      expect((observer as any).hostProjection).toBeNull();
+    } finally {
+      observer.stop();
+    }
+  });
+
+  it('serializes poll and host consumption while host IO runs during a poll callback', async () => {
+    await writeFile(file, '');
+    const { observer, callbacks, order } = setup();
+    const pollEntered = deferred<void>();
+    const pollGate = deferred<void>();
+    const closing = deferred<void>();
+    const closeGate = deferred<void>();
+    const closed = deferred<void>();
+    const fsPromises = jest.requireActual<typeof FsPromisesModule>('fs/promises');
+    const open = fsPromises.open;
+    let restoreOpen = () => {};
+    let completing: Promise<void> | undefined;
+    callbacks.finished.mockImplementationOnce(async event => {
+      order.push(`finish:${event.turnId}`);
+      pollEntered.resolve();
+      await pollGate.promise;
+    });
+    try {
+      await observer.start(file);
+      await appendFile(file, `${peerTurn('poll', 'poll').join('\n')}\n`);
+      await within(pollEntered.promise, 'poll callback did not enter', 3_500);
+      const reader = (observer as any).reader as ClaudeTranscriptTailReader;
+      const pollOffset = reader.getOffset();
+      observer.beginUserTurnProjection('host');
+      const next = `${peerTurn('host-peer', 'host').join('\n')}\n`;
+      await appendFile(file, next);
+      const openSpy = jest.spyOn(fsPromises, 'open').mockImplementationOnce(async (...args) => {
+        const handle = await open(...args);
+        const close = handle.close.bind(handle);
+        handle.close = async () => { closing.resolve(); await closeGate.promise; await close(); closed.resolve(); };
+        return handle;
+      });
+      restoreOpen = () => openSpy.mockRestore();
+      completing = observer.completeUserTurnProjection('host');
+      void completing.catch(() => {});
+      await within(closing.promise, 'host IO did not reach close while poll consumption was gated');
+      expect(reader.getOffset()).toBe(pollOffset);
+      expect(callbacks.projectEmbeddedExternal).not.toHaveBeenCalled();
+      closeGate.resolve();
+      await within(closed.promise, 'host IO did not close');
+      await new Promise<void>(resolve => setImmediate(resolve));
+      expect(reader.getOffset()).toBe(pollOffset + Buffer.byteLength(next));
+      expect(callbacks.projectEmbeddedExternal).not.toHaveBeenCalled();
+      pollGate.resolve();
+      await within(completing, 'host completion did not follow poll completion');
+      expect(callbacks.projectEmbeddedExternal.mock.calls.map(([event]) => event.turnId)).toEqual(['host-peer']);
+      expect(order.indexOf('finish:poll')).toBeGreaterThan(-1);
+      expect(order.indexOf('release:poll')).toBeGreaterThan(order.indexOf('finish:poll'));
+      expect(order.indexOf('embedded:host-peer')).toBeGreaterThan(order.indexOf('release:poll'));
+    } finally {
+      closeGate.resolve();
+      pollGate.resolve();
+      observer.stop();
+      restoreOpen();
+      if (completing) await Promise.allSettled([completing]);
+    }
+  }, 8_000);
+
+  it.each(['open', 'read', 'close'] as const)(
+    'preserves host catch-up %s failure without consuming or projecting the batch',
+    async stage => {
+      await writeFile(file, '');
+      const { observer, callbacks } = setup();
+      const fsPromises = jest.requireActual<typeof FsPromisesModule>('fs/promises');
+      const open = fsPromises.open;
+      const failure = new Error(`host ${stage} failure`);
+      let restoreOpen = () => {};
+      try {
+        await observer.start(file);
+        observer.beginUserTurnProjection('host');
+        const token = (observer as any).hostProjection;
+        await appendFile(file, `${peerTurn('peer', 'value').join('\n')}\n`);
+        const reader = (observer as any).reader as ClaudeTranscriptTailReader;
+        const openSpy = jest.spyOn(fsPromises, 'open').mockImplementationOnce(async (...args) => {
+          if (stage === 'open') throw failure;
+          const handle = await open(...args);
+          if (stage === 'read') handle.read = (async () => { throw failure; }) as typeof handle.read;
+          const close = handle.close.bind(handle);
+          handle.close = async () => { await close(); if (stage === 'close') throw failure; };
+          return handle;
+        });
+        restoreOpen = () => openSpy.mockRestore();
+        await expect(observer.completeUserTurnProjection('host')).rejects.toBe(failure);
+        expect(reader.getOffset()).toBe(0);
+        expect((observer as any).hostProjection).toBe(token);
+        expect(callbacks.started).not.toHaveBeenCalled();
+        expect(callbacks.projectEmbeddedExternal).not.toHaveBeenCalled();
+        openSpy.mockRestore();
+        await observer.completeUserTurnProjection('host');
+        expect(reader.getOffset()).toBe((await stat(file)).size);
+        expect(callbacks.projectEmbeddedExternal.mock.calls.map(([event]) => event.turnId)).toEqual(['peer']);
+        expect((observer as any).hostUserTurnId).toBeNull();
+      } finally {
+        restoreOpen();
+        observer.stop();
+      }
+    },
+  );
+
   it('recovery replays only an unfinished external turn', async () => {
     await writeFile(file, `${peerTurn('peer-open', 'hello', false).join('\n')}\n`);
     const { observer, callbacks } = setup();
@@ -73,7 +1484,7 @@ describe('ClaudeTranscriptTurnObserver', () => {
     await writeFile(file, snapshot);
     const boundary = (await stat(file)).size;
     const { observer, callbacks } = setup();
-    await observer.start(file, boundary);
+    await observer.start(file, await tailStartDescriptor(file, boundary));
     await appendFile(file, `${peerTurn('new', 'new').join('\n')}\n`);
     const reader = (observer as any).reader as ClaudeTranscriptTailReader;
     const batch = await reader.readAvailable();
@@ -258,18 +1669,22 @@ describe('ClaudeTranscriptTurnObserver', () => {
     await writeFile(file, '');
     await observer.start(file);
     const generation = (observer as any).generation;
-    const consuming = (observer as any).consumeBatch({
-      lines: [...peerTurn('peer-stuck', 'stuck'), ...peerTurn('peer-next', 'next')],
-      reset: false,
-    }, generation);
-    await jest.advanceTimersByTimeAsync(1_000);
-    await consuming;
-    await (observer as any).settleQuietCandidate(generation);
-    expect(callbacks.cancelled).toHaveBeenCalledWith(expect.objectContaining({ turnId: 'peer-stuck' }));
-    expect(order).toContain('release:peer-stuck');
-    expect(order).toContain('start:peer-next');
-    observer.stop();
-    jest.useRealTimers();
+    try {
+      const consuming = (observer as any).consumeBatch({
+        lines: [...peerTurn('peer-stuck', 'stuck'), ...peerTurn('peer-next', 'next')],
+        reset: false,
+      }, generation);
+      const settlement = consuming.then(() => null, (error: unknown) => error);
+      await jest.advanceTimersByTimeAsync(1_000);
+      expect(await settlement).toEqual(expect.objectContaining({ message: 'chunk_timeout' }));
+      await (observer as any).settleQuietCandidate(generation);
+      expect(callbacks.cancelled).toHaveBeenCalledWith(expect.objectContaining({ turnId: 'peer-stuck' }));
+      expect(order).toContain('release:peer-stuck');
+      expect(order).toContain('start:peer-next');
+    } finally {
+      observer.stop();
+      jest.useRealTimers();
+    }
   });
 
   it('projects a mid-turn peer only as an embedded bubble after catch-up', async () => {
@@ -302,15 +1717,19 @@ describe('ClaudeTranscriptTurnObserver', () => {
   it.each(['chunk', 'finished'])('cancels and releases the lease when %s callback rejects', async failing => {
     await writeFile(file, '');
     const { observer, callbacks } = setup();
-    callbacks[failing as 'chunk' | 'finished'].mockRejectedValueOnce(new Error('injected'));
+    const failure = new Error('injected');
+    callbacks[failing as 'chunk' | 'finished'].mockRejectedValueOnce(failure);
     await observer.start(file);
     const generation = (observer as any).generation;
-    await (observer as any).consumeBatch({ lines: peerTurn('peer-fail', 'failure'), reset: false }, generation);
-    expect(callbacks.cancelled).toHaveBeenCalledWith(expect.objectContaining({
-      turnId: 'peer-fail',
-      interrupted: true,
-    }));
-    observer.stop();
+    try {
+      await expect((observer as any).consumeBatch({ lines: peerTurn('peer-fail', 'failure'), reset: false }, generation)).rejects.toBe(failure);
+      expect(callbacks.cancelled).toHaveBeenCalledWith(expect.objectContaining({
+        turnId: 'peer-fail',
+        interrupted: true,
+      }));
+    } finally {
+      observer.stop();
+    }
   });
 
   it('stops an unfinished active turn with the interrupted flag, never as completed', async () => {
@@ -619,8 +2038,9 @@ describe('ClaudeTranscriptTurnObserver', () => {
     expect(committed).toBeLessThan(raw.length);
 
     // Layer 2 (service): the page handoff offset equals the committed
-    // boundary; this is the value Tab.ts forwards to the runtime's
-    // setTranscriptObserverStartOffset.
+    // boundary, and the tail-start descriptor carries the snapshot's source
+    // identity for it — what Tab.ts forwards to the runtime's
+    // setTranscriptObserverTailStart.
     const sessionPathSpy = jest.spyOn(sdkSessionPaths, 'getSDKSessionPath').mockReturnValue(file);
     const existsSpy = jest.spyOn(sdkSessionPaths, 'sdkSessionExists').mockReturnValue(true);
     const conversation: Conversation = {
@@ -636,6 +2056,17 @@ describe('ClaudeTranscriptTurnObserver', () => {
       projectionLevel: 'detail',
     });
     expect(page.snapshotOffset).toBe(committed);
+    expect(page.tailStart).toEqual({
+      provider: 'claude',
+      protocol: 1,
+      payload: {
+        path: file,
+        dev: indexResult.index.dev,
+        ino: indexResult.index.ino,
+        snapshotSize: indexResult.index.snapshotSize,
+        committedOffset: committed,
+      },
+    });
     lease.release();
     sessionPathSpy.mockRestore();
     existsSpy.mockRestore();
@@ -644,7 +2075,7 @@ describe('ClaudeTranscriptTurnObserver', () => {
     // and the line after it are each consumed once; nothing replays.
     const { observer, callbacks } = setup();
     try {
-      await observer.start(file, page.snapshotOffset);
+      await observer.start(file, page.tailStart);
       await appendFile(file, `${openUserRow.slice(40)}\n${openResultRow}\n`);
       const reader = (observer as any).reader as ClaudeTranscriptTailReader;
       const batch = await reader.readAvailable();

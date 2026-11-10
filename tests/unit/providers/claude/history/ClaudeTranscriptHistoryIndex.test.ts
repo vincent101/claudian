@@ -1,3 +1,4 @@
+import type * as fsPromisesModule from 'fs/promises';
 import { readFile, writeFile } from 'fs/promises';
 import { join } from 'path';
 import type * as workerThreadsModule from 'worker_threads';
@@ -6,23 +7,31 @@ import type { Conversation } from '@/core/types';
 import { ClaudeConversationHistoryService } from '@/providers/claude/history/ClaudeConversationHistoryService';
 import {
   buildTranscriptIndex,
+  builtIndexCacheKey,
   clearTranscriptIndexCache,
   getTranscriptIndexCacheSize,
+  materializeTranscriptEntries,
   materializeTranscriptPage,
+  materializeTranscriptToolAssociations,
   protectTranscriptIndex,
   releaseTranscriptIndex,
   resetTranscriptIndexWorkerProbe,
   setTranscriptIndexDiagnosticSink,
   type TranscriptHistoryIndex,
   type TranscriptIndexDiagnosticEvent,
+  transcriptIndexResultIdentity,
 } from '@/providers/claude/history/ClaudeTranscriptHistoryIndex';
 import { filterActiveBranch } from '@/providers/claude/history/sdkBranchFilter';
 import type { SDKNativeMessage } from '@/providers/claude/history/sdkHistoryTypes';
 import * as sdkSessionPaths from '@/providers/claude/history/sdkSessionPaths';
 import { HISTORY_OMISSION_MARKER } from '@/providers/claude/runtime/HistoryContextAccumulator';
 
+const fsPromises = jest.requireActual<typeof fsPromisesModule>('fs/promises');
+
 let mockWorkerConstructorMode: 'real' | 'throw' | 'record' | 'probe-error' | 'build-error' = 'real';
 const mockWorkerSources: string[] = [];
+let mockWorkerStartGate: Promise<void> | null = null;
+let mockWorkerObserver: ((worker: workerThreadsModule.Worker) => void) | null = null;
 
 jest.mock('worker_threads', () => {
   const actual = jest.requireActual<typeof workerThreadsModule>('worker_threads');
@@ -34,8 +43,12 @@ jest.mock('worker_threads', () => {
         if (mockWorkerConstructorMode === 'throw') {
           throw new TypeError("Failed to construct 'Worker': The V8 platform used by this instance of Node does not support creating Workers");
         }
-        super(...args);
         const source = String(args[0]);
+        const startGate = source.includes('postMessage("ready")') ? null : mockWorkerStartGate;
+        if (startGate) args = [`require('worker_threads').parentPort.once('message', () => {\n${source}\n});`, args[1]];
+        super(...args);
+        mockWorkerObserver?.(this);
+        if (startGate) void startGate.then(() => { this.postMessage('start'); });
         if (mockWorkerConstructorMode === 'record') mockWorkerSources.push(source);
         if (mockWorkerConstructorMode === 'probe-error' && source.includes('postMessage("ready")')) {
           queueMicrotask(() => this.emit('error', new Error('probe failed')));
@@ -49,6 +62,197 @@ jest.mock('worker_threads', () => {
 });
 
 const fixtures = join(__dirname, '..', 'transcript', 'fixtures');
+const realSetTimeout = setTimeout;
+const realClearTimeout = clearTimeout;
+const realNow = Date.now.bind(Date);
+let poisonedTestFile: string | undefined;
+let scopeSequence = 0;
+
+function describeReason(reason: unknown, withStack = false): string {
+  try {
+    return withStack && reason instanceof Error ? String(reason.stack ?? reason.message) : String(reason);
+  } catch {
+    return '[unprintable reason]';
+  }
+}
+
+beforeEach(() => {
+  if (poisonedTestFile) throw new Error(`Previous cleanup did not finish: ${poisonedTestFile}`);
+});
+
+class CoordinationScope {
+  private readonly deadline = realNow() + 2200;
+  private readonly sentinelPath = join(process.env.TMPDIR ?? '/tmp', `claudian-queue-sentinel-${process.pid}-${++scopeSequence}.jsonl`);
+  private readonly tracked = new Map<Promise<unknown>, {
+    label: string; status: 'pending' | 'fulfilled' | 'rejected'; reason?: unknown; allowedReason?: { reason: unknown };
+  }>();
+  private readonly workers = new Map<workerThreadsModule.Worker, Promise<void>>();
+  private workerSequence = 0;
+  private readonly handles = new Set<Awaited<ReturnType<typeof fsPromises.open>>>();
+  private readonly releases: Array<() => void> = [];
+  private readonly controllers: AbortController[] = [];
+  private readonly cleanupHooks: Array<() => void> = [];
+  private readonly restorers: Array<() => void> = [];
+  private phase = 'setup';
+  private state = 'not started';
+  closing = false;
+
+  constructor(private readonly label: string) {
+    mockWorkerObserver = worker => {
+      const label = `worker ${++this.workerSequence} termination`;
+      const terminate = worker.terminate.bind(worker);
+      worker.terminate = () => {
+        try { return this.track(label, terminate()); }
+        catch (reason) { return this.track(label, Promise.reject(reason)); }
+      };
+      const exited = new Promise<void>(resolve => worker.once('exit', () => resolve()));
+      this.workers.set(worker, exited);
+      void exited.then(() => this.workers.delete(worker));
+      if (this.closing) void worker.terminate();
+    };
+  }
+
+  gate(): { promise: Promise<void>; release: () => void } {
+    let release!: () => void;
+    const promise = new Promise<void>(resolve => { release = resolve; });
+    this.releases.push(release);
+    return { promise, release };
+  }
+
+  controller(): AbortController {
+    const controller = new AbortController();
+    this.controllers.push(controller);
+    return controller;
+  }
+
+  release(fn: () => void): void { this.cleanupHooks.push(fn); }
+  restore(fn: () => void): void { this.restorers.push(fn); }
+  update(state: string): void { this.state = state; }
+
+  track<T>(label: string, promise: Promise<T>, allowedReason?: { reason: unknown }): Promise<T> {
+    if (this.tracked.has(promise)) return promise;
+    const record: { label: string; status: 'pending' | 'fulfilled' | 'rejected'; reason?: unknown; allowedReason?: { reason: unknown } } = {
+      label, status: 'pending', allowedReason,
+    };
+    this.tracked.set(promise, record);
+    void promise.then(() => { record.status = 'fulfilled'; }, reason => { record.status = 'rejected'; record.reason = reason; });
+    return promise;
+  }
+
+  private pending(): Promise<unknown>[] {
+    return [...this.tracked].filter(([, record]) => record.status === 'pending').map(([promise]) => promise);
+  }
+
+  handle(handle: Awaited<ReturnType<typeof fsPromises.open>>): typeof handle {
+    this.handles.add(handle);
+    const close = handle.close.bind(handle);
+    handle.close = () => this.track('file close', (async () => {
+      await close();
+      this.handles.delete(handle);
+    })());
+    return handle;
+  }
+
+  private details(): string {
+    const pending = [...this.tracked.values()].filter(record => record.status === 'pending').map(record => record.label);
+    return `${this.label}; phase=${this.phase}; state=${this.state}; pending=${pending.join(',') || 'none'}; workers=${this.workers.size}; handles=${this.handles.size}`;
+  }
+
+  private async until<T>(promise: Promise<T>, deadline: number, name: string): Promise<T> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<never>((_, reject) => {
+      timer = realSetTimeout(() => reject(new Error(`${name}: ${this.details()}`)), Math.max(0, deadline - realNow()));
+    });
+    try { return await Promise.race([promise, timeout]); }
+    finally { if (timer) realClearTimeout(timer); }
+  }
+
+  async wait<T>(phase: string, promise: Promise<T>): Promise<T> {
+    this.phase = phase;
+    return this.until(promise, this.deadline, 'GateTimeout');
+  }
+
+  async finish(): Promise<void> {
+    this.closing = true;
+    const errors: Array<{ label: string; reason: unknown }> = [];
+    const attempt = (label: string, fn: () => void) => {
+      try { fn(); } catch (reason) { errors.push({ label, reason }); }
+    };
+    const deadline = realNow() + 1800;
+    try {
+      this.releases.forEach((release, index) => attempt(`gate ${index} release`, release));
+      this.controllers.forEach((controller, index) => attempt(`controller ${index} abort`, () => controller.abort()));
+      this.cleanupHooks.forEach((release, index) => attempt(`owned resource ${index} release`, release));
+      const drain = async () => {
+        for (const worker of this.workers.keys()) void worker.terminate();
+        while (this.pending().length || this.workers.size) {
+          await Promise.allSettled([...this.pending(), ...this.workers.values()]);
+        }
+        // The failing scan proves direct-queue progress without occupying an LRU slot.
+        let wroteSentinel = false;
+        try {
+          await writeFile(this.sentinelPath, `${JSON.stringify({ type: 'user', uuid: 'sentinel', message: { content: 'sentinel' } })}\n`);
+          wroteSentinel = true;
+        } catch (reason) { errors.push({ label: 'sentinel write', reason }); }
+        if (wroteSentinel) {
+          try {
+            let finalized = false;
+            const sentinel = await buildTranscriptIndex(this.sentinelPath, {
+              useWorker: false, forceNewSnapshot: true, maxLineBytes: 1, resumeAtMessageId: 'sentinel',
+              onFinalize: () => { finalized = true; },
+            });
+            if (!finalized || sentinel.status !== 'failed' || sentinel.error !== 'Transcript resume anchor falls inside an oversized line') {
+              throw new Error(`Unexpected sentinel result: finalized=${finalized}, result=${JSON.stringify(sentinel)}`);
+            }
+          } catch (reason) { errors.push({ label: 'sentinel verification', reason }); }
+        }
+        try { await fsPromises.unlink(this.sentinelPath); }
+        catch (reason) { errors.push({ label: 'sentinel unlink', reason }); }
+        while (this.pending().length || this.workers.size) {
+          await Promise.allSettled([...this.pending(), ...this.workers.values()]);
+        }
+      };
+      await this.until(drain(), deadline, 'CleanupTimeout');
+    } catch (reason) {
+      errors.push({ label: 'drain', reason });
+    } finally {
+      this.restorers.reverse().forEach((restore, index) => attempt(`restore ${index}`, restore));
+      mockWorkerObserver = null;
+      mockWorkerStartGate = null;
+      mockWorkerConstructorMode = 'real';
+      attempt('diagnostic sink restore', () => setTranscriptIndexDiagnosticSink(null));
+      attempt('worker probe reset', () => resetTranscriptIndexWorkerProbe());
+      attempt('real timers restore', () => jest.useRealTimers());
+    }
+    for (const record of this.tracked.values()) {
+      if (record.status === 'rejected' && (!record.allowedReason || record.reason !== record.allowedReason.reason)) {
+        errors.push({ label: record.label, reason: record.reason });
+      }
+    }
+    if (this.pending().length || this.workers.size) errors.push({ label: 'unfinished resources', reason: new Error(this.details()) });
+    if (this.handles.size) errors.push({ label: 'file handles', reason: new Error(`${this.handles.size} still open`) });
+    if (errors.length) {
+      poisonedTestFile = 'Cleanup failure';
+      const message = errors.map(({ label, reason }) => `${label}: ${describeReason(reason)}`).join('; ');
+      poisonedTestFile = message;
+      throw new AggregateError(errors.map(({ reason }) => reason), `Cleanup failure: ${message}`);
+    }
+  }
+}
+
+async function coordinated(label: string, run: (scope: CoordinationScope) => Promise<void>): Promise<void> {
+  const scope = new CoordinationScope(label);
+  let failure: unknown;
+  let hasFailure = false;
+  try { await run(scope); } catch (error) { hasFailure = true; failure = error; }
+  try { await scope.finish(); } catch (cleanup) {
+    if (hasFailure) {
+      throw new AggregateError([failure, cleanup], `First failure: ${describeReason(failure, true)}\nCleanup failure: ${describeReason(cleanup)}`, { cause: cleanup });
+    }
+    throw cleanup;
+  }
+  if (hasFailure) throw failure;
+}
 
 async function fixture(name: string): Promise<{ path: string; rows: SDKNativeMessage[] }> {
   const path = join(fixtures, name);
@@ -139,7 +343,7 @@ describe('ClaudeTranscriptHistoryIndex', () => {
     jest.spyOn(sdkSessionPaths, 'sdkSessionExists').mockReturnValue(true);
 
     const chunks = [];
-    for await (const chunk of service.iterateFullHistory(conversation, '/vault', {
+    for await (const chunk of service.iterateFullHistory(conversation, process.env.TEST_VAULT ?? process.env.TMPDIR ?? '/tmp', {
       maxTurnsPerChunk: 10, maxSourceBytesPerChunk: 100_000, maxProjectedCharsPerChunk: 100_000, projectionLevel: 'detail',
     })) chunks.push(chunk);
     const contents = chunks.flatMap(chunk => chunk.messages).map(message => message.content).join('\n');
@@ -343,14 +547,14 @@ describe('ClaudeTranscriptHistoryIndex', () => {
     const { path } = await fixture('production-auto-turn-sequence.jsonl');
     const first = buildTranscriptIndex(path, { useWorker: false });
     const second = buildTranscriptIndex(path, { useWorker: false });
-    expect(second).toBe(first);
-    const result = await first;
-    if (result.status === 'failed') throw new Error(result.error);
+    const [result, other] = await Promise.all([first, second]);
+    if (result.status === 'failed' || other.status === 'failed') throw new Error('shared build failed');
+    expect(other.index).toBe(result.index);
     expect(result.status).toBe('complete');
     expect(result.index.turns.map(turn => turn.turnId)).toEqual(['peer-a', 'peer-b']);
   });
 
-  it('lets a superseding build succeed when the previous build is aborted mid-scan', async () => {
+  it('lets a superseding build succeed when the previous build is aborted mid-scan', async () => coordinated('superseding direct build', async scope => {
     const path = join(process.env.TMPDIR ?? '/tmp', `claudian-supersede-${process.pid}.jsonl`);
     const lines = [
       JSON.stringify({ type: 'user', uuid: 'u1', message: { content: 'one' } }),
@@ -360,34 +564,990 @@ describe('ClaudeTranscriptHistoryIndex', () => {
       JSON.stringify({ type: 'user', uuid: 'u3', parentUuid: 'a2', message: { content: 'five' } }),
       JSON.stringify({ type: 'assistant', uuid: 'a3', parentUuid: 'u3', message: { content: 'six' } }),
     ];
-    await writeFile(path, `${lines.join('\n')}\n`);
-    const superseded = new AbortController();
-    const superseding = new AbortController();
-    let releaseProgress!: () => void;
-    const progressGate = new Promise<void>(resolve => { releaseProgress = resolve; });
-    const first = buildTranscriptIndex(path, {
-      useWorker: false,
-      chunkSize: 16,
-      signal: superseded.signal,
-      onProgress: () => releaseProgress(),
-    });
-    // loadInitialHistory aborts the old controller and starts a new build for
-    // the same path in the same synchronous section; pause mid-scan to pin
-    // that window open.
-    await progressGate;
+    await scope.wait('write snapshot', scope.track('write', writeFile(path, `${lines.join('\n')}\n`)));
+    const superseded = scope.controller(), superseding = scope.controller();
+    const progress = scope.gate();
+    const first = scope.track('first subscription', buildTranscriptIndex(path, {
+      useWorker: false, chunkSize: 16, signal: superseded.signal, onProgress: progress.release,
+    }));
+    // Abort and replace the old subscriber after the scan has started.
+    await scope.wait('first progress', progress.promise);
     superseded.abort();
-    const second = buildTranscriptIndex(path, {
-      useWorker: false,
-      chunkSize: 16,
-      signal: superseding.signal,
-    });
-    const [firstResult, secondResult] = await Promise.all([first, second]);
+    const second = scope.track('second subscription', buildTranscriptIndex(path, {
+      useWorker: false, chunkSize: 16, signal: superseding.signal,
+    }));
+    const [firstResult, secondResult] = await scope.wait('results', Promise.all([first, second]));
     expect(firstResult).toEqual({ status: 'failed', error: 'History index build aborted' });
     expect(secondResult.status).toBe('complete');
     if (secondResult.status !== 'complete') return;
     expect(secondResult.index.turns.map(turn => turn.turnId)).toEqual(['u1', 'u2', 'u3']);
     expect(secondResult.index.entries.map(entry => entry.messageKey)).toEqual(['u1', 'a1', 'u2', 'a2', 'u3', 'a3']);
+  }));
+});
+
+describe('ClaudeTranscriptHistoryIndex materialization source identity', () => {
+  const invalidated = 'Transcript index invalidated by replacement or truncation';
+  const rows = [
+    JSON.stringify({ type: 'user', uuid: 'u-old', message: { content: 'question' } }),
+    JSON.stringify({ type: 'assistant', uuid: 'a-old', parentUuid: 'u-old', message: { content: [
+      { type: 'tool_use', id: 'tool-1', name: 'Read', input: {} },
+    ] } }),
+    JSON.stringify({ type: 'user', uuid: 't-old', parentUuid: 'a-old', message: { content: [
+      { type: 'tool_result', tool_use_id: 'tool-1', content: 'result' },
+    ] } }),
+  ];
+  const source = `${rows.join('\n')}\n`;
+
+  async function indexed(name: string): Promise<{ path: string; index: TranscriptHistoryIndex }> {
+    const path = join(process.env.TMPDIR ?? '/tmp', `claudian-i1-${name}-${process.pid}.jsonl`);
+    await writeFile(path, source);
+    const result = await buildTranscriptIndex(path, { useWorker: false, forceNewSnapshot: true });
+    if (result.status !== 'complete') throw new Error(result.error);
+    return { path, index: result.index };
+  }
+
+  it.each((['equal', 'longer', 'shorter'] as const).flatMap(size =>
+    (['page', 'entries', 'associations'] as const).map(entrypoint => [size, entrypoint] as const)))
+  ('rejects a %s replacement before open through %s', async (size, entrypoint) => {
+    const { path, index } = await indexed(`${size}-${entrypoint}`);
+    const replacementPath = `${path}.replacement`;
+    const replacement = source.replace(/old/g, 'new');
+    const replacementContent = size === 'equal' ? replacement : size === 'longer'
+      ? replacement + ' '.repeat(40) : replacement.slice(0, -1);
+    await writeFile(replacementPath, replacementContent);
+    const originalInfo = await fsPromises.stat(path), replacementInfo = await fsPromises.stat(replacementPath);
+    expect([originalInfo.dev, originalInfo.ino]).toEqual([index.dev, index.ino]);
+    expect([replacementInfo.dev, replacementInfo.ino]).not.toEqual([index.dev, index.ino]);
+    expect(Math.sign(replacementInfo.size - index.snapshotSize)).toBe(size === 'equal' ? 0 : size === 'longer' ? 1 : -1);
+    const open = fsPromises.open;
+    let swapped = false, closed = 0;
+    const spy = jest.spyOn(fsPromises, 'open').mockImplementation(async (...args) => {
+      if (args[0] === path && !swapped) {
+        swapped = true;
+        await fsPromises.rename(replacementPath, path);
+      }
+      const handle = await open(...args);
+      if (args[0] === path) {
+        const close = handle.close.bind(handle);
+        handle.close = async () => { closed += 1; await close(); };
+      }
+      return handle;
+    });
+    try {
+      const result = entrypoint === 'page' ? materializeTranscriptPage(index, 0, 1)
+        : entrypoint === 'entries' ? materializeTranscriptEntries(index, index.entries)
+          : materializeTranscriptToolAssociations(index, [{ type: 'assistant', uuid: 'caller', message: {
+            content: [{ type: 'tool_use', id: 'tool-1', name: 'Read', input: {} }],
+          } }]);
+      await expect(result).rejects.toThrow(invalidated);
+      expect(swapped).toBe(true);
+      expect(closed).toBe(1);
+    } finally { spy.mockRestore(); }
   });
+
+  it('rejects same-inode truncation before open even when indexed rows remain readable', async () => {
+    const { path, index } = await indexed('truncate');
+    const open = fsPromises.open;
+    let truncated = false, closed = 0;
+    const spy = jest.spyOn(fsPromises, 'open').mockImplementation(async (...args) => {
+      if (args[0] === path && !truncated) {
+        truncated = true;
+        await fsPromises.truncate(path, index.snapshotSize - 1);
+      }
+      const handle = await open(...args);
+      if (args[0] === path) {
+        const close = handle.close.bind(handle);
+        handle.close = async () => { closed += 1; await close(); };
+      }
+      return handle;
+    });
+    try {
+      await expect(materializeTranscriptEntries(index, index.entries)).rejects.toThrow(invalidated);
+      const info = await fsPromises.stat(path);
+      expect([info.dev, info.ino, info.size]).toEqual([index.dev, index.ino, index.snapshotSize - 1]);
+      expect(truncated).toBe(true);
+      expect(closed).toBe(1);
+    } finally { spy.mockRestore(); }
+  });
+
+  it('permits append on the indexed inode and closes the materialization handle', async () => {
+    const { path, index } = await indexed('append');
+    const open = fsPromises.open;
+    let closed = 0;
+    const spy = jest.spyOn(fsPromises, 'open').mockImplementation(async (...args) => {
+      if (args[0] === path) await fsPromises.appendFile(path, `${JSON.stringify({ type: 'user', uuid: 'later', message: { content: 'later' } })}\n`);
+      const handle = await open(...args);
+      if (args[0] === path) {
+        const close = handle.close.bind(handle);
+        handle.close = async () => { closed += 1; await close(); };
+      }
+      return handle;
+    });
+    try {
+      const messages = await materializeTranscriptPage(index, 0, 1);
+      expect(messages.map(message => message.uuid)).toEqual(['u-old', 'a-old']);
+      const appendedInfo = await fsPromises.stat(path);
+      expect([appendedInfo.dev, appendedInfo.ino]).toEqual([index.dev, index.ino]);
+      expect(appendedInfo.size).toBeGreaterThan(index.snapshotSize);
+      expect(closed).toBe(1);
+    } finally { spy.mockRestore(); }
+  });
+
+  it('rejects a short second read without returning the already read row and closes the handle', async () => {
+    const { path, index } = await indexed('short-read');
+    const open = fsPromises.open;
+    let closed = 0, reads = 0;
+    const spy = jest.spyOn(fsPromises, 'open').mockImplementation(async (...args) => {
+      const handle = await open(...args);
+      if (args[0] === path) {
+        const close = handle.close.bind(handle), read = handle.read.bind(handle);
+        handle.close = async () => { closed += 1; await close(); };
+        handle.read = (async (buffer: Buffer, offset: number, length: number, position: number) => {
+          reads += 1;
+          return reads === 2 ? { bytesRead: 0, buffer } : read(buffer, offset, length, position);
+        }) as typeof handle.read;
+      }
+      return handle;
+    });
+    try {
+      await expect(materializeTranscriptPage(index, 0, 1)).rejects.toThrow(`Short transcript read at offset ${index.entries[1].offset}`);
+      expect(reads).toBe(2);
+      expect(closed).toBe(1);
+    } finally { spy.mockRestore(); }
+  });
+
+  it('closes the handle when its stat fails', async () => {
+    const { path, index } = await indexed('stat-failure');
+    const open = fsPromises.open;
+    const failure = new Error('synthetic handle stat failure');
+    let closed = 0;
+    const spy = jest.spyOn(fsPromises, 'open').mockImplementation(async (...args) => {
+      const handle = await open(...args);
+      if (args[0] === path) {
+        const close = handle.close.bind(handle);
+        handle.close = async () => { closed += 1; await close(); };
+        handle.stat = (async () => { throw failure; }) as typeof handle.stat;
+      }
+      return handle;
+    });
+    try {
+      await expect(materializeTranscriptPage(index, 0, 1)).rejects.toBe(failure);
+      expect(closed).toBe(1);
+    } finally { spy.mockRestore(); }
+  });
+});
+
+describe('ClaudeTranscriptHistoryIndex shared build subscriptions', () => {
+  beforeEach(() => clearTranscriptIndexCache());
+
+  it('cancels the first of two subscribers without cancelling the second real reader', async () => {
+    const path = join(process.env.TMPDIR ?? '/tmp', `claudian-subscriptions-${process.pid}.jsonl`);
+    await writeFile(path, `${JSON.stringify({ type: 'user', uuid: 'u1', message: { content: 'shared question' } })}\n`);
+    const firstController = new AbortController();
+    const secondController = new AbortController();
+    const first = buildTranscriptIndex(path, { useWorker: false, signal: firstController.signal });
+    const second = buildTranscriptIndex(path, { useWorker: false, signal: secondController.signal });
+    firstController.abort();
+    const [cancelled, result] = await Promise.all([first, second]);
+    expect(cancelled).toEqual({ status: 'failed', error: 'History index build aborted' });
+    expect(result.status).toBe('complete');
+    if (result.status !== 'complete') throw new Error(result.error);
+    expect((await materializeTranscriptPage(result.index, 0, 1)).map(row => row.message?.content))
+      .toEqual(['shared question']);
+  });
+
+  it.each([false, true])('keeps one physical build and independently reports progress after cancellation (worker=%s)', async useWorker => {
+    resetTranscriptIndexWorkerProbe();
+    const path = join(process.env.TMPDIR ?? '/tmp', `claudian-mid-subscription-${useWorker}-${process.pid}.jsonl`);
+    await writeFile(path, `${JSON.stringify({ type: 'user', uuid: 'u1', message: { content: 'shared worker question' } })}\n`);
+    const events: TranscriptIndexDiagnosticEvent[] = [];
+    setTranscriptIndexDiagnosticSink(event => events.push(event));
+    const controller = new AbortController();
+    const secondProgress = jest.fn();
+    const secondFinalize = jest.fn();
+    let third: Promise<Awaited<ReturnType<typeof buildTranscriptIndex>>> | undefined;
+    const first = buildTranscriptIndex(path, {
+      useWorker, chunkSize: 16, signal: controller.signal,
+      onProgress: () => {
+        controller.abort();
+        third = buildTranscriptIndex(path, { useWorker, chunkSize: 16 });
+      },
+    });
+    const second = buildTranscriptIndex(path, { useWorker, chunkSize: 16, onProgress: secondProgress, onFinalize: secondFinalize });
+    try {
+      const [cancelled, result] = await Promise.all([first, second]);
+      expect(cancelled.status).toBe('failed');
+      expect(result.status).toBe('complete');
+      if (result.status === 'failed') throw new Error(result.error);
+      const thirdResult = await third!;
+      expect(thirdResult.status).toBe('complete');
+      if (thirdResult.status === 'failed') throw new Error(thirdResult.error);
+      expect(thirdResult.index).toBe(result.index);
+      expect(secondProgress).toHaveBeenCalled();
+      expect(secondFinalize).toHaveBeenCalledTimes(1);
+      expect(events.filter(event => event.phase === 'queued')).toHaveLength(1);
+      expect(events.filter(event => event.phase === 'start').map(event => event.mode)).toEqual([useWorker ? 'worker' : 'direct']);
+      expect((await materializeTranscriptPage(result.index, 0, 1))[0].message?.content).toBe('shared worker question');
+    } finally { setTranscriptIndexDiagnosticSink(null); resetTranscriptIndexWorkerProbe(); }
+  });
+
+  it.each([false, true])('aborts only after the last cross-request subscriber exits and accepts a new subscriber (worker=%s)', async useWorker => {
+    const path = join(process.env.TMPDIR ?? '/tmp', `claudian-last-subscription-${process.pid}.jsonl`);
+    await writeFile(path, `${JSON.stringify({ type: 'user', uuid: 'u1', message: { content: 'last subscriber question' } })}\n`);
+    const events: TranscriptIndexDiagnosticEvent[] = [];
+    setTranscriptIndexDiagnosticSink(event => events.push(event));
+    const firstController = new AbortController();
+    const secondController = new AbortController();
+    let progressed!: () => void;
+    const progress = new Promise<void>(resolve => { progressed = resolve; });
+    const first = buildTranscriptIndex(path, { useWorker, chunkSize: 16, signal: firstController.signal });
+    const second = buildTranscriptIndex(path, { useWorker, chunkSize: 17, signal: secondController.signal, onProgress: progressed });
+    try {
+      await progress;
+      firstController.abort();
+      await expect(first).resolves.toMatchObject({ status: 'failed' });
+      expect(events.some(event => event.phase === 'aborted')).toBe(false);
+      secondController.abort();
+      await expect(second).resolves.toMatchObject({ status: 'failed' });
+      const fresh = await buildTranscriptIndex(path, { useWorker, chunkSize: 17 });
+      expect(fresh.status).toBe('complete');
+      if (fresh.status === 'failed') throw new Error(fresh.error);
+      expect(fresh.fromCache).toBeUndefined();
+      expect(events.filter(event => event.phase === 'queued')).toHaveLength(2);
+      expect(events.filter(event => event.phase === 'aborted')).toHaveLength(1);
+      expect((await materializeTranscriptPage(fresh.index, 0, 1))[0].message?.content).toBe('last subscriber question');
+    } finally { firstController.abort(); secondController.abort(); setTranscriptIndexDiagnosticSink(null); }
+  });
+
+  it.each([
+    [false, false, 'onProgress'], [false, true, 'onProgress'],
+    [true, false, 'onProgress'], [true, true, 'onProgress'],
+    [false, false, 'onFinalize'], [false, true, 'onFinalize'],
+    [true, false, 'onFinalize'], [true, true, 'onFinalize'],
+    [false, false, 'onLineSkipped'], [false, true, 'onLineSkipped'],
+    [true, false, 'onLineSkipped'], [true, true, 'onLineSkipped'],
+  ] as const)('second subscriber callback isolation (worker=%s, crossRequest=%s, callback=%s)', async (useWorker, crossRequest, callback) => {
+    resetTranscriptIndexWorkerProbe();
+    const path = join(process.env.TMPDIR ?? '/tmp', `claudian-callback-${useWorker}-${crossRequest}-${callback}-${process.pid}.jsonl`);
+    await writeFile(path, `${JSON.stringify({ type: 'user', uuid: 'u1', message: { content: 'callback question' } })}\nmalformed row\n`);
+    const reason = new Error(`synthetic ${callback} failure`);
+    const throwingCallback = jest.fn(() => { throw reason; });
+    const events: TranscriptIndexDiagnosticEvent[] = [];
+    setTranscriptIndexDiagnosticSink(event => events.push(event));
+    const first = buildTranscriptIndex(path, { useWorker, chunkSize: 16 });
+    const second = buildTranscriptIndex(path, { useWorker, chunkSize: crossRequest ? 17 : 16, [callback]: throwingCallback });
+    try {
+      const [good, failed] = await Promise.all([first, second]);
+      expect(good.status).toBe('complete');
+      expect(failed).toEqual({ status: 'failed', error: reason.message });
+      expect(throwingCallback).toHaveBeenCalledTimes(1);
+      expect(events.filter(event => event.phase === 'queued')).toHaveLength(1);
+      if (good.status === 'failed') throw new Error(good.error);
+      expect((await materializeTranscriptPage(good.index, 0, 1))[0].message?.content).toBe('callback question');
+      const cached = await buildTranscriptIndex(path, { useWorker, forceNewSnapshot: true });
+      expect(cached.status).toBe('complete');
+      if (cached.status === 'failed') throw new Error(cached.error);
+      expect(cached.index).toBe(good.index);
+      expect(cached.fromCache).toBe(true);
+    } finally { setTranscriptIndexDiagnosticSink(null); resetTranscriptIndexWorkerProbe(); }
+  });
+
+  it.each([false, true])('cleans up a last failing callback and accepts a replacement flight (worker=%s)', async useWorker => {
+    const path = join(process.env.TMPDIR ?? '/tmp', `claudian-last-callback-${useWorker}-${process.pid}.jsonl`);
+    await writeFile(path, `${JSON.stringify({ type: 'user', uuid: 'u1', message: { content: 'replacement question' } })}\n`);
+    const events: TranscriptIndexDiagnosticEvent[] = [];
+    setTranscriptIndexDiagnosticSink(event => events.push(event));
+    try {
+      const failed = await buildTranscriptIndex(path, { useWorker, chunkSize: 16, onProgress: () => { throw new Error('last callback failed'); } });
+      expect(failed).toEqual({ status: 'failed', error: 'last callback failed' });
+      const replacement = await buildTranscriptIndex(path, { useWorker, chunkSize: 17 });
+      expect(replacement.status).toBe('complete');
+      if (replacement.status === 'failed') throw new Error(replacement.error);
+      expect(replacement.fromCache).toBeUndefined();
+      expect(events.filter(event => event.phase === 'queued')).toHaveLength(2);
+      expect((await materializeTranscriptPage(replacement.index, 0, 1))[0].message?.content).toBe('replacement question');
+      clearTranscriptIndexCache();
+      expect(getTranscriptIndexCacheSize()).toBe(0);
+    } finally { setTranscriptIndexDiagnosticSink(null); }
+  });
+
+  it.each([false, true])('registers the actual scanned snapshot after stat-open append (worker=%s)', async useWorker => {
+    const path = join(process.env.TMPDIR ?? '/tmp', `claudian-actual-snapshot-${useWorker}-${process.pid}.jsonl`);
+    await writeFile(path, `${JSON.stringify({ type: 'user', uuid: 'u1', message: { content: 'first question' } })}\n`);
+    const stat = fsPromises.stat;
+    let appended = false;
+    const statSpy = jest.spyOn(fsPromises, 'stat').mockImplementation(async (...args) => {
+      const info = await stat(...args);
+      if (args[0] === path && !appended) {
+        appended = true;
+        await fsPromises.appendFile(path, `${JSON.stringify({ type: 'user', uuid: 'u2', parentUuid: 'u1', message: { content: 'second question' } })}\n`);
+      }
+      return info;
+    });
+    let first: Awaited<ReturnType<typeof buildTranscriptIndex>>;
+    try { first = await buildTranscriptIndex(path, { useWorker }); }
+    finally { statSpy.mockRestore(); }
+    const same = await buildTranscriptIndex(path, { useWorker, forceNewSnapshot: true });
+    expect(first.status).toBe('complete');
+    expect(same.status).toBe('complete');
+    if (first.status === 'failed' || same.status === 'failed') throw new Error('actual snapshot failed');
+    expect(first.index.turns.map(turn => turn.turnId)).toEqual(['u1', 'u2']);
+    expect(same.index).toBe(first.index);
+    expect(same.fromCache).toBe(true);
+    expect(getTranscriptIndexCacheSize()).toBe(1);
+    expect(first.index.committedSize).toBe(first.index.snapshotSize);
+  });
+
+  it.each([
+    ['cache', undefined], ['flight', undefined], ['cache', 'a1'], ['flight', 'a1'],
+  ] as const)('reconciles an actual-key %s without duplicating its index instance (anchor=%s)', async (ownerKind, resumeAtMessageId) => {
+    await coordinated(`actual owner=${ownerKind}, anchor=${resumeAtMessageId}`, async scope => {
+    const path = join(process.env.TMPDIR ?? '/tmp', `claudian-actual-owner-${ownerKind}-${resumeAtMessageId ?? 'plain'}-${process.pid}.jsonl`);
+    const base = [
+      JSON.stringify({ type: 'user', uuid: 'u1', message: { content: 'first question' } }),
+      JSON.stringify({ type: 'assistant', uuid: 'a1', parentUuid: 'u1', message: { content: 'first answer' } }),
+    ].join('\n') + '\n';
+    const tail = [
+      JSON.stringify({ type: 'user', uuid: 'u2', parentUuid: 'a1', message: { content: 'second question' } }),
+      JSON.stringify({ type: 'assistant', uuid: 'a2', parentUuid: 'u2', message: { content: 'second answer' } }),
+    ].join('\n') + '\n';
+    await scope.wait('write snapshot', scope.track('write', writeFile(path, base)));
+    const observed = scope.gate(), observation = scope.gate(), closing = scope.gate(), closeGate = scope.gate();
+    const workerComplete = scope.gate();
+    setTranscriptIndexDiagnosticSink(event => {
+      if (event.phase === 'complete' && event.mode === 'worker') workerComplete.release();
+    });
+    const stat = fsPromises.stat;
+    const open = fsPromises.open;
+    let intercept = true;
+    const statSpy = jest.spyOn(fsPromises, 'stat').mockImplementation((...args) => scope.track('stat', (async () => {
+      const info = await stat(...args);
+      if (args[0] === path && intercept) {
+        intercept = false;
+        await fsPromises.appendFile(path, tail);
+        observed.release();
+        await observation.promise;
+      }
+      return info;
+    })()));
+    scope.restore(() => statSpy.mockRestore());
+    const openSpy = jest.spyOn(fsPromises, 'open').mockImplementation((...args) => scope.track('open', (async () => {
+      const opened = await open(...args);
+      if (args[0] !== path) return opened;
+      const handle = scope.handle(opened);
+      if (ownerKind === 'flight') {
+        const close = handle.close.bind(handle);
+        handle.close = async () => { closing.release(); await closeGate.promise; await close(); };
+      }
+      return handle;
+    })()));
+    scope.restore(() => openSpy.mockRestore());
+    const finalized = jest.fn();
+    const original = scope.track('original subscription', buildTranscriptIndex(path, {
+      useWorker: true, resumeAtMessageId, onFinalize: finalized, signal: scope.controller().signal,
+    }));
+    await scope.wait('original observed stat', observed.promise);
+    const canonical = scope.track('canonical subscription', buildTranscriptIndex(path, {
+      useWorker: false, resumeAtMessageId, forceNewSnapshot: true, signal: scope.controller().signal,
+    }));
+    if (ownerKind === 'cache') await scope.wait('canonical cache', canonical);
+    else await scope.wait('canonical before close', closing.promise);
+    observation.release();
+    if (ownerKind === 'flight') {
+      await scope.wait('worker complete', workerComplete.promise);
+      await scope.wait('reconciliation turn', new Promise<void>(resolve => setImmediate(resolve)));
+      closeGate.release();
+    }
+    const [first, owner] = await scope.wait('results', Promise.all([original, canonical]));
+      if (first.status === 'failed' || owner.status === 'failed') throw new Error('actual owner failed');
+      expect(first.index).toBe(owner.index);
+      expect(finalized).toHaveBeenCalledTimes(1);
+      expect(first.index.turns.map(turn => turn.turnId)).toEqual(resumeAtMessageId ? ['u1'] : ['u1', 'u2']);
+      expect(first.index.committedSize).toBe(Buffer.byteLength(base + tail));
+      const cached = await scope.wait('cached index', scope.track('cached subscription', buildTranscriptIndex(path, {
+        useWorker: true, resumeAtMessageId, forceNewSnapshot: true, signal: scope.controller().signal,
+      })));
+      if (cached.status === 'failed') throw new Error(cached.error);
+      expect(cached.index).toBe(owner.index);
+      expect(cached.fromCache).toBe(true);
+      expect(getTranscriptIndexCacheSize()).toBe(1);
+    });
+    clearTranscriptIndexCache();
+    expect(getTranscriptIndexCacheSize()).toBe(0);
+  });
+
+  it.each([
+    [false, 'complete', 'advance', 'index'], [true, 'complete', 'advance', 'index'],
+    [false, 'partial', 'advance', 'index'], [true, 'partial', 'advance', 'index'],
+    [false, 'complete', 'fail', 'index'], [true, 'complete', 'fail', 'index'],
+    [false, 'partial', 'fail', 'index'], [true, 'partial', 'fail', 'index'],
+    [false, 'complete', 'advance', 'lease'], [true, 'complete', 'advance', 'lease'],
+    [false, 'partial', 'advance', 'lease'], [true, 'partial', 'advance', 'lease'],
+    [false, 'complete', 'fail', 'lease'], [true, 'complete', 'fail', 'lease'],
+    [false, 'partial', 'fail', 'lease'], [true, 'partial', 'fail', 'lease'],
+  ] as const)('keeps proven snapshot when predicted owner changes or fails (worker=%s, snapshot=%s, owner=%s, consumer=%s)', async (useWorker, snapshotKind, ownerKind, consumer) => {
+    await coordinated(`worker=${useWorker}, snapshot=${snapshotKind}, owner=${ownerKind}, consumer=${consumer}`, async scope => {
+    resetTranscriptIndexWorkerProbe();
+    if (!useWorker && consumer === 'lease') mockWorkerConstructorMode = 'throw';
+    const vaultPath = process.env.TMPDIR ?? '/tmp';
+    const path = join(vaultPath, `claudian-proven-${useWorker}-${snapshotKind}-${ownerKind}-${consumer}-${process.pid}.jsonl`);
+    const row = (uuid: string, parentUuid: string | null) => `${JSON.stringify({ type: 'user', uuid, parentUuid,
+      message: { content: `${uuid}-${'x'.repeat(1024)}` } })}\n`;
+    const firstRow = row('u1', null);
+    const secondRow = row('u2', 'u1');
+    const thirdRow = row('u3', 'u2');
+    const scannedSource = firstRow + secondRow + (snapshotKind === 'partial' ? thirdRow.slice(0, -1) : '');
+    await scope.wait('write initial snapshot', scope.track('write', writeFile(path, firstRow)));
+    const registered = scope.gate(), physicalComplete = scope.gate(), opening = scope.gate();
+    const openGate = scope.gate(), statObserved = scope.gate(), statGate = scope.gate();
+    const stat = fsPromises.stat;
+    const open = fsPromises.open;
+    let firstStat = true;
+    let directAOpened = false;
+    let ownerOpenIntercepted = false;
+    const expectedOwnerOpenFailure = new Error('synthetic predicted-owner open failure');
+    const statSpy = jest.spyOn(fsPromises, 'stat').mockImplementation((...args) => scope.track('stat', (async () => {
+      const info = await stat(...args);
+      if (args[0] === path && firstStat) {
+        firstStat = false;
+        await fsPromises.appendFile(path, scannedSource.slice(firstRow.length));
+        if (useWorker) { statObserved.release(); await statGate.promise; }
+      }
+      return info;
+    })()));
+    scope.restore(() => statSpy.mockRestore());
+    const openSpy = jest.spyOn(fsPromises, 'open').mockImplementation((...args) => {
+      const expectedOwnerOpen = ownerKind === 'fail' && args[0] === path && (useWorker || directAOpened) && !ownerOpenIntercepted;
+      return scope.track('open', (async () => {
+        if (args[0] !== path) return open(...args);
+        if (!useWorker && !directAOpened) {
+          directAOpened = true;
+          const handle = scope.handle(await open(...args));
+          const close = handle.close.bind(handle);
+          handle.close = async () => { await registered.promise; await close(); };
+          return handle;
+        }
+        if (!ownerOpenIntercepted) {
+          ownerOpenIntercepted = true;
+          opening.release();
+          await openGate.promise;
+          if (ownerKind === 'fail') throw expectedOwnerOpenFailure;
+        }
+        return scope.handle(await open(...args));
+      })(), expectedOwnerOpen ? { reason: expectedOwnerOpenFailure } : undefined);
+    });
+    scope.restore(() => openSpy.mockRestore());
+    const service = new ClaudeConversationHistoryService();
+    const conversation: Conversation = { id: `proven-${useWorker}-${snapshotKind}-${ownerKind}`, providerId: 'claude',
+      title: 'Synthetic', createdAt: 1, updatedAt: 1, sessionId: 'proven', messages: [] };
+    if (consumer === 'lease') {
+      const pathSpy = jest.spyOn(sdkSessionPaths, 'getSDKSessionPath').mockReturnValue(path);
+      scope.restore(() => pathSpy.mockRestore());
+      const existsSpy = jest.spyOn(sdkSessionPaths, 'sdkSessionExists').mockReturnValue(true);
+      scope.restore(() => existsSpy.mockRestore());
+    }
+    const ownerController = scope.controller(), originalController = scope.controller();
+    let owner: Promise<Awaited<ReturnType<typeof buildTranscriptIndex>>> | undefined;
+    const startOwner = () => {
+      if (owner || scope.closing) return;
+      scope.update('owner started');
+      owner = scope.track('owner subscription', buildTranscriptIndex(path, {
+        useWorker: false, chunkSize: 17, forceNewSnapshot: true, signal: ownerController.signal,
+      }));
+    };
+    let lease: ReturnType<typeof service.acquireHistoryIndex> | undefined;
+    let fresh: ReturnType<typeof service.acquireHistoryIndex> | undefined;
+    scope.release(() => { lease?.release(); fresh?.release(); });
+    let rejectFallback!: (error: Error) => void;
+    const unexpectedFallback = new Promise<never>((_, reject) => { rejectFallback = reject; });
+    void unexpectedFallback.catch(() => undefined);
+    const wait = <T>(phase: string, promise: Promise<T>) => scope.wait(phase, Promise.race([promise, unexpectedFallback]));
+    const onDiagnostic = (event: TranscriptIndexDiagnosticEvent) => {
+      if (event.phase === 'index_worker_fallback' && useWorker && !scope.closing) {
+        scope.update('unexpected worker fallback');
+        openGate.release(); statGate.release();
+        rejectFallback(new Error('Unexpected worker fallback'));
+      }
+      if (owner && event.phase === 'queued' && event.mode === 'direct') { scope.update('owner registered direct'); registered.release(); }
+      if (event.phase === 'complete' && event.mode === (useWorker ? 'worker' : 'direct')) {
+        scope.update(`original complete ${event.mode}`); physicalComplete.release();
+      }
+    };
+    let original: Promise<Awaited<ReturnType<typeof buildTranscriptIndex>> | void>;
+    if (consumer === 'lease') {
+      lease = service.acquireHistoryIndex(conversation, vaultPath, event => { if (event.phase === 'indexing') startOwner(); });
+      original = scope.track('original lease', lease.ready);
+    } else original = scope.track('original subscription', buildTranscriptIndex(path, {
+      useWorker, chunkSize: 16, onProgress: startOwner, signal: originalController.signal,
+    }));
+    // The service installs its own sink synchronously during acquisition.
+    setTranscriptIndexDiagnosticSink(onDiagnostic);
+    let resolved = false;
+    void original.then(() => { resolved = true; }, () => { resolved = true; });
+    if (useWorker) {
+      await wait('original observed old stat', statObserved.promise);
+      startOwner();
+      await wait('owner before open', opening.promise);
+      statGate.release();
+    }
+    await wait('original physical completion', physicalComplete.promise);
+    await wait('owner before open', opening.promise);
+    await wait('reconciliation turn', new Promise<void>(resolve => setImmediate(resolve)));
+      expect(resolved).toBe(false);
+      if (ownerKind === 'advance') await wait('advance snapshot', scope.track('append', fsPromises.appendFile(path, snapshotKind === 'partial' ? '\n' : thirdRow)));
+      openGate.release();
+      const ownerResult = await wait('owner result', owner!);
+      expect(ownerResult.status).toBe(ownerKind === 'advance' ? 'complete' : 'failed');
+      const result = await wait('original result', original);
+      let observed: unknown;
+      if (consumer === 'index') {
+        if (!result || result.status === 'failed') throw new Error('proven scan was lost');
+        const messages = await wait('materialize fixed page', scope.track('materialize', materializeTranscriptPage(result.index, 0, 2)));
+        const refreshed = await wait('refresh index', scope.track('refresh', buildTranscriptIndex(path, {
+          useWorker, forceNewSnapshot: true, signal: scope.controller().signal,
+        })));
+        if (refreshed.status === 'failed') throw new Error(refreshed.error);
+        observed = {
+          status: result.status, turns: result.index.turns.map(turn => turn.turnId),
+          snapshotSize: result.index.snapshotSize, committedSize: result.index.committedSize,
+          messageIds: messages.map(message => message.uuid),
+          refreshedTurns: refreshed.index.turns.length, fromCache: refreshed.fromCache,
+          sharesFixedIndex: refreshed.index === result.index, stillFixedTurns: result.index.turns.length,
+        };
+      } else {
+        const page = await wait('materialize fixed lease', scope.track('lease page', lease!.loadWindow({ anchorTurn: 0, direction: 'newer',
+          budget: { maxTurns: 5, maxSourceBytes: 100_000, maxProjectedChars: 100_000, timeSliceMs: 0 }, projectionLevel: 'detail' })));
+        const fixedTotal = lease!.totalTurns;
+        fresh = service.acquireHistoryIndex(conversation, vaultPath, undefined, true);
+        await wait('fresh lease', scope.track('fresh lease', fresh.ready));
+        observed = {
+          fixedTotal, messageIds: page.messages.map(message => message.id), committedSize: page.snapshotOffset,
+          refreshedTurns: fresh.totalTurns, acquireOutcome: fresh.acquireOutcome, stillFixedTurns: lease!.totalTurns,
+        };
+      }
+      expect(observed).toEqual(consumer === 'index' ? {
+        status: snapshotKind === 'partial' ? 'partial' : 'complete', turns: ['u1', 'u2'],
+        snapshotSize: Buffer.byteLength(scannedSource), committedSize: Buffer.byteLength(firstRow + secondRow),
+        messageIds: ['u1', 'u2'], refreshedTurns: ownerKind === 'advance' ? 3 : 2, fromCache: true,
+        sharesFixedIndex: ownerKind === 'fail', stillFixedTurns: 2,
+      } : {
+        fixedTotal: 2, messageIds: ['u1', 'u2'], committedSize: Buffer.byteLength(firstRow + secondRow),
+        refreshedTurns: ownerKind === 'advance' ? 3 : 2, acquireOutcome: 'cache_hit', stillFixedTurns: 2,
+      });
+    });
+    clearTranscriptIndexCache();
+    expect(getTranscriptIndexCacheSize()).toBe(0);
+  });
+
+  it.each(['waiter', 'owner', 'first-of-two-waiters', 'new-actual-owner'] as const)(
+    'preserves owner independence and exact pins during proven snapshot coordination (%s)', async cancelKind => {
+      await coordinated(`cancellation=${cancelKind}, expected=worker`, async scope => {
+      resetTranscriptIndexWorkerProbe();
+      const pins: TranscriptHistoryIndex[] = [];
+      const path = join(process.env.TMPDIR ?? '/tmp', `claudian-proof-cancel-${cancelKind}-${process.pid}.jsonl`);
+      const row = (uuid: string, parentUuid: string | null) => `${JSON.stringify({ type: 'user', uuid, parentUuid, message: { content: uuid } })}\n`;
+      const firstRow = row('u1', null), secondRow = row('u2', 'u1'), thirdRow = row('u3', 'u2');
+      const physicalComplete = scope.gate(), opening = scope.gate(), openGate = scope.gate();
+      const newOwnerRegistered = scope.gate(), oldOwnerComplete = scope.gate(), newOwnerGate = scope.gate();
+      const statObserved = scope.gate(), statGate = scope.gate();
+      const retain = (index: TranscriptHistoryIndex) => {
+        if (scope.closing) return;
+        protectTranscriptIndex(index); pins.push(index);
+      };
+      scope.release(() => pins.forEach(releaseTranscriptIndex));
+      for (let index = 0; index < 8; index += 1) {
+        const pinPath = `${path}.pin-${index}.jsonl`;
+        await scope.wait('write pin', scope.track('pin write', writeFile(pinPath, row(`pin-${index}`, null))));
+        const result = await scope.wait('build pin', scope.track('pin build', buildTranscriptIndex(pinPath, {
+          useWorker: false, signal: scope.controller().signal,
+        })));
+        if (result.status === 'failed') throw new Error(result.error);
+        retain(result.index);
+      }
+      await scope.wait('write original', scope.track('original write', writeFile(path, firstRow)));
+      const stat = fsPromises.stat, open = fsPromises.open;
+      let firstStat = true, ownerOpenIntercepted = false;
+      const statSpy = jest.spyOn(fsPromises, 'stat').mockImplementation((...args) => scope.track('stat', (async () => {
+        const info = await stat(...args);
+        if (args[0] === path && firstStat) {
+          firstStat = false; await fsPromises.appendFile(path, secondRow); statObserved.release(); await statGate.promise;
+        }
+        return info;
+      })()));
+      scope.restore(() => statSpy.mockRestore());
+      const openSpy = jest.spyOn(fsPromises, 'open').mockImplementation((...args) => scope.track('open', (async () => {
+        if (args[0] === path && !ownerOpenIntercepted) {
+          ownerOpenIntercepted = true; opening.release(); await openGate.promise;
+        }
+        const handle = await open(...args);
+        return args[0] === path ? scope.handle(handle) : handle;
+      })()));
+      scope.restore(() => openSpy.mockRestore());
+      const waiterController = scope.controller(), ownerController = scope.controller();
+      let second: Promise<Awaited<ReturnType<typeof buildTranscriptIndex>>> | undefined;
+      let owner: Promise<Awaited<ReturnType<typeof buildTranscriptIndex>>> | undefined;
+      let newOwner: Promise<Awaited<ReturnType<typeof buildTranscriptIndex>>> | undefined;
+      let newOwnerSettled = false;
+      const events: TranscriptIndexDiagnosticEvent[] = [];
+      let rejectFallback!: (error: Error) => void;
+      const unexpectedFallback = new Promise<never>((_, reject) => { rejectFallback = reject; });
+      void unexpectedFallback.catch(() => undefined);
+      const wait = <T>(phase: string, promise: Promise<T>) => scope.wait(phase, Promise.race([promise, unexpectedFallback]));
+      const startOwner = () => {
+        if (!owner && !scope.closing) owner = scope.track('owner subscription', buildTranscriptIndex(path, {
+          useWorker: false, chunkSize: 17, forceNewSnapshot: true, signal: ownerController.signal, onIndex: retain,
+        }));
+      };
+      setTranscriptIndexDiagnosticSink(event => {
+        events.push(event);
+        if (event.phase === 'index_worker_fallback' && !scope.closing) {
+          scope.update('unexpected worker fallback');
+          openGate.release(); statGate.release(); newOwnerGate.release();
+          rejectFallback(new Error('Unexpected worker fallback'));
+        }
+        if (owner && event.phase === 'queued' && event.mode === 'direct') scope.update('owner registered direct');
+        if (event.phase === 'complete' && event.mode === 'worker' && !newOwner) physicalComplete.release();
+        if (newOwner && event.phase === 'queued' && event.mode === 'worker') { scope.update('new worker owner registered'); newOwnerRegistered.release(); }
+        if (newOwner && event.phase === 'complete' && event.mode === 'direct') oldOwnerComplete.release();
+      });
+      const original = scope.track('original subscription', buildTranscriptIndex(path, { useWorker: true, chunkSize: 16,
+        signal: waiterController.signal, onProgress: startOwner, onIndex: retain }));
+      if (cancelKind === 'first-of-two-waiters') second = scope.track('second subscription', buildTranscriptIndex(path, {
+        useWorker: true, chunkSize: 16, onIndex: retain, signal: scope.controller().signal,
+      }));
+      await wait('original observed old stat', statObserved.promise);
+      startOwner();
+      await wait('owner before open', opening.promise);
+      statGate.release();
+      await wait('original worker complete', physicalComplete.promise);
+      await wait('reconciliation turn', new Promise<void>(resolve => setImmediate(resolve)));
+      if (cancelKind === 'waiter' || cancelKind === 'first-of-two-waiters') waiterController.abort();
+      if (cancelKind === 'owner') ownerController.abort();
+      await wait('advance snapshot', scope.track('append', fsPromises.appendFile(path, thirdRow)));
+      if (cancelKind === 'new-actual-owner') {
+        mockWorkerStartGate = newOwnerGate.promise;
+        newOwner = scope.track('new owner subscription', buildTranscriptIndex(path, {
+          useWorker: true, chunkSize: 19, forceNewSnapshot: true, onIndex: retain, signal: scope.controller().signal,
+        }));
+        void newOwner.then(() => { newOwnerSettled = true; }, () => { newOwnerSettled = true; });
+        await wait('new owner registered', newOwnerRegistered.promise);
+      }
+      openGate.release();
+      if (newOwner) {
+        await wait('old owner physical complete', oldOwnerComplete.promise);
+        await wait('candidate reconciliation turn', new Promise<void>(resolve => setImmediate(resolve)));
+      }
+      expect(newOwnerSettled).toBe(false);
+      newOwnerGate.release();
+      const [a, b, remaining, current] = await wait('all results', Promise.all([original, owner!, second, newOwner]));
+        const summary = (value: Awaited<ReturnType<typeof buildTranscriptIndex>> | undefined) => ({
+          status: value?.status ?? null,
+          turns: value && value.status !== 'failed' ? value.index.turns.map(turn => turn.turnId) : null,
+        });
+        const currentIndex = current && current.status !== 'failed' ? current.index : undefined;
+        const ownerIndex = b.status !== 'failed' ? b.index : undefined;
+        const originalIndex = a.status !== 'failed' ? a.index : undefined;
+        const waiterCancelled = cancelKind === 'waiter' || cancelKind === 'first-of-two-waiters';
+        expect({ original: summary(a), owner: summary(b), remaining: summary(remaining), current: summary(current),
+          sharesActualOwner: currentIndex ? ownerIndex === currentIndex : null,
+          distinctFixedSnapshot: currentIndex ? originalIndex !== currentIndex : null,
+        }).toEqual({
+          original: { status: waiterCancelled ? 'failed' : 'complete', turns: waiterCancelled ? null : ['u1', 'u2'] },
+          owner: { status: cancelKind === 'owner' ? 'failed' : 'complete', turns: cancelKind === 'owner' ? null : ['u1', 'u2', 'u3'] },
+          remaining: { status: second ? 'complete' : null, turns: second ? ['u1', 'u2'] : null },
+          current: { status: newOwner ? 'complete' : null, turns: newOwner ? ['u1', 'u2', 'u3'] : null },
+          sharesActualOwner: newOwner ? true : null, distinctFixedSnapshot: newOwner ? true : null,
+        });
+        expect(events.filter(event => event.phase === 'queued')).toHaveLength(newOwner ? 3 : 2);
+        clearTranscriptIndexCache();
+        expect(getTranscriptIndexCacheSize()).toBe(cancelKind === 'first-of-two-waiters' || newOwner ? 10 : 9);
+      });
+      clearTranscriptIndexCache(); expect(getTranscriptIndexCacheSize()).toBe(0);
+    },
+  );
+
+  it.each([[false, false], [false, true], [true, false], [true, true]] as const)(
+    'requires a decision on semantic maxLineBytes identity (worker=%s, concurrent=%s)', async (useWorker, concurrent) => {
+      resetTranscriptIndexWorkerProbe();
+      const path = join(process.env.TMPDIR ?? '/tmp', `claudian-cap-identity-${useWorker}-${concurrent}-${process.pid}.jsonl`);
+      await writeFile(path, [
+        JSON.stringify({ type: 'user', uuid: 'u1', message: { content: 'short' } }),
+        JSON.stringify({ type: 'user', uuid: 'u2', parentUuid: 'u1', message: { content: 'x'.repeat(512) } }),
+      ].join('\n') + '\n');
+      const original = buildTranscriptIndex(path, { useWorker, maxLineBytes: 4096 });
+      const limited = concurrent
+        ? buildTranscriptIndex(path, { useWorker, maxLineBytes: 100 })
+        : original.then(() => buildTranscriptIndex(path, { useWorker, maxLineBytes: 100, forceNewSnapshot: true }));
+      const [full, capped] = await Promise.all([original, limited]);
+      if (full.status === 'failed' || capped.status === 'failed') throw new Error('semantic policy probe failed');
+      expect({ fullOpaque: full.index.entries.filter(entry => entry.oversized).map(entry => entry.messageKey),
+        cappedOpaque: capped.index.entries.filter(entry => entry.oversized).map(entry => entry.messageKey),
+      }).toEqual({ fullOpaque: [], cappedOpaque: ['u2'] });
+    },
+  );
+
+  it.each([[false, false], [false, true], [true, false], [true, true]] as const)(
+    'keeps reverse cap variants separate (worker=%s, concurrent=%s)', async (useWorker, concurrent) => {
+      const path = join(process.env.TMPDIR ?? '/tmp', `claudian-reverse-cap-${useWorker}-${concurrent}-${process.pid}.jsonl`);
+      await writeFile(path, [
+        JSON.stringify({ type: 'user', uuid: 'u1', message: { content: 'short' } }),
+        JSON.stringify({ type: 'user', uuid: 'u2', parentUuid: 'u1', message: { content: 'x'.repeat(512) } }),
+      ].join('\n') + '\n');
+      const limited = buildTranscriptIndex(path, { useWorker, maxLineBytes: 100 });
+      const full = concurrent ? buildTranscriptIndex(path, { useWorker, maxLineBytes: 4096 })
+        : limited.then(() => buildTranscriptIndex(path, { useWorker, maxLineBytes: 4096, forceNewSnapshot: true }));
+      const [capped, original] = await Promise.all([limited, full]);
+      if (capped.status === 'failed' || original.status === 'failed') throw new Error('cap variant failed');
+      expect({ cappedOpaque: capped.index.entries.filter(entry => entry.oversized).map(entry => entry.messageKey),
+        fullOpaque: original.index.entries.filter(entry => entry.oversized).map(entry => entry.messageKey),
+      }).toEqual({ cappedOpaque: ['u2'], fullOpaque: [] });
+    },
+  );
+
+  it.each([['maxLineBytes', false], ['maxLineBytes', true], ['chunkSize', false], ['chunkSize', true]] as const)(
+    'rejects invalid %s before cold/hot lookup (hot=%s)', async (parameter, hot) => {
+      const path = join(process.env.TMPDIR ?? '/tmp', `claudian-invalid-${parameter}-${hot}-${process.pid}.jsonl`);
+      await writeFile(path, `${JSON.stringify({ type: 'user', uuid: 'u1', message: { content: 'valid source' } })}\n`);
+      if (hot) await buildTranscriptIndex(path, { useWorker: false });
+      const events: TranscriptIndexDiagnosticEvent[] = [];
+      setTranscriptIndexDiagnosticSink(event => events.push(event));
+      const onIndex = jest.fn();
+      try {
+        for (const value of [0, -1, 0.5, NaN, Infinity, -Infinity, Number.MAX_SAFE_INTEGER + 1, null, '100', true]) {
+          const result = await buildTranscriptIndex(path, { useWorker: false, [parameter]: value, onIndex } as any);
+          expect(result).toEqual({ status: 'failed', error: `Invalid history index ${parameter}: expected a positive finite safe integer` });
+        }
+        expect(onIndex).not.toHaveBeenCalled();
+        expect(events).toEqual([]);
+      } finally { setTranscriptIndexDiagnosticSink(null); }
+    },
+  );
+
+  it.each([false, true])('carries a readonly frozen projection variant (worker=%s)', async useWorker => {
+    resetTranscriptIndexWorkerProbe();
+    const path = join(process.env.TMPDIR ?? '/tmp', `claudian-projection-proof-${useWorker}-${process.pid}.jsonl`);
+    await writeFile(path, `${JSON.stringify({ type: 'user', uuid: 'u1', message: { content: 'projection identity' } })}\n`);
+    const events: TranscriptIndexDiagnosticEvent[] = [];
+    setTranscriptIndexDiagnosticSink(event => events.push(event));
+    try {
+      const options = { useWorker, maxLineBytes: 4096, resumeAtMessageId: '' };
+      const pending = buildTranscriptIndex(path, options);
+      options.maxLineBytes = 100; options.resumeAtMessageId = 'u1';
+      const result = await pending;
+      if (result.status === 'failed') throw new Error(result.error);
+      const descriptor = Object.getOwnPropertyDescriptor(result.index, 'projectionVariantKey');
+      expect({ value: descriptor?.value, writable: descriptor?.writable, configurable: descriptor?.configurable })
+        .toEqual({ value: JSON.stringify([null, 4096]), writable: false, configurable: false });
+      expect(events.some(event => event.phase === 'index_worker_fallback')).toBe(false);
+      expect(events.filter(event => event.phase === 'complete').map(event => event.mode)).toEqual([useWorker ? 'worker' : 'direct']);
+    } finally { setTranscriptIndexDiagnosticSink(null); resetTranscriptIndexWorkerProbe(); }
+  });
+
+  it.each([false, true])('normalizes defaults, plain resume and execution hints without replaying cache progress (worker=%s)', async useWorker => {
+    const path = join(process.env.TMPDIR ?? '/tmp', `claudian-normalized-${useWorker}-${process.pid}.jsonl`);
+    await writeFile(path, `${JSON.stringify({ type: 'user', uuid: 'u1', message: { content: 'normalization' } })}\n`);
+    const events: TranscriptIndexDiagnosticEvent[] = [];
+    setTranscriptIndexDiagnosticSink(event => events.push(event));
+    const onIndex = jest.fn(), onProgress = jest.fn(), onFinalize = jest.fn(), onLineSkipped = jest.fn();
+    try {
+      const first = buildTranscriptIndex(path, { useWorker });
+      const equivalent = buildTranscriptIndex(path, { useWorker, chunkSize: 1024 * 1024, maxLineBytes: 16 * 1024 * 1024, resumeAtMessageId: '' });
+      const [a, b] = await Promise.all([first, equivalent]);
+      if (a.status === 'failed' || b.status === 'failed') throw new Error('default normalization failed');
+      expect(b.index).toBe(a.index);
+      const hinted = await buildTranscriptIndex(path, { useWorker: !useWorker, chunkSize: 7,
+        forceNewSnapshot: true, onIndex, onProgress, onFinalize, onLineSkipped });
+      if (hinted.status === 'failed') throw new Error(hinted.error);
+      expect(hinted.index).toBe(a.index); expect(hinted.fromCache).toBe(true);
+      expect(onIndex).toHaveBeenCalledTimes(1);
+      expect(onProgress).not.toHaveBeenCalled(); expect(onFinalize).not.toHaveBeenCalled(); expect(onLineSkipped).not.toHaveBeenCalled();
+      expect(events.filter(event => event.phase === 'queued')).toHaveLength(1);
+      expect(a.index.projectionVariantKey).toBe(JSON.stringify([null, 16 * 1024 * 1024]));
+    } finally { setTranscriptIndexDiagnosticSink(null); }
+  });
+
+  it.each([false, true])('keeps exact resume spelling and rejects a capped opaque anchor (worker=%s)', async useWorker => {
+    const path = join(process.env.TMPDIR ?? '/tmp', `claudian-anchor-policy-${useWorker}-${process.pid}.jsonl`);
+    await writeFile(path, [
+      JSON.stringify({ type: 'user', uuid: 'u1', message: { content: 'short' } }),
+      JSON.stringify({ type: 'assistant', uuid: 'a1', parentUuid: 'u1', message: { content: 'x'.repeat(512) } }),
+      JSON.stringify({ type: 'user', uuid: 'u2', parentUuid: 'a1', message: { content: 'next' } }),
+      JSON.stringify({ type: 'assistant', uuid: 'A1', parentUuid: 'u2', message: { content: 'upper' } }),
+    ].join('\n') + '\n');
+    const lower = await buildTranscriptIndex(path, { useWorker, maxLineBytes: 4096, resumeAtMessageId: 'a1' });
+    const capped = await buildTranscriptIndex(path, { useWorker, maxLineBytes: 100, resumeAtMessageId: 'a1' });
+    const upper = await buildTranscriptIndex(path, { useWorker, maxLineBytes: 4096, resumeAtMessageId: 'A1' });
+    const spaced = await buildTranscriptIndex(path, { useWorker, maxLineBytes: 4096, resumeAtMessageId: ' a1 ' });
+    if (lower.status === 'failed' || upper.status === 'failed' || spaced.status === 'failed') throw new Error('resume variant failed');
+    expect(capped.status).toBe('failed');
+    expect(lower.index.turns.map(turn => turn.turnId)).toEqual(['u1']);
+    expect(upper.index.turns.map(turn => turn.turnId)).toEqual(['u1', 'u2']);
+    expect([lower.index.projectionVariantKey, upper.index.projectionVariantKey, spaced.index.projectionVariantKey])
+      .toEqual(['a1', 'A1', ' a1 '].map(anchor => JSON.stringify([anchor, 4096])));
+  });
+
+  it.each([false, true])('accepts safe upper numeric bounds and prioritizes pre-abort over invalid options (worker=%s)', async useWorker => {
+    const path = join(process.env.TMPDIR ?? '/tmp', `claudian-numeric-bound-${useWorker}-${process.pid}.jsonl`);
+    await writeFile(path, `${JSON.stringify({ type: 'user', uuid: 'u1', message: { content: 'small bounded source' } })}\n`);
+    const result = await buildTranscriptIndex(path, { useWorker, maxLineBytes: Number.MAX_SAFE_INTEGER, chunkSize: Number.MAX_SAFE_INTEGER });
+    expect(result.status).toBe('complete');
+    const controller = new AbortController(); controller.abort();
+    const onIndex = jest.fn();
+    await expect(buildTranscriptIndex(path, { useWorker, maxLineBytes: 0, chunkSize: NaN, signal: controller.signal, onIndex }))
+      .resolves.toEqual({ status: 'failed', error: 'History index build aborted' });
+    expect(onIndex).not.toHaveBeenCalled();
+  });
+
+  it.each([false, true].flatMap(useWorker => [1, 7, 128].flatMap(chunkSize => [99, 100, 101].map(bytes => [useWorker, chunkSize, bytes] as const))))(
+    'keeps byte caps exact across chunks, CRLF and UTF8 (worker=%s, chunk=%s, bytes=%s)', async (useWorker, chunkSize, bytes) => {
+      const path = join(process.env.TMPDIR ?? '/tmp', `claudian-byte-cap-${useWorker}-${chunkSize}-${bytes}-${process.pid}.jsonl`);
+      const text = '你🙂';
+      const row = (content: string) => JSON.stringify({ type: 'user', uuid: 'u1', message: { content } });
+      const content = text + 'x'.repeat(bytes - 1 - Buffer.byteLength(row(text)));
+      const line = row(content) + '\r';
+      await writeFile(path, line + '\n');
+      const events: TranscriptIndexDiagnosticEvent[] = [];
+      setTranscriptIndexDiagnosticSink(event => events.push(event));
+      try {
+        const result = await buildTranscriptIndex(path, { useWorker, chunkSize, maxLineBytes: 100 });
+        if (result.status === 'failed') throw new Error(result.error);
+        const materialized = await materializeTranscriptPage(result.index, 0, 1);
+        expect({ status: result.status, length: result.index.entries[0].length, opaque: result.index.entries[0].oversized === true,
+          content: materialized[0]?.message?.content ?? null, committed: result.index.committedSize })
+          .toEqual({ status: 'complete', length: bytes, opaque: bytes > 100, content: bytes > 100 ? null : content, committed: bytes + 1 });
+        expect(events.some(event => event.phase === 'index_worker_fallback')).toBe(false);
+      } finally { setTranscriptIndexDiagnosticSink(null); }
+    },
+  );
+
+  it.each([false, true])('heals a capped partial row only after its LF closes the source snapshot (worker=%s)', async useWorker => {
+    const path = join(process.env.TMPDIR ?? '/tmp', `claudian-cap-partial-${useWorker}-${process.pid}.jsonl`);
+    const prefix = `${JSON.stringify({ type: 'user', uuid: 'u1', message: { content: 'first' } })}\n`;
+    const tail = JSON.stringify({ type: 'user', uuid: 'u2', parentUuid: 'u1', message: { content: 'x'.repeat(512) } });
+    await writeFile(path, prefix + tail);
+    const partial = await buildTranscriptIndex(path, { useWorker, chunkSize: 7, maxLineBytes: 100 });
+    await fsPromises.appendFile(path, '\n');
+    const complete = await buildTranscriptIndex(path, { useWorker, chunkSize: 7, maxLineBytes: 100, forceNewSnapshot: true });
+    if (partial.status === 'failed' || complete.status === 'failed') throw new Error('capped partial failed');
+    expect({ oldStatus: partial.status, oldCommitted: partial.index.committedSize, newStatus: complete.status,
+      newCommitted: complete.index.committedSize, opaque: complete.index.entries.filter(entry => entry.oversized).map(entry => entry.messageKey) })
+      .toEqual({ oldStatus: 'partial', oldCommitted: Buffer.byteLength(prefix), newStatus: 'complete',
+        newCommitted: Buffer.byteLength(prefix + tail + '\n'), opaque: ['u2'] });
+  });
+
+  it('encodes S/P/C from result-owned metadata without an outer projection label', async () => {
+    const path = join(process.env.TMPDIR ?? '/tmp', `claudian-result-identity-${process.pid}.jsonl`);
+    const prefix = `${JSON.stringify({ type: 'user', uuid: 'u1', message: { content: 'short' } })}\n`;
+    await writeFile(path, prefix + JSON.stringify({ type: 'user', uuid: 'u2', parentUuid: 'u1', message: { content: 'x'.repeat(512) } }) + '\n');
+    const full = await buildTranscriptIndex(path, { useWorker: false, maxLineBytes: 4096 });
+    const capped = await buildTranscriptIndex(path, { useWorker: false, maxLineBytes: 100 });
+    if (full.status === 'failed' || capped.status === 'failed') throw new Error('identity source failed');
+    expect(builtIndexCacheKey(full.index)).not.toBe(builtIndexCacheKey(capped.index));
+    const [snapshot, projection] = JSON.parse(builtIndexCacheKey(full.index));
+    expect(JSON.parse(snapshot)).toEqual([path, full.index.dev, full.index.ino, full.index.snapshotSize, full.index.mtimeMs, full.index.ctimeMs]);
+    expect(JSON.parse(projection)).toEqual([null, 4096]);
+    expect(transcriptIndexResultIdentity(full)).not.toBe(transcriptIndexResultIdentity(capped));
+    // Mechanical codec checks only: today's reader emits one fixed partial
+    // error message, so distinct partial errors have no production trigger.
+    const partial = { status: 'partial' as const, index: full.index, error: 'reason "one"\n' };
+    const otherError = { ...partial, error: 'reason two' };
+    const otherCoverage = { ...partial, index: { ...full.index, committedSize: Buffer.byteLength(prefix) } };
+    expect(transcriptIndexResultIdentity(partial)).not.toBe(transcriptIndexResultIdentity(otherError));
+    expect(transcriptIndexResultIdentity(partial)).not.toBe(transcriptIndexResultIdentity(otherCoverage));
+    expect(transcriptIndexResultIdentity(partial)).not.toBe(transcriptIndexResultIdentity(full));
+  });
+
+  it.each([false, true])('rekeys a partial actual snapshot without losing committedSize (worker=%s)', async useWorker => {
+    const path = join(process.env.TMPDIR ?? '/tmp', `claudian-actual-partial-${useWorker}-${process.pid}.jsonl`);
+    const prefix = `${JSON.stringify({ type: 'user', uuid: 'u1', message: { content: 'committed question' } })}\n`;
+    await writeFile(path, prefix);
+    const stat = fsPromises.stat;
+    let calls = 0;
+    const statSpy = jest.spyOn(fsPromises, 'stat').mockImplementation(async (...args) => {
+      const info = await stat(...args);
+      if (args[0] === path) {
+        calls += 1;
+        if (calls === 1) await fsPromises.appendFile(path, '{"type":"user","uuid":"u2"');
+      }
+      return info;
+    });
+    try {
+      const first = await buildTranscriptIndex(path, { useWorker });
+      const same = await buildTranscriptIndex(path, { useWorker, forceNewSnapshot: true });
+      expect(first.status).toBe('partial');
+      expect(same.status).toBe('partial');
+      if (first.status === 'failed' || same.status === 'failed') throw new Error('partial failed');
+      expect(same.index).toBe(first.index);
+      expect(same.fromCache).toBe(true);
+      expect(first.index.committedSize).toBe(Buffer.byteLength(prefix));
+      expect(first.index.snapshotSize).toBeGreaterThan(first.index.committedSize);
+      expect(calls).toBe(2);
+    } finally { statSpy.mockRestore(); }
+  });
+
+  it('does not let a late old flight delete the same-key replacement physical build', async () => coordinated('same-key replacement', async scope => {
+    const path = join(process.env.TMPDIR ?? '/tmp', `claudian-flight-cas-${process.pid}.jsonl`);
+    await scope.wait('write snapshot', scope.track('write', writeFile(path, `${JSON.stringify({ type: 'user', uuid: 'u1', message: { content: 'CAS question' } })}\n`)));
+    const oldClose = scope.gate(), freshClose = scope.gate(), oldClosing = scope.gate(), freshClosing = scope.gate();
+    const queued = scope.gate(), progress = scope.gate(), statObserved = scope.gate();
+    const open = fsPromises.open;
+    let opens = 0;
+    const openSpy = jest.spyOn(fsPromises, 'open').mockImplementation((...args) => scope.track('open', (async () => {
+      const opened = await open(...args);
+      if (args[0] !== path) return opened;
+      const handle = scope.handle(opened);
+      const ordinal = ++opens;
+      const close = handle.close.bind(handle);
+      handle.close = async () => {
+        if (ordinal === 1) { oldClosing.release(); await oldClose.promise; }
+        if (ordinal === 2) { freshClosing.release(); await freshClose.promise; }
+        await close();
+      };
+      return handle;
+    })()));
+    scope.restore(() => openSpy.mockRestore());
+    const events: TranscriptIndexDiagnosticEvent[] = [];
+    setTranscriptIndexDiagnosticSink(event => {
+      events.push(event);
+      if (events.filter(item => item.phase === 'queued').length === 2) queued.release();
+    });
+    const controller = scope.controller();
+    const old = scope.track('old subscription', buildTranscriptIndex(path, {
+      useWorker: false, chunkSize: 16, signal: controller.signal, onProgress: progress.release,
+    }));
+    await scope.wait('old progress', progress.promise);
+    controller.abort();
+    await scope.wait('old before close', oldClosing.promise);
+    // Different request options still share the exact same physical snapshot.
+    const fresh = scope.track('fresh subscription', buildTranscriptIndex(path, {
+      useWorker: false, chunkSize: 17, signal: scope.controller().signal,
+    }));
+    await scope.wait('replacement queued', queued.promise);
+    oldClose.release();
+    await scope.wait('old subscription', old);
+    await scope.wait('fresh before close', freshClosing.promise);
+    const stat = fsPromises.stat;
+    const statSpy = jest.spyOn(fsPromises, 'stat').mockImplementation((...args) => scope.track('stat', (async () => {
+      const info = await stat(...args);
+      statObserved.release();
+      return info;
+    })()));
+    scope.restore(() => statSpy.mockRestore());
+    const third = scope.track('third subscription', buildTranscriptIndex(path, {
+      useWorker: false, chunkSize: 19, signal: scope.controller().signal,
+    }));
+    await scope.wait('third observed stat', statObserved.promise);
+    await scope.wait('third registration turn', new Promise<void>(resolve => setImmediate(resolve)));
+    statSpy.mockRestore();
+    freshClose.release();
+    const [freshResult, thirdResult] = await scope.wait('results', Promise.all([fresh, third]));
+    expect(events.filter(event => event.phase === 'queued')).toHaveLength(2);
+    expect(freshResult.status).toBe('complete');
+    expect(thirdResult.status).toBe('complete');
+    if (freshResult.status === 'failed' || thirdResult.status === 'failed') throw new Error('replacement failed');
+    expect(thirdResult.index).toBe(freshResult.index);
+    expect((await scope.wait('materialize', scope.track('materialize', materializeTranscriptPage(thirdResult.index, 0, 1))))[0].message?.content).toBe('CAS question');
+  }));
 });
 
 describe('ClaudeTranscriptHistoryIndex oversized line degradation', () => {
@@ -1125,38 +2285,38 @@ describe('fork resume through the history service', () => {
 
 describe('ClaudeTranscriptHistoryIndex worker fallback', () => {
   afterEach(() => {
+    jest.useRealTimers();
     mockWorkerConstructorMode = 'real';
     mockWorkerSources.length = 0;
     setTranscriptIndexDiagnosticSink(null);
     resetTranscriptIndexWorkerProbe();
   });
 
-  it('records throttled direct-build lifecycle events including stalled without terminating', async () => {
+  it('records throttled direct-build lifecycle events including stalled without terminating', async () => coordinated('stalled direct build', async scope => {
     jest.useFakeTimers({ doNotFake: ['setImmediate'] });
     const events: TranscriptIndexDiagnosticEvent[] = [];
     setTranscriptIndexDiagnosticSink(event => events.push(event));
     const path = join(process.env.TMPDIR ?? '/tmp', `claudian-stalled-${process.pid}.jsonl`);
-    await writeFile(path, `${JSON.stringify({ type: 'user', uuid: 'u1', message: { content: 'x' } })}\n`);
+    await scope.wait('write snapshot', scope.track('write', writeFile(path, `${JSON.stringify({ type: 'user', uuid: 'u1', message: { content: 'x' } })}\n`)));
     let advanced = false;
 
-    const resultPromise = buildTranscriptIndex(path, {
-      useWorker: false,
+    const resultPromise = scope.track('direct subscription', buildTranscriptIndex(path, {
+      useWorker: false, signal: scope.controller().signal,
       onProgress: () => {
         if (advanced) return;
         advanced = true;
         jest.advanceTimersByTime(31_000);
       },
-    });
-    await jest.runAllTimersAsync();
-    const result = await resultPromise;
+    }));
+    await scope.wait('run fake timers', scope.track('fake timers', jest.runAllTimersAsync()));
+    const result = await scope.wait('direct result', resultPromise);
 
     expect(result.status).toBe('complete');
     expect(events.map(event => event.phase)).toEqual(expect.arrayContaining([
       'queued', 'start', 'progress', 'stalled', 'finalize', 'complete',
     ]));
     expect(events.filter(event => event.phase === 'progress')).toHaveLength(1);
-    jest.useRealTimers();
-  });
+  }));
 
   it('records failed and aborted terminal events', async () => {
     const events: TranscriptIndexDiagnosticEvent[] = [];

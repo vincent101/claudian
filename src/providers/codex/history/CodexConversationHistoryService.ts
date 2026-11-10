@@ -1,56 +1,88 @@
-import type { ProviderConversationHistoryService } from '../../../core/providers/types';
+import { readFileSync } from 'fs';
+
+import type {
+  ConversationHistoryHydrationResult,
+  ConversationSizeReadInput,
+  ConversationSizeReadResult,
+  ConversationSizeSource,
+  ProviderConversationHistoryService,
+} from '../../../core/providers/types';
 import type { Conversation } from '../../../core/types';
+import { sizeSourceRecord, sizeSourceString, statConversationFile } from '../../../utils/conversationSizeSource';
 import type { CodexProviderState } from '../types';
 import { getCodexState } from '../types';
 import {
   type CodexParsedTurn,
   deriveCodexSessionsRootFromSessionPath,
   findCodexSessionFile,
-  parseCodexSessionFile,
   parseCodexSessionTurns,
 } from './CodexHistoryStore';
 
-function readSessionTurns(sessionFilePath: string): CodexParsedTurn[] {
-  let content: string;
+function readSessionTurns(sessionFilePath: string): { turns: CodexParsedTurn[] } {
   try {
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
-    content = require('fs').readFileSync(sessionFilePath, 'utf-8');
+    return { turns: parseCodexSessionTurns(readFileSync(sessionFilePath, 'utf-8')) };
   } catch {
-    return [];
+    return { turns: [] };
   }
-  return parseCodexSessionTurns(content);
 }
 
 export class CodexConversationHistoryService implements ProviderConversationHistoryService {
   private hydratedConversationPaths = new Map<string, string>();
 
+  captureConversationSizeSource(conversation: Conversation): ConversationSizeSource {
+    const state = getCodexState(sizeSourceRecord(conversation.providerState));
+    return Object.freeze({ filePath: sizeSourceString(state.sessionFilePath) ?? null });
+  }
+
+  async readConversationSize(
+    input: ConversationSizeReadInput,
+    _vaultPath: string | null,
+    options: { revision: number; signal?: AbortSignal },
+  ): Promise<ConversationSizeReadResult> {
+    const path = input.providerId === 'codex' ? sizeSourceString(input.source.filePath) : null;
+    return { snapshot: {
+      conversationId: input.id, revision: options.revision,
+      files: await statConversationFile(path, options.signal),
+    } };
+  }
+
   async hydrateConversationHistory(
     conversation: Conversation,
     _vaultPath: string | null,
-  ): Promise<void> {
+  ): Promise<ConversationHistoryHydrationResult> {
     const state = getCodexState(conversation.providerState);
     const transcriptRootPath = state.transcriptRootPath
       ?? deriveCodexSessionsRootFromSessionPath(state.sessionFilePath);
+    const ready = (): ConversationHistoryHydrationResult => ({ status: 'ready' });
 
     // Pending fork with existing in-memory messages: keep them as-is
     if (this.isPendingForkConversation(conversation) && conversation.messages.length > 0) {
-      return;
+      return ready();
     }
 
     // Pending fork without messages: hydrate from source transcript truncated at resumeAt
     if (this.isPendingForkConversation(conversation)) {
       const sourceSessionFile = this.resolveSourceSessionFile(state);
-      if (!sourceSessionFile) return;
+      if (!sourceSessionFile) return ready();
 
-      const turns = readSessionTurns(sourceSessionFile);
+      const source = readSessionTurns(sourceSessionFile);
       const resumeAt = state.forkSource!.resumeAt;
-      const truncated = this.truncateTurnsAtCheckpoint(turns, resumeAt);
+      const truncated = this.truncateTurnsAtCheckpoint(source.turns, resumeAt);
       if (!truncated) {
         this.hydratedConversationPaths.delete(conversation.id);
-        return;
+        return ready();
+      }
+      const sourceRoot = state.forkSourceTranscriptRootPath
+        ?? deriveCodexSessionsRootFromSessionPath(sourceSessionFile);
+      if (!state.forkSourceSessionFilePath || (sourceRoot && state.forkSourceTranscriptRootPath == null)) {
+        conversation.providerState = {
+          ...(conversation.providerState ?? {}),
+          forkSourceSessionFilePath: sourceSessionFile,
+          ...(sourceRoot && state.forkSourceTranscriptRootPath == null ? { forkSourceTranscriptRootPath: sourceRoot } : {}),
+        };
       }
       conversation.messages = truncated.flatMap(t => t.messages);
-      return;
+      return ready();
     }
 
     // Established fork: source prefix + fork-only turns
@@ -63,31 +95,44 @@ export class CodexConversationHistoryService implements ProviderConversationHist
       );
 
       if (sourceSessionFile && forkSessionFile) {
-        const sourceTurns = readSessionTurns(sourceSessionFile);
-        const forkTurns = readSessionTurns(forkSessionFile);
+        const source = readSessionTurns(sourceSessionFile);
+        const fork = readSessionTurns(forkSessionFile);
 
         const resumeAt = state.forkSource.resumeAt;
-        const sourcePrefix = this.truncateTurnsAtCheckpoint(sourceTurns, resumeAt);
+        const sourcePrefix = this.truncateTurnsAtCheckpoint(source.turns, resumeAt);
         if (!sourcePrefix) {
           this.hydratedConversationPaths.delete(conversation.id);
-          return;
+          return ready();
         }
-        const sourceTurnIds = new Set(sourceTurns.map(t => t.turnId).filter(Boolean));
-        const forkOnlyTurns = forkTurns.filter(t => !t.turnId || !sourceTurnIds.has(t.turnId));
+        const sourceTurnIds = new Set(source.turns.map(turn => turn.turnId).filter(Boolean));
+        const forkOnlyTurns = fork.turns.filter(turn => !turn.turnId || !sourceTurnIds.has(turn.turnId));
 
         const messages = [
           ...sourcePrefix.flatMap(t => t.messages),
           ...forkOnlyTurns.flatMap(t => t.messages),
         ];
-
+        const sourceRoot = state.forkSourceTranscriptRootPath
+          ?? deriveCodexSessionsRootFromSessionPath(sourceSessionFile);
+        const nativeRoot = transcriptRootPath ?? deriveCodexSessionsRootFromSessionPath(forkSessionFile);
+        if (!state.forkSourceSessionFilePath || !state.sessionFilePath
+          || (sourceRoot && state.forkSourceTranscriptRootPath == null)
+          || (nativeRoot && state.transcriptRootPath == null)) {
+          conversation.providerState = {
+            ...(conversation.providerState ?? {}),
+            forkSourceSessionFilePath: sourceSessionFile,
+            sessionFilePath: forkSessionFile,
+            ...(sourceRoot && state.forkSourceTranscriptRootPath == null ? { forkSourceTranscriptRootPath: sourceRoot } : {}),
+            ...(nativeRoot && state.transcriptRootPath == null ? { transcriptRootPath: nativeRoot } : {}),
+          };
+        }
         if (messages.length === 0) {
           this.hydratedConversationPaths.delete(conversation.id);
-          return;
+          return ready();
         }
 
         conversation.messages = messages;
         this.hydratedConversationPaths.set(conversation.id, `fork::${state.threadId}`);
-        return;
+        return ready();
       }
     }
 
@@ -103,7 +148,7 @@ export class CodexConversationHistoryService implements ProviderConversationHist
 
     if (!sessionFilePath) {
       this.hydratedConversationPaths.delete(conversation.id);
-      return;
+      return ready();
     }
 
     const hydrationKey = `${threadId ?? ''}::${sessionFilePath}`;
@@ -111,7 +156,7 @@ export class CodexConversationHistoryService implements ProviderConversationHist
       conversation.messages.length > 0
       && this.hydratedConversationPaths.get(conversation.id) === hydrationKey
     ) {
-      return;
+      return ready();
     }
 
     if (sessionFilePath !== state.sessionFilePath) {
@@ -129,14 +174,16 @@ export class CodexConversationHistoryService implements ProviderConversationHist
       };
     }
 
-    const sdkMessages = parseCodexSessionFile(sessionFilePath);
+    const parsed = readSessionTurns(sessionFilePath);
+    const sdkMessages = parsed.turns.flatMap(turn => turn.messages);
     if (sdkMessages.length === 0) {
       this.hydratedConversationPaths.delete(conversation.id);
-      return;
+      return ready();
     }
 
     conversation.messages = sdkMessages;
     this.hydratedConversationPaths.set(conversation.id, hydrationKey);
+    return ready();
   }
 
   async deleteConversationSession(

@@ -1,17 +1,32 @@
 import '@/providers';
 
 import { createMockEl } from '@test/helpers/mockElement';
+import * as nodeFs from 'fs';
 import { Notice } from 'obsidian';
+import * as nodeOs from 'os';
+import * as nodePath from 'path';
 
+import type {
+  ProviderCommandCatalog,
+  ProviderCommandDropdownConfig,
+} from '@/core/providers/commands/ProviderCommandCatalog';
+import type { CommandDropdownSession, CommandDropdownSnapshot } from '@/core/providers/commands/ProviderCommandDiscovery';
+import type { ProviderCommandEntry } from '@/core/providers/commands/ProviderCommandEntry';
 import { ProviderRegistry } from '@/core/providers/ProviderRegistry';
 import { ProviderWorkspaceRegistry } from '@/core/providers/ProviderWorkspaceRegistry';
+import type { ProviderId } from '@/core/providers/types';
+import type { VaultFileAdapter } from '@/core/storage/VaultFileAdapter';
 import type { ChatMessage } from '@/core/types';
 import type { ConversationController } from '@/features/chat/controllers/ConversationController';
 import { InputController } from '@/features/chat/controllers/InputController';
 import { TurnCoordinator } from '@/features/chat/controllers/TurnCoordinator';
+import type { MarkdownRenderSummary } from '@/features/chat/history/HistoryDiagnostics';
+import { MarkdownRenderDiagnostics } from '@/features/chat/rendering/MarkdownRenderDiagnostics';
 import { ChatState } from '@/features/chat/state/ChatState';
+import type * as TabModule from '@/features/chat/tabs/Tab';
 import {
   activateTab,
+  cleanupTabRuntime,
   closeHistorySearchForTab,
   createTab,
   deactivateTab,
@@ -26,15 +41,24 @@ import {
   openHistorySearchForTab,
   renderTabHydrationPlaceholder,
   setupServiceCallbacks,
+  subscribeTabCommandContextChanges,
   type TabCreateOptions,
   wireTabInputEvents,
 } from '@/features/chat/tabs/Tab';
+import type * as InputToolbarModule from '@/features/chat/ui/InputToolbar';
+import type { ModelSelector } from '@/features/chat/ui/InputToolbar';
 import { t } from '@/i18n/i18n';
+import { ClaudeCommandCatalog } from '@/providers/claude/commands/ClaudeCommandCatalog';
+import { SkillStorage } from '@/providers/claude/storage/SkillStorage';
+import { SlashCommandStorage } from '@/providers/claude/storage/SlashCommandStorage';
+import { CodexSkillCatalog } from '@/providers/codex/commands/CodexSkillCatalog';
 import {
   DEFAULT_CODEX_MINI_MODEL,
   DEFAULT_CODEX_PRIMARY_MODEL,
   DEFAULT_CODEX_PRIMARY_MODEL_LABEL,
 } from '@/providers/codex/types/models';
+import { OpencodeCommandCatalog } from '@/providers/opencode/commands/OpencodeCommandCatalog';
+import type * as SlashDropdownModule from '@/shared/components/SlashCommandDropdown';
 import * as envUtils from '@/utils/env';
 
 // Mock ResizeObserver (not available in jsdom)
@@ -90,6 +114,7 @@ const createMockSlashCommandDropdown = () => ({
   isVisible: jest.fn().mockReturnValue(false),
   hide: jest.fn(),
   resetSdkSkillsCache: jest.fn(),
+  setProviderCatalog: jest.fn(),
   setHiddenCommands: jest.fn(),
   setEnabled: jest.fn(),
   destroy: jest.fn(),
@@ -185,6 +210,9 @@ const createMockMcpServerSelector = () => ({
 const createMockPermissionToggle = () => ({
   setVisible: jest.fn(),
   updateDisplay: jest.fn(),
+  isMenuOpen: jest.fn().mockReturnValue(false),
+  handleKeydown: jest.fn().mockReturnValue(false),
+  destroy: jest.fn(),
 });
 
 const createMockServiceTierToggle = () => ({
@@ -801,6 +829,24 @@ describe('Tab - Service Initialization', () => {
       expect(tab.serviceInitialized).toBe(true);
     });
 
+    it('uses metadata without triggering history hydration when initializing a bound runtime', async () => {
+      const conversation = {
+        id: 'metadata-only', providerId: 'claude' as const, title: 'Metadata',
+        messages: [], sessionId: 'session-1', createdAt: 1, updatedAt: 1,
+      };
+      const plugin = createMockPlugin({
+        getConversationSync: jest.fn().mockReturnValue(conversation),
+        getConversationById: jest.fn().mockResolvedValue(conversation),
+      });
+      const tab = createTab(createMockOptions({ plugin, conversation }));
+
+      await initializeTabService(tab, plugin);
+
+      expect(plugin.getConversationSync).toHaveBeenCalledWith(conversation.id);
+      expect(plugin.getConversationById).not.toHaveBeenCalled();
+      expect(tab.serviceInitialized).toBe(true);
+    });
+
     it('should create the runtime for the conversation provider', async () => {
       const createChatRuntimeSpy = jest.spyOn(ProviderRegistry, 'createChatRuntime');
       const mockRuntime = createMockClaudianService({ providerId: 'codex' });
@@ -817,6 +863,7 @@ describe('Tab - Service Initialization', () => {
       };
 
       const plugin = createMockPlugin({
+        getConversationSync: jest.fn().mockReturnValue(conversation),
         getConversationById: jest.fn().mockResolvedValue(conversation),
       });
 
@@ -850,6 +897,7 @@ describe('Tab - Service Initialization', () => {
       };
 
       const plugin = createMockPlugin({
+        getConversationSync: jest.fn().mockReturnValue(conversation),
         getConversationById: jest.fn().mockResolvedValue(conversation),
       });
 
@@ -906,6 +954,7 @@ describe('Tab - Service Initialization', () => {
 
       const plugin = createMockPlugin();
       plugin.settings.persistentExternalContextPaths = ['/persistent/path'];
+      plugin.getConversationSync = jest.fn().mockReturnValue(conversation);
       plugin.getConversationById = jest.fn().mockResolvedValue(conversation);
 
       const options = createMockOptions({ plugin, conversation });
@@ -1517,6 +1566,196 @@ describe('Tab - Destruction', () => {
 
 describe('Tab - Service Callbacks', () => {
   describe('setupServiceCallbacks', () => {
+    const createCallbackRuntime = () => ({
+      getCapabilities: jest.fn().mockReturnValue({ supportsPlanMode: true }),
+      onHistoryRecoveryStateChange: jest.fn((_listener: (state: { status: string; generation: number }) => void) => jest.fn()),
+      retryHistoryRecovery: jest.fn().mockReturnValue(true),
+      setApprovalCallback: jest.fn(),
+      setApprovalDismisser: jest.fn(),
+      setAskUserQuestionCallback: jest.fn(),
+      setExitPlanModeCallback: jest.fn(),
+      setSubagentHookProvider: jest.fn(),
+      setAutoTurnCallback: jest.fn(),
+      setOnEmbeddedExternal: jest.fn(),
+      setPermissionModeSyncCallback: jest.fn(),
+    });
+
+    it('does not publish a retired service callback recovery banner', () => {
+      let active = true;
+      const plugin = createMockPlugin();
+      const tab = createTab(createMockOptions({ plugin }));
+      const service = createCallbackRuntime();
+      tab.service = service as any;
+      tab.controllers.inputController = {} as any;
+      (setupServiceCallbacks as any)(tab, plugin, () => active);
+      const onRecovery = service.onHistoryRecoveryStateChange.mock.calls[0][0];
+
+      active = false;
+      onRecovery({ status: 'tripped', generation: 1 });
+
+      expect(tab.dom.contentEl.querySelector('.claudian-history-recovery-banner')).toBeNull();
+    });
+
+    it('does not run retired service callback recovery actions', () => {
+      let active = true;
+      const plugin = createMockPlugin();
+      const tab = createTab(createMockOptions({ plugin }));
+      const service = createCallbackRuntime();
+      const createNew = jest.fn().mockResolvedValue(undefined);
+      tab.service = service as any;
+      tab.controllers.inputController = {} as any;
+      tab.controllers.conversationController = { createNew } as any;
+      (setupServiceCallbacks as any)(tab, plugin, () => active);
+      const onRecovery = service.onHistoryRecoveryStateChange.mock.calls[0][0];
+      onRecovery({ status: 'tripped', generation: 1 });
+      const actions = tab.dom.contentEl.querySelector('.claudian-history-recovery-actions') as any;
+      expect(actions.children).toHaveLength(2);
+
+      active = false;
+      actions.children[0].click();
+      actions.children[1].click();
+
+      expect(createNew).not.toHaveBeenCalled();
+      expect(service.retryHistoryRecovery).not.toHaveBeenCalled();
+    });
+
+    it('cancels a retired service callback approval result and balances attention', async () => {
+      let active = true;
+      let finish!: (value: string) => void;
+      const approval = new Promise<string>(resolve => { finish = resolve; });
+      const plugin = createMockPlugin();
+      const tab = createTab(createMockOptions({ plugin }));
+      const service = createCallbackRuntime();
+      tab.service = service as any;
+      tab.controllers.inputController = { handleApprovalRequest: jest.fn(() => approval) } as any;
+      (setupServiceCallbacks as any)(tab, plugin, () => active);
+      const request = service.setApprovalCallback.mock.calls[0][0];
+      const result = request('Read', {}, 'Read a file');
+      expect(tab.state.needsAttention).toBe(true);
+
+      active = false;
+      finish('allow-always');
+
+      await expect(result).resolves.toBe('cancel');
+      expect(tab.state.needsAttention).toBe(false);
+    });
+
+    it('does not start a retired service callback question', async () => {
+      let active = true;
+      const plugin = createMockPlugin();
+      const tab = createTab(createMockOptions({ plugin }));
+      const service = createCallbackRuntime();
+      const handleAskUserQuestion = jest.fn().mockResolvedValue({ answer: 'yes' });
+      tab.service = service as any;
+      tab.controllers.inputController = { handleAskUserQuestion } as any;
+      (setupServiceCallbacks as any)(tab, plugin, () => active);
+      const ask = service.setAskUserQuestionCallback.mock.calls[0][0];
+
+      active = false;
+      await expect(ask({ questions: [] })).resolves.toBeNull();
+      expect(handleAskUserQuestion).not.toHaveBeenCalled();
+      expect(tab.state.needsAttention).toBe(false);
+    });
+
+    it('does not let a replaced service callback dismiss the new input prompt', () => {
+      const plugin = createMockPlugin();
+      const tab = createTab(createMockOptions({ plugin }));
+      const service = createCallbackRuntime();
+      const oldDismiss = jest.fn();
+      const newDismiss = jest.fn();
+      tab.service = service as any;
+      tab.controllers.inputController = { dismissPendingApprovalPrompt: oldDismiss } as any;
+      (setupServiceCallbacks as any)(tab, plugin, () => true);
+      const dismiss = service.setApprovalDismisser.mock.calls[0][0];
+      tab.service = createCallbackRuntime() as any;
+      tab.controllers.inputController = { dismissPendingApprovalPrompt: newDismiss } as any;
+
+      dismiss();
+
+      expect(newDismiss).not.toHaveBeenCalled();
+    });
+
+    it('commits each normalized four-mode observation through the same settings owner', () => {
+      const plugin = createMockPlugin();
+      const tab = createTab(createMockOptions({ plugin }));
+      const service = createCallbackRuntime();
+      tab.service = service as any;
+      tab.controllers.inputController = {} as any;
+      (setupServiceCallbacks as any)(tab, plugin, () => true);
+      const syncMode = service.setPermissionModeSyncCallback.mock.calls[0][0];
+
+      // Provider-normalized app modes (never raw SDK values) reach the writer.
+      for (const mode of ['auto', 'manual', 'acceptEdits', 'yolo']) {
+        syncMode(mode);
+        expect(plugin.settings.permissionMode).toBe(mode);
+        expect(plugin.settings.savedProviderPermissionMode.claude).toBe(mode);
+      }
+      // A value outside the provider policy fails closed to manual, never
+      // back to auto/yolo (fail-closed contract).
+      syncMode('bogus');
+      expect(plugin.settings.permissionMode).toBe('manual');
+      expect(plugin.saveSettings).toHaveBeenCalled();
+    });
+
+    it('records the pre-plan choice when plan arrives from the runtime', () => {
+      const plugin = createMockPlugin();
+      const tab = createTab(createMockOptions({ plugin }));
+      const service = createCallbackRuntime();
+      tab.service = service as any;
+      tab.controllers.inputController = {} as any;
+      (setupServiceCallbacks as any)(tab, plugin, () => true);
+      const syncMode = service.setPermissionModeSyncCallback.mock.calls[0][0];
+
+      syncMode('acceptEdits');
+      syncMode('plan');
+
+      expect(plugin.settings.permissionMode).toBe('plan');
+      expect(tab.state.prePlanPermissionMode).toBe('acceptEdits');
+    });
+
+    it('does not let a retired service callback change permission settings', () => {
+      let active = true;
+      const plugin = createMockPlugin();
+      const tab = createTab(createMockOptions({ plugin }));
+      const service = createCallbackRuntime();
+      tab.service = service as any;
+      tab.controllers.inputController = {} as any;
+      (setupServiceCallbacks as any)(tab, plugin, () => active);
+      const syncMode = service.setPermissionModeSyncCallback.mock.calls[0][0];
+
+      active = false;
+      syncMode('plan');
+
+      expect(plugin.saveSettings).not.toHaveBeenCalled();
+      expect(tab.state.prePlanPermissionMode).toBeNull();
+    });
+
+    it('does not start a callback save when projection finishes after retirement', async () => {
+      let active = true;
+      let finish!: () => void;
+      const projection = new Promise<void>(resolve => { finish = resolve; });
+      const plugin = createMockPlugin();
+      const tab = createTab(createMockOptions({ plugin }));
+      const service = createCallbackRuntime();
+      const save = jest.fn().mockResolvedValue(undefined);
+      tab.service = service as any;
+      tab.controllers.inputController = {} as any;
+      tab.controllers.autoTurnProjectionController = {
+        projectEmbeddedExternal: jest.fn(() => projection),
+      } as any;
+      tab.controllers.conversationController = { save } as any;
+      (setupServiceCallbacks as any)(tab, plugin, () => active);
+      const onEmbedded = service.setOnEmbeddedExternal.mock.calls[0][0];
+      const pending = onEmbedded({ turnId: 'embedded-1' });
+
+      active = false;
+      finish();
+      await pending;
+
+      expect(save).not.toHaveBeenCalled();
+      expect(tab.state.hasPendingConversationSave).toBe(false);
+    });
+
     it('routes subagent task notifications through the StreamController hydration entry', () => {
       const plugin = createMockPlugin();
       const tab = createTab(createMockOptions({ plugin }));
@@ -1905,6 +2144,77 @@ describe('Tab - Controller Initialization', () => {
       expect(tab.renderer).toBeDefined();
     });
 
+    it.each(['current', 'legacy'])('binds diagnostics by default with the %s signature and releases pending work', signature => {
+      const events: MarkdownRenderSummary[] = [];
+      const collector = new MarkdownRenderDiagnostics('aaaaaaaaaaaa', event => events.push(event));
+      const binding = {
+        collector,
+        bindConversation: jest.fn(),
+        dispose: jest.fn(() => collector.dispose()),
+      };
+      const register = jest.fn().mockReturnValue(binding);
+      const onConversationIdChanged = jest.fn();
+      const plugin = createMockPlugin({ registerMarkdownRenderDiagnostics: register });
+      const options = createMockOptions({ plugin, onConversationIdChanged });
+      const tab = createTab(options);
+      initializeTabUI(tab, plugin);
+      const cleanupIndex = tab.dom.eventCleanups.length;
+      if (signature === 'legacy') {
+        initializeTabControllers(tab, plugin, {} as any, options.mcpManager);
+      } else {
+        initializeTabControllers(tab, plugin, {} as any);
+      }
+
+      expect(register).toHaveBeenCalledWith(tab.id, null, expect.any(Function));
+      const getActive = register.mock.calls[0][2] as () => boolean;
+      tab.dom.contentEl.style.display = '';
+      expect(getActive()).toBe(true);
+      tab.dom.contentEl.style.display = 'none';
+      expect(getActive()).toBe(false);
+      tab.dom.contentEl.style.display = '';
+      const { MessageRenderer } = jest.requireMock('@/features/chat/rendering/MessageRenderer');
+      expect(MessageRenderer.mock.calls[MessageRenderer.mock.calls.length - 1][7]).toBe(collector);
+      tab.state.currentConversationId = 'fixture-conversation';
+      expect(binding.bindConversation).toHaveBeenCalledWith('fixture-conversation');
+      expect(onConversationIdChanged).toHaveBeenCalledWith('fixture-conversation');
+
+      const element = { isConnected: true, ownerDocument: { visibilityState: 'visible' } } as HTMLElement;
+      const token = collector.start(element, 3);
+      tab.dom.eventCleanups[cleanupIndex]();
+      expect(binding.dispose).toHaveBeenCalledTimes(1);
+      expect(tab.markdownRenderDiagnostics).toBeNull();
+      expect(events.find(event => event.flushScope === 'window')).toMatchObject({
+        flushReason: 'dispose', callsSum: 1, settledCalls: 0, abandonedCalls: 1,
+      });
+      const count = events.length;
+      collector.end(token, true);
+      collector.dispose();
+      expect(events).toHaveLength(count);
+    });
+
+    it.each(['current', 'legacy'])('skips diagnostics when disabled with the %s signature', signature => {
+      const register = jest.fn();
+      const onConversationIdChanged = jest.fn();
+      const plugin = createMockPlugin({ registerMarkdownRenderDiagnostics: register });
+      const options = createMockOptions({ plugin, onConversationIdChanged });
+      const tab = createTab(options);
+      initializeTabUI(tab, plugin);
+
+      if (signature === 'legacy') {
+        initializeTabControllers(tab, plugin, {} as any, options.mcpManager, undefined, undefined, undefined, undefined, false);
+      } else {
+        initializeTabControllers(tab, plugin, {} as any, undefined, undefined, undefined, undefined, false);
+      }
+
+      expect(register).not.toHaveBeenCalled();
+      expect(tab.markdownRenderDiagnostics).toBeNull();
+      expect(tab.renderer).toBeDefined();
+      const { MessageRenderer } = jest.requireMock('@/features/chat/rendering/MessageRenderer');
+      expect(MessageRenderer.mock.calls[MessageRenderer.mock.calls.length - 1][7]).toBeUndefined();
+      tab.state.currentConversationId = 'fixture-conversation';
+      expect(onConversationIdChanged).toHaveBeenCalledWith('fixture-conversation');
+    });
+
     it('should create SelectionController', () => {
       const options = createMockOptions();
       const tab = createTab(options);
@@ -1947,6 +2257,95 @@ describe('Tab - Controller Initialization', () => {
       initializeTabControllers(tab, options.plugin, mockComponent, options.mcpManager);
 
       expect(tab.controllers.inputController).toBeDefined();
+    });
+
+    it('rejects the initialized runtime fast path after the manager retires', async () => {
+      let active = true;
+      const hooks = {
+        isManagerActive: () => active,
+        markHydrationReady: jest.fn(),
+        isHydrationReady: () => true,
+        reserveConversation: jest.fn().mockResolvedValue(true),
+        commitConversation: jest.fn(),
+        cancelConversationReservation: jest.fn(),
+        releaseConversation: jest.fn(),
+      };
+      const options = createMockOptions();
+      const tab = createTab(options);
+      initializeTabUI(tab, options.plugin);
+      initializeTabControllers(tab, options.plugin, {} as any, undefined, undefined, undefined, hooks);
+      tab.lifecycleState = 'bound_active';
+      tab.serviceInitialized = true;
+      tab.service = createMockClaudianService() as any;
+      const constructorMock = InputController as unknown as jest.Mock;
+      const deps = constructorMock.mock.calls[constructorMock.mock.calls.length - 1][0];
+
+      await expect(deps.ensureServiceInitialized()).resolves.toBe(true);
+      active = false;
+      await expect(deps.ensureServiceInitialized()).resolves.toBe(false);
+    });
+
+    it('does not create a runtime when retirement occurs during settings persistence', async () => {
+      let active = true;
+      let finishSettings!: () => void;
+      const saveSettings = jest.fn(() => new Promise<void>(resolve => { finishSettings = resolve; }));
+      const plugin = createMockPlugin({ saveSettings });
+      const options = createMockOptions({ plugin });
+      const tab = createTab(options);
+      const hooks = {
+        isManagerActive: () => active,
+        markHydrationReady: jest.fn(),
+        isHydrationReady: () => true,
+        reserveConversation: jest.fn().mockResolvedValue(true),
+        commitConversation: jest.fn(),
+        cancelConversationReservation: jest.fn(),
+        releaseConversation: jest.fn(),
+      };
+      const createRuntime = jest.spyOn(ProviderRegistry, 'createChatRuntime');
+      initializeTabUI(tab, plugin);
+      initializeTabControllers(tab, plugin, {} as any, undefined, undefined, undefined, hooks);
+      const constructorMock = InputController as unknown as jest.Mock;
+      const deps = constructorMock.mock.calls[constructorMock.mock.calls.length - 1][0];
+
+      const initializing = deps.ensureServiceInitialized();
+      expect(saveSettings).toHaveBeenCalled();
+      active = false;
+      finishSettings();
+
+      await expect(initializing).resolves.toBe(false);
+      expect(createRuntime).not.toHaveBeenCalled();
+      expect(tab.service).toBeNull();
+      createRuntime.mockRestore();
+    });
+
+    it('does not clean an installed runtime from a retired controller callback', () => {
+      let active = true;
+      const hooks = {
+        isManagerActive: () => active,
+        markHydrationReady: jest.fn(),
+        isHydrationReady: () => true,
+        reserveConversation: jest.fn().mockResolvedValue(true),
+        commitConversation: jest.fn(),
+        cancelConversationReservation: jest.fn(),
+        releaseConversation: jest.fn(),
+      };
+      const options = createMockOptions();
+      const tab = createTab(options);
+      initializeTabUI(tab, options.plugin);
+      initializeTabControllers(tab, options.plugin, {} as any, undefined, undefined, undefined, hooks);
+      const runtime = createMockClaudianService();
+      tab.service = runtime as any;
+      tab.serviceInitialized = true;
+      tab.lifecycleState = 'bound_active';
+      const { ConversationController } = jest.requireMock('@/features/chat/controllers/ConversationController');
+      const callbacks = ConversationController.mock.calls.at(-1)[1];
+
+      active = false;
+      callbacks.onNewConversation();
+
+      expect(runtime.cleanup).not.toHaveBeenCalled();
+      expect(tab.service).toBe(runtime);
+      expect(tab.lifecycleState).toBe('bound_active');
     });
 
     it('injects the tab-level onTurnCompleted callback into the InputController deps', () => {
@@ -2894,6 +3293,12 @@ describe('Tab - Controller Configuration', () => {
       mockSlashCommandDropdown.isVisible.mockReturnValue(true);
       expect(config.shouldSkipEscapeHandling()).toBe(true);
 
+      // Test when the permission menu is open (Escape closes it, not blur)
+      mockSlashCommandDropdown.isVisible.mockReturnValue(false);
+      mockPermissionToggle.isMenuOpen.mockReturnValue(true);
+      expect(config.shouldSkipEscapeHandling()).toBe(true);
+      mockPermissionToggle.isMenuOpen.mockReturnValue(false);
+
       // Test when mention dropdown is visible
       mockSlashCommandDropdown.isVisible.mockReturnValue(false);
       mockFileContextManager.isMentionDropdownVisible.mockReturnValue(true);
@@ -2999,7 +3404,7 @@ describe('Tab - Controller Configuration', () => {
       expect(tab.dom.welcomeEl).toBe(newWelcomeEl);
     });
 
-    it('should reset slash-command cache across conversation lifecycle events', () => {
+    it('should rebind slash commands for a new conversation and reset the cache on load or switch', () => {
       const { ConversationController } = jest.requireMock('@/features/chat/controllers/ConversationController');
       const options = createMockOptions();
       const tab = createTab(options);
@@ -3015,7 +3420,8 @@ describe('Tab - Controller Configuration', () => {
       callbacks.onConversationLoaded();
       callbacks.onConversationSwitched();
 
-      expect(mockSlashCommandDropdown.resetSdkSkillsCache).toHaveBeenCalledTimes(3);
+      expect(mockSlashCommandDropdown.setProviderCatalog).toHaveBeenCalledWith(null, null, 'claude');
+      expect(mockSlashCommandDropdown.resetSdkSkillsCache).toHaveBeenCalledTimes(2);
     });
 
     it('should close the history search panel on conversation switch and new conversation', () => {
@@ -3076,6 +3482,45 @@ describe('Tab - handleForkRequest', () => {
 
   beforeEach(() => {
     mockNotice.mockClear();
+  });
+
+  it('drops an exact fork result that arrives after manager retirement', async () => {
+    let active = true;
+    let finishRead!: (value: any) => void;
+    const resolveExactUserMessage = jest.fn(() => new Promise(resolve => { finishRead = resolve; }));
+    const forkRequestCallback = jest.fn().mockResolvedValue(undefined);
+    const hooks = {
+      isManagerActive: () => active,
+      markHydrationReady: jest.fn(),
+      isHydrationReady: () => true,
+      reserveConversation: jest.fn().mockResolvedValue(true),
+      commitConversation: jest.fn(),
+      cancelConversationReservation: jest.fn(),
+      releaseConversation: jest.fn(),
+    };
+    const plugin = createMockPlugin({ getConversationSync: jest.fn().mockReturnValue({ title: 'Source' }) });
+    const tab = createTab(createMockOptions({ plugin }));
+    initializeTabUI(tab, plugin);
+    initializeTabControllers(tab, plugin, {} as any, forkRequestCallback, undefined, undefined, hooks);
+    tab.controllers.conversationController = { resolveExactUserMessage } as any;
+    tab.state.messages = [
+      { id: 'a0', role: 'assistant', content: 'before', timestamp: 1, assistantMessageId: 'a0' },
+      { id: 'u1', role: 'user', content: 'question', timestamp: 2, userMessageId: 'u1' },
+      { id: 'a1', role: 'assistant', content: 'answer', timestamp: 3, assistantMessageId: 'a1' },
+    ];
+    tab.conversationId = 'source';
+    tab.service = { resolveSessionIdForFork: jest.fn().mockReturnValue('session') } as any;
+    const { MessageRenderer } = jest.requireMock('@/features/chat/rendering/MessageRenderer') as { MessageRenderer: jest.Mock };
+    const forkCallback = MessageRenderer.mock.calls.at(-1)?.[4];
+
+    const forking = forkCallback('u1');
+    expect(resolveExactUserMessage).toHaveBeenCalledTimes(1);
+    active = false;
+    finishRead({ status: 'exact', message: tab.state.messages[1] });
+
+    await expect(forking).resolves.toBeUndefined();
+    expect(forkRequestCallback).not.toHaveBeenCalled();
+    expect(mockNotice).not.toHaveBeenCalled();
   });
 
   it('should show notice when streaming', async () => {
@@ -4643,5 +5088,1189 @@ describe('Tab - InputController getTabProviderId wiring', () => {
     // For a blank tab with default model, should resolve to claude
     const result = config.getTabProviderId();
     expect(result).toBe('claude');
+  });
+});
+
+describe('Tab - L1a runtime cleanup exception safety', () => {
+  function setup(initialized = true) {
+    const tab = createTab(createMockOptions());
+    const runtime = {
+      setHistoryRecoverySource: jest.fn(),
+      cleanup: jest.fn(),
+    };
+    tab.service = runtime as any;
+    tab.serviceInitialized = initialized;
+    return { tab, runtime };
+  }
+
+  function captureFailure(action: () => void): unknown {
+    try {
+      action();
+    } catch (error) {
+      return error;
+    }
+    throw new Error('Expected cleanup to throw');
+  }
+
+  it.each([new Error('E0'), { step: 'unbind' }, 'E0', null, undefined])(
+    'still cleans and detaches when unbinding throws %p, preserving its identity', error => {
+      const { tab, runtime } = setup();
+      runtime.setHistoryRecoverySource.mockImplementation(() => { throw error; });
+
+      const thrown = captureFailure(() => cleanupTabRuntime(tab));
+
+      expect(runtime.setHistoryRecoverySource).toHaveBeenCalledWith(null);
+      expect(runtime.cleanup).toHaveBeenCalledTimes(1);
+      expect(tab.service).toBeNull();
+      expect(tab.serviceInitialized).toBe(false);
+      expect(thrown).toBe(error);
+    },
+  );
+
+  it('detaches when cleanup throws, after attempting unbinding, preserving E1', () => {
+    const { tab, runtime } = setup();
+    const error = new Error('E1');
+    runtime.cleanup.mockImplementation(() => { throw error; });
+
+    const thrown = captureFailure(() => cleanupTabRuntime(tab));
+
+    expect(runtime.setHistoryRecoverySource).toHaveBeenCalledWith(null);
+    expect(runtime.cleanup).toHaveBeenCalledTimes(1);
+    expect(tab.service).toBeNull();
+    expect(tab.serviceInitialized).toBe(false);
+    expect(thrown).toBe(error);
+  });
+
+  it('aggregates both original errors in unbind/cleanup order and detaches', () => {
+    const { tab, runtime } = setup();
+    const errors = [{ step: 'unbind' }, new Error('E1')];
+    const steps: string[] = [];
+    runtime.setHistoryRecoverySource.mockImplementation(() => {
+      steps.push('unbind');
+      throw errors[0];
+    });
+    runtime.cleanup.mockImplementation(() => {
+      steps.push('cleanup');
+      throw errors[1];
+    });
+
+    const thrown = captureFailure(() => cleanupTabRuntime(tab));
+
+    expect(steps).toEqual(['unbind', 'cleanup']);
+    expect(thrown).toBeInstanceOf(AggregateError);
+    expect((thrown as AggregateError).errors).toHaveLength(2);
+    expect((thrown as AggregateError).errors[0]).toBe(errors[0]);
+    expect((thrown as AggregateError).errors[1]).toBe(errors[1]);
+    expect(tab.service).toBeNull();
+    expect(tab.serviceInitialized).toBe(false);
+  });
+
+  it.each(['unbind', 'cleanup'] as const)('preserves a nested AggregateError from %s as one original error, without flattening', step => {
+    const { tab, runtime } = setup();
+    const innerErrors = [new Error('inner'), { step: 'nested' }];
+    const nested = new AggregateError(innerErrors, 'nested');
+    const other = new Error('other');
+    const errors = step === 'unbind' ? [nested, other] : [other, nested];
+    const steps: string[] = [];
+    runtime.setHistoryRecoverySource.mockImplementation(() => {
+      steps.push('unbind');
+      throw errors[0];
+    });
+    runtime.cleanup.mockImplementation(() => {
+      steps.push('cleanup');
+      throw errors[1];
+    });
+
+    const thrown = captureFailure(() => cleanupTabRuntime(tab));
+
+    expect(steps).toEqual(['unbind', 'cleanup']);
+    expect(thrown).toBeInstanceOf(AggregateError);
+    expect(thrown).not.toBe(nested);
+    expect((thrown as AggregateError).errors).toHaveLength(2);
+    expect((thrown as AggregateError).errors[0]).toBe(errors[0]);
+    expect((thrown as AggregateError).errors[1]).toBe(errors[1]);
+    expect(nested.errors).toHaveLength(2);
+    expect(nested.errors[0]).toBe(innerErrors[0]);
+    expect(nested.errors[1]).toBe(innerErrors[1]);
+    expect(tab.service).toBeNull();
+    expect(tab.serviceInitialized).toBe(false);
+  });
+
+  it('preserves the runtime receiver and action order', () => {
+    const { tab, runtime } = setup();
+    const steps: string[] = [];
+    runtime.setHistoryRecoverySource.mockImplementation(() => { steps.push('unbind'); });
+    runtime.cleanup.mockImplementation(() => { steps.push('cleanup'); });
+
+    cleanupTabRuntime(tab);
+
+    expect(steps).toEqual(['unbind', 'cleanup']);
+    expect(runtime.setHistoryRecoverySource.mock.contexts).toEqual([runtime]);
+    expect(runtime.cleanup.mock.contexts).toEqual([runtime]);
+    expect(tab.service).toBeNull();
+    expect(tab.serviceInitialized).toBe(false);
+  });
+
+  describe.each(['unbind', 'cleanup'] as const)('replacement during %s', step => {
+    it.each([true, false])('preserves R1 and its initialized=%p without redirecting the old request', initialized => {
+      const { tab, runtime } = setup();
+      const replacement = { setHistoryRecoverySource: jest.fn(), cleanup: jest.fn() };
+      const replace = () => {
+        tab.service = replacement as any;
+        tab.serviceInitialized = initialized;
+      };
+      (step === 'unbind' ? runtime.setHistoryRecoverySource : runtime.cleanup)
+        .mockImplementation(replace);
+
+      cleanupTabRuntime(tab);
+
+      expect(runtime.setHistoryRecoverySource).toHaveBeenCalledTimes(1);
+      expect(runtime.cleanup).toHaveBeenCalledTimes(1);
+      expect(replacement.setHistoryRecoverySource).not.toHaveBeenCalled();
+      expect(replacement.cleanup).not.toHaveBeenCalled();
+      expect(tab.service).toBe(replacement);
+      expect(tab.serviceInitialized).toBe(initialized);
+    });
+  });
+
+  describe.each(['unbind', 'cleanup'] as const)('same-runtime reentry during %s', step => {
+    it.each([true, false])('returns without any field mutation while the outer initialized=%p request is active', initialized => {
+      const { tab, runtime } = setup(initialized);
+      let entered = false;
+      let observedInnerReturn = false;
+      (step === 'unbind' ? runtime.setHistoryRecoverySource : runtime.cleanup)
+        .mockImplementation(() => {
+          // Bound the red baseline's recursion without hiding a repeated action.
+          if (entered) return;
+          entered = true;
+          expect(cleanupTabRuntime(tab)).toBeUndefined();
+          expect(tab.service).toBe(runtime);
+          expect(tab.serviceInitialized).toBe(initialized);
+          observedInnerReturn = true;
+        });
+
+      cleanupTabRuntime(tab);
+
+      expect(observedInnerReturn).toBe(true);
+      expect(runtime.setHistoryRecoverySource).toHaveBeenCalledTimes(1);
+      expect(runtime.cleanup).toHaveBeenCalledTimes(1);
+      expect(tab.service).toBeNull();
+      expect(tab.serviceInitialized).toBe(false);
+    });
+  });
+
+  it.each(['unbind', 'cleanup'] as const)('releases the guard synchronously after a %s failure', step => {
+    const { tab, runtime } = setup();
+    const error = { step };
+    (step === 'unbind' ? runtime.setHistoryRecoverySource : runtime.cleanup)
+      .mockImplementationOnce(() => { throw error; });
+
+    expect(captureFailure(() => cleanupTabRuntime(tab))).toBe(error);
+    expect(tab.service).toBeNull();
+    tab.service = runtime as any;
+    tab.serviceInitialized = true;
+    cleanupTabRuntime(tab);
+
+    expect(runtime.setHistoryRecoverySource).toHaveBeenCalledTimes(2);
+    expect(runtime.cleanup).toHaveBeenCalledTimes(2);
+    expect(tab.service).toBeNull();
+    expect(tab.serviceInitialized).toBe(false);
+  });
+
+  it('does not memoize a successfully cleaned runtime', () => {
+    const { tab, runtime } = setup();
+    cleanupTabRuntime(tab);
+    tab.service = runtime as any;
+    tab.serviceInitialized = true;
+
+    cleanupTabRuntime(tab);
+
+    expect(runtime.setHistoryRecoverySource).toHaveBeenCalledTimes(2);
+    expect(runtime.cleanup).toHaveBeenCalledTimes(2);
+    expect(tab.service).toBeNull();
+    expect(tab.serviceInitialized).toBe(false);
+  });
+
+  it('accepts an explicit helper request for R1 during R0 cleanup', () => {
+    const { tab, runtime } = setup();
+    const steps: string[] = [];
+    const replacement = {
+      setHistoryRecoverySource: jest.fn(() => { steps.push('R1 unbind'); }),
+      cleanup: jest.fn(() => { steps.push('R1 cleanup'); }),
+    };
+    runtime.setHistoryRecoverySource.mockImplementation(() => {
+      steps.push('R0 unbind');
+      tab.service = replacement as any;
+      tab.serviceInitialized = true;
+      cleanupTabRuntime(tab);
+      expect(tab.service).toBeNull();
+      expect(tab.serviceInitialized).toBe(false);
+    });
+    runtime.cleanup.mockImplementation(() => { steps.push('R0 cleanup'); });
+
+    cleanupTabRuntime(tab);
+
+    expect(steps).toEqual(['R0 unbind', 'R1 unbind', 'R1 cleanup', 'R0 cleanup']);
+    expect(runtime.cleanup).toHaveBeenCalledTimes(1);
+    expect(replacement.cleanup).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not share the guard between different tabs holding the same runtime', () => {
+    const { tab, runtime } = setup();
+    const otherTab = createTab(createMockOptions());
+    otherTab.service = runtime as any;
+    otherTab.serviceInitialized = true;
+    let entered = false;
+    runtime.setHistoryRecoverySource.mockImplementation(() => {
+      if (entered) return;
+      entered = true;
+      cleanupTabRuntime(otherTab);
+      expect(otherTab.service).toBeNull();
+      expect(otherTab.serviceInitialized).toBe(false);
+      expect(tab.service).toBe(runtime);
+      expect(tab.serviceInitialized).toBe(true);
+    });
+
+    cleanupTabRuntime(tab);
+
+    expect(runtime.setHistoryRecoverySource).toHaveBeenCalledTimes(2);
+    expect(runtime.cleanup).toHaveBeenCalledTimes(2);
+    expect(tab.service).toBeNull();
+    expect(tab.serviceInitialized).toBe(false);
+  });
+
+  it('cleans a runtime without the optional history-recovery method', () => {
+    const { tab } = setup();
+    const runtime = { cleanup: jest.fn() };
+    tab.service = runtime as any;
+
+    cleanupTabRuntime(tab);
+
+    expect(runtime.cleanup).toHaveBeenCalledTimes(1);
+    expect(tab.service).toBeNull();
+    expect(tab.serviceInitialized).toBe(false);
+  });
+
+  it.each([true, false])('resets initialized=%p with no runtime', initialized => {
+    const tab = createTab(createMockOptions());
+    tab.serviceInitialized = initialized;
+
+    cleanupTabRuntime(tab);
+
+    expect(tab.service).toBeNull();
+    expect(tab.serviceInitialized).toBe(false);
+  });
+});
+
+describe('Tab - L1a real production cleanup chains', () => {
+  // Legacy tests above intentionally mock Tab's collaborators. Load a separate
+  // module graph here: only Obsidian/DOM and persistence boundaries remain fake.
+  const modulesToUnmock = [
+    '@/providers/claude/runtime/ClaudeChatRuntime',
+    '@/features/chat/ui/FileContext',
+    '@/features/chat/ui/ImageContext',
+    '@/features/chat/ui/InstructionModeManager',
+    '@/features/chat/ui/StatusPanel',
+    '@/features/chat/ui/InputToolbar',
+    '@/shared/components/SlashCommandDropdown',
+    '@/features/chat/rendering/MessageRenderer',
+    '@/features/chat/rendering/ThinkingBlockRenderer',
+    '@/features/chat/controllers/SelectionController',
+    '@/features/chat/controllers/BrowserSelectionController',
+    '@/features/chat/controllers/CanvasSelectionController',
+    '@/features/chat/controllers/StreamController',
+    '@/features/chat/controllers/ConversationController',
+    '@/features/chat/controllers/InputController',
+    '@/features/chat/controllers/NavigationController',
+    '@/features/chat/services/SubagentManager',
+    '@/providers/claude/auxiliary/ClaudeInstructionRefineService',
+    '@/providers/claude/auxiliary/ClaudeTitleGenerationService',
+    '@/utils/path',
+  ];
+  const previousMocks = new Map<string, unknown>();
+  let realTab: typeof TabModule;
+  let realRegistry: typeof ProviderRegistry;
+  let realController: typeof ConversationController;
+  let realModelSelector: typeof ModelSelector;
+  let documentDescriptor: PropertyDescriptor | undefined;
+  let windowDescriptor: PropertyDescriptor | undefined;
+  const tabs: ReturnType<typeof createTab>[] = [];
+
+  beforeAll(() => {
+    for (const moduleName of modulesToUnmock) {
+      previousMocks.set(moduleName, jest.requireMock(moduleName));
+      jest.dontMock(moduleName);
+    }
+    jest.isolateModules(() => {
+      jest.requireActual('@/providers');
+      realTab = jest.requireActual('@/features/chat/tabs/Tab');
+      realRegistry = jest.requireActual('@/core/providers/ProviderRegistry').ProviderRegistry;
+      realController = jest.requireActual('@/features/chat/controllers/ConversationController').ConversationController;
+      realModelSelector = jest.requireActual('@/features/chat/ui/InputToolbar').ModelSelector;
+    });
+  });
+
+  afterAll(() => {
+    for (const [moduleName, exports] of previousMocks) {
+      jest.doMock(moduleName, () => exports);
+    }
+  });
+
+  beforeEach(() => {
+    documentDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'document');
+    windowDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'window');
+    const domDocument = createMockEl();
+    Object.assign(domDocument, {
+      body: createMockEl(),
+      documentElement: createMockEl(),
+      activeElement: null,
+      createElement: (tag: string) => createMockEl(tag),
+      createElementNS: (_namespace: string, tag: string) => createMockEl(tag),
+      getSelection: () => null,
+    });
+    Object.defineProperty(globalThis, 'document', { configurable: true, value: domDocument });
+    Object.defineProperty(globalThis, 'window', { configurable: true, value: { innerHeight: 800 } });
+  });
+
+  afterEach(() => {
+    for (const tab of tabs.splice(0)) {
+      tab.controllers.navigationController?.dispose();
+      tab.controllers.projectionWriteCoordinator?.dispose();
+      tab.services.askRelay?.dispose();
+      for (const cleanup of tab.dom.eventCleanups) cleanup();
+      tab.ui.fileContextManager?.destroy();
+      tab.ui.slashCommandDropdown?.destroy();
+      tab.ui.instructionModeManager?.destroy();
+      tab.ui.bangBashModeManager?.destroy();
+      tab.ui.statusPanel?.destroy();
+      tab.ui.navigationSidebar?.destroy();
+    }
+    if (documentDescriptor) Object.defineProperty(globalThis, 'document', documentDescriptor);
+    else Reflect.deleteProperty(globalThis, 'document');
+    if (windowDescriptor) Object.defineProperty(globalThis, 'window', windowDescriptor);
+    else Reflect.deleteProperty(globalThis, 'window');
+  });
+
+  function setupChain(trace: string[], conversation?: any) {
+    const plugin = createMockPlugin({
+      app: {
+        vault: {
+          adapter: { basePath: process.env.TEST_VAULT },
+          on: () => ({}),
+          offref: () => {},
+          getFiles: () => [],
+          getAllLoadedFiles: () => [],
+          getAbstractFileByPath: () => null,
+        },
+        workspace: {
+          getActiveFile: () => null,
+          getActiveViewOfType: () => null,
+          getLeavesOfType: () => [],
+        },
+      },
+      getConversationSync: jest.fn(() => conversation ?? null),
+      saveSettings: jest.fn(async () => { trace.push('save settings'); }),
+    });
+    plugin.settings.model = 'sonnet';
+    plugin.settings.savedProviderModel = { claude: 'sonnet' };
+    const tab = realTab.createTab({ plugin, containerEl: createMockEl(), conversation });
+    tabs.push(tab);
+    realTab.initializeTabUI(tab, plugin);
+    const runtime = {
+      providerId: 'claude',
+      getCapabilities: () => realRegistry.getCapabilities('claude'),
+      setHistoryRecoverySource: (_source: null) => { trace.push('unbind'); },
+      cleanup: () => { trace.push('cleanup'); },
+      syncConversationState: () => {},
+      buildSessionUpdates: () => ({ updates: {} }),
+    };
+    tab.service = runtime as any;
+    tab.serviceInitialized = true;
+    return { tab, plugin, runtime };
+  }
+
+  function clickOpus(tab: ReturnType<typeof createTab>): Promise<void> {
+    expect(tab.ui.modelSelector).toBeInstanceOf(realModelSelector);
+    expect(jest.isMockFunction(realModelSelector)).toBe(false);
+    const options = tab.dom.contentEl.querySelectorAll('.claudian-model-option') as any;
+    const option = options.find((element: any) => element.children.some((child: any) => child.textContent === 'Opus'));
+    expect(option).toBeDefined();
+    const handler = option._eventListeners.get('click')[0];
+    // Invoke the real registered DOM handler, retaining its rejection promise.
+    return handler({ stopPropagation: () => {} });
+  }
+
+  it('runs blank-toolbar model-change cleanup before saving settings', async () => {
+    const trace: string[] = [];
+    const { tab, plugin } = setupChain(trace);
+
+    await clickOpus(tab);
+
+    expect(trace).toEqual(['unbind', 'cleanup', 'save settings']);
+    expect(plugin.saveSettings).toHaveBeenCalledTimes(1);
+    expect(tab.service).toBeNull();
+    expect(tab.serviceInitialized).toBe(false);
+  });
+
+  it('propagates the original toolbar cleanup error and never saves settings', async () => {
+    const trace: string[] = [];
+    const { tab, plugin, runtime } = setupChain(trace);
+    const error = { step: 'toolbar cleanup' };
+    runtime.cleanup = () => { trace.push('cleanup'); throw error; };
+
+    await expect(clickOpus(tab)).rejects.toBe(error);
+
+    expect(trace).toEqual(['unbind', 'cleanup']);
+    expect(plugin.saveSettings).not.toHaveBeenCalled();
+    expect(tab.service).toBeNull();
+    expect(tab.serviceInitialized).toBe(false);
+  });
+
+  function startNewConversation() {
+    const trace: string[] = [];
+    const conversation = {
+      id: 'l1a-outgoing', providerId: 'claude', title: 'Outgoing',
+      messages: [{ id: 'user-1', role: 'user', content: 'Save me', timestamp: 1 }],
+      createdAt: 1, updatedAt: 1,
+    };
+    const { tab, plugin, runtime } = setupChain(trace, conversation);
+    let resolve!: () => void;
+    let reject!: (reason: unknown) => void;
+    const persistence = new Promise<void>((onResolve, onReject) => {
+      resolve = onResolve;
+      reject = onReject;
+    });
+    plugin.updateConversation = jest.fn(() => { trace.push('save started'); return persistence; });
+    const component = {
+      registerDomEvent: (element: HTMLElement, type: string, handler: EventListener) => {
+        element.addEventListener(type, handler);
+      },
+    };
+    realTab.initializeTabControllers(tab, plugin, component as any);
+    tab.lifecycleState = 'bound_active';
+    tab.state.currentConversationId = conversation.id;
+    tab.state.messages = [...conversation.messages] as ChatMessage[];
+    const controller = tab.controllers.conversationController!;
+    expect(controller).toBeInstanceOf(realController);
+    expect(jest.isMockFunction(realController)).toBe(false);
+    expect(jest.isMockFunction(controller.createNew)).toBe(false);
+    expect(jest.isMockFunction(controller.save)).toBe(false);
+    expect(jest.isMockFunction(realTab.cleanupTabRuntime)).toBe(false);
+
+    const pending = controller.createNew();
+
+    expect(plugin.updateConversation).toHaveBeenCalledWith(conversation.id, expect.objectContaining({
+      messages: conversation.messages,
+    }));
+    expect(trace).toEqual(['save started']);
+    expect(tab.service).toBe(runtime);
+    expect(tab.serviceInitialized).toBe(true);
+    expect(tab.state.isCreatingConversation).toBe(true);
+    return { tab, runtime, conversation, trace, pending, resolve, reject };
+  }
+
+  it('real createNew cleans only after outgoing persistence succeeds', async () => {
+    const { tab, trace, pending, resolve } = startNewConversation();
+    trace.push('save completed');
+    resolve();
+
+    await pending;
+
+    expect(trace).toEqual(['save started', 'save completed', 'unbind', 'cleanup']);
+    expect(tab.service).toBeNull();
+    expect(tab.serviceInitialized).toBe(false);
+    expect(tab.lifecycleState).toBe('blank');
+    expect(tab.conversationId).toBeNull();
+    expect(tab.state.isCreatingConversation).toBe(false);
+  });
+
+  it('real createNew performs no cleanup when outgoing persistence rejects', async () => {
+    const { tab, runtime, conversation, trace, pending, reject } = startNewConversation();
+    const error = { step: 'persistence' };
+    reject(error);
+
+    await expect(pending).rejects.toBe(error);
+
+    expect(trace).toEqual(['save started']);
+    expect(tab.service).toBe(runtime);
+    expect(tab.serviceInitialized).toBe(true);
+    expect(tab.lifecycleState).toBe('bound_active');
+    expect(tab.conversationId).toBe(conversation.id);
+    expect(tab.state.isCreatingConversation).toBe(false);
+  });
+});
+
+describe('Tab - Command context notifications', () => {
+  beforeEach(() => {
+    // Earlier describes spy on ProviderRegistry.createChatRuntime without an
+    // afterEach restore ('Tab - First Send Binding'); without this the leaked
+    // mockReturnValue would shadow the module-mock construction path here.
+    jest.restoreAllMocks();
+  });
+  afterEach(() => {
+    jest.restoreAllMocks();
+  });
+
+  it('notifies command consumers after each actual runtime commit', async () => {
+    const options = createMockOptions();
+    const tab = createTab(options);
+    initializeTabUI(tab, options.plugin);
+    try {
+      const runtimeModule = jest.requireMock('@/providers/claude/runtime/ClaudeChatRuntime') as { ClaudianService: jest.Mock };
+      runtimeModule.ClaudianService.mockImplementationOnce(() => createMockClaudianService() as any);
+
+      const seen: Array<{ service: unknown; serviceInitialized: boolean }> = [];
+      const listener = jest.fn(() => {
+        seen.push({ service: tab.service, serviceInitialized: tab.serviceInitialized });
+      });
+      subscribeTabCommandContextChanges(tab, listener);
+
+      // Install: the listener observes the newly installed runtime.
+      await initializeTabService(tab, options.plugin);
+      expect(listener).toHaveBeenCalledTimes(1);
+      expect(seen[0].service).toBe(tab.service);
+      expect(seen[0].serviceInitialized).toBe(true);
+
+      // No-change re-init (initialized service on the same provider) stays silent.
+      await initializeTabService(tab, options.plugin);
+      expect(listener).toHaveBeenCalledTimes(1);
+
+      // Replacement: the old runtime detach and the new install each notify.
+      tab.serviceInitialized = false;
+      const previousService = tab.service;
+      runtimeModule.ClaudianService.mockImplementationOnce(() => createMockClaudianService() as any);
+      await initializeTabService(tab, options.plugin);
+      expect(listener).toHaveBeenCalledTimes(3);
+      expect(seen[1].service).toBeNull();
+      expect(seen[1].serviceInitialized).toBe(false);
+      expect(seen[2].service).not.toBe(previousService);
+      expect(seen[2].serviceInitialized).toBe(true);
+
+      // Reentry guard: a runtime whose cleanup re-enters cleanupTabRuntime must
+      // hit the in-progress guard instead of recursing; the detach still lands
+      // and notifies exactly once.
+      const reentrantRuntime = {
+        providerId: 'claude',
+        cleanup: () => cleanupTabRuntime(tab),
+        setHistoryRecoverySource: jest.fn(),
+      } as any;
+      tab.service = reentrantRuntime;
+      tab.serviceInitialized = true;
+      cleanupTabRuntime(tab);
+      expect(listener).toHaveBeenCalledTimes(4);
+      expect(tab.service).toBeNull();
+
+      // A null-service cleanup is not an actual commit and stays silent.
+      cleanupTabRuntime(tab);
+      expect(listener).toHaveBeenCalledTimes(4);
+
+      // Error path: the failed install clears the runtime fields and notifies.
+      jest.spyOn(ProviderRegistry, 'createChatRuntime').mockImplementationOnce(() => {
+        throw new Error('runtime install failed');
+      });
+      await expect(initializeTabService(tab, options.plugin)).rejects.toThrow('runtime install failed');
+      expect(listener).toHaveBeenCalledTimes(5);
+      expect(seen.at(-1)).toEqual({ service: null, serviceInitialized: false });
+
+      // destroyTab clears the runtime after the field commit and notifies.
+      tab.service = createMockClaudianService() as any;
+      tab.serviceInitialized = true;
+      await destroyTab(tab);
+      expect(listener).toHaveBeenCalledTimes(6);
+      expect(seen.at(-1)).toEqual({ service: null, serviceInitialized: false });
+    } finally {
+      await destroyTab(tab).catch(() => undefined);
+    }
+  });
+
+  it('revokes manager commands before resetting dropdown and prescanning directories', () => {
+    const options = createMockOptions();
+    const tab = createTab(options);
+    initializeTabUI(tab, options.plugin);
+    try {
+      // Tab's production wiring, captured on the (mocked) selector.
+      const changeCallback = mockExternalContextSelector.setOnChange.mock.calls.at(-1)?.[0];
+      const persistenceCallback = mockExternalContextSelector.setOnPersistenceChange.mock.calls.at(-1)?.[0];
+      expect(typeof changeCallback).toBe('function');
+      expect(typeof persistenceCallback).toBe('function');
+
+      // A real selector drives the captured callbacks through the production
+      // commit ordering (assignment → effective change → persistence).
+      const toolbarModule = jest.requireActual('@/features/chat/ui/InputToolbar') as typeof InputToolbarModule;
+      const realSelector = new toolbarModule.ExternalContextSelector(createMockEl(), {} as any);
+
+      const observedDirs: string[][] = [];
+      const managerRevoke = jest.fn(() => {
+        observedDirs.push(realSelector.getExternalContexts());
+      });
+      subscribeTabCommandContextChanges(tab, managerRevoke);
+
+      const persistenceSpy = jest.fn(persistenceCallback);
+      realSelector.setOnChange(changeCallback);
+      realSelector.setOnPersistenceChange(persistenceSpy);
+
+      const persistentDir = nodeFs.mkdtempSync(nodePath.join(nodeOs.tmpdir(), 'claudian-tab-order-'));
+      realSelector.setPersistentPaths([persistentDir]);
+
+      // The manager listener sees the already-committed directories, then the
+      // dropdown resets, then the prescan runs.
+      expect(managerRevoke).toHaveBeenCalledTimes(1);
+      expect(observedDirs.at(-1)).toEqual([persistentDir]);
+      expect(managerRevoke.mock.invocationCallOrder[0])
+        .toBeLessThan(mockSlashCommandDropdown.resetSdkSkillsCache.mock.invocationCallOrder[0]);
+      expect(mockSlashCommandDropdown.resetSdkSkillsCache.mock.invocationCallOrder[0])
+        .toBeLessThan(mockFileContextManager.preScanExternalContexts.mock.invocationCallOrder[0]);
+
+      // Persistent removal: revocation chain first, persistence last.
+      managerRevoke.mockClear();
+      realSelector.removePath(persistentDir);
+      expect(managerRevoke).toHaveBeenCalledTimes(1);
+      expect(observedDirs.at(-1)).toEqual([]);
+      expect(managerRevoke.mock.invocationCallOrder[0])
+        .toBeLessThan(mockSlashCommandDropdown.resetSdkSkillsCache.mock.invocationCallOrder.at(-1)!);
+      expect(mockSlashCommandDropdown.resetSdkSkillsCache.mock.invocationCallOrder.at(-1)!)
+        .toBeLessThan(mockFileContextManager.preScanExternalContexts.mock.invocationCallOrder.at(-1)!);
+      expect(mockFileContextManager.preScanExternalContexts.mock.invocationCallOrder.at(-1)!)
+        .toBeLessThan(persistenceSpy.mock.invocationCallOrder[0]);
+
+      nodeFs.rmSync(persistentDir, { recursive: true, force: true });
+    } finally {
+      destroyTab(tab).catch(() => undefined);
+    }
+  });
+
+  it('uses the unbound registry factory during UI initialization without a manager', async () => {
+    const createCatalogAdapter = (files: Record<string, string>): VaultFileAdapter => ({
+      listFilesRecursive: async (folder: string) => {
+        const prefix = folder.endsWith('/') ? folder : `${folder}/`;
+        return Object.keys(files).filter(key => key.startsWith(prefix));
+      },
+      read: async (filePath: string) => {
+        if (!(filePath in files)) throw new Error(`File not found: ${filePath}`);
+        return files[filePath];
+      },
+      exists: async (filePath: string) => filePath in files,
+      listFolders: async (folder: string) => {
+        const prefix = folder.endsWith('/') ? folder : `${folder}/`;
+        const folders = new Set<string>();
+        for (const key of Object.keys(files)) {
+          if (key.startsWith(prefix)) {
+            const rest = key.slice(prefix.length);
+            const firstSlash = rest.indexOf('/');
+            if (firstSlash >= 0) folders.add(prefix + rest.slice(0, firstSlash));
+          }
+        }
+        return Array.from(folders);
+      },
+      write: async () => {},
+      delete: async () => {},
+      ensureFolder: async () => {},
+      rename: async () => {},
+      append: async () => {},
+      stat: async () => null,
+      deleteFolder: async () => {},
+    } as unknown as VaultFileAdapter);
+
+    const vaultFile = (name: string) => ({
+      [`.claude/commands/${name}.md`]: `---\ndescription: ${name} command\n---\nBody of ${name}`,
+    });
+
+    const catalog = new ClaudeCommandCatalog(
+      new SlashCommandStorage(createCatalogAdapter(vaultFile('vault-only'))),
+      new SkillStorage(createCatalogAdapter({})),
+    );
+    // The legacy global slot must never leak into the typed factory read.
+    catalog.setRuntimeCommands([{ id: 'sdk:foreign', name: 'foreign', content: '', source: 'sdk' } as any]);
+    const listLegacy = jest.spyOn(catalog, 'listDropdownEntries');
+
+    const plugin = createMockPlugin();
+    const options = createMockOptions({ plugin });
+    ProviderWorkspaceRegistry.setServices('claude', {
+      mcpManager: plugin.mcpManager,
+      mcpServerManager: plugin.mcpManager,
+      agentMentionProvider: plugin.agentManager,
+      commandCatalog: catalog,
+    } as any);
+
+    const tab = createTab(options);
+    try {
+      // Default entry point: initializeTabUI without a manager config.
+      initializeTabUI(tab, plugin);
+
+      const dropdownConstructor = (jest.requireMock('@/shared/components/SlashCommandDropdown') as {
+        SlashCommandDropdown: jest.Mock;
+      }).SlashCommandDropdown;
+      const constructorOptions = dropdownConstructor.mock.calls.at(-1)?.[3];
+      expect(constructorOptions).toBeDefined();
+      expect(typeof constructorOptions.providerConfig.createDiscoverySession).toBe('function');
+
+      // The unbound factory reads vault entries, never the global sdkCommands
+      // array, and never consults the legacy list path.
+      const session = constructorOptions.providerConfig.createDiscoverySession();
+      const snapshot = await session.read();
+      expect(snapshot.status).toBe('ready');
+      const ready = snapshot as Extract<CommandDropdownSnapshot, { status: 'ready' }>;
+      expect(ready.entries.map(entry => entry.name)).toEqual(['vault-only']);
+      expect(ready.receipt.runtimeEligibility).toBeNull();
+      expect(listLegacy).not.toHaveBeenCalled();
+      session.release();
+
+      // The no-manager entry also subscribes to registry replacements and
+      // rebinds the dropdown to the replacement catalog.
+      const replacement = new ClaudeCommandCatalog(
+        new SlashCommandStorage(createCatalogAdapter(vaultFile('vault-second'))),
+        new SkillStorage(createCatalogAdapter({})),
+      );
+      ProviderWorkspaceRegistry.setServices('claude', {
+        mcpManager: plugin.mcpManager,
+        mcpServerManager: plugin.mcpManager,
+        agentMentionProvider: plugin.agentManager,
+        commandCatalog: replacement,
+      } as any);
+      expect(mockSlashCommandDropdown.setProviderCatalog).toHaveBeenCalledTimes(1);
+      const [replacementConfig, replacementGetEntries] = mockSlashCommandDropdown.setProviderCatalog.mock.calls[0];
+      expect(typeof replacementConfig.createDiscoverySession).toBe('function');
+      await expect(replacementGetEntries()).resolves.toEqual([
+        expect.objectContaining({ name: 'vault-second' }),
+      ]);
+
+      // Destroy unsubscribes: later replacements never reach the dead tab.
+      await destroyTab(tab);
+      ProviderWorkspaceRegistry.setServices('claude', {
+        mcpManager: plugin.mcpManager,
+        mcpServerManager: plugin.mcpManager,
+        agentMentionProvider: plugin.agentManager,
+        commandCatalog: catalog,
+      } as any);
+      expect(mockSlashCommandDropdown.setProviderCatalog).toHaveBeenCalledTimes(1);
+    } finally {
+      await destroyTab(tab).catch(() => undefined);
+      ProviderWorkspaceRegistry.setServices('claude', {
+        mcpManager: plugin.mcpManager,
+        mcpServerManager: plugin.mcpManager,
+        agentMentionProvider: plugin.agentManager,
+      } as any);
+    }
+  });
+});
+
+describe('Tab - S3 no-manager catalog binding', () => {
+  const tabs: ReturnType<typeof createTab>[] = [];
+
+  beforeEach(() => {
+    jest.restoreAllMocks();
+    jest.clearAllMocks();
+  });
+
+  afterEach(async () => {
+    for (const tab of tabs.splice(0)) await destroyTab(tab).catch(() => undefined);
+    jest.restoreAllMocks();
+    ProviderWorkspaceRegistry.setServices('claude', undefined);
+    ProviderWorkspaceRegistry.setServices('codex', undefined);
+    ProviderWorkspaceRegistry.setServices('opencode', undefined);
+  });
+
+  function makeTab(options: TestTabCreateOptions): ReturnType<typeof createTab> {
+    const tab = createTab(options);
+    tabs.push(tab);
+    return tab;
+  }
+
+  function initializeRealDropdown(
+    tab: ReturnType<typeof createTab>,
+    plugin: any,
+    options?: Parameters<typeof initializeTabUI>[2],
+  ) {
+    const actual = jest.requireActual<typeof SlashDropdownModule>('@/shared/components/SlashCommandDropdown');
+    const mocked = jest.requireMock('@/shared/components/SlashCommandDropdown') as {
+      SlashCommandDropdown: jest.Mock;
+    };
+    mocked.SlashCommandDropdown.mockImplementationOnce(
+      (...args: ConstructorParameters<typeof actual.SlashCommandDropdown>) => new actual.SlashCommandDropdown(...args),
+    );
+    initializeTabUI(tab, plugin, options);
+    return tab.ui.slashCommandDropdown!;
+  }
+
+  function setCatalog(providerId: ProviderId, catalog: ProviderCommandCatalog | null): void {
+    const previous = ProviderWorkspaceRegistry.getServices(providerId);
+    ProviderWorkspaceRegistry.setServices(providerId, { ...previous, commandCatalog: catalog });
+  }
+
+  function createClaudeCatalog(name: string) {
+    const files: Record<string, string> = {
+      [`.claude/commands/${name}.md`]: `---\ndescription: ${name}\n---\n${name} body`,
+    };
+    const adapter = {
+      listFilesRecursive: async (folder: string) => Object.keys(files).filter(path => path.startsWith(`${folder}/`)),
+      read: async (path: string) => {
+        if (!(path in files)) throw new Error(`missing ${path}`);
+        return files[path];
+      },
+      exists: async (path: string) => path in files,
+      listFolders: async () => [],
+      write: async () => {},
+      delete: async () => {},
+      ensureFolder: async () => {},
+      rename: async () => {},
+      append: async () => {},
+      stat: async () => null,
+      deleteFolder: async () => {},
+    } as unknown as VaultFileAdapter;
+    const catalog = new ClaudeCommandCatalog(new SlashCommandStorage(adapter), new SkillStorage(adapter));
+    return {
+      catalog,
+      open: jest.spyOn(catalog, 'openDropdownSession'),
+      legacy: jest.spyOn(catalog, 'listDropdownEntries'),
+    };
+  }
+
+  function createCodexCatalog(name: string) {
+    const listProvider = {
+      listSkills: jest.fn().mockResolvedValue([{
+        name, path: `/skills/${name}/SKILL.md`, scope: 'user', enabled: true, description: name,
+      }]),
+      invalidate: jest.fn(),
+    };
+    return { catalog: new CodexSkillCatalog({} as any, listProvider, null), listProvider };
+  }
+
+  function trackSubscriptions() {
+    const records: Array<{ providerId: ProviderId; listener: () => void; unsubscribe: jest.Mock }> = [];
+    const original = ProviderWorkspaceRegistry.subscribeCommandCatalog.bind(ProviderWorkspaceRegistry);
+    const subscribe = jest.spyOn(ProviderWorkspaceRegistry, 'subscribeCommandCatalog')
+      .mockImplementation((providerId, listener) => {
+        const unsubscribe = jest.fn(original(providerId, listener));
+        records.push({ providerId, listener, unsubscribe });
+        return unsubscribe;
+      });
+    return { records, subscribe };
+  }
+
+  async function commands(tab: ReturnType<typeof createTab>, input = '/'): Promise<string[]> {
+    tab.dom.inputEl.value = input;
+    tab.dom.inputEl.selectionStart = input.length;
+    tab.dom.inputEl.selectionEnd = input.length;
+    tab.ui.slashCommandDropdown!.handleInputChange();
+    for (let i = 0; i < 50; i++) await Promise.resolve();
+    return Array.from(tab.dom.inputContainerEl.querySelectorAll('.claudian-slash-name'))
+      .map(element => element.textContent ?? '');
+  }
+
+  function toolbarCallbacks(): any {
+    const toolbar = jest.requireMock('@/features/chat/ui/InputToolbar') as { createInputToolbar: jest.Mock };
+    return toolbar.createInputToolbar.mock.calls.at(-1)?.[1];
+  }
+
+  it('uses the current provider capabilities when initialized without any catalog', async () => {
+    const conversation = {
+      id: 's3-opencode', providerId: 'opencode', title: 'OpenCode', messages: [],
+      createdAt: 1, updatedAt: 1,
+    } as const;
+    const plugin = createMockPlugin({ getConversationSync: jest.fn().mockReturnValue(conversation) });
+    const options = createMockOptions({ plugin, conversation: conversation as any });
+    setCatalog('opencode', null);
+    const tab = makeTab(options);
+    initializeRealDropdown(tab, plugin);
+
+    const names = await commands(tab);
+    expect(names).toEqual(expect.arrayContaining(['/clear', '/resume']));
+    expect(names).not.toContain('/fork');
+  });
+
+  it.each(['remove', 'clear'] as const)(
+    'releases the old typed session after replacement and registry %s', async action => {
+      const plugin = createMockPlugin();
+      const options = createMockOptions({ plugin });
+      const first = createClaudeCatalog('s3-first');
+      const second = createClaudeCatalog('s3-second');
+      setCatalog('claude', first.catalog);
+      const tab = makeTab(options);
+      const dropdown = initializeRealDropdown(tab, plugin);
+      const firstSession = first.open.mock.results[0].value as CommandDropdownSession;
+      const firstRelease = jest.spyOn(firstSession, 'release');
+      const firstRead = jest.spyOn(firstSession, 'read');
+
+      expect(await commands(tab)).toContain('/s3-first');
+      const readsBeforeReplacement = firstRead.mock.calls.length;
+      setCatalog('claude', second.catalog);
+      expect(firstRelease).toHaveBeenCalledTimes(1);
+      expect(tab.dom.inputContainerEl.querySelectorAll('.claudian-slash-name')).toHaveLength(0);
+      expect(await commands(tab)).toContain('/s3-second');
+      expect(firstRead).toHaveBeenCalledTimes(readsBeforeReplacement);
+
+      const secondSession = second.open.mock.results[0].value as CommandDropdownSession;
+      const secondRelease = jest.spyOn(secondSession, 'release');
+      const secondRead = jest.spyOn(secondSession, 'read');
+      if (action === 'clear') ProviderWorkspaceRegistry.clear();
+      else setCatalog('claude', null);
+      expect(secondRelease).toHaveBeenCalledTimes(1);
+      const readsBeforeRemoval = secondRead.mock.calls.length;
+
+      let names = await commands(tab);
+      expect(names).toEqual(expect.arrayContaining(['/clear', '/resume', '/fork']));
+      expect(names).not.toContain('/s3-first');
+      expect(names).not.toContain('/s3-second');
+      dropdown.resetSdkSkillsCache();
+      names = await commands(tab);
+      expect(names).toEqual(expect.arrayContaining(['/clear', '/resume', '/fork']));
+      expect(secondRead).toHaveBeenCalledTimes(readsBeforeRemoval);
+      expect(first.legacy).not.toHaveBeenCalled();
+      expect(second.legacy).not.toHaveBeenCalled();
+      expect(first.open).toHaveBeenCalledTimes(1);
+      expect(second.open).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  it('moves one subscription A→B→A and rejects copied, stale and closing notifications', async () => {
+    const plugin = createMockPlugin();
+    const options = createMockOptions({ plugin });
+    const firstA = createClaudeCatalog('s3-alpha');
+    const nextA = createClaudeCatalog('s3-alpha-next');
+    const firstB = createCodexCatalog('s3-beta');
+    const nextB = createCodexCatalog('s3-beta-next');
+    setCatalog('claude', firstA.catalog);
+    setCatalog('codex', firstB.catalog);
+    const tracking = trackSubscriptions();
+    const tab = makeTab(options);
+    const dropdown = initializeRealDropdown(tab, plugin);
+    const setCatalogSpy = jest.spyOn(dropdown, 'setProviderCatalog');
+    const cleanupCount = tab.dom.eventCleanups.length;
+    expect(tracking.records.map(record => record.providerId)).toEqual(['claude']);
+    expect(await commands(tab)).toContain('/s3-alpha');
+
+    const staleA = tracking.records[0];
+    let earlyStaleCalls = -1;
+    const stopContextListener = subscribeTabCommandContextChanges(tab, () => {
+      if (tab.providerId !== 'codex' || earlyStaleCalls !== -1) return;
+      const before = setCatalogSpy.mock.calls.length;
+      staleA.listener();
+      earlyStaleCalls = setCatalogSpy.mock.calls.length - before;
+    });
+    await toolbarCallbacks().onModelChange({ providerId: 'codex', modelId: DEFAULT_CODEX_PRIMARY_MODEL });
+    expect(earlyStaleCalls).toBe(0);
+    expect(tracking.records.map(record => record.providerId)).toEqual(['claude', 'codex']);
+    expect(staleA.unsubscribe).toHaveBeenCalledTimes(1);
+    expect(staleA.unsubscribe.mock.invocationCallOrder[0]).toBeLessThan(tracking.subscribe.mock.invocationCallOrder[1]);
+    expect(tracking.subscribe.mock.invocationCallOrder[1]).toBeLessThan(setCatalogSpy.mock.invocationCallOrder.at(-1)!);
+    expect(await commands(tab, '$')).toContain('$s3-beta');
+
+    let rebinds = setCatalogSpy.mock.calls.length;
+    setCatalog('claude', nextA.catalog);
+    staleA.listener();
+    expect(setCatalogSpy).toHaveBeenCalledTimes(rebinds);
+    expect(await commands(tab, '$')).toContain('$s3-beta');
+
+    setCatalog('codex', nextB.catalog);
+    expect(setCatalogSpy).toHaveBeenCalledTimes(rebinds + 1);
+    expect(await commands(tab, '$')).toContain('$s3-beta-next');
+    expect(firstB.listProvider.listSkills).toHaveBeenCalledTimes(1);
+    await toolbarCallbacks().onModelChange({ providerId: 'codex', modelId: DEFAULT_CODEX_PRIMARY_MODEL });
+    expect(tracking.records).toHaveLength(2);
+
+    await toolbarCallbacks().onModelChange({ providerId: 'claude', modelId: 'opus' });
+    expect(tracking.records.map(record => record.providerId)).toEqual(['claude', 'codex', 'claude']);
+    expect(tracking.records[1].unsubscribe).toHaveBeenCalledTimes(1);
+    expect(tab.dom.eventCleanups).toHaveLength(cleanupCount);
+    expect(await commands(tab)).toContain('/s3-alpha-next');
+    rebinds = setCatalogSpy.mock.calls.length;
+    staleA.listener();
+    expect(setCatalogSpy).toHaveBeenCalledTimes(rebinds);
+    setCatalog('claude', firstA.catalog);
+    expect(setCatalogSpy).toHaveBeenCalledTimes(++rebinds);
+    expect(await commands(tab)).toContain('/s3-alpha');
+
+    stopContextListener();
+    tab.lifecycleState = 'closing';
+    tracking.records[2].listener();
+    expect(setCatalogSpy).toHaveBeenCalledTimes(rebinds);
+    await destroyTab(tab);
+    expect(tracking.records[2].unsubscribe).toHaveBeenCalledTimes(1);
+    tracking.records.forEach(record => record.listener());
+    setCatalog('claude', nextA.catalog);
+    expect(setCatalogSpy).toHaveBeenCalledTimes(rebinds);
+  });
+
+  it('rebinds through conversation changes, including a catalog-less provider', async () => {
+    const openCodeConversation = {
+      id: 's3-conversation-b', providerId: 'opencode', title: 'B', messages: [],
+      createdAt: 1, updatedAt: 1,
+    };
+    const plugin = createMockPlugin({
+      getConversationSync: jest.fn((id: string) => id === openCodeConversation.id ? openCodeConversation : null),
+    });
+    const options = createMockOptions({ plugin });
+    const initial = createClaudeCatalog('s3-conversation-a');
+    setCatalog('claude', initial.catalog);
+    setCatalog('opencode', null);
+    const tracking = trackSubscriptions();
+    const tab = makeTab(options);
+    initializeRealDropdown(tab, plugin);
+    const session = initial.open.mock.results[0].value as CommandDropdownSession;
+    const release = jest.spyOn(session, 'release');
+    expect(await commands(tab)).toContain('/s3-conversation-a');
+
+    initializeTabControllers(tab, plugin, {} as any);
+    const controller = jest.requireMock('@/features/chat/controllers/ConversationController') as {
+      ConversationController: jest.Mock;
+    };
+    const deps = controller.ConversationController.mock.calls.at(-1)?.[0];
+    await deps.ensureServiceForConversation(openCodeConversation);
+    expect(release).toHaveBeenCalledTimes(1);
+    expect(tracking.records.map(record => record.providerId)).toEqual(['claude', 'opencode']);
+    const names = await commands(tab);
+    expect(names).toEqual(expect.arrayContaining(['/clear', '/resume']));
+    expect(names).not.toContain('/fork');
+    expect(names).not.toContain('/s3-conversation-a');
+
+    const incoming = new OpencodeCommandCatalog();
+    incoming.setRuntimeCommands([{ id: 's3-new', name: 's3-conversation-b', content: '', source: 'sdk' }]);
+    setCatalog('opencode', incoming);
+    expect(await commands(tab)).toContain('/s3-conversation-b');
+  });
+
+  it('rebinds the fallback when provider availability changes the draft', async () => {
+    const plugin = createMockPlugin();
+    plugin.settings.settingsProvider = 'codex';
+    plugin.settings.model = DEFAULT_CODEX_PRIMARY_MODEL;
+    plugin.settings.savedProviderModel.codex = DEFAULT_CODEX_PRIMARY_MODEL;
+    const options = createMockOptions({ plugin });
+    const claude = createClaudeCatalog('s3-available');
+    const codex = createCodexCatalog('s3-disabled');
+    setCatalog('claude', claude.catalog);
+    setCatalog('codex', codex.catalog);
+    const tracking = trackSubscriptions();
+    const tab = makeTab(options);
+    initializeRealDropdown(tab, plugin);
+    expect(tab.providerId).toBe('codex');
+    expect(await commands(tab, '$')).toContain('$s3-disabled');
+
+    plugin.settings.codexEnabled = false;
+    onProviderAvailabilityChanged(tab, plugin);
+    expect(tab.providerId).toBe('claude');
+    expect(tracking.records.map(record => record.providerId)).toEqual(['codex', 'claude']);
+    expect(tracking.records[0].unsubscribe).toHaveBeenCalledTimes(1);
+    expect(await commands(tab)).toContain('/s3-available');
+  });
+
+  it('rebinds the manager catalog when availability changes the draft', async () => {
+    const plugin = createMockPlugin();
+    plugin.settings.settingsProvider = 'codex';
+    plugin.settings.model = DEFAULT_CODEX_PRIMARY_MODEL;
+    plugin.settings.savedProviderModel.codex = DEFAULT_CODEX_PRIMARY_MODEL;
+    const options = createMockOptions({ plugin });
+    const claude = createClaudeCatalog('s3-manager-available');
+    const codex = createCodexCatalog('s3-manager-disabled');
+    setCatalog('claude', claude.catalog);
+    setCatalog('codex', codex.catalog);
+    const tracking = trackSubscriptions();
+    const target = {
+      subscribe: jest.fn(() => jest.fn()),
+      capture: jest.fn(() => ({
+        target: {
+          kind: 'unbound',
+          providerId: 'claude',
+          sessionEpoch: 0,
+          registryRevision: 0,
+          targetToken: null,
+          ticket: null,
+          generation: null,
+          runtime: null,
+          contextKey: null,
+          requestedExternalPaths: [],
+        },
+        eligibilitySignal: new AbortController().signal,
+        isCurrent: () => true,
+      })),
+    } as any;
+    const tab = makeTab(options);
+    const accessor = jest.fn((): {
+      config: ProviderCommandDropdownConfig;
+      getEntries: () => Promise<ProviderCommandEntry[]>;
+    } => {
+      if (tab.providerId === 'codex') {
+        return {
+          config: codex.catalog.getDropdownConfig(),
+          getEntries: async () => codex.catalog.listDropdownEntries({ includeBuiltIns: false }),
+        };
+      }
+      return {
+        config: {
+          ...claude.catalog.getDropdownConfig(),
+          createDiscoverySession: () => claude.catalog.openDropdownSession(target),
+        },
+        getEntries: jest.fn().mockResolvedValue([] as ProviderCommandEntry[]),
+      };
+    });
+    const dropdown = initializeRealDropdown(tab, plugin, { getProviderCatalogConfig: accessor });
+    const setCatalogSpy = jest.spyOn(dropdown, 'setProviderCatalog');
+    expect(tab.providerId).toBe('codex');
+    expect(await commands(tab, '$')).toContain('$s3-manager-disabled');
+    const accessorCalls = accessor.mock.calls.length;
+
+    const notified = jest.fn();
+    const unsubscribe = subscribeTabCommandContextChanges(tab, notified);
+    plugin.settings.codexEnabled = false;
+    onProviderAvailabilityChanged(tab, plugin);
+    expect(tab.providerId).toBe('claude');
+    // Fallback without a runtime still revokes eligibility first...
+    expect(notified.mock.calls.length).toBeGreaterThan(0);
+    // ...then rebinds through the saved manager accessor with the new identity.
+    expect(accessor.mock.calls.length).toBeGreaterThan(accessorCalls);
+    expect(setCatalogSpy).toHaveBeenCalled();
+    const [reboundConfig, , reboundProviderId] = setCatalogSpy.mock.calls.at(-1)!;
+    expect(reboundConfig?.providerId).toBe('claude');
+    expect(reboundProviderId).toBe('claude');
+    expect(await commands(tab)).toContain('/s3-manager-available');
+    // Manager-path tabs never grow a per-tab registry binding.
+    expect(tracking.records).toHaveLength(0);
+    unsubscribe();
+  });
+
+  it('does not install an unbound registry factory when the manager returns no catalog', async () => {
+    const plugin = createMockPlugin();
+    const options = createMockOptions({ plugin });
+    const catalog = createClaudeCatalog('s3-unbound');
+    setCatalog('claude', catalog.catalog);
+    const tracking = trackSubscriptions();
+    const tab = makeTab(options);
+    initializeRealDropdown(tab, plugin, { getProviderCatalogConfig: () => null });
+
+    expect(catalog.open).not.toHaveBeenCalled();
+    expect(tracking.records).toHaveLength(0);
+    expect(await commands(tab)).toEqual(expect.arrayContaining(['/clear', '/resume', '/fork']));
+    await toolbarCallbacks().onModelChange({ providerId: 'claude', modelId: 'opus' });
+    expect(catalog.open).not.toHaveBeenCalled();
+    expect(tracking.records).toHaveLength(0);
+  });
+
+  it('leaves manager-provided target factories as the only manager-path writer', async () => {
+    const plugin = createMockPlugin();
+    const options = createMockOptions({ plugin });
+    const first = createClaudeCatalog('s3-managed-first');
+    const second = createClaudeCatalog('s3-managed-second');
+    setCatalog('claude', first.catalog);
+    const tracking = trackSubscriptions();
+    const target = { subscribe: jest.fn(() => jest.fn()), capture: jest.fn() } as any;
+    const managerInfo = (catalog: ClaudeCommandCatalog) => ({
+      config: { ...catalog.getDropdownConfig(), createDiscoverySession: () => catalog.openDropdownSession(target) },
+      getEntries: jest.fn().mockResolvedValue([]),
+    });
+    let current = managerInfo(first.catalog);
+    const tab = makeTab(options);
+    const dropdown = initializeRealDropdown(tab, plugin, { getProviderCatalogConfig: () => current });
+    const setCatalogSpy = jest.spyOn(dropdown, 'setProviderCatalog');
+    const firstSession = first.open.mock.results[0].value as CommandDropdownSession;
+    const firstRelease = jest.spyOn(firstSession, 'release');
+    expect(first.open).toHaveBeenCalledWith(target);
+    expect(tracking.records).toHaveLength(0);
+
+    setCatalog('claude', second.catalog);
+    expect(setCatalogSpy).not.toHaveBeenCalled();
+    current = managerInfo(second.catalog);
+    await toolbarCallbacks().onModelChange({ providerId: 'claude', modelId: 'opus' });
+    expect(firstRelease).toHaveBeenCalledTimes(1);
+    expect(second.open).toHaveBeenCalledWith(target);
+    expect(tracking.records).toHaveLength(0);
   });
 });

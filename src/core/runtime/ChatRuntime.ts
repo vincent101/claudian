@@ -1,5 +1,5 @@
-import type { FullHistoryIterable, ProviderCapabilities, ProviderId } from '../providers/types';
 import type { RuntimeCommandDiscovery } from '../providers/commands/ProviderCommandDiscovery';
+import type { FullHistoryIterable, HistoryTailStart, ProviderCapabilities, ProviderId } from '../providers/types';
 import type { ChatMessage, Conversation, SlashCommand, StreamChunk, ToolCallInfo } from '../types';
 import type {
   ApprovalCallback,
@@ -51,8 +51,8 @@ export interface ChatRuntime {
   cancel(): void;
   beginUserTurnProjection?(turnId: string): void;
   completeUserTurnProjection?(turnId: string): Promise<void>;
-  /** Starts transcript observation at an already-materialized snapshot boundary. */
-  setTranscriptObserverStartOffset?(offset: number | null): void;
+  /** Hands the transcript observer the tail-start credentials of the already-materialized snapshot boundary (H/P8). */
+  setTranscriptObserverTailStart?(tailStart: HistoryTailStart | null): void;
   setHistoryRecoverySource?(source: (() => FullHistoryIterable) | null): void;
   onHistoryRecoveryStateChange?(listener: (state: HistoryRecoveryStatus) => void): () => void;
   retryHistoryRecovery?(generation: number): boolean;
@@ -69,7 +69,13 @@ export interface ChatRuntime {
   setApprovalDismisser(dismisser: (() => void) | null): void;
   setAskUserQuestionCallback(callback: AskUserQuestionCallback | null): void;
   setExitPlanModeCallback(callback: ExitPlanModeCallback | null): void;
-  setPermissionModeSyncCallback(callback: ((sdkMode: string) => void) | null): void;
+  /**
+   * Native permission-mode observation sink. Payload contract (#1894): the
+   * value is the PROVIDER-NORMALIZED app permission mode (a provider policy
+   * value plus its transient overlays like 'plan'), never the raw provider
+   * wire mode. Providers reverse-map observations before invoking this.
+   */
+  setPermissionModeSyncCallback(callback: ((appMode: string) => void) | null): void;
   setSubagentHookProvider(getState: () => SubagentRuntimeState): void;
   /** Fix 2: optional — providers that emit harness task-notifications. */
   setSubagentNotificationHandler?(handler: SubagentTaskNotificationHandler | null): void;

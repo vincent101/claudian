@@ -1,3 +1,4 @@
+import type { HistoryTailStart } from '../../../core/providers/types';
 import type { AsyncSubagentStatus, ChatMessage } from '../../../core/types';
 
 export type SDKSessionReadStatus = 'complete' | 'missing' | 'oversize' | 'failed';
@@ -86,3 +87,35 @@ export interface AsyncSubagentResult {
 }
 
 export type ResolvedAsyncStatus = Exclude<AsyncSubagentStatus, 'pending'>;
+
+/** Claude-owned tail-start payload (H/P8): the source identity a windowed
+ * page's committed boundary was observed on. Consumers prime at
+ * committedOffset only after re-verifying dev/ino/snapshotSize against the
+ * live file; a mismatch rejects the handoff as a source change. */
+export interface ClaudeTailStartPayload {
+  path: string;
+  dev: number;
+  ino: number;
+  snapshotSize: number;
+  committedOffset: number;
+}
+
+export function claudeTailStart(index: {
+  filePath: string;
+  dev: number;
+  ino: number;
+  snapshotSize: number;
+  committedSize: number;
+}): HistoryTailStart {
+  return {
+    provider: 'claude',
+    protocol: 1,
+    payload: {
+      path: index.filePath,
+      dev: index.dev,
+      ino: index.ino,
+      snapshotSize: index.snapshotSize,
+      committedOffset: index.committedSize,
+    },
+  };
+}

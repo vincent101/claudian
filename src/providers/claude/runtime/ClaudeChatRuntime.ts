@@ -37,6 +37,7 @@ import type {
   AppAgentManager,
   AppPluginManager,
   FullHistoryIterable,
+  HistoryTailStart,
 } from '../../../core/providers/types';
 import type { ChatRuntime, HistoryRecoveryStatus } from '../../../core/runtime/ChatRuntime';
 import type {
@@ -383,7 +384,7 @@ export class ClaudianService implements ChatRuntime {
   private transcriptObserver: ClaudeTranscriptTurnObserver | null = null;
   private transcriptObserverTarget: string | null = null;
   private transcriptObserverRestartChain: Promise<void> = Promise.resolve();
-  private transcriptObserverStartOffset: number | null = null;
+  private transcriptObserverTailStart: HistoryTailStart | null = null;
   private historyRecoverySource: (() => FullHistoryIterable) | null = null;
   private transcriptDiagnosticLog: ClaudeTranscriptDiagnosticLog | null = null;
   private transcriptCliVersion: string | undefined;
@@ -3862,8 +3863,8 @@ export class ClaudianService implements ChatRuntime {
     // Runtime starts on demand when query() is called.
   }
 
-  setTranscriptObserverStartOffset(offset: number | null): void {
-    this.transcriptObserverStartOffset = offset;
+  setTranscriptObserverTailStart(tailStart: HistoryTailStart | null): void {
+    this.transcriptObserverTailStart = tailStart;
   }
 
   setHistoryRecoverySource(source: (() => FullHistoryIterable) | null): void {
@@ -3913,10 +3914,24 @@ export class ClaudianService implements ChatRuntime {
       });
       this.transcriptObserver = observer;
       try {
-        const fromOffset = this.transcriptObserverStartOffset ?? undefined;
-        this.transcriptObserverStartOffset = null;
-        await observer.start(target, fromOffset);
-      } catch {
+        // The tail-start credentials are consumed exactly once: the first
+        // observer start after runtime creation primes at the committed
+        // boundary only after re-verifying the snapshot's source identity.
+        const tailStart = this.transcriptObserverTailStart ?? undefined;
+        this.transcriptObserverTailStart = null;
+        await observer.start(target, tailStart);
+      } catch (error) {
+        // A source-change rejection kills this observer on purpose; the
+        // diagnostic carries the session identity (hashed — no paths or raw
+        // ids land in the log) so the restart-loop cause stays auditable.
+        if (error instanceof Error && /source.*changed/i.test(error.message)) {
+          this.transcriptDiagnosticLog?.record({
+            phase: 'prime_rejected',
+            reason: 'source_changed',
+            conversationIdHash: this.transcriptDiagnosticLog.hashId(sessionId ?? 'unknown'),
+            detail: 'observer_start',
+          });
+        }
         observer.stop('start_failed');
         if (this.transcriptObserver === observer) this.transcriptObserver = null;
         if (this.transcriptObserverTarget === target) this.transcriptObserverTarget = null;
